@@ -127,6 +127,25 @@ Key sources this is modeled on / ported from:
   ImmichFrame-snapweb's `snapstream.ts` (itself derived from esp32 snapclient's
   `TimeFilter.c`).
 
+## Flashing
+
+[scripts/flash.sh](scripts/flash.sh) (ergonomics adapted from speakeasy's flasher)
+builds and flashes in one step:
+
+```bash
+scripts/flash.sh --usb                      # serial: auto-detects the ESP32 port
+scripts/flash.sh 192.168.1.42 kitchen.local # ESPHome OTA, multiple devices, -p for parallel
+scripts/flash.sh --docker --usb             # build in ghcr.io/esphome/esphome, flash from host
+scripts/flash.sh -c example/snapclient-example.yaml --usb --log
+```
+
+Docker note: mount the **repo root** (so `external_components: path: ../components`
+resolves) — `docker run --rm -v "$PWD":/config ghcr.io/esphome/esphome run
+example/esp32-s3-supermini.yaml`. On Linux add `--device=/dev/ttyACM0` for serial;
+Docker Desktop on macOS cannot pass USB through, so build in Docker and flash from
+the host (what `--docker` does), use https://web.esphome.io with
+`firmware.factory.bin`, or flash once via USB and use OTA thereafter.
+
 ## Testing without hardware
 
 [tests/run-qemu-test.sh](tests/run-qemu-test.sh) runs the real firmware on an emulated
