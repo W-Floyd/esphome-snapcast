@@ -53,6 +53,9 @@ static constexpr int64_t SOFT_CORRECTION_DEADBAND_US = 2000;
 // catch-up); below it, corrections stay at an inaudible 1-2 frames per chunk.
 static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
 
+// At most one hard-resync log line this often; the sync report carries full counts
+static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
+
 // Time-sync RTT gating (see handle_time_reply_)
 static constexpr int64_t RTT_GATE_US = 20000;      // reject samples this far above the floor
 static constexpr int64_t RTT_FLOOR_LEAK_US = 500;  // floor rises this much per sample (~0.5 ms/s)
@@ -700,6 +703,7 @@ void SnapcastClient::player_task_() {
   // EWMA of the sync error (~1 s time constant at 24 ms chunks); soft corrections
   // act on this, not the noisy per-chunk error
   int64_t err_ewma_us = 0;
+  int64_t last_resync_log_us = 0;
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -776,9 +780,17 @@ void SnapcastClient::player_task_() {
       hard_resyncs = 0;
     }
 
+    // Hard-resync logging is throttled to one line per RESYNC_LOG_INTERVAL_US: during
+    // a recovery storm this fires per chunk, and when logs stream over the api the
+    // log traffic competes with the audio stream on the already-congested link — a
+    // feedback loop that prolongs the outage. The periodic sync report carries the
+    // full per-window count either way.
     if (error_us > hard_us) {
       // Hard resync, late: drop whole chunks until we catch back up
-      ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunk", error_us / 1000);
+      if (now_us() - last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
+        last_resync_log_us = now_us();
+        ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunks (throttled log)", error_us / 1000);
+      }
       hard_resyncs++;
       err_ewma_us = 0;
       this->discard_ring_bytes_(rec.bytes);
@@ -791,8 +803,10 @@ void SnapcastClient::player_task_() {
       // loop stays responsive), keeping the DAC fed and continuous
       const int64_t gap_frames = (-error_us) * rec.params.sample_rate / 1000000;
       const uint32_t fill = std::min<int64_t>(gap_frames, rec.params.sample_rate / 2);
-      ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms early, inserting %" PRIu32 " frames of silence", -error_us / 1000,
-               fill);
+      if (now_us() - last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
+        last_resync_log_us = now_us();
+        ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms early, inserting silence (throttled log)", -error_us / 1000);
+      }
       hard_resyncs++;
       err_ewma_us = 0;
       this->push_silence_(fill, rec.params);
