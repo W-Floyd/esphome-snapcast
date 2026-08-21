@@ -97,6 +97,12 @@ static constexpr float TRIM_CLAMP_PPM = 500.0f;
 // notify_audio_played()
 static constexpr int64_t PIPELINE_FLUSH_GAP_US = 500000;
 
+// Keepalive silence while no chunk is available: pushed in these slices, up to
+// this total, so the speaker's no-data timeout (500 ms) cannot tear the pipeline
+// down mid-hiccup. The cap lets a genuinely ended stream idle out normally.
+static constexpr int64_t KEEPALIVE_SLICE_US = 50000;
+static constexpr int64_t KEEPALIVE_MAX_US = 10000000;
+
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
 
@@ -1150,11 +1156,31 @@ void SnapcastClient::player_task_() {
   bool converged = false;
   uint32_t in_band_chunks = 0;
   int64_t last_resync_log_us = 0;
+  // Format of the last chunk played, for keepalive silence during a delivery gap
+  StreamParams keepalive_params{};
+  int64_t keepalive_pushed_us = 0;
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
+      // No chunk available: keep the downstream pipeline FED rather than idle.
+      // The speaker and mixer stop themselves after `timeout` (500 ms default)
+      // without data, which tears down and rebuilds their ring buffers -- turning
+      // a sub-second delivery hiccup into a multi-second dropout (pipeline
+      // restart, unobservable refill, accounting re-baseline, mute, re-lock).
+      // Silence occupies exactly the missing duration, so the playout timeline
+      // stays continuous and a live stream resumes with no correction at all.
+      // Capped: a genuinely ended stream should be allowed to idle out.
+      if (keepalive_params.valid() && this->output_active_.load(std::memory_order_relaxed) &&
+          keepalive_pushed_us < KEEPALIVE_MAX_US) {
+        const uint32_t frames = keepalive_params.sample_rate / (1000000 / KEEPALIVE_SLICE_US);
+        if (this->push_silence_(frames, keepalive_params) > 0) {
+          keepalive_pushed_us += KEEPALIVE_SLICE_US;
+        }
+      }
       continue;
     }
+    keepalive_params = rec.params;
+    keepalive_pushed_us = 0;
 
     const uint32_t frame_bytes = rec.params.frame_bytes();
     if (frame_bytes == 0) {

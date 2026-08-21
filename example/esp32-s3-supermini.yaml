@@ -100,6 +100,11 @@ speaker:
     sample_rate: 48000
     channel: stereo
     buffer_duration: 100ms
+    # Never stop on a data gap: the default 500 ms timeout tears down and rebuilds
+    # the speaker/mixer rings, escalating a brief delivery hiccup into a
+    # multi-second dropout. The snapclient also pushes keepalive silence, so this
+    # is belt-and-braces; with auto_clear the DMA plays silence when idle anyway.
+    timeout: never
   # Blend announcements over the music
   - platform: mixer
     output_speaker: dac_speaker
