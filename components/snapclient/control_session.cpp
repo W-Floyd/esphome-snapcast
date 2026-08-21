@@ -28,6 +28,7 @@ void ControlSession::close() {
     ::close(this->sock_);
     this->sock_ = -1;
   }
+  this->warned_not_found_ = false;
   if (this->was_ready_) {
     this->was_ready_ = false;
     ESP_LOGD(TAG, "Control session closed");
@@ -196,7 +197,12 @@ static void build_filter(JsonDocument &f) {
   f["id"] = true;
   f["method"] = true;
   for (const char *root : {"result", "params"}) {
-    JsonVariant server = f[root]["server"];
+    // to<JsonObject>() CREATES the nested object: plain `JsonVariant v = f[x][y]`
+    // is a read that binds nothing on a missing key, and writes through the
+    // unbound variant vanish -- which silently emptied this whole filter branch
+    // (GetStatus responses deserialized with `server` stripped, so group/stream/
+    // metadata never populated while everything else looked healthy)
+    JsonObject server = f[root]["server"].to<JsonObject>();
     server["groups"][0]["id"] = true;
     server["groups"][0]["stream_id"] = true;
     server["groups"][0]["clients"][0]["id"] = true;
@@ -289,12 +295,16 @@ void ControlSession::parse_server_(const void *server_variant) {
       my_group = gid != nullptr ? gid : "";
     }
   }
-  if (my_stream != this->stream_id_ || my_group != this->group_id_) {
-    if (my_group.empty()) {
+  if (my_group.empty()) {
+    // Fires even without a state transition (empty -> empty is the silent
+    // failure mode: never matched at all), once per session
+    if (!this->warned_not_found_) {
+      this->warned_not_found_ = true;
       ESP_LOGW(TAG, "This client not found in server status (id '%s'); no metadata", this->client_id_.c_str());
-    } else {
-      ESP_LOGD(TAG, "This client: group '%s', stream '%s'", my_group.c_str(), my_stream.c_str());
     }
+  } else if (my_stream != this->stream_id_ || my_group != this->group_id_) {
+    ESP_LOGD(TAG, "This client: group '%s', stream '%s'", my_group.c_str(), my_stream.c_str());
+    this->warned_not_found_ = false;
   }
   this->group_id_ = my_group;
   this->stream_id_ = my_stream;

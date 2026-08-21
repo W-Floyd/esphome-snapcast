@@ -100,6 +100,7 @@ class ControlSession {
 
   bool status_pending_{false};
   int64_t last_status_req_us_{0};
+  bool warned_not_found_{false};  // once per session
 
   // Learned identity of this client on the server
   std::string group_id_;
