@@ -48,6 +48,7 @@ static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 // nearly every chunk — a constant stream of tiny waveform discontinuities, audible
 // as micro-stutter. The reference snapclient median-filters over long windows for
 // the same reason.
+// (Configurable via SnapcastClientConfig::sync_deadband_us; this is the default.)
 static constexpr int64_t SOFT_CORRECTION_DEADBAND_US = 2000;
 // Above this error, trade a little audibility for fast convergence (post-stall
 // catch-up); below it, corrections stay at an inaudible 1-2 frames per chunk.
@@ -810,7 +811,7 @@ void SnapcastClient::player_task_() {
       hard_resyncs++;
       err_ewma_us = 0;
       this->push_silence_(fill, rec.params);
-    } else if (std::abs(err_ewma_us) > SOFT_CORRECTION_DEADBAND_US) {
+    } else if (std::abs(err_ewma_us) > this->config_.sync_deadband_us) {
       // Soft correction: drop (late) or pad (early) a tiny number of frames per
       // chunk. Gated on the smoothed error so feedback quantization noise doesn't
       // trigger a correction on every chunk (audible as micro-stutter); genuine

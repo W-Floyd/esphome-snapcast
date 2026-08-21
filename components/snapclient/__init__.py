@@ -41,6 +41,7 @@ PHASE_MODES = {
     "both": PhaseMode.BOTH,
 }
 CONF_PHASE_INVERT = "phase_invert"
+CONF_SYNC_DEADBAND = "sync_deadband"
 
 
 def _request_networking(config: ConfigType) -> ConfigType:
@@ -73,6 +74,17 @@ CONFIG_SCHEMA = cv.All(
                 cv.Range(
                     min=cv.TimePeriod(milliseconds=100),
                     max=cv.TimePeriod(seconds=60),
+                ),
+            ),
+            # Smoothed sync error below which no correction is applied. The default
+            # suits a solo speaker; set both devices of a synchronized stereo pair to
+            # ~500us — each device drifting freely inside its own deadband wanders
+            # the stereo image (localization hears sub-millisecond shifts).
+            cv.Optional(CONF_SYNC_DEADBAND, default="2ms"): cv.All(
+                cv.positive_time_period_microseconds,
+                cv.Range(
+                    min=cv.TimePeriod(microseconds=100),
+                    max=cv.TimePeriod(milliseconds=20),
                 ),
             ),
             cv.Optional(CONF_HARD_RESYNC_THRESHOLD, default="50ms"): cv.All(
@@ -116,6 +128,7 @@ async def to_code(config: ConfigType) -> None:
             config[CONF_TIME_SYNC_INTERVAL].total_milliseconds
         )
     )
+    cg.add(var.set_sync_deadband(config[CONF_SYNC_DEADBAND].total_microseconds))
     cg.add(
         var.set_hard_resync_threshold(
             config[CONF_HARD_RESYNC_THRESHOLD].total_milliseconds

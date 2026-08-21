@@ -56,6 +56,7 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   void set_time_sync_interval(uint32_t interval_ms) { this->time_sync_interval_ms_ = interval_ms; }
   void set_hard_resync_threshold(uint32_t threshold_ms) { this->hard_resync_threshold_ms_ = threshold_ms; }
   void set_stream_idle_timeout(uint32_t timeout_ms) { this->stream_idle_timeout_ms_ = timeout_ms; }
+  void set_sync_deadband(uint32_t deadband_us) { this->sync_deadband_us_ = deadband_us; }
 
   // --- Child component API (main loop thread) ---
 
@@ -124,6 +125,7 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   uint32_t time_sync_interval_ms_{1000};
   uint32_t hard_resync_threshold_ms_{50};
   uint32_t stream_idle_timeout_ms_{3000};
+  uint32_t sync_deadband_us_{2000};
 
   // Deferred child registrations from before setup() ran
   SnapcastAudioListener *pending_audio_listener_{nullptr};

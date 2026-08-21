@@ -32,6 +32,7 @@ void SnapclientHub::setup() {
   config.time_sync_interval_ms = this->time_sync_interval_ms_;
   config.hard_resync_threshold_ms = this->hard_resync_threshold_ms_;
   config.stream_idle_timeout_ms = this->stream_idle_timeout_ms_;
+  config.sync_deadband_us = this->sync_deadband_us_;
 
   this->client_ = std::make_unique<SnapcastClient>(std::move(config));
   this->client_->set_listener(this);
