@@ -219,6 +219,10 @@ class SnapcastClient {
   void discard_ring_bytes_(size_t bytes);
   /// Pushes silence downstream. @return frames actually pushed.
   uint32_t push_silence_(uint32_t frames, const StreamParams &params);
+  /// Pushes one copy of the most recently pushed frame (sample stuffing, like the
+  /// reference); a repeated frame is nearly click-free where an inserted silence
+  /// frame is a hard amplitude step. Falls back to silence when no frame is cached.
+  void push_repeat_frame_(const StreamParams &params);
   /// Pushes @p bytes from the ring downstream, dropping @p drop_frames from the front.
   void push_chunk_(const ChunkRecord &rec, uint32_t drop_frames);
   /// @brief Applies the configured channel routing and polarity inversion in-place
@@ -304,6 +308,9 @@ class SnapcastClient {
   // --- Player task locals ---
   std::unique_ptr<uint8_t[]> slice_buffer_;
   static constexpr size_t SLICE_BUFFER_SIZE = 4096;
+  // Most recent pushed frame, for click-free servo insertion (player task only)
+  uint8_t last_frame_[8]{};
+  uint32_t last_frame_bytes_{0};
 };
 
 }  // namespace esphome::snapclient

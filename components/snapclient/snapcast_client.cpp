@@ -49,8 +49,8 @@ static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 // trims single frames. Hardware medians sit far below this in steady state.
 static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 3000;
 
-// Median window for the steering servo's error signal (~0.4 s of chunks)
-static constexpr size_t MEDIAN_WINDOW = 15;
+// Median window for the steering servo's error signal (~0.8 s of chunks)
+static constexpr size_t MEDIAN_WINDOW = 31;
 
 // A playback-feedback gap this long means the pipeline stopped (and flushed its
 // buffers on restart); triggers the frame-accounting re-baseline in
@@ -184,7 +184,8 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   // fitting a slope too would amplify its estimation noise over the pivot-to-now
   // lever arm into millisecond wobble, while real DAC-vs-esp_timer clock drift only
   // moves the pivot slowly — which the steering servo absorbs by design.
-  constexpr double ALPHA = 1.0 / 64.0;
+  // ~2.5 s memory: hardware feedback noise must average to well below the servo band
+  constexpr double ALPHA = 1.0 / 256.0;
   const double f = static_cast<double>(this->played_frames_total_);
   const double t = static_cast<double>(timestamp_us);
   if (this->fb_samples_ == 0) {
@@ -914,7 +915,7 @@ void SnapcastClient::player_task_() {
         soft_dropped_frames++;
       } else if (steer_dir < 0) {
         soft_inserted_frames++;
-        this->push_silence_(1, rec.params);
+        this->push_repeat_frame_(rec.params);
       }
     }
 
@@ -1051,6 +1052,32 @@ void SnapcastClient::apply_channel_mode_(uint8_t *data, size_t len, const Stream
   }
 }
 
+// THREAD CONTEXT: Player task
+void SnapcastClient::push_repeat_frame_(const StreamParams &params) {
+  const uint32_t frame_bytes = params.frame_bytes();
+  if (this->audio_listener_ == nullptr || frame_bytes == 0 || frame_bytes > sizeof(this->last_frame_)) {
+    return;
+  }
+  if (this->last_frame_bytes_ != frame_bytes) {
+    // No cached frame in this format yet
+    this->push_silence_(1, params);
+    return;
+  }
+  size_t offset = 0;
+  while (offset < frame_bytes && this->output_active_.load(std::memory_order_relaxed) &&
+         !this->shutdown_.load(std::memory_order_relaxed)) {
+    const size_t written =
+        this->audio_listener_->on_audio_write(this->last_frame_ + offset, frame_bytes - offset, 100, params);
+    if (written == 0) {
+      return;
+    }
+    offset += written;
+  }
+  this->playout_mutex_.lock();
+  this->pushed_frames_total_ += 1;
+  this->playout_mutex_.unlock();
+}
+
 void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames) {
   const uint32_t frame_bytes = rec.params.frame_bytes();
   size_t remaining = rec.bytes;
@@ -1065,6 +1092,12 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames) {
     remaining -= got;
 
     this->apply_channel_mode_(this->slice_buffer_.get(), got, rec.params);
+
+    // Cache the slice's final frame (post-transform) for click-free servo insertion
+    if (got >= frame_bytes && frame_bytes <= sizeof(this->last_frame_)) {
+      memcpy(this->last_frame_, this->slice_buffer_.get() + got - frame_bytes, frame_bytes);
+      this->last_frame_bytes_ = frame_bytes;
+    }
 
     size_t offset = 0;
     if (skip > 0) {
