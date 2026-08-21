@@ -20,14 +20,33 @@ same interface, different LL backend).
 - The reference esp32 snapclient steers the APLL while playing (`adjust_apll(±1)`),
   holding lock with zero splices. The S3 has no APLL — its I2S MCLK comes from a
   fixed 160 MHz PLL through a **fractional-N divider**: `MCLK = 160 MHz / (N + b/a)`.
-- Verified against IDF 5.5.5 headers (`hal/esp32s3/include/hal/i2s_ll.h`):
+- Verified against IDF 5.5.5 sources (`hal/esp32s3/include/hal/i2s_ll.h`,
+  `esp_driver_i2s/i2s_std.c`):
   - `I2S_LL_GET_HW(port)` — hardware access **by port number**, no channel handle
     needed, so no fork of ESPHome's i2s speaker is required for a PoC.
-  - `i2s_ll_tx_set_mclk(hw, hal_utils_clk_div_t{integer, numerator, denominator})` —
-    runtime divider programming (the driver itself uses it live).
-- Resolution: denominators up to 511 give adjacent rational ratios well under 1 ppm
-  apart (Stern–Brocot density) — far finer than the ±200 ppm steering range needed
-  and finer than the APLL's own steps.
+  - `i2s_ll_tx_set_mclk()` exists but is **not usable as-is on a running channel**:
+    it delegates to `i2s_ll_tx_set_raw_clk_div()`, whose "double division issue"
+    workaround first programs `div_num = 2` (MCLK ≈ 80 MHz, ~6.5× overspeed) before
+    the target — a full-speed clock burst on every call, not a phase blip. The
+    PCM5102A's clock-error detector may mute/relock on it.
+  - **No precedent for live writes**: `i2s_channel_reconfig_std_clock()` requires
+    the channel disabled (`i2s_std.c:381`) — IDF never reprograms this divider
+    while running. Glitch-free live steering must be proven, not assumed.
+  - Likely mitigation: write only the fractional fields
+    (`tx_clkm_div_conf.{x,y,z,yn1}`) directly — a ±ppm trim never changes the
+    integer part, and the workaround exists for `div_num` changes. Whether
+    fractional-only writes dodge the double-division erratum is the central
+    phase-1 question.
+  - No LL getter for readback: read `tx_clkm_conf.tx_clkm_div_num` +
+    `tx_clkm_div_conf` and invert the encoding — `a = (x+1)·z + y`,
+    `b = yn1 ? a−z : z`. All-zeros fractional fields = pure integer divider,
+    doubling as the "uninitialized" sentinel.
+- Resolution: the x/y/z fields are 9-bit, so denominators up to 511 are valid;
+  Farey spacing near the 48 kHz ratio (N ≈ 13.02) gives worst-case steps of
+  ~0.15 ppm — far finer than the ±200 ppm steering range needed and finer than
+  the APLL's own steps.
+- BCK/WS divide down from MCLK, so a fractional MCLK trim steers the actual
+  sample rate with no change to the BCK divider.
 
 ## Design
 
@@ -39,17 +58,30 @@ component, guarded by `USE_SNAPCLIENT_RATE_LOCK` + SOC check:
 - Config on the hub: `rate_lock: {i2s_port: 0}` (option absent = feature off,
   splice servo unchanged).
 - At first trim: **read back** the divider registers the i2s driver programmed
-  (robust to whatever rate/mclk_multiple the speaker chose), derive the base ratio.
+  (robust to whatever rate/mclk_multiple the speaker chose), invert the x/y/z/yn1
+  encoding to `N + b/a`, derive the base ratio.
 - `set_trim_ppm(float ppm)`: compute target ratio `base × (1 − ppm·1e-6)`, find the
   best rational `N + b/a` (continued-fraction / Stern–Brocot search, a ≤ 511), write
-  via `i2s_ll_tx_set_mclk()`. Called from the player task; the write is a couple of
-  register stores.
+  the **fractional fields only** (`tx_clkm_div_conf.{x,y,z,yn1}`), never through
+  `i2s_ll_tx_set_mclk()` (its double-division workaround bursts MCLK to ~80 MHz on
+  every call). Reject any trim whose best rational changes the integer part (can't
+  happen within ±500 ppm at sane base ratios; assert anyway). Called from the
+  player task.
 - Safety: clamp to ±500 ppm; no-op with a warning if the read-back divider looks
-  uninitialized (speaker not started yet).
+  uninitialized — all-zeros fractional fields (pure integer divider) or a zero
+  `div_num` (speaker not started yet).
 
-Risk check in this phase: momentary MCLK phase disturbance on divider writes —
-validate audibly with a sine and by scoping BCK if needed. PCM5102A/MAX98357A derive
-from BCK with tolerant clocking; expected inaudible.
+**Central phase-1 question:** are fractional-only field writes glitch-free on a
+running channel? IDF never reprograms this divider live (`reconfig_std_clock`
+requires the channel disabled), so there is no precedent either way — the
+double-division erratum workaround targets `div_num` changes, which we never make.
+Validate audibly with a sine (PCM5102A's clock-error detector would mute/relock on
+a real glitch — easy to hear) and by scoping BCK if needed. If fractional-only
+writes still glitch, fall back to rate-limiting writes and/or gating them into
+inter-chunk silence; if that fails too, the feature dies here cheaply.
+
+Note: fractional-divider jitter is not a new concern — the driver already uses a
+fractional ratio (12.288 MHz from 160 MHz); trimming adds no new jitter class.
 
 ### Phase 2 — Servo integration
 
@@ -61,7 +93,10 @@ from BCK with tolerant clocking; expected inaudible.
     incident: gain × measurement lag caused oscillation — model first, then tune).
   - Alternatively phase-1-simple: bang-bang ±20 ppm with the existing hysteresis
     band (direct port of the reference's `adjust_apll(dir)` law) — start here,
-    PI only if residual hunt is measurable.
+    PI only if residual hunt is measurable. Caveat: hunting near the hysteresis
+    boundary means divider writes several times per second, multiplying any
+    per-write artifact phase 1 finds; if writes aren't perfectly clean,
+    rate-limit them or go straight to PI, which settles to a constant trim.
 - Splices remain for: hard resync (big jumps), catch-up beyond ±clamp, and as the
   automatic fallback when rate lock is unavailable (non-S3, option off, port
   read-back failed).
@@ -93,8 +128,8 @@ from BCK with tolerant clocking; expected inaudible.
 
 | Risk | Mitigation |
 |---|---|
-| LL API churn across IDF majors | Version-guard includes; feature is opt-in; splice servo always present as fallback |
-| Divider write glitches audio | Phase 1 validates in isolation before servo wiring; writes are rare (bang-bang direction changes) |
+| LL API churn across IDF majors | Version-guard includes; feature is opt-in; splice servo always present as fallback. We write register fields directly (not the LL setter), so the coupling is to the S3 register layout — stable — not the LL API |
+| Divider write glitches audio (**the** open question — no IDF precedent for live writes) | Fractional-fields-only writes, never `i2s_ll_tx_set_mclk()` and its ~80 MHz burst workaround; phase 1 validates in isolation before servo wiring; fallbacks: rate-limit writes, gate into silence, or abandon cheaply |
 | Driver reprograms divider (rate change, channel restart) | Re-read base ratio on stream format change and after flush-gap re-baseline |
 | Control-loop oscillation (again) | Start with the reference's proven bang-bang law; PI only after measuring loop lag; trim clamp ±500 ppm bounds worst case |
 | Announcement pipeline shares the DAC clock | ±100 ppm = 0.01% pitch shift on announcements — imperceptible; documented |
