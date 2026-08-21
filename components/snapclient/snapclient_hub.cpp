@@ -18,7 +18,15 @@ void SnapclientHub::setup() {
   SnapcastClientConfig config;
   config.server_host = this->server_host_;
   config.server_port = this->server_port_;
-  config.hostname = this->client_name_.empty() ? App.get_name() : this->client_name_;
+  // Hello HostName, which the server uses as the client's default display name:
+  // explicit `name:` config > the device's friendly_name > the node name.
+  if (!this->client_name_.empty()) {
+    config.hostname = this->client_name_;
+  } else if (!App.get_friendly_name().empty()) {
+    config.hostname = App.get_friendly_name();
+  } else {
+    config.hostname = App.get_name();
+  }
   config.client_id = get_mac_address_pretty();
   config.buffer_size = this->buffer_size_;
   config.time_sync_interval_ms = this->time_sync_interval_ms_;
