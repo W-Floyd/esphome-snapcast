@@ -65,13 +65,20 @@ fi
 command -v esphome >/dev/null || { echo "ERROR: esphome not found on PATH" >&2; exit 1; }
 
 # Detect the first ESP32 USB serial port by Espressif VID (0x303A), from speakeasy.
+# pyserial comes from esphome's own interpreter (it's an esphome dependency), so no
+# extra install is needed; falls back to system python3, then to a device-name glob.
 detect_port() {
-    python3 - <<'PYEOF'
+    local esphome_py rc result
+    esphome_py=$(head -1 "$(command -v esphome)" | sed 's/^#!//')
+    for py in "${esphome_py}" python3; do
+        [[ -x "${py}" ]] || command -v "${py}" >/dev/null 2>&1 || continue
+        rc=0
+        result=$("${py}" - <<'PYEOF'
 import sys
 try:
     import serial.tools.list_ports
 except ImportError:
-    sys.exit("ERROR: pyserial not installed — run: pip install pyserial")
+    sys.exit(3)
 ports = [p for p in serial.tools.list_ports.comports() if p.vid == 0x303A]
 if not ports:
     sys.exit("ERROR: no ESP32 device found (VID 0x303A) — connect via USB or use --port")
@@ -80,6 +87,22 @@ if len(ports) > 1:
     print(f"WARNING: multiple ESP32 devices found ({names}), using first", file=sys.stderr)
 print(ports[0].device)
 PYEOF
+        ) || rc=$?
+        if [[ ${rc} -eq 0 ]]; then
+            echo "${result}"
+            return 0
+        elif [[ ${rc} -ne 3 ]]; then
+            # pyserial was present but detection genuinely failed (error already on stderr)
+            return 1
+        fi
+    done
+    # No pyserial anywhere: fall back to common ESP device names
+    local dev
+    for dev in /dev/cu.usbmodem* /dev/ttyACM* /dev/ttyUSB*; do
+        [[ -e "${dev}" ]] && { echo "${dev}"; return 0; }
+    done
+    echo "ERROR: no serial device found — connect via USB or use --port" >&2
+    return 1
 }
 
 # ── Build ─────────────────────────────────────────────────────────────────────
