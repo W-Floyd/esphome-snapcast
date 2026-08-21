@@ -75,6 +75,17 @@ struct StreamParams {
   bool valid() const { return this->sample_rate != 0 && this->bits_per_sample != 0 && this->channels != 0; }
 };
 
+/// @brief One snapserver found by an mDNS scan (_snapcast._tcp).
+struct ServerCandidate {
+  std::string name;  // mDNS instance name (hostname or IP when unnamed)
+  std::string host;  // IPv4 address string
+  uint16_t port;
+
+  bool operator==(const ServerCandidate &o) const {
+    return this->port == o.port && this->host == o.host && this->name == o.name;
+  }
+};
+
 /// @brief Events the client pushes to its listener.
 ///
 /// All callbacks fire on the main loop thread, dispatched from SnapcastClient::loop();
@@ -85,6 +96,8 @@ class SnapcastClientListener {
   virtual void on_server_settings(const ServerSettings &settings) = 0;
   virtual void on_stream_start(const StreamParams &params) = 0;
   virtual void on_stream_end() = 0;
+  /// @brief Fired when an mDNS scan changed the discovered-server list.
+  virtual void on_servers_discovered(const std::vector<ServerCandidate> &servers) {}
 };
 
 /// @brief Sink for synchronized PCM audio.
@@ -136,6 +149,16 @@ class SnapcastClient {
 
   /// @brief Per-device latency trim, subtracted from every chunk deadline.
   void set_static_delay_ms(int32_t delay_ms) { this->static_delay_ms_.store(delay_ms, std::memory_order_relaxed); }
+
+  /// @brief Overrides the connection target, taking precedence over the configured
+  /// server and mDNS discovery. Empty @p host clears the override; @p port 0 means
+  /// the configured default port. A live session to a different target is dropped
+  /// and the network task reconnects to the new one.
+  void set_server_override(const std::string &host, uint16_t port);
+
+  /// @brief Keeps the discovered-server list fresh by re-scanning mDNS on reconnects
+  /// even when a target is already known (for the server select entity).
+  void set_discovery_enabled(bool enabled) { this->discovery_enabled_.store(enabled, std::memory_order_relaxed); }
 
   /// @brief Output channel routing; applied in-place to stereo 16-bit audio as it is
   /// pushed, so it may be changed at any time without disturbing sync accounting.
@@ -193,9 +216,10 @@ class SnapcastClient {
   void network_task_();
   /// One connection lifetime: connect, hello, pump until error/shutdown.
   void connection_session_();
-  /// Discovers a snapserver via an mDNS PTR query for _snapcast._tcp.
-  /// @return true if @p host and @p port were filled from the first usable result.
-  bool discover_server_(std::string &host, uint16_t &port);
+  /// Scans for snapservers via an mDNS PTR query for _snapcast._tcp, storing every
+  /// usable result in discovered_servers_ (dirty-flagged for the listener).
+  /// @return true if at least one server was found.
+  bool scan_servers_();
   bool connect_socket_(const std::string &host, uint16_t port);
   bool send_message_(MessageType type, const uint8_t *payload, size_t len, uint16_t refers_to = 0);
   /// Reads exactly @p len bytes; false on error/close/shutdown. Services periodic
@@ -279,6 +303,17 @@ class SnapcastClient {
   bool latency_dirty_{false};
   int32_t latency_pending_ms_{0};
 
+  // Server discovery + override. Strings can't ride the byte-copying FreeRTOS event
+  // queue, so the candidate list is handed to the main loop under this mutex.
+  Mutex server_mutex_;
+  std::vector<ServerCandidate> discovered_servers_;
+  bool discovered_dirty_{false};
+  std::string override_host_;  // empty: no override
+  uint16_t override_port_{0};  // 0: configured default port
+  std::atomic<bool> discovery_enabled_{false};
+  // Asks the network task to drop the session (target changed); checked in recv waits
+  std::atomic<bool> reconnect_requested_{false};
+
   // Clock offset filter: fed by the network task, read by the player task + main loop.
   Mutex filter_mutex_;
   KalmanTimeFilter time_filter_;
@@ -306,6 +341,7 @@ class SnapcastClient {
 
   // --- Network task locals ---
   int sock_{-1};
+  int64_t last_scan_us_{0};  // last mDNS scan, rate-limits re-scans on reconnect
   std::string active_host_;  // host of the current session (config or mDNS result)
   uint16_t next_message_id_{0};
   bool stream_active_{false};

@@ -110,6 +110,22 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   /// @brief Sets this client's server-side latency via the server's control API.
   /// The server persists it and pushes updated ServerSettings back.
   void set_server_latency(int32_t latency_ms);
+
+  // --- Server selection (main loop thread) ---
+  // Connection-target precedence: manual (text entity) > selection (select entity)
+  // > YAML `server:` > mDNS automatic. Empty host steps down to the next source.
+
+  /// @brief Manual server override from the server text entity.
+  void set_server_manual(const std::string &host, uint16_t port);
+  /// @brief Server chosen from the discovered-servers select entity.
+  void set_server_selection(const std::string &host, uint16_t port);
+  /// @brief Keeps the discovered-server list refreshed on reconnects (called by the
+  /// server select entity at setup).
+  void enable_server_discovery();
+  /// @brief Fires with the discovered-server list whenever an mDNS scan changes it.
+  template<typename F> void add_discovered_servers_callback(F &&callback) {
+    this->discovered_servers_callbacks_.add(std::forward<F>(callback));
+  }
   /// @brief Fires with true and the stream format on stream start, false on stream end.
   template<typename F> void add_stream_state_callback(F &&callback) {
     this->stream_state_callbacks_.add(std::forward<F>(callback));
@@ -122,6 +138,10 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   void on_server_settings(const ServerSettings &settings) override;
   void on_stream_start(const StreamParams &params) override;
   void on_stream_end() override;
+  void on_servers_discovered(const std::vector<ServerCandidate> &servers) override;
+
+  /// @brief Pushes the effective override (manual wins over selection) to the client.
+  void apply_server_override_();
 
   std::unique_ptr<SnapcastClient> client_;
 
@@ -146,11 +166,18 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   PhaseMode phase_mode_{PhaseMode::NONE};
   VolumeCurve volume_curve_{};
 
+  // Server override sources (empty host = not set)
+  std::string manual_host_;
+  uint16_t manual_port_{0};
+  std::string selected_host_;
+  uint16_t selected_port_{0};
+
   // Callback fan-out to child components
   CallbackManager<void(bool)> connection_callbacks_{};
   CallbackManager<void(uint8_t, bool, int32_t)> server_settings_callbacks_{};
   CallbackManager<void(bool, const StreamParams &)> stream_state_callbacks_{};
   CallbackManager<void()> volume_curve_callbacks_{};
+  CallbackManager<void(const std::vector<ServerCandidate> &)> discovered_servers_callbacks_{};
 };
 
 /// @brief Base class for all snapclient subcomponents.

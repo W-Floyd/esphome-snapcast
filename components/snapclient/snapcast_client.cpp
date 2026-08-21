@@ -36,6 +36,10 @@ static constexpr uint32_t TIME_SYNC_IDLE_INTERVAL_MS = 2000;
 static constexpr uint32_t RECONNECT_DELAY_MS = 2000;
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 5000;
 
+// Minimum interval between mDNS server scans; each blocks the network task ~3 s, so
+// the list refreshes on reconnects rather than on a timer of its own
+static constexpr int64_t SERVER_SCAN_MIN_INTERVAL_US = 60000000;
+
 // Deadline slack before the first playback feedback arrives: the first chunk is
 // released this far ahead of its deadline so the pipeline has time to spin up, and
 // the first feedback-based correction absorbs the remainder.
@@ -159,6 +163,20 @@ void SnapcastClient::loop() {
         break;
     }
   }
+
+  // Discovered-server list: built on the network task, handed over under the mutex
+  // (its strings can't ride the byte-copying event queue)
+  this->server_mutex_.lock();
+  const bool dirty = this->discovered_dirty_;
+  std::vector<ServerCandidate> servers;
+  if (dirty) {
+    servers = this->discovered_servers_;
+    this->discovered_dirty_ = false;
+  }
+  this->server_mutex_.unlock();
+  if (dirty && this->listener_ != nullptr) {
+    this->listener_->on_servers_discovered(servers);
+  }
 }
 
 // THREAD CONTEXT: Main loop
@@ -191,6 +209,20 @@ void SnapcastClient::send_client_info(uint8_t volume_percent, bool muted) {
   this->client_info_volume_ = volume_percent;
   this->client_info_muted_ = muted;
   this->client_info_mutex_.unlock();
+}
+
+// THREAD CONTEXT: Main loop
+void SnapcastClient::set_server_override(const std::string &host, uint16_t port) {
+  this->server_mutex_.lock();
+  const bool changed = host != this->override_host_ || port != this->override_port_;
+  this->override_host_ = host;
+  this->override_port_ = port;
+  this->server_mutex_.unlock();
+  if (changed) {
+    // Drop the current session; the network task reconnects to the new target
+    // (or back to configured/discovered when the override was cleared)
+    this->reconnect_requested_.store(true, std::memory_order_relaxed);
+  }
 }
 
 // THREAD CONTEXT: Speaker playback callback thread
@@ -262,7 +294,9 @@ void SnapcastClient::network_task_() {
       continue;
     }
     this->connection_session_();
-    if (!this->shutdown_.load(std::memory_order_relaxed)) {
+    // No backoff when the session ended because the user changed the target
+    if (!this->shutdown_.load(std::memory_order_relaxed) &&
+        !this->reconnect_requested_.load(std::memory_order_relaxed)) {
       vTaskDelay(pdMS_TO_TICKS(RECONNECT_DELAY_MS));
     }
   }
@@ -270,11 +304,43 @@ void SnapcastClient::network_task_() {
 }
 
 void SnapcastClient::connection_session_() {
-  std::string host = this->config_.server_host;
+  this->reconnect_requested_.store(false, std::memory_order_relaxed);
+
+  // Target precedence: override (manual/select entities) > configured server > mDNS
+  std::string host;
   uint16_t port = this->config_.server_port;
+  this->server_mutex_.lock();
+  if (!this->override_host_.empty()) {
+    host = this->override_host_;
+    if (this->override_port_ != 0) {
+      port = this->override_port_;
+    }
+  }
+  this->server_mutex_.unlock();
   if (host.empty()) {
-    if (!this->discover_server_(host, port)) {
-      return;
+    host = this->config_.server_host;
+  }
+
+  // Scan on every attempt while no target is known -- a boot-time scan often comes
+  // up empty (mDNS races the network coming up) and must retry on the reconnect
+  // cadence, not a scan timer. When a target IS known and the server select wants
+  // the list, refresh it opportunistically on reconnects (rate-limited -- each scan
+  // blocks ~3 s). An empty scan keeps the previous list (last-known-good fallback).
+  const bool need_discovery = host.empty();
+  if (need_discovery ||
+      (this->discovery_enabled_.load(std::memory_order_relaxed) &&
+       (this->last_scan_us_ == 0 || now_us() - this->last_scan_us_ >= SERVER_SCAN_MIN_INTERVAL_US))) {
+    this->scan_servers_();
+  }
+  if (need_discovery) {
+    this->server_mutex_.lock();
+    if (!this->discovered_servers_.empty()) {
+      host = this->discovered_servers_[0].host;
+      port = this->discovered_servers_[0].port;
+    }
+    this->server_mutex_.unlock();
+    if (host.empty()) {
+      return;  // nothing found; retried after the reconnect delay
     }
     ESP_LOGI(TAG, "Discovered snapserver at %s:%u", host.c_str(), port);
   }
@@ -360,36 +426,49 @@ void SnapcastClient::connection_session_() {
 // mdns component initializes it when the network comes up, which is before
 // network_ready_ lets us get here — a not-yet-ready stack just returns an error and
 // we retry after the reconnect delay).
-bool SnapcastClient::discover_server_(std::string &host, uint16_t &port) {
+bool SnapcastClient::scan_servers_() {
 #ifdef USE_MDNS
+  this->last_scan_us_ = now_us();
   mdns_result_t *results = nullptr;
   esp_err_t err = mdns_query_ptr("_snapcast", "_tcp", 3000, 8, &results);
   if (err != ESP_OK) {
     ESP_LOGW(TAG, "mDNS query failed: %d", err);
     return false;
   }
-  if (results == nullptr) {
-    ESP_LOGW(TAG, "No snapserver found via mDNS (_snapcast._tcp)");
-    return false;
-  }
-  bool found = false;
-  for (mdns_result_t *r = results; r != nullptr && !found; r = r->next) {
+  std::vector<ServerCandidate> servers;
+  for (mdns_result_t *r = results; r != nullptr; r = r->next) {
     for (mdns_ip_addr_t *a = r->addr; a != nullptr; a = a->next) {
       if (a->addr.type == ESP_IPADDR_TYPE_V4) {
         char buf[16];
         esp_ip4addr_ntoa(&a->addr.u_addr.ip4, buf, sizeof(buf));
-        host = buf;
-        port = r->port != 0 ? r->port : this->config_.server_port;
-        found = true;
+        ServerCandidate c;
+        c.host = buf;
+        c.port = r->port != 0 ? r->port : this->config_.server_port;
+        if (r->instance_name != nullptr && r->instance_name[0] != '\0') {
+          c.name = r->instance_name;
+        } else if (r->hostname != nullptr && r->hostname[0] != '\0') {
+          c.name = r->hostname;
+        } else {
+          c.name = c.host;
+        }
+        servers.push_back(std::move(c));
         break;
       }
     }
   }
   mdns_query_results_free(results);
-  if (!found) {
-    ESP_LOGW(TAG, "mDNS results for _snapcast._tcp carried no IPv4 address");
+  if (servers.empty()) {
+    ESP_LOGW(TAG, "No snapserver found via mDNS (_snapcast._tcp)");
+    return false;
   }
-  return found;
+  this->server_mutex_.lock();
+  // Dirty-flag only real changes so the listener isn't re-notified every reconnect
+  if (servers != this->discovered_servers_) {
+    this->discovered_servers_ = std::move(servers);
+    this->discovered_dirty_ = true;
+  }
+  this->server_mutex_.unlock();
+  return true;
 #else
   ESP_LOGE(TAG, "No server configured and mDNS support is not compiled in");
   vTaskDelay(pdMS_TO_TICKS(5000));
@@ -501,7 +580,8 @@ bool SnapcastClient::send_message_(MessageType type, const uint8_t *payload, siz
 bool SnapcastClient::recv_exact_(uint8_t *buf, size_t len) {
   size_t got = 0;
   while (got < len) {
-    if (this->shutdown_.load(std::memory_order_relaxed) || this->sock_ < 0) {
+    if (this->shutdown_.load(std::memory_order_relaxed) || this->sock_ < 0 ||
+        this->reconnect_requested_.load(std::memory_order_relaxed)) {
       return false;
     }
     fd_set read_set;

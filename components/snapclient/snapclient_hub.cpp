@@ -137,6 +137,35 @@ void SnapclientHub::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
   }
 }
 
+void SnapclientHub::set_server_manual(const std::string &host, uint16_t port) {
+  this->manual_host_ = host;
+  this->manual_port_ = port;
+  this->apply_server_override_();
+}
+
+void SnapclientHub::set_server_selection(const std::string &host, uint16_t port) {
+  this->selected_host_ = host;
+  this->selected_port_ = port;
+  this->apply_server_override_();
+}
+
+void SnapclientHub::apply_server_override_() {
+  if (this->client_ == nullptr) {
+    return;
+  }
+  if (!this->manual_host_.empty()) {
+    this->client_->set_server_override(this->manual_host_, this->manual_port_);
+  } else {
+    this->client_->set_server_override(this->selected_host_, this->selected_port_);
+  }
+}
+
+void SnapclientHub::enable_server_discovery() {
+  if (this->client_ != nullptr) {
+    this->client_->set_discovery_enabled(true);
+  }
+}
+
 // --- SnapcastClientListener overrides ---
 // THREAD CONTEXT: Main loop (dispatched from client_->loop())
 
@@ -144,6 +173,10 @@ void SnapclientHub::on_connection_changed(bool connected) { this->connection_cal
 
 void SnapclientHub::on_server_settings(const ServerSettings &settings) {
   this->server_settings_callbacks_.call(settings.volume, settings.muted, settings.latency);
+}
+
+void SnapclientHub::on_servers_discovered(const std::vector<ServerCandidate> &servers) {
+  this->discovered_servers_callbacks_.call(servers);
 }
 
 void SnapclientHub::set_server_latency(int32_t latency_ms) {

@@ -11,6 +11,7 @@ CODEOWNERS = ["@W-Floyd"]
 
 CONF_CHANNEL_MODE = "channel_mode"
 CONF_PHASE = "phase"
+CONF_SERVER = "server"
 
 # Option orders must match the ChannelMode / PhaseMode enums
 CHANNEL_MODE_OPTIONS = ["Stereo", "Left", "Right", "Mono"]
@@ -21,6 +22,9 @@ SnapclientChannelModeSelect = snapclient_ns.class_(
 )
 SnapclientPhaseSelect = snapclient_ns.class_(
     "SnapclientPhaseSelect", cg.Component, select.Select
+)
+SnapclientServerSelect = snapclient_ns.class_(
+    "SnapclientServerSelect", cg.Component, select.Select
 )
 
 
@@ -44,6 +48,12 @@ CONFIG_SCHEMA = cv.All(
                 SnapclientChannelModeSelect, "mdi:speaker-multiple"
             ),
             CONF_PHASE: _select_schema(SnapclientPhaseSelect, "mdi:sine-wave"),
+            # Discovered-server picker: "Automatic" + one option per snapserver found
+            # via mDNS; selecting one overrides the connection target (a manual
+            # server text entity takes precedence over this)
+            CONF_SERVER: _select_schema(
+                SnapclientServerSelect, "mdi:server-network"
+            ),
         },
     ),
     cv.only_on_esp32,
@@ -52,6 +62,7 @@ CONFIG_SCHEMA = cv.All(
 _OPTIONS = {
     CONF_CHANNEL_MODE: CHANNEL_MODE_OPTIONS,
     CONF_PHASE: PHASE_OPTIONS,
+    CONF_SERVER: ["Automatic"],
 }
 
 
