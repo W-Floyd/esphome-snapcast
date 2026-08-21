@@ -153,6 +153,14 @@ void SnapcastClient::set_output_active(bool active) {
 }
 
 // THREAD CONTEXT: Main loop
+void SnapcastClient::set_server_latency(int32_t latency_ms) {
+  this->client_info_mutex_.lock();
+  this->latency_dirty_ = true;
+  this->latency_pending_ms_ = latency_ms;
+  this->client_info_mutex_.unlock();
+}
+
+// THREAD CONTEXT: Main loop
 void SnapcastClient::send_client_info(uint8_t volume_percent, bool muted) {
   this->client_info_mutex_.lock();
   this->client_info_dirty_ = true;
@@ -238,6 +246,7 @@ void SnapcastClient::connection_session_() {
     }
     ESP_LOGI(TAG, "Discovered snapserver at %s:%u", host.c_str(), port);
   }
+  this->active_host_ = host;
 
   if (!this->connect_socket_(host, port)) {
     this->close_socket_();
@@ -520,12 +529,63 @@ void SnapcastClient::service_tx_() {
     this->send_message_(MessageType::CLIENT_INFO, reinterpret_cast<const uint8_t *>(payload.data()), payload.size());
   }
 
+  // Pending server-latency change (control API)
+  this->client_info_mutex_.lock();
+  const bool latency_dirty = this->latency_dirty_;
+  const int32_t latency_ms = this->latency_pending_ms_;
+  this->latency_dirty_ = false;
+  this->client_info_mutex_.unlock();
+  if (latency_dirty) {
+    this->send_set_latency_rpc_(latency_ms);
+  }
+
   // Stream idle detection: the server stops sending chunks when the group stream goes idle
   if (this->stream_active_ &&
       now - this->last_chunk_us_ > static_cast<int64_t>(this->config_.stream_idle_timeout_ms) * 1000) {
     ESP_LOGD(TAG, "Stream idle for %" PRIu32 " ms, ending stream", this->config_.stream_idle_timeout_ms);
     this->set_stream_active_(false);
   }
+}
+
+// THREAD CONTEXT: Network task. A short-lived connection to the JSON-RPC control
+// port; failures are logged and dropped (the entity re-syncs from the next
+// ServerSettings push either way).
+void SnapcastClient::send_set_latency_rpc_(int32_t latency_ms) {
+  if (this->active_host_.empty()) {
+    return;
+  }
+  struct addrinfo hints = {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo *res = nullptr;
+  if (getaddrinfo(this->active_host_.c_str(), "1705", &hints, &res) != 0 || res == nullptr) {
+    ESP_LOGW(TAG, "Control API DNS lookup failed");
+    return;
+  }
+  int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (sock >= 0) {
+    struct timeval tv = {.tv_sec = 2, .tv_usec = 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(sock, res->ai_addr, res->ai_addrlen) == 0) {
+      char req[192];
+      const int len = snprintf(req, sizeof(req),
+                               "{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"Client.SetLatency\","
+                               "\"params\":{\"id\":\"%s\",\"latency\":%" PRId32 "}}\r\n",
+                               this->config_.client_id.c_str(), latency_ms);
+      if (send(sock, req, len, 0) == len) {
+        char reply[128];
+        recv(sock, reply, sizeof(reply), 0);  // best-effort; drained for TCP hygiene
+        ESP_LOGD(TAG, "Requested server latency %" PRId32 " ms", latency_ms);
+      } else {
+        ESP_LOGW(TAG, "Control API send failed");
+      }
+    } else {
+      ESP_LOGW(TAG, "Control API connect to %s:1705 failed", this->active_host_.c_str());
+    }
+    close(sock);
+  }
+  freeaddrinfo(res);
 }
 
 void SnapcastClient::handle_time_reply_(const BaseMessage &base, const uint8_t *payload, size_t len, int64_t recv_us) {

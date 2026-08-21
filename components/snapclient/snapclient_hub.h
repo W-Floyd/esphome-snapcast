@@ -98,10 +98,15 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   template<typename F> void add_connection_callback(F &&callback) {
     this->connection_callbacks_.add(std::forward<F>(callback));
   }
-  /// @brief Fires with (volume_percent, muted) whenever the server pushes settings.
+  /// @brief Fires with (volume_percent, muted, latency_ms) whenever the server
+  /// pushes settings.
   template<typename F> void add_server_settings_callback(F &&callback) {
     this->server_settings_callbacks_.add(std::forward<F>(callback));
   }
+
+  /// @brief Sets this client's server-side latency via the server's control API.
+  /// The server persists it and pushes updated ServerSettings back.
+  void set_server_latency(int32_t latency_ms);
   /// @brief Fires with true and the stream format on stream start, false on stream end.
   template<typename F> void add_stream_state_callback(F &&callback) {
     this->stream_state_callbacks_.add(std::forward<F>(callback));
@@ -137,7 +142,7 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
 
   // Callback fan-out to child components
   CallbackManager<void(bool)> connection_callbacks_{};
-  CallbackManager<void(uint8_t, bool)> server_settings_callbacks_{};
+  CallbackManager<void(uint8_t, bool, int32_t)> server_settings_callbacks_{};
   CallbackManager<void(bool, const StreamParams &)> stream_state_callbacks_{};
   CallbackManager<void()> volume_curve_callbacks_{};
 };

@@ -111,8 +111,14 @@ select:
 
 number:
   - platform: snapclient
+    type: volume_curve
     name: Volume Curve      # dB range of the extra volume taper; 0 = off (recommended —
                             # ESPHome speakers already apply a 49 dB perceptual taper)
+  - platform: snapclient
+    type: server_latency
+    name: Server Latency    # this client's latency ON the snapserver (Client.SetLatency
+                            # via the control API); server-persisted, stays in sync with
+                            # changes made from snapweb or other controllers
 ```
 
 ### Sync accuracy notes

@@ -20,7 +20,7 @@ static constexpr char URI_CURRENT[] = "snapcast://current";
 void SnapclientMediaSource::setup() {
   this->parent_->set_static_delay_ms(this->static_delay_ms_);
 
-  this->parent_->add_server_settings_callback([this](uint8_t volume, bool muted) {
+  this->parent_->add_server_settings_callback([this](uint8_t volume, bool muted, int32_t latency_ms) {
     // Track the server's current belief so notify_volume_changed / notify_mute_changed
     // don't echo the same values straight back as a ClientInfo message.
     this->last_server_volume_ = volume;

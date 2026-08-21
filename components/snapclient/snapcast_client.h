@@ -146,6 +146,10 @@ class SnapcastClient {
   /// @brief Reports a local volume/mute change to the server via a ClientInfo message.
   void send_client_info(uint8_t volume_percent, bool muted);
 
+  /// @brief Sets this client's server-side latency via the control API (JSON-RPC,
+  /// port 1705). The server persists it and pushes the updated ServerSettings back.
+  void set_server_latency(int32_t latency_ms);
+
   // --- Playback feedback ---
 
   /// @brief Feed DAC-write feedback from the speaker's audio output callback.
@@ -193,6 +197,8 @@ class SnapcastClient {
   bool recv_exact_(uint8_t *buf, size_t len);
   /// Sends due time-sync requests / pending ClientInfo and runs the stream idle check.
   void service_tx_();
+  /// Sends one Client.SetLatency request on the server's control port (1705).
+  void send_set_latency_rpc_(int32_t latency_ms);
   void handle_codec_header_(const uint8_t *payload, size_t len);
   void handle_wire_chunk_(const uint8_t *payload, size_t len);
   void handle_time_reply_(const BaseMessage &base, const uint8_t *payload, size_t len, int64_t recv_us);
@@ -263,6 +269,9 @@ class SnapcastClient {
   bool client_info_dirty_{false};
   uint8_t client_info_volume_{100};
   bool client_info_muted_{false};
+  // Pending Client.SetLatency RPC (same producer/consumer pattern)
+  bool latency_dirty_{false};
+  int32_t latency_pending_ms_{0};
 
   // Clock offset filter: fed by the network task, read by the player task + main loop.
   Mutex filter_mutex_;
@@ -291,6 +300,7 @@ class SnapcastClient {
 
   // --- Network task locals ---
   int sock_{-1};
+  std::string active_host_;  // host of the current session (config or mDNS result)
   uint16_t next_message_id_{0};
   bool stream_active_{false};
   int64_t last_chunk_us_{0};

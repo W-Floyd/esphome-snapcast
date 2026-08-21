@@ -137,7 +137,13 @@ void SnapclientHub::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
 void SnapclientHub::on_connection_changed(bool connected) { this->connection_callbacks_.call(connected); }
 
 void SnapclientHub::on_server_settings(const ServerSettings &settings) {
-  this->server_settings_callbacks_.call(settings.volume, settings.muted);
+  this->server_settings_callbacks_.call(settings.volume, settings.muted, settings.latency);
+}
+
+void SnapclientHub::set_server_latency(int32_t latency_ms) {
+  if (this->client_ != nullptr) {
+    this->client_->set_server_latency(latency_ms);
+  }
 }
 
 void SnapclientHub::on_stream_start(const StreamParams &params) {

@@ -261,6 +261,13 @@ sensor:
 # until this restores. (Speakeasy's step-up-on-disconnect ramp is deliberately not
 # copied: on this board raising power is usually what breaks the link.)
 number:
+  # This client's latency setting on the snapserver (Client.SetLatency via the control
+  # API). Server-persisted and pushed back in ServerSettings, so this entity stays in
+  # sync even when changed from snapweb/HA — the canonical per-room delay trim.
+  - platform: snapclient
+    type: server_latency
+    snapclient_id: snap
+    name: Server Latency
   - platform: template
     name: WiFi TX Power
     id: wifi_tx_power
