@@ -239,6 +239,8 @@ class SnapcastClient {
   // Clock offset filter: fed by the network task, read by the player task + main loop.
   Mutex filter_mutex_;
   KalmanTimeFilter time_filter_;
+  // Decaying minimum observed time-sync RTT (network task only); congestion gate.
+  int64_t min_rtt_us_{INT64_MAX / 2};
 
   // Playout feedback: written from the speaker callback thread, read by the player task.
   Mutex playout_mutex_;

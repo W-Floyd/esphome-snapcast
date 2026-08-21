@@ -133,9 +133,12 @@ void SnapclientHub::on_server_settings(const ServerSettings &settings) {
 
 void SnapclientHub::on_stream_start(const StreamParams &params) {
 #ifdef USE_WIFI
-  // Streaming needs low-latency wifi; modem power save adds tens of ms of jitter
+  // Streaming needs low-latency wifi: modem power save adds tens of ms of jitter,
+  // and a mid-stream roaming scan takes the radio off-channel for hundreds of ms —
+  // long enough to starve the DAC (same pairing sendspin uses).
   if (wifi::global_wifi_component != nullptr) {
     wifi::global_wifi_component->request_high_performance();
+    wifi::global_wifi_component->request_roaming_suppression();
   }
 #endif
   this->stream_state_callbacks_.call(true, params);
@@ -145,6 +148,7 @@ void SnapclientHub::on_stream_end() {
 #ifdef USE_WIFI
   if (wifi::global_wifi_component != nullptr) {
     wifi::global_wifi_component->release_high_performance();
+    wifi::global_wifi_component->release_roaming_suppression();
   }
 #endif
   StreamParams empty{};

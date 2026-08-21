@@ -19,6 +19,22 @@ esphome:
   friendly_name: Snapclient SuperMini
   includes:
     - <esp_wifi.h>  # for the WiFi TX Power slider's esp_wifi_set_max_tx_power call
+  on_boot:
+    # Re-apply a persisted AP lock before wifi starts connecting (wifi setup
+    # priority is 250; globals restore earlier)
+    - priority: 251
+      then:
+        - lambda: |-
+            if (id(locked_bssid) != 0) {
+              wifi::bssid_t bssid;
+              uint64_t packed = id(locked_bssid);
+              for (int i = 5; i >= 0; i--) { bssid[i] = packed & 0xFF; packed >>= 8; }
+              wifi::WiFiAP ap = wifi::global_wifi_component->get_sta();
+              ap.set_bssid(bssid);
+              wifi::global_wifi_component->set_sta(ap);
+              ESP_LOGI("wifi_lock", "Restored AP lock to %02X:%02X:%02X:%02X:%02X:%02X",
+                       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+            }
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -140,6 +156,71 @@ select:
   - platform: snapclient
     snapclient_id: snap
     name: Channel Mode
+# Pin the client to whichever AP it is currently connected to — no hardcoded BSSIDs.
+# Mid-stream roam scans take the radio off-channel for hundreds of ms and starve
+# playback; roaming is already suppressed while streaming, and the lock removes AP
+# switching entirely. The captured BSSID persists across reboots (0 = auto).
+globals:
+  - id: locked_bssid
+    type: uint64_t
+    restore_value: true
+    initial_value: '0'
+
+switch:
+  - platform: template
+    name: Lock to Current AP
+    id: ap_lock_switch
+    icon: mdi:router-wireless-settings
+    entity_category: config
+    lambda: return id(locked_bssid) != 0;
+    turn_on_action:
+      - lambda: |-
+          auto *w = wifi::global_wifi_component;
+          if (!w->is_connected()) {
+            ESP_LOGW("wifi_lock", "Not connected; nothing to lock to");
+            return;
+          }
+          wifi::bssid_t bssid = w->wifi_bssid();
+          uint64_t packed = 0;
+          for (uint8_t b : bssid) packed = (packed << 8) | b;
+          id(locked_bssid) = packed;
+          wifi::WiFiAP ap = w->get_sta();
+          ap.set_bssid(bssid);
+          w->set_sta(ap);
+          ESP_LOGI("wifi_lock", "Locked to current AP %02X:%02X:%02X:%02X:%02X:%02X",
+                   bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
+    turn_off_action:
+      - lambda: |-
+          id(locked_bssid) = 0;
+          auto *w = wifi::global_wifi_component;
+          wifi::WiFiAP ap = w->get_sta();
+          ap.clear_bssid();
+          w->set_sta(ap);
+          ESP_LOGI("wifi_lock", "AP lock cleared (auto selection)");
+
+text_sensor:
+  # Shows which AP the device is on (and thus what the lock would capture)
+  - platform: wifi_info
+    bssid:
+      name: WiFi BSSID
+      entity_category: diagnostic
+
+sensor:
+  # RSSI in dBm plus a friendlier 0-100% quality reading
+  - platform: wifi_signal
+    id: wifi_rssi
+    name: WiFi RSSI
+    update_interval: 30s
+    entity_category: diagnostic
+  - platform: copy
+    source_id: wifi_rssi
+    name: WiFi Signal Quality
+    filters:
+      # Standard mapping: -100 dBm -> 0%, -50 dBm -> 100%
+      - lambda: return std::clamp(2.0f * (x + 100.0f), 0.0f, 100.0f);
+    unit_of_measurement: "%"
+    device_class: ""
+    entity_category: diagnostic
 
 # Runtime WiFi TX power tuning (pattern from speakeasy's wifi-9ramp.yaml). SuperMini
 # antennas distort at high power, so LOWER often connects better; find the sweet spot

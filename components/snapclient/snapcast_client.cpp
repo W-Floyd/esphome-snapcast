@@ -49,6 +49,13 @@ static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 // as micro-stutter. The reference snapclient median-filters over long windows for
 // the same reason.
 static constexpr int64_t SOFT_CORRECTION_DEADBAND_US = 2000;
+// Above this error, trade a little audibility for fast convergence (post-stall
+// catch-up); below it, corrections stay at an inaudible 1-2 frames per chunk.
+static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
+
+// Time-sync RTT gating (see handle_time_reply_)
+static constexpr int64_t RTT_GATE_US = 20000;      // reject samples this far above the floor
+static constexpr int64_t RTT_FLOOR_LEAK_US = 500;  // floor rises this much per sample (~0.5 ms/s)
 
 static inline int64_t now_us() { return esp_timer_get_time(); }
 
@@ -483,6 +490,20 @@ void SnapcastClient::handle_time_reply_(const BaseMessage &base, const uint8_t *
   // The offset measurement (server - client) is (c2s - s2c) / 2.
   const int64_t c2s_us = time_payload.latency.to_us();
   const int64_t s2c_us = recv_us - base.sent.to_us();
+
+  // RTT gate: c2s + s2c is the round trip, with the clock offsets cancelled out.
+  // Samples far above the observed minimum are congestion/roam artifacts whose
+  // asymmetric delay would walk the offset estimate away from truth — a burst of
+  // them (e.g. right after a wifi roam) defeats even the Huber weighting, leaving
+  // playback consistently behind until clean samples slowly win back. The floor
+  // leaks upward slowly so a genuinely changed network re-baselines within minutes.
+  const int64_t rtt_us = c2s_us + s2c_us;
+  this->min_rtt_us_ = std::min(rtt_us, this->min_rtt_us_ + RTT_FLOOR_LEAK_US);
+  if (rtt_us > this->min_rtt_us_ + RTT_GATE_US) {
+    ESP_LOGV(TAG, "Time sync sample rejected: rtt %" PRId64 " us (floor %" PRId64 " us)", rtt_us, this->min_rtt_us_);
+    return;
+  }
+
   const double measurement_ms = static_cast<double>(c2s_us - s2c_us) / 2000.0;
 
   this->filter_mutex_.lock();
@@ -738,12 +759,15 @@ void SnapcastClient::player_task_() {
       max_gap_us = this->max_feedback_gap_us_;
       this->max_feedback_gap_us_ = 0;
       this->playout_mutex_.unlock();
+      // Ring occupancy shows how much dropout cushion is actually held client-side
+      const uint32_t buffered_ms = static_cast<uint32_t>(
+          static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, ewma %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, max feedback gap %" PRId64
-               " ms over %" PRIu32 " chunks",
+               " ms, buffered %" PRIu32 " ms over %" PRIu32 " chunks",
                err_accum_us / err_count, err_peak_us, err_ewma_us, soft_dropped_frames, soft_inserted_frames,
-               hard_resyncs, max_gap_us / 1000, err_count);
+               hard_resyncs, max_gap_us / 1000, buffered_ms, err_count);
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
@@ -779,7 +803,13 @@ void SnapcastClient::player_task_() {
       // clock drift accumulates in the EWMA and is corrected in short bursts.
       const int32_t adjust_frames = static_cast<int32_t>(err_ewma_us * static_cast<int64_t>(rec.params.sample_rate) /
                                                          1000000);
-      const int32_t max_adjust = std::max<int32_t>(1, frames / SOFT_CORRECTION_DIVISOR);
+      // Two-stage limit: gentle 2-frame (~45 us) trims for steady-state clock/
+      // resampler drift — far below audibility — but frames/32 catch-up bursts
+      // (~33 ms/s convergence) while more than SOFT_CORRECTION_AGGRESSIVE_US off,
+      // so a post-stall backlog doesn't leave playback audibly behind for long
+      const int32_t max_adjust = std::abs(err_ewma_us) > SOFT_CORRECTION_AGGRESSIVE_US
+                                     ? std::max<int32_t>(1, frames / (SOFT_CORRECTION_DIVISOR / 4))
+                                     : 2;
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
       if (adjust > 0) {
         drop_frames = adjust;

@@ -38,8 +38,11 @@ def _request_networking(config: ConfigType) -> ConfigType:
     """Request the networking features synchronized streaming needs."""
     network.require_high_performance_networking()
     socket.consume_sockets(1, "snapclient")(config)
-    # The hub requests high performance while a stream is playing and releases it after
+    # The hub requests high performance + roaming suppression while a stream is
+    # playing and releases both after (a roam scan stalls the radio long enough to
+    # starve playback)
     wifi.enable_runtime_power_save_control()
+    wifi.enable_runtime_roaming_suppression()
     return config
 
 
