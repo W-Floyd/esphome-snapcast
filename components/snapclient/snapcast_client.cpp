@@ -277,6 +277,14 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   // tracks the stall truthfully and accounting stays exact through recovery.
   const int64_t available_frames = this->pushed_frames_total_ - this->played_frames_total_;
   if (static_cast<int64_t>(frames) > available_frames) {
+    if (available_frames <= 0 && frames > 0) {
+      // Complete drain: the framework tears its pipeline down and restarts it with
+      // an unpredictable buffer fill level between this feedback point and the DAC
+      // -- invisible to the accounting, so playback would settle audibly offset
+      // (~100-250 ms observed) with clean-looking sync reports. Flag the player to
+      // re-baseline from scratch when audio resumes.
+      this->pipeline_starved_.store(true, std::memory_order_relaxed);
+    }
     frames = static_cast<uint32_t>(std::max<int64_t>(available_frames, 0));
   }
   this->played_frames_total_ += frames;
@@ -1120,6 +1128,29 @@ void SnapcastClient::player_task_() {
       // starts in sync as soon as the source is activated.
       this->discard_ring_bytes_(rec.bytes);
       continue;
+    }
+
+    if (this->pipeline_starved_.exchange(false, std::memory_order_relaxed)) {
+      // The pipeline fully drained (source starvation); the framework restarts its
+      // buffers at a fill level the feedback point cannot observe. Reset the playout
+      // accounting so playback re-baselines exactly like a fresh start (whose fill
+      // is deterministic), at the cost of one muted re-lock -- the automatic version
+      // of the manual speaker restart that used to be the fix.
+      this->playout_mutex_.lock();
+      this->playout_valid_ = false;
+      this->played_frames_total_ = 0;
+      this->pushed_frames_total_ = 0;
+      this->fb_samples_ = 0;
+      this->playout_mutex_.unlock();
+      err_window_filled = 0;
+      steer_dir = 0;
+      converged = false;
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+      if (this->rate_lock_ != nullptr) {
+        this->rate_lock_->invalidate_baseline();
+      }
+#endif
+      ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
     }
 
     const int64_t deadline = this->chunk_deadline_us_(rec);
