@@ -125,7 +125,7 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   uint32_t time_sync_interval_ms_{1000};
   uint32_t hard_resync_threshold_ms_{50};
   uint32_t stream_idle_timeout_ms_{3000};
-  uint32_t sync_deadband_us_{2000};
+  uint32_t sync_deadband_us_{500};
 
   // Deferred child registrations from before setup() ran
   SnapcastAudioListener *pending_audio_listener_{nullptr};

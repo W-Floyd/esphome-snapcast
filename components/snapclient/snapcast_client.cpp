@@ -694,7 +694,7 @@ void SnapcastClient::set_stream_active_(bool active) {
   if (active) {
     // Accuracy starts being consumed now: engage the fast cadence immediately with a
     // short burst to refresh the estimate after a possibly long idle stretch
-    this->time_sync_burst_remaining_ = std::max(this->time_sync_burst_remaining_, 3u);
+    this->time_sync_burst_remaining_ = std::max<uint32_t>(this->time_sync_burst_remaining_, 3);
     this->next_time_sync_us_ = 0;
     this->post_event_(Event{.type = EventType::STREAM_START, .params = this->stream_params_});
   } else {

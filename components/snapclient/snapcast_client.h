@@ -36,10 +36,11 @@ struct SnapcastClientConfig {
   uint32_t time_sync_interval_ms{1000};
   uint32_t hard_resync_threshold_ms{50};
   uint32_t stream_idle_timeout_ms{3000};
-  // Smoothed sync error below which no correction is applied. The default suits a
-  // solo speaker; synchronized stereo pairs want it tight (e.g. 500 us), since each
-  // device drifting freely inside its own deadband wanders the stereo image.
-  int64_t sync_deadband_us{2000};
+  // Smoothed sync error below which no correction is applied. Kept tight by default
+  // so synchronized stereo pairs hold their image (each device drifting freely inside
+  // its own deadband wanders it); corrections are ~45 us events, so the chatter cost
+  // of a tight deadband is inaudible.
+  int64_t sync_deadband_us{500};
 };
 
 /// @brief Output channel routing, matching esp32 snapclient's dsp_channel_mode_t.
