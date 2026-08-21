@@ -1599,8 +1599,10 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
       skip -= offset;
     }
 
+    uint32_t zero_writes = 0;
     while (offset < got) {
-      if (this->audio_listener_ == nullptr || !this->output_active_.load(std::memory_order_relaxed)) {
+      if (this->audio_listener_ == nullptr || !this->output_active_.load(std::memory_order_relaxed) ||
+          this->shutdown_.load(std::memory_order_relaxed)) {
         // Consumer went away mid-chunk: discard the rest, deadlines keep us honest
         this->discard_ring_bytes_(remaining);
         return;
@@ -1609,9 +1611,20 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
                                                              rec.params);
       offset += written;
       if (written > 0) {
+        zero_writes = 0;
         this->playout_mutex_.lock();
         this->pushed_frames_total_ += written / frame_bytes;
         this->playout_mutex_.unlock();
+      } else if (++zero_writes >= 20) {
+        // ~2 s of refused writes: the pipeline is wedged (observed on hardware --
+        // the mixer stopped draining while still active, every write returned 0,
+        // and this loop zombied the player task for minutes: no sync reports, no
+        // recovery, silence). Drop the chunk and keep the player alive; the
+        // deadline logic hard-resyncs through the outage and the starvation
+        // re-baseline restores sync when the pipeline comes back.
+        ESP_LOGW(TAG, "Pipeline refusing audio for 2 s, dropping chunk");
+        this->discard_ring_bytes_(remaining);
+        return;
       }
     }
   }
