@@ -63,6 +63,13 @@ static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
 // constraint through silence, so lock happens in ~1-2 s instead of up to ~10 s
 static constexpr uint32_t STARTUP_STEER_FRAMES = 8;
 
+// Below this median error the muted convergence hands off from the hard 8-frame
+// steering to the fine mechanism (PI trim / single-frame splices): the hard
+// splices limit-cycle at ~±800 us with the measurement lag -- far outside the
+// deadband -- and can never satisfy the consecutive-in-band unmute requirement
+// (observed: a whole fleet oscillating muted forever)
+static constexpr int64_t CONVERGE_FINE_US = 2000;
+
 // Median window for the steering servo's error signal (~0.4 s of chunks)
 static constexpr size_t MEDIAN_WINDOW = 15;
 
@@ -1355,10 +1362,11 @@ void SnapcastClient::player_task_() {
       // Steady-state rate lock: steer the I2S clock instead of splicing frames.
       // Continuous PI on the median error, no deadband -- trims are inaudible, and
       // gating them through the hysteresis band re-creates the limit cycle. The
-      // hysteresis/steer_dir path above still drives the splice fallback.
-      // Pre-convergence stays on hard splices: muted convergence at 8 frames/chunk
-      // is far faster than clock steering could ever be.
-      if (converged && rate_lock_ok) {
+      // hysteresis/steer_dir path above still drives the splice fallback. Muted
+      // convergence uses hard splices while far out (much faster than the trim
+      // slew), handing off to the PI for the end-game so the error actually
+      // settles inside the band instead of splice-limit-cycling around it.
+      if (rate_lock_ok && (converged || std::abs(median_err_us) <= CONVERGE_FINE_US)) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
         const float p_term = TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us);
         // Conditional integration (anti-windup): winding the integral while the
@@ -1381,9 +1389,10 @@ void SnapcastClient::player_task_() {
       }
 #endif
       // While muted (pre-convergence) audibility doesn't constrain splice size, so
-      // steer hard to reach the band quickly instead of crawling in at ~0.9 ms/s
+      // steer hard to reach the band quickly, then single frames for the end-game
       if (!trim_holds) {
-        const uint32_t steer_frames = converged ? 1 : STARTUP_STEER_FRAMES;
+        const uint32_t steer_frames =
+            (converged || std::abs(median_err_us) <= CONVERGE_FINE_US) ? 1 : STARTUP_STEER_FRAMES;
         if (steer_dir > 0) {
           drop_frames = steer_frames;
           soft_dropped_frames += steer_frames;
