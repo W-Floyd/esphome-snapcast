@@ -10,6 +10,10 @@
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
 
+#ifdef USE_OTA_STATE_LISTENER
+#include "esphome/components/ota/ota_backend.h"
+#endif
+
 #include <memory>
 #include <string>
 
@@ -38,7 +42,13 @@ inline constexpr float CHILD = HUB - 1.0f;
 ///  - Client -> component communication happens via the listener interface, dispatched
 ///    on the main loop from client_->loop().
 ///  - Component -> client communication uses exposed functions on the client object.
-class SnapclientHub final : public Component, public SnapcastClientListener {
+class SnapclientHub final : public Component,
+                            public SnapcastClientListener
+#ifdef USE_OTA_STATE_LISTENER
+    ,
+                            public ota::OTAGlobalStateListener
+#endif
+{
  public:
   float get_setup_priority() const override { return snapclient_priority::HUB; }
   void setup() override;
@@ -147,6 +157,14 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   void on_stream_end() override;
   void on_servers_discovered(const std::vector<ServerCandidate> &servers) override;
   void on_stream_metadata(const StreamMetadata &metadata) override;
+
+#ifdef USE_OTA_STATE_LISTENER
+  // THREAD CONTEXT: Main loop (esphome OTA notifies in-loop)
+  void on_ota_global_state(ota::OTAState state, float progress, uint8_t error, ota::OTAComponent *component) override;
+  // Audio + firmware transfer share the radio: the stream both stutters and slows
+  // the flash. Paused on OTA start, restored only if the OTA fails (success reboots).
+  bool ota_paused_{false};
+#endif
 
   /// @brief Pushes the effective override (manual wins over selection) to the client.
   void apply_server_override_();

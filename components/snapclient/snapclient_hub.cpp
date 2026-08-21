@@ -51,11 +51,37 @@ void SnapclientHub::setup() {
     this->mark_failed();
     return;
   }
+
+#ifdef USE_OTA_STATE_LISTENER
+  ota::get_global_ota_callback()->add_global_state_listener(this);
+#endif
 }
+
+#ifdef USE_OTA_STATE_LISTENER
+void SnapclientHub::on_ota_global_state(ota::OTAState state, float progress, uint8_t error,
+                                        ota::OTAComponent *component) {
+  if (state == ota::OTA_STARTED) {
+    ESP_LOGI(TAG, "OTA started; pausing snapclient to free the radio");
+    this->ota_paused_ = true;
+    if (this->client_ != nullptr) {
+      this->client_->set_network_ready(false);
+      this->client_->request_disconnect();
+    }
+  } else if (state == ota::OTA_ERROR || state == ota::OTA_ABORT) {
+    ESP_LOGI(TAG, "OTA ended without reboot; resuming snapclient");
+    this->ota_paused_ = false;  // loop() re-mirrors network readiness
+  }
+  // OTA_COMPLETED reboots the device; nothing to restore
+}
+#endif
 
 void SnapclientHub::loop() {
   // network::is_connected() is main-loop-only; mirror it into the client's tasks
-  this->client_->set_network_ready(network::is_connected());
+  bool ready = network::is_connected();
+#ifdef USE_OTA_STATE_LISTENER
+  ready = ready && !this->ota_paused_;
+#endif
+  this->client_->set_network_ready(ready);
   this->client_->loop();
 }
 

@@ -1,7 +1,7 @@
 """Snapcast client hub component, modeled on ESPHome's sendspin component."""
 
 import esphome.codegen as cg
-from esphome.components import audio, network, socket, wifi
+from esphome.components import audio, network, ota, socket, wifi
 from esphome.components.esp32 import only_on_variant
 from esphome.components.esp32.const import VARIANT_ESP32S3
 import esphome.config_validation as cv
@@ -152,6 +152,10 @@ CONFIG_SCHEMA = cv.All(
 async def to_code(config: ConfigType) -> None:
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
+
+    # Pause the stream during an OTA: audio and the firmware transfer share the
+    # radio (no-op when no ota component is configured)
+    ota.request_ota_state_listeners()
 
     cg.add(var.set_server(config.get(CONF_SERVER, ""), config[CONF_PORT]))
     if CONF_NAME in config:

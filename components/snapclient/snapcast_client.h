@@ -168,6 +168,10 @@ class SnapcastClient {
   /// even when a target is already known (for the server select entity).
   void set_discovery_enabled(bool enabled) { this->discovery_enabled_.store(enabled, std::memory_order_relaxed); }
 
+  /// @brief Drops the current session immediately (e.g. to free the radio for an
+  /// OTA transfer); with network_ready false it stays down until re-enabled.
+  void request_disconnect() { this->reconnect_requested_.store(true, std::memory_order_relaxed); }
+
   /// @brief Output channel routing; applied in-place to stereo 16-bit audio as it is
   /// pushed, so it may be changed at any time without disturbing sync accounting.
   void set_channel_mode(ChannelMode mode) {
