@@ -1,5 +1,11 @@
 # Plan: Hardware rate lock (v2 sync) — steering the I2S clock on ESP32-S3
 
+> **Status (2026-08-21):** Phases 1–2 implemented (`rate_lock.{h,cpp}` + servo
+> integration), opt-in via `rate_lock:` on the hub, enabled in the S3 example
+> config. The interface is chip-agnostic; only the S3 backend exists (other SoCs
+> compile the stub and keep the splice servo). Awaiting phase 3 hardware
+> validation — the fractional-only-write glitch question is still open.
+
 ## Goal
 
 Replace steady-state frame splicing with continuous hardware sample-rate steering,
@@ -87,16 +93,24 @@ fractional ratio (12.288 MHz from 160 MHz); trimming adds no new jitter class.
 
 - Player task: when rate lock is active, the servo's output becomes a trim command
   instead of a splice:
-  - PI on the median error: `ppm = Kp·median + Ki·∫median` with anti-windup;
-    conservative start `Kp ≈ 0.05 ppm/µs`, `Ki` an order below, both re-derived from
-    the loop's measured lag before enabling by default (lesson from the warble
-    incident: gain × measurement lag caused oscillation — model first, then tune).
-  - Alternatively phase-1-simple: bang-bang ±20 ppm with the existing hysteresis
-    band (direct port of the reference's `adjust_apll(dir)` law) — start here,
-    PI only if residual hunt is measurable. Caveat: hunting near the hysteresis
-    boundary means divider writes several times per second, multiplying any
-    per-write artifact phase 1 finds; if writes aren't perfectly clean,
-    rate-limit them or go straight to PI, which settles to a constant trim.
+  - **Hardware result (2026-08-21):** the bang-bang/stepping law limit-cycled at
+    ±250 ppm / ±3 ms, structurally: queue depth integrates a rate mismatch, so the
+    plant is already an integrator and a stepping trim double-integrates. Observed
+    amplitude matched the double-integrator prediction `√(2·e₀·slew)` and ~40 s
+    period. Not a gain problem — no step size damps it.
+  - **Adopted: continuous PI on the median error**, no deadband gating (trims are
+    inaudible; hysteresis gating re-creates the limit cycle):
+    `trim = Kp·median + Ki·∫median`, error in µs, trim in ppm (plant slope:
+    1 ppm = 1 µs/s). `Ki = Kp²/4` (critically damped) absorbs the crystal offset.
+    Integrator clamped to ±500 ppm (anti-windup) and persists across
+    resyncs/flushes/rate changes — it's a property of the crystal, not the stream.
+  - **Gain is set by disturbance tracking, not settling** (second hardware
+    lesson): the clock-offset estimate wanders ~100 µs/s with wifi jitter, and an
+    integrator plant trails a ramp by `rate/Kp`. `Kp = 0.1` measured ±1–2 ms
+    excursions — pure tracking lag, not instability. `Kp = 0.5 ppm/µs` bounds it
+    to ~200 µs with ~50° phase margin against the ~0.85 s measurement lag. The
+    splice servo never showed this because 1 frame/chunk ≈ 875 ppm of authority
+    chased the wander invisibly.
 - Splices remain for: hard resync (big jumps), catch-up beyond ±clamp, and as the
   automatic fallback when rate lock is unavailable (non-S3, option off, port
   read-back failed).

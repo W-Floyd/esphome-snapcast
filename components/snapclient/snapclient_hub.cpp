@@ -33,6 +33,9 @@ void SnapclientHub::setup() {
   config.hard_resync_threshold_ms = this->hard_resync_threshold_ms_;
   config.stream_idle_timeout_ms = this->stream_idle_timeout_ms_;
   config.sync_deadband_us = this->sync_deadband_us_;
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+  config.rate_lock_i2s_port = this->rate_lock_port_;
+#endif
 
   this->client_ = std::make_unique<SnapcastClient>(std::move(config));
   this->client_->set_listener(this);
@@ -70,6 +73,9 @@ void SnapclientHub::dump_config() {
                 this->server_host_.empty() ? "mDNS (_snapcast._tcp)" : "static host", get_mac_address_pretty().c_str(),
                 this->buffer_size_, this->time_sync_interval_ms_, this->hard_resync_threshold_ms_,
                 this->stream_idle_timeout_ms_);
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+  ESP_LOGCONFIG(TAG, "  Rate lock: I2S%u clock steering", this->rate_lock_port_);
+#endif
   if (this->client_ != nullptr && this->client_->is_connected()) {
     ESP_LOGCONFIG(TAG, "  Connected, clock offset: %.2f ms", this->client_->get_clock_offset_ms());
   }

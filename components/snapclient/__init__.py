@@ -2,6 +2,8 @@
 
 import esphome.codegen as cg
 from esphome.components import audio, network, socket, wifi
+from esphome.components.esp32 import only_on_variant
+from esphome.components.esp32.const import VARIANT_ESP32S3
 import esphome.config_validation as cv
 from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_NAME, CONF_PORT
 from esphome.types import ConfigType
@@ -42,6 +44,31 @@ PHASE_MODES = {
 }
 CONF_PHASE_INVERT = "phase_invert"
 CONF_SYNC_DEADBAND = "sync_deadband"
+CONF_RATE_LOCK = "rate_lock"
+CONF_I2S_PORT = "i2s_port"
+
+
+def _none_to_empty_dict(value):
+    return {} if value is None else value
+
+
+# Hardware rate lock: steady-state sync corrections steer the I2S clock divider
+# instead of splicing frames -- zero waveform discontinuities once locked. Opt-in
+# and S3-only for now (the backend steers the S3's MCLK fractional-N divider); the
+# frame-splice servo remains the automatic fallback everywhere else.
+RATE_LOCK_SCHEMA = cv.All(
+    _none_to_empty_dict,
+    cv.Schema(
+        {
+            # The i2s_audio bus port driving the speaker (first bus is port 0)
+            cv.Optional(CONF_I2S_PORT, default=0): cv.int_range(min=0, max=1),
+        }
+    ),
+    only_on_variant(
+        supported=[VARIANT_ESP32S3],
+        msg_prefix="rate_lock (hardware I2S clock steering)",
+    ),
+)
 
 
 def _request_networking(config: ConfigType) -> ConfigType:
@@ -102,6 +129,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PHASE_INVERT, default="none"): cv.enum(
                 PHASE_MODES, lower=True
             ),
+            cv.Optional(CONF_RATE_LOCK): RATE_LOCK_SCHEMA,
             cv.Optional(CONF_STREAM_IDLE_TIMEOUT, default="3s"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(
@@ -143,6 +171,10 @@ async def to_code(config: ConfigType) -> None:
 
     cg.add(var.set_channel_mode(config[CONF_CHANNEL_MODE]))
     cg.add(var.set_phase_mode(config[CONF_PHASE_INVERT]))
+
+    if CONF_RATE_LOCK in config:
+        cg.add_define("USE_SNAPCLIENT_RATE_LOCK", True)
+        cg.add(var.set_rate_lock_port(config[CONF_RATE_LOCK][CONF_I2S_PORT]))
 
     if config[CONF_FLAC]:
         # snapserver's default stream codec; pulls micro_flac from esp-audio-libs

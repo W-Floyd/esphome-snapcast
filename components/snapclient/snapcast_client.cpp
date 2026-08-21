@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -57,6 +58,25 @@ static constexpr uint32_t STARTUP_STEER_FRAMES = 8;
 // Median window for the steering servo's error signal (~0.4 s of chunks)
 static constexpr size_t MEDIAN_WINDOW = 15;
 
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+// Rate-lock PI gains. The plant is an integrator -- queue depth integrates any
+// rate mismatch, so the error's *slope* is the trim -- which is why a stepping
+// bang-bang trim (a second integrator) limit-cycled structurally on hardware
+// (observed: +-250 ppm / +-3 ms swings, matching the double-integrator prediction
+// sqrt(2*e0*slew)). Error in us, trim in ppm (1 ppm = 1 us/s of error slope).
+//
+// Bandwidth is set by disturbance tracking, not settling: the clock-offset estimate
+// (and feedback pivot) wander ~100 us/s with wifi jitter, and the loop trails a
+// ramp by rate/KP (KP = 0.1 measured +-1-2 ms excursions on hardware -- pure
+// tracking lag, not instability). KP = 0.5 bounds that to ~200 us, with ~50 deg
+// phase margin against the ~0.85 s measurement lag (feedback-pivot EWMA + median
+// window). KI = KP^2/4: critically damped; the integrator absorbs the crystal
+// offset so P holds the error at zero.
+static constexpr float TRIM_KP_PPM_PER_US = 0.5f;
+static constexpr float TRIM_KI_PPM_PER_US_S = 0.0625f;
+static constexpr float TRIM_CLAMP_PPM = 500.0f;
+#endif
+
 // A playback-feedback gap this long means the pipeline stopped (and flushed its
 // buffers on restart); triggers the frame-accounting re-baseline in
 // notify_audio_played()
@@ -90,6 +110,10 @@ bool SnapcastClient::start() {
     return false;
   }
   this->slice_buffer_ = std::make_unique<uint8_t[]>(SLICE_BUFFER_SIZE);
+
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+  this->rate_lock_ = std::make_unique<RateLock>(this->config_.rate_lock_i2s_port);
+#endif
 
   this->event_queue_ = xQueueCreate(8, sizeof(Event));
   this->record_queue_ = xQueueCreate(160, sizeof(ChunkRecord));
@@ -186,6 +210,14 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // At resume the pipeline is empty, so played == pushed is ground truth.
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
       this->fb_samples_ = 0;
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+      // The pipeline restart may have reprogrammed the I2S clock divider; re-read
+      // the baseline before the next trim (the requested trim itself stays valid --
+      // it is the learned crystal offset, a property of the hardware)
+      if (this->rate_lock_ != nullptr) {
+        this->rate_lock_->invalidate_baseline();
+      }
+#endif
     }
   }
   this->played_frames_total_ += frames;
@@ -821,6 +853,15 @@ void SnapcastClient::player_task_() {
   // letting it random-walk inside a deadband — a free-walking deadband is exactly
   // what wanders the stereo image between two paired devices.
   int8_t steer_dir = 0;
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+  // Rate lock: once converged, steady-state corrections become hardware clock trims
+  // instead of frame splices. The PI integrator (positive = play faster) persists
+  // across resyncs, flushes, and rate changes because it converges to the crystal
+  // offset, a property of the hardware, not the stream.
+  float trim_integral_ppm = 0.0f;
+  bool rate_lock_ok = this->rate_lock_ != nullptr;
+  uint32_t rate_lock_rate = 0;
+#endif
   // Mute-until-synced: real audio flows only after the first in-band median
   bool converged = false;
   int64_t last_resync_log_us = 0;
@@ -835,6 +876,15 @@ void SnapcastClient::player_task_() {
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
+
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+    if (rate_lock_ok && rec.params.sample_rate != rate_lock_rate) {
+      // The speaker reprograms the I2S clock for a new stream format; re-read the
+      // divider baseline once the new clock is running
+      this->rate_lock_->invalidate_baseline();
+      rate_lock_rate = rec.params.sample_rate;
+    }
+#endif
 
     if (!this->output_active_.load(std::memory_order_relaxed)) {
       // No consumer: discard immediately. New chunks arrive continuously, so playback
@@ -899,12 +949,18 @@ void SnapcastClient::player_task_() {
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
+      char trim_str[32] = "";
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+      if (rate_lock_ok) {
+        snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm", this->rate_lock_->applied_ppm());
+      }
+#endif
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, max feedback gap %" PRId64
-               " ms, buffered %" PRIu32 " ms over %" PRIu32 " chunks",
+               " ms, buffered %" PRIu32 " ms%s over %" PRIu32 " chunks",
                err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
-               hard_resyncs, max_gap_us / 1000, buffered_ms, err_count);
+               hard_resyncs, max_gap_us / 1000, buffered_ms, trim_str, err_count);
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
@@ -978,18 +1034,43 @@ void SnapcastClient::player_task_() {
                  (steer_dir < 0 && median_err_us > -engage_us / 2)) {
         steer_dir = 0;
       }
+      bool trim_holds = false;
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+      // Steady-state rate lock: steer the I2S clock instead of splicing frames.
+      // Continuous PI on the median error, no deadband -- trims are inaudible, and
+      // gating them through the hysteresis band re-creates the limit cycle. The
+      // hysteresis/steer_dir path above still drives the splice fallback.
+      // Pre-convergence stays on hard splices: muted convergence at 8 frames/chunk
+      // is far faster than clock steering could ever be.
+      if (converged && rate_lock_ok) {
+        const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
+        trim_integral_ppm = std::clamp(
+            trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -TRIM_CLAMP_PPM,
+            TRIM_CLAMP_PPM);
+        const float trim_ppm =
+            std::clamp(TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us) + trim_integral_ppm, -TRIM_CLAMP_PPM,
+                       TRIM_CLAMP_PPM);
+        trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
+        if (!trim_holds) {
+          rate_lock_ok = false;
+          ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
+        }
+      }
+#endif
       // While muted (pre-convergence) audibility doesn't constrain splice size, so
       // steer hard to reach the band quickly instead of crawling in at ~0.9 ms/s
-      const uint32_t steer_frames = converged ? 1 : STARTUP_STEER_FRAMES;
-      if (steer_dir > 0) {
-        drop_frames = steer_frames;
-        soft_dropped_frames += steer_frames;
-      } else if (steer_dir < 0) {
-        soft_inserted_frames += steer_frames;
-        if (converged) {
-          this->push_repeat_frame_(rec.params);
-        } else {
-          this->push_silence_(steer_frames, rec.params);
+      if (!trim_holds) {
+        const uint32_t steer_frames = converged ? 1 : STARTUP_STEER_FRAMES;
+        if (steer_dir > 0) {
+          drop_frames = steer_frames;
+          soft_dropped_frames += steer_frames;
+        } else if (steer_dir < 0) {
+          soft_inserted_frames += steer_frames;
+          if (converged) {
+            this->push_repeat_frame_(rec.params);
+          } else {
+            this->push_silence_(steer_frames, rec.params);
+          }
         }
       }
     }
@@ -1030,10 +1111,6 @@ int64_t SnapcastClient::predict_next_play_us_(uint32_t sample_rate) {
 }
 
 int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
-  this->filter_mutex_.lock();
-  const double offset_ms = this->time_filter_.has_estimate() ? this->time_filter_.get_offset(now_us() / 1000.0) : 0.0;
-  this->filter_mutex_.unlock();
-
   // Effective playout buffer, matching the reference client (controller.cpp):
   // max(0, bufferMs - serverLatency - localLatency)
   const int64_t buffer_us =
@@ -1041,6 +1118,10 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
                                this->server_latency_ms_.load(std::memory_order_relaxed) -
                                this->static_delay_ms_.load(std::memory_order_relaxed)) *
       1000;
+
+  this->filter_mutex_.lock();
+  const double offset_ms = this->time_filter_.has_estimate() ? this->time_filter_.get_offset(now_us() / 1000.0) : 0.0;
+  this->filter_mutex_.unlock();
   return rec.server_ts_us + buffer_us - static_cast<int64_t>(offset_ms * 1000.0);
 }
 

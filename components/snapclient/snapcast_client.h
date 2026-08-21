@@ -4,6 +4,7 @@
 
 #ifdef USE_ESP32
 
+#include "rate_lock.h"
 #include "snapcast_proto.h"
 #include "time_filter.h"
 
@@ -40,6 +41,11 @@ struct SnapcastClientConfig {
   // Reference esp32 snapclient uses 128 us; single-frame steering splices are ~23 us
   // events, inaudible.
   int64_t sync_deadband_us{128};
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+  // I2S port whose output clock the hardware rate lock steers (steady-state
+  // corrections become clock trims instead of frame splices where supported)
+  uint8_t rate_lock_i2s_port{0};
+#endif
 };
 
 /// @brief Output channel routing, matching esp32 snapclient's dsp_channel_mode_t.
@@ -316,6 +322,12 @@ class SnapcastClient {
   std::vector<uint8_t> flac_input_;    // undecoded input carry-over across chunks
   std::vector<uint8_t> flac_output_;   // one decoded FLAC frame
   bool flac_header_done_{false};
+#endif
+
+#ifdef USE_SNAPCLIENT_RATE_LOCK
+  // Hardware clock steering; owned here, driven by the player task's servo. The
+  // speaker callback thread only pokes invalidate_baseline() (atomic flag).
+  std::unique_ptr<RateLock> rate_lock_;
 #endif
 
   // --- Player task locals ---
