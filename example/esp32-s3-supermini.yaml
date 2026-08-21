@@ -1,0 +1,109 @@
+# Snapcast player on an ESP32-S3 SuperMini (ESP32-S3FH4R2: 4 MB flash, 2 MB quad PSRAM)
+# wired to an I2S DAC (PCM5102A / MAX98357A style):
+#
+#   GPIO5  -> BCK  (bit clock)
+#   GPIO6  -> LCK  (word select / LR clock)
+#   GPIO7  -> DIN  (data)
+#
+# Any free GPIOs work; adjust below to your wiring. The onboard WS2812 (GPIO48)
+# doubles as a play-state indicator.
+esphome:
+  name: snapclient-supermini
+  friendly_name: Snapclient SuperMini
+
+esp32:
+  board: esp32-s3-devkitc-1
+  flash_size: 4MB
+  framework:
+    type: esp-idf
+
+# The SuperMini's ESP32-S3FH4R2 has 2 MB embedded QUAD PSRAM (not octal)
+psram:
+  mode: quad
+  speed: 80MHz
+
+logger:
+  level: INFO
+
+api:
+
+ota:
+  - platform: esphome
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  # When using this repo remotely instead:
+  # - source: github://W-Floyd/snapclient-esphome
+  #   components: [snapclient]
+
+snapclient:
+  id: snap
+  server: 192.168.1.10   # <- your snapserver
+  # buffer_size: 524288  # fits comfortably in the 2 MB PSRAM
+
+media_source:
+  - platform: snapclient
+    id: snap_source
+    snapclient_id: snap
+    # static_delay: 0ms  # per-device latency trim
+
+i2s_audio:
+  - id: i2s_out
+    i2s_bclk_pin: GPIO5
+    i2s_lrclk_pin: GPIO6
+
+speaker:
+  - platform: i2s_audio
+    id: dac_speaker
+    i2s_audio_id: i2s_out
+    dac_type: external
+    i2s_dout_pin: GPIO7
+    sample_rate: 48000  # match the snapserver stream rate for exact sync feedback
+    channel: stereo
+    buffer_duration: 100ms
+
+media_player:
+  - platform: speaker_source
+    id: player
+    name: Media Player
+    media_pipeline:
+      speaker: dac_speaker
+      sources:
+        - snap_source
+      # Keep the pipeline at the stream's native format so the DAC feedback used
+      # for synchronization counts frames 1:1 with what the source pushes
+      sample_rate: 48000
+      num_channels: 2
+
+# Onboard WS2812 as a play-state indicator
+light:
+  - platform: esp32_rmt_led_strip
+    id: status_led
+    pin: GPIO48
+    num_leds: 1
+    chipset: WS2812
+    rgb_order: GRB
+    name: Status LED
+    default_transition_length: 200ms
+
+interval:
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            media_player.is_playing: player
+          then:
+            - light.turn_on:
+                id: status_led
+                brightness: 20%
+                red: 0%
+                green: 100%
+                blue: 20%
+          else:
+            - light.turn_off: status_led
