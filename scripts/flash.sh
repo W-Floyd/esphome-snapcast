@@ -124,9 +124,15 @@ fi
 
 # A Docker build records container-side paths (/config/...) in esphome's storage
 # JSON, and the host `esphome upload` reads the firmware path straight out of it.
-# Translate that prefix back to the repo root and pass the binary explicitly, so
-# host flashing never chases a /config path that only exists inside the image.
-BIN=""
+# Translate that prefix back to the repo root so host flashing never chases a
+# /config path that only exists inside the image.
+#
+# CRITICAL: the transport needs DIFFERENT artifacts, and firmware_bin_path is the
+# app-only image. Serial flashing writes at offset 0x0 and therefore needs
+# firmware.factory.bin (bootloader + partition table + app); handing it the
+# app-only image writes an app where the bootloader belongs, and the ROM then
+# loads it, fails the image SHA-256 check, "boots anyway" and watchdog-loops
+# forever (~1.3 s per cycle). OTA takes the app image.
 resolve_bin() {
     local storage="$(dirname "${CONFIG}")/.esphome/storage/$(basename "${CONFIG}").json"
     [[ -f "${storage}" ]] || return 1
@@ -142,15 +148,24 @@ print(path)
 PYEOF
 }
 
-if BIN=$(resolve_bin) && [[ -f "${BIN}" ]]; then
-    echo "==> Firmware: ${BIN}"
+# OTA takes the app image, which is exactly firmware_bin_path (path-translated).
+OTA_FILE_ARG=()
+if OTA_BIN=$(resolve_bin) && [[ -f "${OTA_BIN}" ]]; then
+    OTA_FILE_ARG=(--file "${OTA_BIN}")
 else
-    echo "WARNING: could not resolve firmware path; letting esphome pick it" >&2
-    BIN=""
+    echo "WARNING: could not resolve the OTA image; letting esphome pick it" >&2
 fi
 
-FILE_ARG=()
-[[ -n "${BIN}" ]] && FILE_ARG=(--file "${BIN}")
+# Serial takes the factory image from the same build directory.
+USB_FILE_ARG=()
+if [[ -n "${OTA_BIN:-}" ]]; then
+    FACTORY_BIN="$(dirname "${OTA_BIN}")/firmware.factory.bin"
+    if [[ -f "${FACTORY_BIN}" ]]; then
+        USB_FILE_ARG=(--file "${FACTORY_BIN}")
+    else
+        echo "WARNING: ${FACTORY_BIN} not found; letting esphome pick the serial image" >&2
+    fi
+fi
 
 # ── Flash ─────────────────────────────────────────────────────────────────────
 
@@ -161,7 +176,8 @@ if [[ "${USB}" -eq 1 ]]; then
         echo "    found: ${PORT}"
     fi
     echo "==> Flashing via ${PORT}..."
-    esphome upload "${CONFIG}" --device "${PORT}" ${FILE_ARG[@]+"${FILE_ARG[@]}"}
+    # Serial writes at 0x0: factory image only, never the app-only one
+    esphome upload "${CONFIG}" --device "${PORT}" ${USB_FILE_ARG[@]+"${USB_FILE_ARG[@]}"}
     if [[ "${LOG}" -eq 1 ]]; then
         exec esphome logs "${CONFIG}" --device "${PORT}"
     fi
@@ -172,7 +188,7 @@ flash_device() {
     local device="$1"
     echo ""
     echo "══ ${device} ════════════════════════════════════════════"
-    esphome upload "${CONFIG}" --device "${device}" ${FILE_ARG[@]+"${FILE_ARG[@]}"}
+    esphome upload "${CONFIG}" --device "${device}" ${OTA_FILE_ARG[@]+"${OTA_FILE_ARG[@]}"}
 }
 
 FAILED=()
