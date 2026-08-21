@@ -81,8 +81,10 @@ class ControlSession {
   // everywhere); the void* parameters are JsonVariant*, cast inside the .cpp.
   /// Parses a full server status object (GetStatus result / Server.OnUpdate).
   void parse_server_(const void *server_variant);
-  /// Parses one stream object's id + properties.metadata.
+  /// Parses one stream object: id + properties.metadata (GetStatus, Stream.OnUpdate).
   void handle_stream_(const void *stream_variant);
+  /// Stores a metadata object, whichever notification shape carried it.
+  void set_metadata_(const char *stream_name, const void *metadata_variant);
   void request_status_() { this->status_pending_ = true; }
   bool send_raw_(const char *data, size_t len, int64_t now_us);
 

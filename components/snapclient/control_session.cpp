@@ -213,6 +213,7 @@ static void build_filter(JsonDocument &f) {
   }
   f["params"]["id"] = true;
   f["params"]["stream_id"] = true;
+  f["params"]["metadata"] = true;  // Stream.OnProperties carries it here
   f["params"]["stream"]["id"] = true;
   f["params"]["stream"]["properties"]["metadata"] = true;
 }
@@ -226,25 +227,35 @@ void ControlSession::handle_line_(const std::string &line, int64_t now_us) {
   }
   const char *method = doc["method"];
   if (method != nullptr) {
-    if (strcmp(method, "Stream.OnUpdate") == 0) {
+    if (strcmp(method, "Stream.OnProperties") == 0) {
+      // THE live metadata channel: params = {id, metadata:{...}} with metadata
+      // directly under params (NOT stream.properties.metadata). Handling only
+      // Stream.OnUpdate meant track changes were never seen and the sensors
+      // refreshed solely on control-session connect.
+      const char *sid = doc["params"]["id"];
+      if (sid != nullptr && this->stream_id_ == sid) {
+        JsonVariant meta = doc["params"]["metadata"];
+        this->set_metadata_(sid, &meta);
+      } else if (this->stream_id_.empty()) {
+        this->request_status_();  // don't know our stream yet
+      }
+    } else if (strcmp(method, "Stream.OnUpdate") == 0) {
       JsonVariant stream = doc["params"]["stream"];
       const char *sid = stream["id"];
       if (sid != nullptr && this->stream_id_ == sid) {
         this->handle_stream_(&stream);
       } else if (this->stream_id_.empty()) {
-        this->request_status_();  // don't know our stream yet
-      }
-    } else if (strcmp(method, "Group.OnStreamChanged") == 0) {
-      const char *gid = doc["params"]["id"];
-      if (gid != nullptr && this->group_id_ == gid) {
-        this->request_status_();  // our group switched streams
+        this->request_status_();
       }
     } else if (strcmp(method, "Server.OnUpdate") == 0) {
       JsonVariant server = doc["params"]["server"];
       this->parse_server_(&server);
-    } else if (strcmp(method, "Client.OnConnect") == 0 || strcmp(method, "Client.OnDisconnect") == 0) {
-      // Roster changed (regrouping arrives as Server.OnUpdate); volume/mute/name
-      // notifications are deliberately ignored -- they carry nothing we surface
+    } else if (strncmp(method, "Stream.", 7) == 0 || strncmp(method, "Group.", 6) == 0 ||
+               strcmp(method, "Client.OnConnect") == 0 || strcmp(method, "Client.OnDisconnect") == 0) {
+      // Anything else that can move our group, stream, or roster: re-sync from
+      // Server.GetStatus rather than guessing the payload shape (coalesced to one
+      // request per STATUS_MIN_INTERVAL_US). Client volume/mute/name/latency
+      // notifications carry nothing we surface, so they are deliberately excluded.
       this->request_status_();
     }
     return;
@@ -328,10 +339,16 @@ void ControlSession::parse_server_(const void *server_variant) {
 
 void ControlSession::handle_stream_(const void *stream_variant) {
   const JsonVariant &stream = *static_cast<const JsonVariant *>(stream_variant);
-  StreamMetadata md;
-  md.stream_name = stream["id"] | "";
   JsonVariant meta = stream["properties"]["metadata"];
-  md.title = meta["title"] | "";
+  this->set_metadata_(stream["id"] | "", &meta);
+}
+
+void ControlSession::set_metadata_(const char *stream_name, const void *metadata_variant) {
+  const JsonVariant &meta = *static_cast<const JsonVariant *>(metadata_variant);
+  StreamMetadata md;
+  md.stream_name = stream_name != nullptr ? stream_name : "";
+  // "track" is the older key for the same field; accept either
+  md.title = meta["title"] | (meta["track"] | "");
   md.album = meta["album"] | "";
   JsonVariant artist = meta["artist"];
   if (artist.is<const char *>()) {
