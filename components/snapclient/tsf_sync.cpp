@@ -274,7 +274,13 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       }
       continue;
     }
-    if (est.valid) {
+    // Plausibility only means something when our own estimate deserves trust: a
+    // freshly-booted follower's raw Kalman swings +-100 ms under the post-reboot
+    // congestion, vetoing the (maturity-gated, trustworthy) leader's mapping and
+    // churning on its own bad clock instead (observed: a whole fleet rejecting
+    // sign-flipping "implausible" deltas for minutes after a simultaneous OTA).
+    // Immature followers adopt the leader's mapping unconditionally.
+    if (est.valid && est.mature) {
       const int64_t own_offset_us = static_cast<int64_t>(est.offset_ms * 1000.0);
       if (std::abs(implied_offset_us - own_offset_us) > this->plausibility_us_) {
         if (!this->warned_rejected_) {
