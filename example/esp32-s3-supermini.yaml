@@ -129,6 +129,21 @@ media_player:
           decibel_reduction: 0
           duration: 1.0s
 
+# Channel routing (Stereo / Left / Right / Mono), e.g. for using two devices as a
+# synchronized L/R pair. Persisted across reboots.
+select:
+  - platform: snapclient
+    snapclient_id: snap
+    name: Channel Mode
+
+# Volume taper: how many dB the Snapcast volume slider spans (0 = linear/off; the
+# esp32 snapclient reference ships with 60). Persisted across reboots.
+number:
+  - platform: snapclient
+    snapclient_id: snap
+    name: Volume Curve
+    # initial_value: 60
+
 # Onboard WS2812 as a play-state indicator
 light:
   - platform: esp32_rmt_led_strip

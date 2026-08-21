@@ -811,6 +811,38 @@ uint32_t SnapcastClient::push_silence_(uint32_t frames, const StreamParams &para
   return pushed;
 }
 
+// THREAD CONTEXT: Player task. Slices are always frame-aligned: chunk sizes and
+// SLICE_BUFFER_SIZE are multiples of the frame size, and reads are sequential.
+void SnapcastClient::apply_channel_mode_(uint8_t *data, size_t len, const StreamParams &params) {
+  const auto mode = static_cast<ChannelMode>(this->channel_mode_.load(std::memory_order_relaxed));
+  if (mode == ChannelMode::STEREO || params.channels != 2 || params.bits_per_sample != 16) {
+    return;
+  }
+  auto *samples = reinterpret_cast<int16_t *>(data);
+  const size_t frames = len / 4;
+  switch (mode) {
+    case ChannelMode::LEFT_ONLY:
+      for (size_t i = 0; i < frames; i++) {
+        samples[2 * i + 1] = samples[2 * i];
+      }
+      break;
+    case ChannelMode::RIGHT_ONLY:
+      for (size_t i = 0; i < frames; i++) {
+        samples[2 * i] = samples[2 * i + 1];
+      }
+      break;
+    case ChannelMode::MONO:
+      for (size_t i = 0; i < frames; i++) {
+        const int16_t mixed = static_cast<int16_t>((static_cast<int32_t>(samples[2 * i]) + samples[2 * i + 1]) / 2);
+        samples[2 * i] = mixed;
+        samples[2 * i + 1] = mixed;
+      }
+      break;
+    default:
+      break;
+  }
+}
+
 void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames) {
   const uint32_t frame_bytes = rec.params.frame_bytes();
   size_t remaining = rec.bytes;
@@ -823,6 +855,8 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames) {
       got += this->pcm_ring_->read(this->slice_buffer_.get() + got, want - got, pdMS_TO_TICKS(100));
     }
     remaining -= got;
+
+    this->apply_channel_mode_(this->slice_buffer_.get(), got, rec.params);
 
     size_t offset = 0;
     if (skip > 0) {

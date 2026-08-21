@@ -1,0 +1,47 @@
+#include "snapclient_select.h"
+
+#if defined(USE_ESP32) && defined(USE_SELECT)
+
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+
+namespace esphome::snapclient {
+
+static const char *const TAG = "snapclient.select";
+
+void SnapclientChannelModeSelect::setup() {
+  uint8_t index = static_cast<uint8_t>(this->parent_->get_channel_mode());
+  if (this->restore_value_) {
+    this->pref_ = global_preferences->make_preference<uint8_t>(this->get_object_id_hash());
+    uint8_t restored;
+    if (this->pref_.load(&restored) && restored < this->traits.get_options().size()) {
+      index = restored;
+    }
+  }
+  this->apply_(index);
+}
+
+void SnapclientChannelModeSelect::dump_config() { LOG_SELECT("", "Snapclient Channel Mode Select", this); }
+
+// THREAD CONTEXT: Main loop (invoked by the select framework)
+void SnapclientChannelModeSelect::control(const std::string &value) {
+  auto index = this->index_of(value);
+  if (!index.has_value()) {
+    return;
+  }
+  this->apply_(*index);
+  if (this->restore_value_) {
+    uint8_t stored = *index;
+    this->pref_.save(&stored);
+  }
+}
+
+void SnapclientChannelModeSelect::apply_(uint8_t index) {
+  // Option order matches the ChannelMode enum (and the reference dsp_channel_mode_t)
+  this->parent_->set_channel_mode(static_cast<ChannelMode>(index));
+  this->publish_state(this->traits.get_options()[index]);
+}
+
+}  // namespace esphome::snapclient
+
+#endif  // USE_ESP32 && USE_SELECT

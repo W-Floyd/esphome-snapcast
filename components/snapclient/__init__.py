@@ -20,9 +20,18 @@ CONF_FLAC = "flac"
 CONF_TIME_SYNC_INTERVAL = "time_sync_interval"
 CONF_HARD_RESYNC_THRESHOLD = "hard_resync_threshold"
 CONF_STREAM_IDLE_TIMEOUT = "stream_idle_timeout"
+CONF_CHANNEL_MODE = "channel_mode"
 
 snapclient_ns = cg.esphome_ns.namespace("snapclient")
 SnapclientHub = snapclient_ns.class_("SnapclientHub", cg.Component)
+
+ChannelMode = snapclient_ns.enum("ChannelMode", is_class=True)
+CHANNEL_MODES = {
+    "stereo": ChannelMode.STEREO,
+    "left": ChannelMode.LEFT_ONLY,
+    "right": ChannelMode.RIGHT_ONLY,
+    "mono": ChannelMode.MONO,
+}
 
 
 def _request_networking(config: ConfigType) -> ConfigType:
@@ -61,6 +70,10 @@ CONFIG_SCHEMA = cv.All(
                     max=cv.TimePeriod(milliseconds=1000),
                 ),
             ),
+            # Boot default; a snapclient channel-mode select entity overrides it
+            cv.Optional(CONF_CHANNEL_MODE, default="stereo"): cv.enum(
+                CHANNEL_MODES, lower=True
+            ),
             cv.Optional(CONF_STREAM_IDLE_TIMEOUT, default="3s"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(
@@ -98,6 +111,8 @@ async def to_code(config: ConfigType) -> None:
             config[CONF_STREAM_IDLE_TIMEOUT].total_milliseconds
         )
     )
+
+    cg.add(var.set_channel_mode(config[CONF_CHANNEL_MODE]))
 
     if config[CONF_FLAC]:
         # snapserver's default stream codec; pulls micro_flac from esp-audio-libs

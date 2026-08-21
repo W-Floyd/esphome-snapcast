@@ -5,6 +5,7 @@
 #ifdef USE_ESP32
 
 #include "snapcast_client.h"
+#include "volume_curve.h"
 
 #include "esphome/core/component.h"
 #include "esphome/core/helpers.h"
@@ -68,6 +69,20 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   /// @brief Per-device latency trim applied to every chunk deadline.
   void set_static_delay_ms(int32_t delay_ms);
 
+  /// @brief Output channel routing (stereo / left / right / mono). Safe at runtime.
+  void set_channel_mode(ChannelMode mode);
+  ChannelMode get_channel_mode() const { return this->channel_mode_; }
+
+  /// @brief Volume taper between the Snapcast volume slider and the speaker gain.
+  /// 0 dB = linear (off). Fires the volume-curve callbacks so the media source
+  /// re-applies the current volume with the new curve.
+  void set_volume_curve_db_range(float db_range);
+  const VolumeCurve &get_volume_curve() const { return this->volume_curve_; }
+
+  template<typename F> void add_volume_curve_callback(F &&callback) {
+    this->volume_curve_callbacks_.add(std::forward<F>(callback));
+  }
+
   /// @brief Reports a local volume/mute change to the server (ClientInfo message).
   void send_client_volume(uint8_t volume_percent, bool muted);
 
@@ -110,10 +125,14 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   SnapcastAudioListener *pending_audio_listener_{nullptr};
   int32_t pending_static_delay_ms_{0};
 
+  ChannelMode channel_mode_{ChannelMode::STEREO};
+  VolumeCurve volume_curve_{};
+
   // Callback fan-out to child components
   CallbackManager<void(bool)> connection_callbacks_{};
   CallbackManager<void(uint8_t, bool)> server_settings_callbacks_{};
   CallbackManager<void(bool, const StreamParams &)> stream_state_callbacks_{};
+  CallbackManager<void()> volume_curve_callbacks_{};
 };
 
 /// @brief Base class for all snapclient subcomponents.

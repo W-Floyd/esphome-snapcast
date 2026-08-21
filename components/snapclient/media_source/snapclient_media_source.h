@@ -43,11 +43,19 @@ class SnapclientMediaSource final : public SnapclientChild,
   /// @brief Updates the source state and keeps the client's output-active flag in step.
   void set_playback_state_(media_source::MediaSourceState state);
 
+  /// @brief Maps a server volume slider position through the volume curve and
+  /// requests the resulting gain from the orchestrator.
+  void apply_server_volume_(uint8_t volume_percent);
+
   int32_t static_delay_ms_{0};
 
   // Last values the server pushed, used to suppress echoing them straight back
   int last_server_volume_{-1};
   int last_server_muted_{-1};
+
+  // The exact gain we last requested from the orchestrator; a notify with (almost)
+  // this value is our own request echoing back, not a user change.
+  float last_requested_gain_{-1.0f};
 
   // Local state mirrored from the orchestrator, reported to the server on change
   uint8_t local_volume_{100};

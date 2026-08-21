@@ -38,6 +38,14 @@ struct SnapcastClientConfig {
   uint32_t stream_idle_timeout_ms{3000};
 };
 
+/// @brief Output channel routing, matching esp32 snapclient's dsp_channel_mode_t.
+enum class ChannelMode : uint8_t {
+  STEREO = 0,      // Normal stereo
+  LEFT_ONLY = 1,   // Route the left channel to both outputs
+  RIGHT_ONLY = 2,  // Route the right channel to both outputs
+  MONO = 3,        // Mix L+R to mono, route to both outputs
+};
+
 /// @brief Decoded stream format of the current Snapcast stream.
 struct StreamParams {
   uint32_t sample_rate{0};
@@ -109,6 +117,12 @@ class SnapcastClient {
 
   /// @brief Per-device latency trim, subtracted from every chunk deadline.
   void set_static_delay_ms(int32_t delay_ms) { this->static_delay_ms_.store(delay_ms, std::memory_order_relaxed); }
+
+  /// @brief Output channel routing; applied in-place to stereo 16-bit audio as it is
+  /// pushed, so it may be changed at any time without disturbing sync accounting.
+  void set_channel_mode(ChannelMode mode) {
+    this->channel_mode_.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
+  }
 
   /// @brief Reports a local volume/mute change to the server via a ClientInfo message.
   void send_client_info(uint8_t volume_percent, bool muted);
@@ -188,6 +202,8 @@ class SnapcastClient {
   uint32_t push_silence_(uint32_t frames, const StreamParams &params);
   /// Pushes @p bytes from the ring downstream, dropping @p drop_frames from the front.
   void push_chunk_(const ChunkRecord &rec, uint32_t drop_frames);
+  /// @brief Applies the configured channel routing in-place to a frame-aligned slice.
+  void apply_channel_mode_(uint8_t *data, size_t len, const StreamParams &params);
 
   SnapcastClientConfig config_;
   SnapcastClientListener *listener_{nullptr};
@@ -206,6 +222,7 @@ class SnapcastClient {
   std::atomic<bool> connected_{false};
   std::atomic<bool> output_active_{false};
   std::atomic<int32_t> static_delay_ms_{0};
+  std::atomic<uint8_t> channel_mode_{static_cast<uint8_t>(ChannelMode::STEREO)};
 
   // Server settings shadow used by the tasks (buffer_ms/latency for deadlines).
   std::atomic<int32_t> buffer_ms_{1000};

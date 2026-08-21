@@ -31,6 +31,7 @@ void SnapclientHub::setup() {
     this->client_->set_audio_listener(this->pending_audio_listener_);
   }
   this->client_->set_static_delay_ms(this->pending_static_delay_ms_);
+  this->client_->set_channel_mode(this->channel_mode_);
 
   if (!this->client_->start()) {
     ESP_LOGE(TAG, "Failed to start Snapcast client");
@@ -85,6 +86,18 @@ void SnapclientHub::set_static_delay_ms(int32_t delay_ms) {
   if (this->client_ != nullptr) {
     this->client_->set_static_delay_ms(delay_ms);
   }
+}
+
+void SnapclientHub::set_channel_mode(ChannelMode mode) {
+  this->channel_mode_ = mode;
+  if (this->client_ != nullptr) {
+    this->client_->set_channel_mode(mode);
+  }
+}
+
+void SnapclientHub::set_volume_curve_db_range(float db_range) {
+  this->volume_curve_.set_db_range(db_range);
+  this->volume_curve_callbacks_.call();
 }
 
 void SnapclientHub::send_client_volume(uint8_t volume_percent, bool muted) {

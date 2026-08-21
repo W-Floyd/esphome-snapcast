@@ -26,6 +26,11 @@ through ESPHome's own audio stack — so announcements, volume, mixing, and any
   resyncs (beyond `hard_resync_threshold`) to hold the server's `bufferMs` deadline.
 - Volume/mute round-trip: `ServerSettings` drive the media player; local changes go
   back via `ClientInfo`.
+- Channel routing — Stereo / Left / Right / Mono (e.g. two devices as a synchronized
+  L/R pair) — via a `select` entity or the hub's `channel_mode` option, persisted.
+- Volume taper: an optional exponential volume curve (configurable dB range, like the
+  esp32 snapclient's) between the Snapcast slider and the speaker gain, exposed as a
+  `number` slider entity, persisted.
 - Wifi power save is disabled only while a stream is playing.
 
 ## Requirements
@@ -83,7 +88,21 @@ media_player:
 | `time_sync_interval` | `1s` | Steady-state time sync cadence (a fast burst runs at connect) |
 | `hard_resync_threshold` | `50ms` | Sync error beyond which chunks are dropped / silence inserted |
 | `stream_idle_timeout` | `3s` | No wire chunks for this long ⇒ stream ends |
+| `channel_mode` | `stereo` | Boot default routing: `stereo`, `left`, `right`, `mono` |
 | `static_delay` (media_source) | `0ms` | Per-device latency trim, like `snapclient --latency` |
+
+### Entities
+
+```yaml
+select:
+  - platform: snapclient
+    name: Channel Mode      # Stereo / Left / Right / Mono, persisted; overrides channel_mode
+
+number:
+  - platform: snapclient
+    name: Volume Curve      # dB range of the volume taper; 0 = linear/off, reference uses 60
+    # initial_value: 60
+```
 
 ### Sync accuracy notes
 

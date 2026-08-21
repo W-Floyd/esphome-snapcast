@@ -5,6 +5,7 @@
 #include "esphome/components/audio/audio.h"
 #include "esphome/core/log.h"
 
+#include <algorithm>
 #include <cmath>
 
 namespace esphome::snapclient {
@@ -24,8 +25,15 @@ void SnapclientMediaSource::setup() {
     // don't echo the same values straight back as a ClientInfo message.
     this->last_server_volume_ = volume;
     this->last_server_muted_ = muted;
-    this->request_volume_(volume / 100.0f);
+    this->apply_server_volume_(volume);
     this->request_mute_(muted);
+  });
+
+  // A changed volume curve remaps the current slider position to a new gain
+  this->parent_->add_volume_curve_callback([this]() {
+    if (this->last_server_volume_ >= 0) {
+      this->apply_server_volume_(static_cast<uint8_t>(this->last_server_volume_));
+    }
   });
 
   this->parent_->add_stream_state_callback([this](bool started, const StreamParams &params) {
@@ -97,10 +105,25 @@ void SnapclientMediaSource::set_playback_state_(media_source::MediaSourceState s
   this->set_state_(state);
 }
 
+// THREAD CONTEXT: Main loop (server settings / volume curve callbacks)
+void SnapclientMediaSource::apply_server_volume_(uint8_t volume_percent) {
+  // The Snapcast slider is a position; the orchestrator volume is an amplitude gain.
+  // The curve (0 dB range = linear passthrough) maps between them.
+  const float gain = this->parent_->get_volume_curve().apply(volume_percent / 100.0f);
+  this->last_requested_gain_ = gain;
+  this->request_volume_(gain);
+}
+
 // THREAD CONTEXT: Main loop (orchestrator -> source notification)
 void SnapclientMediaSource::notify_volume_changed(float volume) {
-  const int volume_percent = static_cast<int>(std::roundf(volume * 100.0f));
-  this->local_volume_ = static_cast<uint8_t>(volume_percent);
+  if (std::abs(volume - this->last_requested_gain_) < 0.005f) {
+    // Our own request echoing back through the orchestrator, not a user change
+    return;
+  }
+  // A local (HA slider) change: report the equivalent slider position to the server
+  const float slider = this->parent_->get_volume_curve().inverse(volume);
+  const int volume_percent = static_cast<int>(std::roundf(slider * 100.0f));
+  this->local_volume_ = static_cast<uint8_t>(std::clamp(volume_percent, 0, 100));
   if (volume_percent != this->last_server_volume_) {
     this->parent_->send_client_volume(this->local_volume_, this->local_muted_);
   }
