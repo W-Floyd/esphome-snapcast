@@ -86,7 +86,7 @@ media_player:
 |---|---|---|
 | `server` | mDNS discovery | Snapserver host or IP; omit to discover via `_snapcast._tcp` |
 | `port` | `1704` | Snapserver stream port |
-| `name` | node name | `HostName` sent in Hello; the server's default display name |
+| `name` | friendly name | Base of the Hello `HostName` (the MAC is appended); seeds the server display name |
 | `buffer_size` | `524288` | Decoded PCM buffer in bytes (PSRAM-preferred) |
 | `flac` | `true` | Compile in FLAC decoding |
 | `time_sync_interval` | `1s` | Steady-state time sync cadence (a fast burst runs at connect) |
