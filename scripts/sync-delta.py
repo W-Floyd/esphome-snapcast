@@ -21,12 +21,25 @@ import argparse
 import itertools
 import os
 import re
+import shutil
 import statistics
 import sys
 import time
 
 # "[12:36:12.471]...median -204 us" (ms in the timestamp optional)
 LINE_RE = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\].*median (-?\d+)\s*us")
+
+
+REFRESH_S = 10.0
+
+
+def rows_that_fit(n_names):
+    """How many per-row lines leave the pair summary on screen."""
+    pairs = n_names * (n_names - 1) // 2
+    # header + elision note + blank + "pairs (...)" + one line per pair
+    # + group spread + refresh footer (blank + line) + prompt slack
+    overhead = 2 + 2 + pairs + 1 + 2 + 2
+    return max(1, shutil.get_terminal_size((80, 24)).lines - overhead)
 
 
 def parse(path):
@@ -59,7 +72,7 @@ def nearest(series, t):
     return best
 
 
-def pair_and_report(names, all_series, window, quiet_rows):
+def pair_and_report(names, all_series, window, quiet_rows, max_rows=None):
     # Time base: the series with the most reports (a rotated/idle log must not
     # veto the whole fleet). Devices missing a match at a row show as "--".
     base_idx = max(range(len(all_series)), key=lambda i: len(all_series[i]))
@@ -73,9 +86,14 @@ def pair_and_report(names, all_series, window, quiet_rows):
             rows.append((t, meds))
 
     if not quiet_rows:
+        # A redrawn screen holds only so many rows; show the newest that fit, since
+        # the summary below them is what a follow session is watching.
+        shown = rows if max_rows is None else rows[-max_rows:]
         header = "  ".join(f"{n:>8s}" for n in names)
+        if len(shown) < len(rows):
+            print(f"({len(rows) - len(shown)} earlier rows above the screen)")
         print(f"{'t':>10s}  {header}  {'spread':>7s}")
-        for t, meds in rows:
+        for t, meds in shown:
             cells = "  ".join(f"{m:+8d}" if m is not None else f"{'--':>8s}" for m in meds)
             present = [m for m in meds if m is not None]
             print(f"{t:10.3f}  {cells}  {max(present) - min(present):7d}")
@@ -104,19 +122,30 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("logs", nargs="+", help="two or more log files; the first is the time base")
     ap.add_argument("--window", type=float, default=2.0, help="max pairing distance, seconds (default 2)")
-    ap.add_argument("--follow", action="store_true", help="re-read and report every 10 s")
+    ap.add_argument("--follow", action="store_true",
+                    help="re-read and redraw the screen every 10 s")
     ap.add_argument("--summary", action="store_true", help="skip per-row output, print only the pair stats")
     args = ap.parse_args()
     if len(args.logs) < 2:
         ap.error("need at least two logs")
 
     names = [os.path.splitext(os.path.basename(p))[0] for p in args.logs]
+    tty = sys.stdout.isatty()
     while True:
-        pair_and_report(names, [parse(p) for p in args.logs], args.window, args.summary)
+        if args.follow and tty:
+            # Home, erase screen, erase scrollback: each pass overwrites the last
+            # rather than growing the buffer.
+            print("\033[H\033[2J\033[3J", end="")
+        pair_and_report(names, [parse(p) for p in args.logs], args.window, args.summary,
+                        max_rows=rows_that_fit(len(names)) if args.follow and tty else None)
         if not args.follow:
             break
-        time.sleep(10)
-        print("\n--- refresh ---")
+        if tty:
+            print(f"\n[{time.strftime('%H:%M:%S')}] refreshing every {REFRESH_S:.0f} s -- Ctrl-C to stop",
+                  flush=True)
+        else:
+            print("\n--- refresh ---", flush=True)
+        time.sleep(REFRESH_S)
 
 
 if __name__ == "__main__":
