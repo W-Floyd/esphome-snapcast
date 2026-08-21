@@ -279,6 +279,25 @@ light:
     default_transition_length: 200ms
 
 interval:
+  # Radio-link forensics every 10 s at DEBUG: live RSSI, the negotiated PHY mode
+  # (a fallback from HT20/11g down to 11b is the classic marginal-link tell), and
+  # the driver's RX/TX statistics dump — which includes retry counters, so a stall's
+  # cause (retries vs starvation vs roam) shows up next to the player's sync report.
+  - interval: 10s
+    then:
+      - lambda: |-
+          if (!wifi::global_wifi_component->is_connected())
+            return;
+          int rssi = 0;
+          esp_wifi_sta_get_rssi(&rssi);
+          wifi_phy_mode_t phymode;
+          static const char *PHY_NAMES[] = {"LR", "11B", "11G", "11A", "HT20", "HT40", "HE20", "VHT20"};
+          const char *phy = esp_wifi_sta_get_negotiated_phymode(&phymode) == ESP_OK && phymode <= WIFI_PHY_MODE_VHT20
+                                ? PHY_NAMES[phymode]
+                                : "?";
+          ESP_LOGD("wifi_diag", "rssi=%d dBm, phymode=%s", rssi, phy);
+          // Driver TX/RX counters (incl. retries); prints via the esp-idf log
+          esp_wifi_statis_dump(WIFI_STATIS_RXTX | WIFI_STATIS_HW);
   - interval: 1s
     then:
       - if:
