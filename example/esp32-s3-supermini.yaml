@@ -309,11 +309,16 @@ interval:
           ESP_LOGD("wifi_diag", "rssi=%d dBm, phymode=%s", rssi, phy);
           // Driver TX/RX counters (incl. retries); prints via the esp-idf log
           esp_wifi_statis_dump(WIFI_STATIS_RXTX | WIFI_STATIS_HW);
+  # Play-state LED, guarded on transitions: an unconditional turn_on republishes the
+  # light state every tick, spamming the API (visible as [S][light] lines in network
+  # log viewers) and HA's recorder.
   - interval: 1s
     then:
       - if:
           condition:
-            media_player.is_playing: player
+            and:
+              - media_player.is_playing: player
+              - light.is_off: status_led
           then:
             - light.turn_on:
                 id: status_led
@@ -321,5 +326,11 @@ interval:
                 red: 0%
                 green: 100%
                 blue: 20%
-          else:
+      - if:
+          condition:
+            and:
+              - not:
+                  media_player.is_playing: player
+              - light.is_on: status_led
+          then:
             - light.turn_off: status_led
