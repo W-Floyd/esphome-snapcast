@@ -25,6 +25,24 @@ class SnapclientTsfRoleTextSensor final : public SnapclientChild, public text_se
   bool published_{false};
 };
 
+/// @brief Publishes one field of the current stream's metadata (title / artist /
+/// album / stream name), live from the persistent control session. Empty when the
+/// control port is unavailable or the stream carries no metadata.
+class SnapclientMetadataTextSensor final : public SnapclientChild, public text_sensor::TextSensor {
+ public:
+  void setup() override;
+  void dump_config() override;
+
+  void set_field(MetadataField field) { this->field_ = field; }
+
+ protected:
+  void publish_(const StreamMetadata &metadata);
+
+  MetadataField field_{MetadataField::TITLE};
+  std::string last_;
+  bool published_{false};
+};
+
 }  // namespace esphome::snapclient
 
 #endif  // USE_ESP32 && USE_TEXT_SENSOR

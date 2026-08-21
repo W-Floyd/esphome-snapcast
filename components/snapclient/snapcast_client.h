@@ -4,6 +4,7 @@
 
 #ifdef USE_ESP32
 
+#include "control_session.h"
 #include "rate_lock.h"
 #include "snapcast_proto.h"
 #include "time_filter.h"
@@ -103,6 +104,8 @@ class SnapcastClientListener {
   virtual void on_stream_end() = 0;
   /// @brief Fired when an mDNS scan changed the discovered-server list.
   virtual void on_servers_discovered(const std::vector<ServerCandidate> &servers) {}
+  /// @brief Fired when this client's stream metadata changed (control session).
+  virtual void on_stream_metadata(const StreamMetadata &metadata) {}
 };
 
 /// @brief Sink for synchronized PCM audio.
@@ -405,6 +408,10 @@ class SnapcastClient {
   // TSF group sync: serviced by the network task, offset queried by the player task
   std::unique_ptr<TsfSync> tsf_sync_;
 #endif
+
+  // Persistent control-port session (metadata, roster, control RPCs); serviced by
+  // the network task, metadata handed to the main loop
+  std::unique_ptr<ControlSession> control_session_;
 
   // --- Player task locals ---
   std::unique_ptr<uint8_t[]> slice_buffer_;

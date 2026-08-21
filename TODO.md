@@ -1,25 +1,14 @@
 # TODO
 
-## Persistent control session (metadata + control)
+## Persistent control session — DONE (control_session.{h,cpp})
 
-Replace the one-shot `Client.SetLatency` socket with a persistent JSON-RPC
-connection to the server's control port (1705), following the pattern observed in
-FutureProofHomes Satellite1's `dev-snapcast` branch (`SnapcastControlSession`):
-
-- Keep one connection open alongside the stream; subscribe to notifications.
-- `Server.GetStatus` on connect (and on `Stream.OnUpdate` / group-change
-  notifications) to learn this client's group, its stream, and the stream's
-  metadata.
-- Surface stream metadata as entities: `text_sensor` platform for track
-  title / artist / album (and stream name), updated live from `Stream.OnUpdate`
-  properties — the missing piece for display-equipped devices.
-- Route `Client.SetLatency` (and any future control calls, e.g. group volume or
-  stream switching) through the session instead of per-call sockets.
-- Reconnect with backoff, tied to the stream connection's lifecycle; all parsing on
-  the network task, entities updated via the existing hub event queue.
-- Scope guard: control-port availability is optional (server may disable `[tcp]`);
-  everything must degrade gracefully to today's behavior — the Server Latency
-  number entity falls back to one-shot sockets or goes unavailable.
+Implemented as specified: persistent non-blocking JSON-RPC session on 1705 tied
+to the stream session's lifecycle, `Server.GetStatus` + live notifications,
+metadata text sensors (`stream_title` / `stream_artist` / `stream_album` /
+`stream_name`), `Client.SetLatency` routed through it with one-shot fallback.
+Bonus: the TSF unicast peer roster rides the session (live, non-blocking),
+replacing the blocking off-stream fetch except as a control-port-disabled
+fallback. Verified degrading gracefully in QEMU with `[tcp] enabled = false`.
 
 ## Other candidates (unordered)
 

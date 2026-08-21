@@ -179,6 +179,8 @@ void SnapclientHub::on_servers_discovered(const std::vector<ServerCandidate> &se
   this->discovered_servers_callbacks_.call(servers);
 }
 
+void SnapclientHub::on_stream_metadata(const StreamMetadata &metadata) { this->metadata_callbacks_.call(metadata); }
+
 void SnapclientHub::set_server_latency(int32_t latency_ms) {
   if (this->client_ != nullptr) {
     this->client_->set_server_latency(latency_ms);

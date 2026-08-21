@@ -129,6 +129,10 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   template<typename F> void add_discovered_servers_callback(F &&callback) {
     this->discovered_servers_callbacks_.add(std::forward<F>(callback));
   }
+  /// @brief Fires whenever this client's stream metadata changes (control session).
+  template<typename F> void add_metadata_callback(F &&callback) {
+    this->metadata_callbacks_.add(std::forward<F>(callback));
+  }
   /// @brief Fires with true and the stream format on stream start, false on stream end.
   template<typename F> void add_stream_state_callback(F &&callback) {
     this->stream_state_callbacks_.add(std::forward<F>(callback));
@@ -142,6 +146,7 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   void on_stream_start(const StreamParams &params) override;
   void on_stream_end() override;
   void on_servers_discovered(const std::vector<ServerCandidate> &servers) override;
+  void on_stream_metadata(const StreamMetadata &metadata) override;
 
   /// @brief Pushes the effective override (manual wins over selection) to the client.
   void apply_server_override_();
@@ -181,6 +186,7 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   CallbackManager<void(bool, const StreamParams &)> stream_state_callbacks_{};
   CallbackManager<void()> volume_curve_callbacks_{};
   CallbackManager<void(const std::vector<ServerCandidate> &)> discovered_servers_callbacks_{};
+  CallbackManager<void(const StreamMetadata &)> metadata_callbacks_{};
 };
 
 /// @brief Base class for all snapclient subcomponents.

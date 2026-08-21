@@ -190,6 +190,24 @@ text_sensor:
     type: tsf_role
     snapclient_id: snap
     name: TSF Role
+  # Now-playing metadata from the server's control API (persistent session);
+  # empty when the control port is disabled or the stream has no metadata
+  - platform: snapclient
+    type: stream_title
+    snapclient_id: snap
+    name: Track Title
+  - platform: snapclient
+    type: stream_artist
+    snapclient_id: snap
+    name: Track Artist
+  - platform: snapclient
+    type: stream_album
+    snapclient_id: snap
+    name: Track Album
+  - platform: snapclient
+    type: stream_name
+    snapclient_id: snap
+    name: Stream
   # Shows which AP the device is on (what the Access Point select would pin)
   - platform: wifi_info
     bssid:

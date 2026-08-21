@@ -135,6 +135,8 @@ bool SnapcastClient::start() {
       std::make_unique<TsfSync>(static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000);
 #endif
 
+  this->control_session_ = std::make_unique<ControlSession>(this->config_.client_id);
+
   this->event_queue_ = xQueueCreate(8, sizeof(Event));
   this->record_queue_ = xQueueCreate(160, sizeof(ChunkRecord));
   if (this->event_queue_ == nullptr || this->record_queue_ == nullptr) {
@@ -192,6 +194,14 @@ void SnapcastClient::loop() {
   this->server_mutex_.unlock();
   if (dirty && this->listener_ != nullptr) {
     this->listener_->on_servers_discovered(servers);
+  }
+
+  // Stream metadata from the control session (network task -> main loop handoff)
+  if (this->control_session_ != nullptr && this->listener_ != nullptr) {
+    StreamMetadata metadata;
+    if (this->control_session_->take_metadata(metadata)) {
+      this->listener_->on_stream_metadata(metadata);
+    }
   }
 }
 
@@ -454,6 +464,9 @@ void SnapcastClient::connection_session_() {
   }
 
   this->close_socket_();
+  if (this->control_session_ != nullptr) {
+    this->control_session_->close();  // tied to the stream session's lifecycle
+  }
   this->connected_.store(false, std::memory_order_relaxed);
   this->set_stream_active_(false);
   this->post_event_(Event{.type = EventType::DISCONNECTED});
@@ -687,7 +700,24 @@ void SnapcastClient::service_tx_() {
   this->latency_dirty_ = false;
   this->client_info_mutex_.unlock();
   if (latency_dirty) {
-    this->send_set_latency_rpc_(latency_ms);
+    // Prefer the persistent control session; one-shot socket as the fallback
+    // (control port may answer one-shots even when the session is mid-reconnect)
+    if (this->control_session_ == nullptr || !this->control_session_->send_set_latency(latency_ms, now)) {
+      this->send_set_latency_rpc_(latency_ms);
+    }
+  }
+
+  // Persistent control session: metadata + roster + control RPCs (non-blocking)
+  if (this->control_session_ != nullptr) {
+    this->control_session_->service(now, this->active_host_);
+#ifdef SNAPCLIENT_TSF_ACTIVE
+    if (this->tsf_sync_ != nullptr) {
+      std::vector<uint32_t> peers;
+      if (this->control_session_->take_peers(peers)) {
+        this->tsf_sync_->set_peers(std::move(peers));
+      }
+    }
+#endif
   }
 
   // Stream idle detection: the server stops sending chunks when the group stream goes idle
@@ -699,10 +729,14 @@ void SnapcastClient::service_tx_() {
 
 #ifdef SNAPCLIENT_TSF_ACTIVE
   if (this->tsf_sync_ != nullptr) {
-    // Unicast roster: once at session start, then refreshed only off-stream (the
-    // RPC blocks up to ~2 s, which mid-stream would starve the playout buffer)
-    if (this->last_peer_refresh_us_ == 0 ||
-        (!this->stream_active_ && now - this->last_peer_refresh_us_ >= TSF_PEER_REFRESH_US)) {
+    // Unicast roster: the control session feeds it live (non-blocking); the
+    // blocking one-shot fetch remains only as the fallback when the control port
+    // is unavailable -- once at session start, then refreshed only off-stream
+    // (the RPC blocks up to ~2 s, which mid-stream would starve playout)
+    const bool session_feeds_roster = this->control_session_ != nullptr && this->control_session_->connected();
+    if (!session_feeds_roster &&
+        (this->last_peer_refresh_us_ == 0 ||
+         (!this->stream_active_ && now - this->last_peer_refresh_us_ >= TSF_PEER_REFRESH_US))) {
       this->refresh_tsf_peers_();
     }
     // Elections/beacons only while a stream is active: that is when deadlines are
