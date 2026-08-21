@@ -8,6 +8,10 @@
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
 
+#ifdef USE_MDNS
+#include <mdns.h>
+#endif
+
 #include <algorithm>
 #include <cinttypes>
 #include <cstdlib>
@@ -165,12 +169,21 @@ void SnapcastClient::network_task_() {
 }
 
 void SnapcastClient::connection_session_() {
-  if (!this->connect_socket_()) {
+  std::string host = this->config_.server_host;
+  uint16_t port = this->config_.server_port;
+  if (host.empty()) {
+    if (!this->discover_server_(host, port)) {
+      return;
+    }
+    ESP_LOGI(TAG, "Discovered snapserver at %s:%u", host.c_str(), port);
+  }
+
+  if (!this->connect_socket_(host, port)) {
     this->close_socket_();
     return;
   }
 
-  ESP_LOGI(TAG, "Connected to %s:%u", this->config_.server_host.c_str(), this->config_.server_port);
+  ESP_LOGI(TAG, "Connected to %s:%u", host.c_str(), port);
   this->connected_.store(true, std::memory_order_relaxed);
   this->post_event_(Event{.type = EventType::CONNECTED});
 
@@ -240,17 +253,59 @@ void SnapcastClient::connection_session_() {
   ESP_LOGW(TAG, "Disconnected from server");
 }
 
-bool SnapcastClient::connect_socket_() {
+// THREAD CONTEXT: Network task. The mDNS query blocks for up to its timeout; the
+// espressif mdns library is safe to call from any task once initialized (ESPHome's
+// mdns component initializes it when the network comes up, which is before
+// network_ready_ lets us get here — a not-yet-ready stack just returns an error and
+// we retry after the reconnect delay).
+bool SnapcastClient::discover_server_(std::string &host, uint16_t &port) {
+#ifdef USE_MDNS
+  mdns_result_t *results = nullptr;
+  esp_err_t err = mdns_query_ptr("_snapcast", "_tcp", 3000, 8, &results);
+  if (err != ESP_OK) {
+    ESP_LOGW(TAG, "mDNS query failed: %d", err);
+    return false;
+  }
+  if (results == nullptr) {
+    ESP_LOGW(TAG, "No snapserver found via mDNS (_snapcast._tcp)");
+    return false;
+  }
+  bool found = false;
+  for (mdns_result_t *r = results; r != nullptr && !found; r = r->next) {
+    for (mdns_ip_addr_t *a = r->addr; a != nullptr; a = a->next) {
+      if (a->addr.type == ESP_IPADDR_TYPE_V4) {
+        char buf[16];
+        esp_ip4addr_ntoa(&a->addr.u_addr.ip4, buf, sizeof(buf));
+        host = buf;
+        port = r->port != 0 ? r->port : this->config_.server_port;
+        found = true;
+        break;
+      }
+    }
+  }
+  mdns_query_results_free(results);
+  if (!found) {
+    ESP_LOGW(TAG, "mDNS results for _snapcast._tcp carried no IPv4 address");
+  }
+  return found;
+#else
+  ESP_LOGE(TAG, "No server configured and mDNS support is not compiled in");
+  vTaskDelay(pdMS_TO_TICKS(5000));
+  return false;
+#endif
+}
+
+bool SnapcastClient::connect_socket_(const std::string &host, uint16_t port) {
   struct addrinfo hints = {};
   hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   char port_str[6];
-  snprintf(port_str, sizeof(port_str), "%u", this->config_.server_port);
+  snprintf(port_str, sizeof(port_str), "%u", port);
 
   struct addrinfo *res = nullptr;
-  int err = getaddrinfo(this->config_.server_host.c_str(), port_str, &hints, &res);
+  int err = getaddrinfo(host.c_str(), port_str, &hints, &res);
   if (err != 0 || res == nullptr) {
-    ESP_LOGW(TAG, "DNS lookup for '%s' failed: %d", this->config_.server_host.c_str(), err);
+    ESP_LOGW(TAG, "DNS lookup for '%s' failed: %d", host.c_str(), err);
     return false;
   }
 
@@ -266,7 +321,7 @@ bool SnapcastClient::connect_socket_() {
   err = connect(this->sock_, res->ai_addr, res->ai_addrlen);
   freeaddrinfo(res);
   if (err != 0 && errno != EINPROGRESS) {
-    ESP_LOGW(TAG, "Connect to %s failed: errno %d", this->config_.server_host.c_str(), errno);
+    ESP_LOGW(TAG, "Connect to %s failed: errno %d", host.c_str(), errno);
     return false;
   }
   if (err != 0) {
@@ -275,14 +330,14 @@ bool SnapcastClient::connect_socket_() {
     FD_SET(this->sock_, &write_set);
     struct timeval timeout = {.tv_sec = CONNECT_TIMEOUT_MS / 1000, .tv_usec = (CONNECT_TIMEOUT_MS % 1000) * 1000};
     if (select(this->sock_ + 1, nullptr, &write_set, nullptr, &timeout) <= 0) {
-      ESP_LOGW(TAG, "Connect to %s timed out", this->config_.server_host.c_str());
+      ESP_LOGW(TAG, "Connect to %s timed out", host.c_str());
       return false;
     }
     int so_error = 0;
     socklen_t len = sizeof(so_error);
     getsockopt(this->sock_, SOL_SOCKET, SO_ERROR, &so_error, &len);
     if (so_error != 0) {
-      ESP_LOGW(TAG, "Connect to %s failed: errno %d", this->config_.server_host.c_str(), so_error);
+      ESP_LOGW(TAG, "Connect to %s failed: errno %d", host.c_str(), so_error);
       return false;
     }
   }

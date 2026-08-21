@@ -14,6 +14,7 @@ through ESPHome's own audio stack — so announcements, volume, mixing, and any
 
 - Snapcast binary protocol v2: Hello, ServerSettings, CodecHeader, WireChunk, Time,
   ClientInfo (local volume/mute reported back to the server).
+- Server auto-discovery via mDNS (`_snapcast._tcp`) when no `server:` is configured.
 - **PCM** and **FLAC** streams (FLAC is snapserver's default), decoded with ESPHome's
   own `micro_flac` (esp-audio-libs). `opus`/`vorbis` are not yet supported — set your
   stream to `codec=flac` or `codec=pcm`.
@@ -71,7 +72,7 @@ media_player:
 
 | Option | Default | Description |
 |---|---|---|
-| `server` | — | Snapserver host or IP (required) |
+| `server` | mDNS discovery | Snapserver host or IP; omit to discover via `_snapcast._tcp` |
 | `port` | `1704` | Snapserver stream port |
 | `name` | node name | `HostName` sent in Hello; the server's default display name |
 | `buffer_size` | `524288` | Decoded PCM buffer in bytes (PSRAM-preferred) |
@@ -114,5 +115,4 @@ under QEMU's imperfect timing (real hardware is tighter).
 ## Not yet implemented
 
 - Opus / Vorbis codecs (Snapcast uses raw non-Ogg framing; needs bespoke decoders).
-- mDNS server auto-discovery (`server:` is required).
 - Retargeting servers at runtime via `snapcast://host:port` URIs.

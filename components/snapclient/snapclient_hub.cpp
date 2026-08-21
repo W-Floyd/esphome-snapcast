@@ -49,13 +49,16 @@ void SnapclientHub::dump_config() {
   ESP_LOGCONFIG(TAG,
                 "Snapclient Hub:\n"
                 "  Server: %s:%u\n"
+                "  Discovery: %s\n"
                 "  Client ID: %s\n"
                 "  Buffer size: %zu bytes\n"
                 "  Time sync interval: %" PRIu32 " ms\n"
                 "  Hard resync threshold: %" PRIu32 " ms\n"
                 "  Stream idle timeout: %" PRIu32 " ms",
-                this->server_host_.c_str(), this->server_port_, get_mac_address_pretty().c_str(), this->buffer_size_,
-                this->time_sync_interval_ms_, this->hard_resync_threshold_ms_, this->stream_idle_timeout_ms_);
+                this->server_host_.empty() ? "(mDNS)" : this->server_host_.c_str(), this->server_port_,
+                this->server_host_.empty() ? "mDNS (_snapcast._tcp)" : "static host", get_mac_address_pretty().c_str(),
+                this->buffer_size_, this->time_sync_interval_ms_, this->hard_resync_threshold_ms_,
+                this->stream_idle_timeout_ms_);
   if (this->client_ != nullptr && this->client_->is_connected()) {
     ESP_LOGCONFIG(TAG, "  Connected, clock offset: %.2f ms", this->client_->get_clock_offset_ms());
   }

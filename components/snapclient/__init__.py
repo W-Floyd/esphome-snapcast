@@ -9,8 +9,9 @@ from esphome.types import ConfigType
 CODEOWNERS = ["@W-Floyd"]
 DEPENDENCIES = ["network"]
 # audio: micro decoder libraries (FLAC); json: ArduinoJson for hello/settings payloads;
-# ring_buffer: the decoded-PCM buffer between the network and player tasks.
-AUTO_LOAD = ["audio", "json", "ring_buffer"]
+# ring_buffer: the decoded-PCM buffer between the network and player tasks;
+# mdns: server auto-discovery via _snapcast._tcp when no server is configured.
+AUTO_LOAD = ["audio", "json", "mdns", "ring_buffer"]
 DOMAIN = "snapclient"
 
 CONF_SERVER = "server"
@@ -37,7 +38,8 @@ CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
             cv.GenerateID(): cv.declare_id(SnapclientHub),
-            cv.Required(CONF_SERVER): cv.string_strict,
+            # Omit to discover the server via mDNS (_snapcast._tcp)
+            cv.Optional(CONF_SERVER): cv.string_strict,
             cv.Optional(CONF_PORT, default=1704): cv.port,
             # Hello HostName; the server derives the default display name from it.
             cv.Optional(CONF_NAME): cv.string,
@@ -77,7 +79,7 @@ async def to_code(config: ConfigType) -> None:
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
 
-    cg.add(var.set_server(config[CONF_SERVER], config[CONF_PORT]))
+    cg.add(var.set_server(config.get(CONF_SERVER, ""), config[CONF_PORT]))
     if CONF_NAME in config:
         cg.add(var.set_client_name(config[CONF_NAME]))
     cg.add(var.set_buffer_size(config[CONF_BUFFER_SIZE]))

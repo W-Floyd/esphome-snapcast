@@ -28,7 +28,7 @@ namespace esphome::snapclient {
 
 /// @brief Compile-time configuration for SnapcastClient, built by the hub's codegen setters.
 struct SnapcastClientConfig {
-  std::string server_host;
+  std::string server_host;  // empty: discover the server via mDNS (_snapcast._tcp)
   uint16_t server_port{1704};
   std::string hostname;   // Hello HostName (display name basis on the server)
   std::string client_id;  // Hello MAC/ID; the pretty MAC address
@@ -150,7 +150,10 @@ class SnapcastClient {
   void network_task_();
   /// One connection lifetime: connect, hello, pump until error/shutdown.
   void connection_session_();
-  bool connect_socket_();
+  /// Discovers a snapserver via an mDNS PTR query for _snapcast._tcp.
+  /// @return true if @p host and @p port were filled from the first usable result.
+  bool discover_server_(std::string &host, uint16_t &port);
+  bool connect_socket_(const std::string &host, uint16_t port);
   bool send_message_(MessageType type, const uint8_t *payload, size_t len, uint16_t refers_to = 0);
   /// Reads exactly @p len bytes; false on error/close/shutdown. Services periodic
   /// TX (time sync, ClientInfo, idle detection) while waiting for data.
