@@ -16,6 +16,10 @@ CONF_SERVER = "server"
 # Option orders must match the ChannelMode / PhaseMode enums
 CHANNEL_MODE_OPTIONS = ["Stereo", "Left", "Right", "Mono"]
 PHASE_OPTIONS = ["None", "Left", "Right", "Both"]
+# Mono-summing amps (MAX98357A style) analog-mix L+R: inverting one side of
+# duplicated content cancels to silence, so only whole-program inversion is offered
+PHASE_OPTIONS_MONO = ["None", "Inverted"]
+CONF_MONO_DAC = "mono_dac"
 
 SnapclientChannelModeSelect = snapclient_ns.class_(
     "SnapclientChannelModeSelect", cg.Component, select.Select
@@ -51,7 +55,14 @@ CONFIG_SCHEMA = cv.All(
             CONF_CHANNEL_MODE: _select_schema(
                 SnapclientChannelModeSelect, "mdi:speaker-multiple"
             ),
-            CONF_PHASE: _select_schema(SnapclientPhaseSelect, "mdi:sine-wave"),
+            CONF_PHASE: _select_schema(SnapclientPhaseSelect, "mdi:sine-wave").extend(
+                {
+                    # Set for MAX98357A-style mono-summing amps: single-side
+                    # inversion would cancel to silence, so the options collapse
+                    # to None / Inverted
+                    cv.Optional(CONF_MONO_DAC, default=False): cv.boolean,
+                }
+            ),
             # Discovered-server picker: "Automatic" + one option per snapserver found
             # via mDNS; selecting one overrides the connection target (a manual
             # server text entity takes precedence over this)
@@ -90,7 +101,12 @@ _OPTIONS = {
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
-    await select.register_select(var, config, options=_OPTIONS[config[CONF_TYPE]])
+    options = _OPTIONS[config[CONF_TYPE]]
+    if config[CONF_TYPE] == CONF_PHASE:
+        if config[CONF_MONO_DAC]:
+            options = PHASE_OPTIONS_MONO
+        cg.add(var.set_mono_dac(config[CONF_MONO_DAC]))
+    await select.register_select(var, config, options=options)
 
     if config[CONF_TYPE] == CONF_BSSID:
         # Standalone wifi entity: scan results + connect state drive the options

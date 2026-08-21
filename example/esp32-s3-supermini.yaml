@@ -153,12 +153,15 @@ select:
     type: channel_mode
     snapclient_id: snap
     name: Channel Mode
-  # Polarity inversion (None / Left / Right / Both) — fixes an out-of-phase driver
-  # in software; an inverted speaker in a synchronized pair cancels bass
+  # Polarity inversion — fixes an out-of-phase driver in software; an inverted
+  # speaker in a synchronized pair cancels bass. mono_dac collapses the options to
+  # None / Inverted: the MAX98357A analog-sums L+R, so single-side inversion of
+  # duplicated content would cancel to silence.
   - platform: snapclient
     type: phase
     snapclient_id: snap
     name: Phase
+    mono_dac: true
   # Discovered snapservers ("Automatic" + one entry per mDNS result); picking one
   # overrides the connection target. The manual Server text below outranks it.
   - platform: snapclient

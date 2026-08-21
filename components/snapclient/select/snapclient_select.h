@@ -64,16 +64,35 @@ class SnapclientChannelModeSelect final : public SnapclientIndexedSelect {
   uint8_t initial_index_() const override { return static_cast<uint8_t>(this->parent_->get_channel_mode()); }
 };
 
-/// @brief Output polarity inversion (None / Left / Right / Both), for correcting an
-/// out-of-phase driver in software (an inverted speaker in a synchronized pair
-/// cancels bass with its partner).
+/// @brief Output polarity inversion, for correcting an out-of-phase driver in
+/// software (an inverted speaker in a synchronized pair cancels bass with its
+/// partner).
+///
+/// Options are None / Left / Right / Both — except with `mono_dac: true`
+/// (MAX98357A-style summing amps, which analog-mix L+R: inverting a single side of
+/// duplicated content cancels to silence), where they collapse to None / Inverted
+/// (mapped to NONE / BOTH).
 class SnapclientPhaseSelect final : public SnapclientIndexedSelect {
  public:
   void dump_config() override;
 
+  void set_mono_dac(bool mono) { this->mono_dac_ = mono; }
+
  protected:
-  void apply_index_(uint8_t index) override { this->parent_->set_phase_mode(static_cast<PhaseMode>(index)); }
-  uint8_t initial_index_() const override { return static_cast<uint8_t>(this->parent_->get_phase_mode()); }
+  void apply_index_(uint8_t index) override {
+    const PhaseMode mode =
+        this->mono_dac_ ? (index == 0 ? PhaseMode::NONE : PhaseMode::BOTH) : static_cast<PhaseMode>(index);
+    this->parent_->set_phase_mode(mode);
+  }
+  uint8_t initial_index_() const override {
+    const PhaseMode mode = this->parent_->get_phase_mode();
+    if (this->mono_dac_) {
+      return mode == PhaseMode::NONE ? 0 : 1;
+    }
+    return static_cast<uint8_t>(mode);
+  }
+
+  bool mono_dac_{false};
 };
 
 /// @brief Picker over mDNS-discovered snapservers ("Automatic" + one option per
