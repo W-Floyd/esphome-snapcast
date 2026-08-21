@@ -172,9 +172,12 @@ def main():
         elif ota_times and any(0 <= t0 - ot <= OTA_SHADOW_S for ot in ota_times):
             cls = "OTA (within a firmware-update shadow; expected disturbance)"
         elif len(devs) >= 2 and ("reconnect" in kinds or "stream_idle" in kinds) and spread <= SIMULTANEOUS_S:
-            cls = "SERVER (simultaneous fleet-wide: server dropped/stalled -- check snapserver host)"
+            cls = ("UPSTREAM (simultaneous fleet-wide drop: snapserver host OR the AP's radio -- "
+                   "probe the server from another band/wire to split them)")
         elif len(devs) >= 2 and worst_late >= UPSTREAM_FREEZE_MS:
-            cls = "SERVER (multi-second delivery freeze on several devices -- check snapserver host)"
+            cls = ("UPSTREAM (multi-second delivery freeze on several devices: snapserver host OR the "
+                   "AP's 2.4 GHz radio stalling, e.g. background channel scans -- a clean probe of the "
+                   "server from another band/wire during an event exonerates the host)")
         elif len(devs) >= 2:
             cls = "CONGESTION (staggered starvations across devices: shared-channel airtime)"
         else:
@@ -211,9 +214,12 @@ def main():
 
     # ── Recommendations ────────────────────────────────────────────────────────
     print(f"\n{'=' * 74}\nRECOMMENDATIONS (prioritized)\n{'=' * 74}")
-    if counts.get("SERVER"):
-        print(f"* {counts['SERVER']} server-plane incident(s): check the snapserver host at those"
-              "\n  timestamps (journalctl -u snapserver; host load/containers; the source feeding it).")
+    if counts.get("UPSTREAM"):
+        print(f"* {counts['UPSTREAM']} upstream incident(s): either the snapserver host or the AP's"
+              "\n  2.4 GHz radio (fleet-wide from the ESP view either way). Split them by probing the"
+              "\n  server from another band/wire DURING an event: clean probe -> AP radio (check its"
+              "\n  background-scan / auto-channel / RRM settings); slow probe -> server host"
+              "\n  (journalctl -u snapserver, host load, the source feeding it).")
     if counts.get("DEVICE"):
         dev_names = defaultdict(int)
         for group in fleet:
