@@ -29,6 +29,8 @@ static constexpr uint32_t MAX_PAYLOAD_SIZE = 262144;
 // state. Mirrors the reference web client / embedded snapclient startup behavior.
 static constexpr uint32_t TIME_SYNC_BURST_COUNT = 10;
 static constexpr uint32_t TIME_SYNC_BURST_INTERVAL_MS = 100;
+// While no stream is active, sync only often enough to keep the clock estimate warm
+static constexpr uint32_t TIME_SYNC_IDLE_INTERVAL_MS = 2000;
 
 static constexpr uint32_t RECONNECT_DELAY_MS = 2000;
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 5000;
@@ -451,15 +453,22 @@ bool SnapcastClient::recv_exact_(uint8_t *buf, size_t len) {
 void SnapcastClient::service_tx_() {
   const int64_t now = now_us();
 
-  // Time sync request
+  // Time sync request. Adaptive cadence: the configured (fast) interval while a
+  // stream is active — playout accuracy is being consumed — and a slow interval while
+  // idle, which keeps the clock warm for instant stream starts without denying the
+  // modem its power-save sleep windows.
   if (now >= this->next_time_sync_us_) {
     uint8_t payload[TimePayload::WIRE_SIZE];
     TimePayload{}.serialize(payload);
     this->send_message_(MessageType::TIME, payload, sizeof(payload));
-    uint32_t interval_ms =
-        this->time_sync_burst_remaining_ > 0 ? TIME_SYNC_BURST_INTERVAL_MS : this->config_.time_sync_interval_ms;
+    uint32_t interval_ms;
     if (this->time_sync_burst_remaining_ > 0) {
       this->time_sync_burst_remaining_--;
+      interval_ms = TIME_SYNC_BURST_INTERVAL_MS;
+    } else if (this->stream_active_) {
+      interval_ms = this->config_.time_sync_interval_ms;
+    } else {
+      interval_ms = std::max(this->config_.time_sync_interval_ms, TIME_SYNC_IDLE_INTERVAL_MS);
     }
     this->next_time_sync_us_ = now + static_cast<int64_t>(interval_ms) * 1000;
   }
@@ -683,6 +692,10 @@ void SnapcastClient::set_stream_active_(bool active) {
   }
   this->stream_active_ = active;
   if (active) {
+    // Accuracy starts being consumed now: engage the fast cadence immediately with a
+    // short burst to refresh the estimate after a possibly long idle stretch
+    this->time_sync_burst_remaining_ = std::max(this->time_sync_burst_remaining_, 3u);
+    this->next_time_sync_us_ = 0;
     this->post_event_(Event{.type = EventType::STREAM_START, .params = this->stream_params_});
   } else {
     this->post_event_(Event{.type = EventType::STREAM_END});

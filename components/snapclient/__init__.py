@@ -69,7 +69,8 @@ CONFIG_SCHEMA = cv.All(
             # Sized for >1 s of 48 kHz/16-bit stereo by default.
             cv.Optional(CONF_BUFFER_SIZE, default=524288): cv.int_range(min=65536),
             cv.Optional(CONF_FLAC, default=True): cv.boolean,
-            cv.Optional(CONF_TIME_SYNC_INTERVAL, default="1s"): cv.All(
+            # Cadence while a stream is active; idle clients sync at max(this, 2s)
+            cv.Optional(CONF_TIME_SYNC_INTERVAL, default="250ms"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(
                     min=cv.TimePeriod(milliseconds=100),

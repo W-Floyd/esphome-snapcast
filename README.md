@@ -89,7 +89,7 @@ media_player:
 | `name` | node name | `HostName` sent in Hello; the server's default display name |
 | `buffer_size` | `524288` | Decoded PCM buffer in bytes (PSRAM-preferred) |
 | `flac` | `true` | Compile in FLAC decoding |
-| `time_sync_interval` | `1s` | Steady-state time sync cadence (a fast burst runs at connect) |
+| `time_sync_interval` | `250ms` | Time sync cadence while streaming; idle clients sync at max(this, 2s). Bursts run at connect and stream start |
 | `sync_deadband` | `2ms` | Sync error tolerated without correction; use `500us` on synchronized stereo pairs to keep the image stable |
 | `hard_resync_threshold` | `50ms` | Sync error beyond which chunks are dropped / silence inserted |
 | `stream_idle_timeout` | `3s` | No wire chunks for this long ⇒ stream ends |
