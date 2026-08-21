@@ -1160,10 +1160,19 @@ void SnapcastClient::player_task_() {
 
     if (++err_count >= 128) {
       int64_t max_gap_us;
+      int64_t pipeline_frames;
       this->playout_mutex_.lock();
       max_gap_us = this->max_feedback_gap_us_;
       this->max_feedback_gap_us_ = 0;
+      pipeline_frames = this->pushed_frames_total_ - this->played_frames_total_;
       this->playout_mutex_.unlock();
+      // Accounted pipeline depth (pushed-but-unplayed). Sane: a stable few hundred
+      // ms (mixer + speaker buffers). Divergence from reality is invisible to the
+      // servo -- a value outside ~0..500 ms means the accounting has split from the
+      // pipeline (e.g. an unnoticed flush) and playback is audibly offset while the
+      // report looks clean.
+      const int32_t pipeline_ms =
+          static_cast<int32_t>(pipeline_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
@@ -1187,9 +1196,9 @@ void SnapcastClient::player_task_() {
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, max feedback gap %" PRId64
-               " ms, buffered %" PRIu32 " ms%s%s over %" PRIu32 " chunks",
+               " ms, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s over %" PRIu32 " chunks",
                err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
-               hard_resyncs, max_gap_us / 1000, buffered_ms, trim_str, tsf_str, err_count);
+               hard_resyncs, max_gap_us / 1000, buffered_ms, pipeline_ms, trim_str, tsf_str, err_count);
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
