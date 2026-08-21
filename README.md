@@ -131,14 +131,63 @@ number:
 
 ## Design
 
-Key sources this is modeled on / ported from:
+### Architecture
 
-- `esphome/components/sendspin` (architecture: hub + children, media_source player).
-- Snapcast binary protocol per `badaix/snapcast` and the esp32 `snapclient` project's
-  `lightsnapcast` component.
-- The Kalman time filter is a C++ port of the Sage-Husa/Huber filter from
-  ImmichFrame-snapweb's `snapstream.ts` (itself derived from esp32 snapclient's
-  `TimeFilter.c`).
+Structured like ESPHome's upstream `sendspin` component: `SnapclientHub` (a thin
+`Component` adapter) owns a plain `SnapcastClient` core and fans its events out to
+child platforms via `CallbackManager`s; children (`media_source`, `select`, `number`)
+inherit `SnapclientChild`, pinned one setup step after the hub. The core runs two
+FreeRTOS tasks:
+
+- **Network task** — TCP connection (or mDNS discovery), Hello handshake, message
+  framing, time sync, FLAC/PCM decode into a timestamped PCM ring buffer
+  (PSRAM-preferred). A full ring blocks the task, backpressuring TCP exactly like a
+  desktop snapclient.
+- **Player task** — pops timestamped chunks, computes each chunk's local playout
+  deadline (`server_ts + bufferMs − serverLatency − clock_offset − static_delay`),
+  and pushes PCM into the `speaker_source` pipeline, steering playback against the
+  speaker's DAC-write feedback.
+
+All events cross to the main loop through a queue drained in `hub.loop()`; tasks
+never touch ESPHome entities directly.
+
+### Synchronization
+
+- **Clock offset**: Snapcast Time messages (250 ms cadence while streaming, burst at
+  connect/stream-start, RTT-gated against congestion outliers) feed a 2-state Kalman
+  filter — offset + drift with Sage-Husa adaptive measurement noise and Huber
+  M-estimate outlier weighting.
+- **Playout position**: the speaker reports DAC writes as (frames, timestamp); an
+  exponentially-weighted pivot extrapolated along the exact nominal sample rate
+  smooths the DMA-burst quantization to microsecond scale.
+- **Steering** (ported from the reference esp32 snapclient's control law): a
+  median-filtered error drives a bang-bang servo with hysteresis — engage at
+  `sync_deadband` (128 µs), trim one frame per chunk using sample stuffing (repeat
+  the last frame; never insert silence mid-music), disengage at half. Larger errors
+  correct proportionally (>10 ms) or by hard resync (>50 ms, dropping whole chunks /
+  inserting silence). Playback stays **muted until the first in-band lock** (~1–2 s,
+  steering hard through silence), so convergence is inaudible; hard resyncs re-mute,
+  turning recovery storms into silent gaps.
+- **Pipeline-flush re-baseline**: a starved-then-restarted speaker pipeline discards
+  pushed-but-unplayed frames; a >500 ms feedback gap re-baselines the frame
+  accounting, preventing a permanent hard-resync spiral.
+
+A planned v2 ([PLAN-rate-lock.md](PLAN-rate-lock.md)) replaces steady-state frame
+splices with hardware rate steering via the S3's fractional I2S clock divider.
+
+### Key sources
+
+- `esphome/components/sendspin` — architecture template: hub + children, the
+  media_source player contract, codegen idioms.
+- `badaix/snapcast` — binary protocol ground truth (message layout, Time reply
+  semantics, ClientInfo, effective-buffer composition), verified against server
+  source.
+- esp32 `snapclient` (`lightsnapcast`) — the sync control law (median filters,
+  128/64 µs steering thresholds, sample stuffing, mute-until-synced), channel modes,
+  and the volume curve.
+- ImmichFrame-snapweb's `snapstream.ts` — the Sage-Husa/Huber Kalman time filter
+  (itself derived from esp32 snapclient's `TimeFilter.c`), ported to C++ in
+  `time_filter.h`.
 
 ## Flashing
 
