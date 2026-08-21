@@ -36,8 +36,11 @@ through ESPHome's own audio stack — so announcements, volume, mixing, and any
 
 ## Usage
 
-See [example/snapclient-example.yaml](example/snapclient-example.yaml) for a complete
-config. The short version:
+See [example/snapclient-example.yaml](example/snapclient-example.yaml) for a minimal
+config, and [example/esp32-s3-supermini.yaml](example/esp32-s3-supermini.yaml) for the
+full smart-speaker pattern on real hardware (Speakeasy OTS pinout) — Snapcast mixed
+with Home Assistant announcements via a `mixer` speaker and dual pipelines, with the
+music ducking under announcements while staying in sync. The short version:
 
 ```yaml
 external_components:
