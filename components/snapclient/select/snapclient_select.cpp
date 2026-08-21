@@ -150,6 +150,130 @@ void SnapclientServerSelect::on_servers_discovered_(const std::vector<ServerCand
 
 void SnapclientServerSelect::dump_config() { LOG_SELECT("", "Snapclient Server Select", this); }
 
+#ifdef SNAPCLIENT_BSSID_SELECT
+
+static std::string bssid_to_string(const uint8_t *b) {
+  return str_sprintf("%02X:%02X:%02X:%02X:%02X:%02X", b[0], b[1], b[2], b[3], b[4], b[5]);
+}
+
+static bool parse_bssid(const std::string &s, wifi::bssid_t &out) {
+  unsigned int v[6];
+  if (sscanf(s.c_str(), "%02X:%02X:%02X:%02X:%02X:%02X", &v[0], &v[1], &v[2], &v[3], &v[4], &v[5]) != 6) {
+    return false;
+  }
+  for (int i = 0; i < 6; i++) {
+    out[i] = static_cast<uint8_t>(v[i]);
+  }
+  return true;
+}
+
+void SnapclientBssidSelect::setup() {
+  auto *w = wifi::global_wifi_component;
+  if (w == nullptr) {
+    this->mark_failed();
+    return;
+  }
+  w->add_scan_results_listener(this);
+  w->add_connect_state_listener(this);
+
+  if (this->restore_value_) {
+    this->pref_ = global_preferences->make_preference<StoredOption>(this->get_object_id_hash());
+    StoredOption stored{};
+    wifi::bssid_t parsed;
+    if (this->pref_.load(&stored)) {
+      stored.value[sizeof(stored.value) - 1] = '\0';
+      if (stored.value[0] != '\0' && parse_bssid(stored.value, parsed)) {
+        this->desired_ = stored.value;
+      }
+    }
+  }
+  // The lock itself is applied by on_wifi_connect_state once connected
+  this->rebuild_options_();
+}
+
+// THREAD CONTEXT: Main loop (invoked by the select framework)
+void SnapclientBssidSelect::control(const std::string &value) {
+  wifi::bssid_t parsed;
+  this->desired_ = (value != AUTOMATIC_OPTION && parse_bssid(value, parsed)) ? value : "";
+  if (this->restore_value_) {
+    StoredOption stored{};
+    strncpy(stored.value, this->desired_.c_str(), sizeof(stored.value) - 1);
+    this->pref_.save(&stored);
+  }
+  this->apply_lock_();
+  this->rebuild_options_();
+}
+
+void SnapclientBssidSelect::apply_lock_() {
+  auto *w = wifi::global_wifi_component;
+  wifi::WiFiAP sta = w->get_sta();
+  if (sta.get_ssid().empty()) {
+    // Pre-first-connect the selected STA config is empty; stamping a BSSID onto it
+    // would wipe the credentials. on_wifi_connect_state re-applies once connected.
+    return;
+  }
+  wifi::bssid_t target;
+  if (!this->desired_.empty() && parse_bssid(this->desired_, target)) {
+    sta.set_bssid(target);
+    w->set_sta(sta);
+    if (w->is_connected() && w->wifi_bssid() != target) {
+      ESP_LOGI(TAG, "On wrong AP; reconnecting to pinned %s", this->desired_.c_str());
+      w->retry_connect();
+    }
+  } else {
+    sta.clear_bssid();
+    w->set_sta(sta);
+  }
+}
+
+void SnapclientBssidSelect::on_wifi_connect_state(StringRef ssid, std::span<const uint8_t, 6> bssid) {
+  if (ssid.empty()) {
+    return;  // disconnect
+  }
+  this->network_ssid_ = ssid.str();
+  this->apply_lock_();
+  this->rebuild_options_();
+}
+
+void SnapclientBssidSelect::on_wifi_scan_results(const wifi::wifi_scan_vector_t<wifi::WiFiScanResult> &results) {
+  this->scan_snapshot_.clear();
+  for (const auto &r : results) {
+    this->scan_snapshot_.emplace_back(r.get_ssid().str(), bssid_to_string(r.get_bssid().data()));
+  }
+  this->rebuild_options_();
+}
+
+void SnapclientBssidSelect::rebuild_options_() {
+  std::vector<std::string> options{AUTOMATIC_OPTION};
+  auto listed = [&options](const std::string &v) {
+    return std::find(options.begin(), options.end(), v) != options.end();
+  };
+  // Scan results are filtered to the connected SSID (unknown before first connect,
+  // so the boot scan's snapshot is re-filtered once on_wifi_connect_state names it)
+  for (const auto &entry : this->scan_snapshot_) {
+    if (!this->network_ssid_.empty() && entry.first == this->network_ssid_ && !listed(entry.second)) {
+      options.push_back(entry.second);
+    }
+  }
+  // The current AP and the pinned choice stay listed even when scans miss them
+  auto *w = wifi::global_wifi_component;
+  if (w != nullptr && w->is_connected()) {
+    const std::string current = bssid_to_string(w->wifi_bssid().data());
+    if (!listed(current)) {
+      options.push_back(current);
+    }
+  }
+  if (!this->desired_.empty() && !listed(this->desired_)) {
+    options.push_back(this->desired_);
+  }
+  this->set_dynamic_options_(std::move(options));
+  this->publish_state(this->desired_.empty() ? AUTOMATIC_OPTION : this->desired_);
+}
+
+void SnapclientBssidSelect::dump_config() { LOG_SELECT("", "Snapclient BSSID Select", this); }
+
+#endif  // SNAPCLIENT_BSSID_SELECT
+
 }  // namespace esphome::snapclient
 
 #endif  // USE_ESP32 && USE_SELECT
