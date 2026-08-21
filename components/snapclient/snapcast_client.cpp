@@ -294,15 +294,20 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   // tracks the stall truthfully and accounting stays exact through recovery.
   const int64_t available_frames = this->pushed_frames_total_ - this->played_frames_total_;
   if (static_cast<int64_t>(frames) > available_frames) {
-    if (available_frames <= 0 && frames > 0) {
+    if (available_frames <= 0 && frames > 0 && !this->starved_latched_) {
       // Complete drain: the framework tears its pipeline down and restarts it with
       // an unpredictable buffer fill level between this feedback point and the DAC
       // -- invisible to the accounting, so playback would settle audibly offset
       // (~100-250 ms observed) with clean-looking sync reports. Flag the player to
-      // re-baseline from scratch when audio resumes.
+      // re-baseline from scratch when audio resumes. Latched: every zero-clamped
+      // callback during one drain would otherwise re-fire the flag and the player
+      // would re-baseline in a tight loop (observed: 9 resets in 261 ms).
+      this->starved_latched_ = true;
       this->pipeline_starved_.store(true, std::memory_order_relaxed);
     }
     frames = static_cast<uint32_t>(std::max<int64_t>(available_frames, 0));
+  } else if (frames > 0) {
+    this->starved_latched_ = false;  // real audio flowing again
   }
   this->played_frames_total_ += frames;
   this->played_last_ts_us_ = timestamp_us;

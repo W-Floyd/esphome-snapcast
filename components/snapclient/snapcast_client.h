@@ -368,8 +368,10 @@ class SnapcastClient {
   // window; read-and-reset by the player task's periodic sync report
   int64_t max_feedback_gap_us_{0};
   // Set by the feedback clamp when the pipeline fully drains (source starvation);
-  // consumed by the player task, which re-baselines playout from scratch
+  // consumed by the player task, which re-baselines playout from scratch. The latch
+  // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
   std::atomic<bool> pipeline_starved_{false};
+  bool starved_latched_{false};
 
   // --- Network task locals ---
   int sock_{-1};
