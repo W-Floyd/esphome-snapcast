@@ -268,6 +268,17 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
 #endif
     }
   }
+  // Physical invariant: played can never exceed pushed. During a source starvation
+  // the pipeline keeps reporting playback progress (it is playing fill, not our
+  // audio) with no feedback gap, so the flush detector cannot fire; counting those
+  // phantom frames permanently offsets the accounting by the starvation length
+  // (observed: pipeline depth -268 ms during a receive stall, then a clean-looking
+  // steady state playing ~230 ms audibly late). Clamp the excess -- the pivot then
+  // tracks the stall truthfully and accounting stays exact through recovery.
+  const int64_t available_frames = this->pushed_frames_total_ - this->played_frames_total_;
+  if (static_cast<int64_t>(frames) > available_frames) {
+    frames = static_cast<uint32_t>(std::max<int64_t>(available_frames, 0));
+  }
   this->played_frames_total_ += frames;
   this->played_last_ts_us_ = timestamp_us;
   this->playout_valid_ = true;
