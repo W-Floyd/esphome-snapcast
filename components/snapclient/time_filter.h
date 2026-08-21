@@ -120,6 +120,10 @@ class KalmanTimeFilter {
   /// @brief True once at least one measurement has been inserted.
   bool has_estimate() const { return this->count_ > 0; }
 
+  /// @brief Drift estimate (offset ms per client ms, dimensionless — equivalently
+  /// ppm×1e-6); 0.0 until statistically significant, matching get_offset()'s gating.
+  double get_drift() const { return this->use_drift_ ? this->drift_ : 0.0; }
+
   /// @brief Current adaptive measurement-noise estimate R̂ in ms² (diagnostic).
   double get_r_hat() const { return this->r_hat_; }
 

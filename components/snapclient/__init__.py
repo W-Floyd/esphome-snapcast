@@ -46,6 +46,7 @@ CONF_PHASE_INVERT = "phase_invert"
 CONF_SYNC_DEADBAND = "sync_deadband"
 CONF_RATE_LOCK = "rate_lock"
 CONF_I2S_PORT = "i2s_port"
+CONF_TSF_SYNC = "tsf_sync"
 
 
 def _none_to_empty_dict(value):
@@ -130,6 +131,10 @@ CONFIG_SCHEMA = cv.All(
                 PHASE_MODES, lower=True
             ),
             cv.Optional(CONF_RATE_LOCK): RATE_LOCK_SCHEMA,
+            # TSF group sync (PLAN-tsf-sync.md): same-AP clients share one
+            # server->TSF mapping so their mutual sync is us-class; wifi-only,
+            # silently inactive elsewhere (Kalman fallback)
+            cv.Optional(CONF_TSF_SYNC, default=False): cv.boolean,
             cv.Optional(CONF_STREAM_IDLE_TIMEOUT, default="3s"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(
@@ -175,6 +180,9 @@ async def to_code(config: ConfigType) -> None:
     if CONF_RATE_LOCK in config:
         cg.add_define("USE_SNAPCLIENT_RATE_LOCK", True)
         cg.add(var.set_rate_lock_port(config[CONF_RATE_LOCK][CONF_I2S_PORT]))
+
+    if config[CONF_TSF_SYNC]:
+        cg.add_define("USE_SNAPCLIENT_TSF_SYNC", True)
 
     if config[CONF_FLAC]:
         # snapserver's default stream codec; pulls micro_flac from esp-audio-libs

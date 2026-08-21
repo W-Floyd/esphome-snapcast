@@ -7,6 +7,7 @@
 #include "rate_lock.h"
 #include "snapcast_proto.h"
 #include "time_filter.h"
+#include "tsf_sync.h"
 
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/core/helpers.h"
@@ -85,6 +86,10 @@ struct ServerCandidate {
     return this->port == o.port && this->host == o.host && this->name == o.name;
   }
 };
+
+/// @brief TSF group-sync role, for diagnostics entities. INACTIVE covers: feature
+/// off/unsupported (no wifi), no session, or no election result yet.
+enum class TsfRole : uint8_t { INACTIVE, FOLLOWER, LEADER };
 
 /// @brief Events the client pushes to its listener.
 ///
@@ -188,6 +193,22 @@ class SnapcastClient {
   // --- Diagnostics (main loop) ---
 
   bool is_connected() const { return this->connected_.load(std::memory_order_relaxed); }
+  /// @brief Current TSF group-sync role (atomic read; INACTIVE when unavailable).
+  TsfRole get_tsf_role() const {
+#ifdef SNAPCLIENT_TSF_ACTIVE
+    if (this->tsf_sync_ != nullptr) {
+      switch (this->tsf_sync_->role()) {
+        case TsfSync::Role::LEADER:
+          return TsfRole::LEADER;
+        case TsfSync::Role::FOLLOWER:
+          return TsfRole::FOLLOWER;
+        default:
+          break;
+      }
+    }
+#endif
+    return TsfRole::INACTIVE;
+  }
   /// @brief Current server-minus-client clock offset estimate in ms.
   float get_clock_offset_ms();
   const ServerSettings &get_server_settings() const { return this->settings_main_; }
@@ -229,6 +250,11 @@ class SnapcastClient {
   void service_tx_();
   /// Sends one Client.SetLatency request on the server's control port (1705).
   void send_set_latency_rpc_(int32_t latency_ms);
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  /// Fetches the server's client roster (Server.GetStatus, control port) for TSF
+  /// unicast beacons. Blocking; only called while no stream is active.
+  void refresh_tsf_peers_();
+#endif
   void handle_codec_header_(const uint8_t *payload, size_t len);
   void handle_wire_chunk_(const uint8_t *payload, size_t len);
   void handle_time_reply_(const BaseMessage &base, const uint8_t *payload, size_t len, int64_t recv_us);
@@ -343,6 +369,12 @@ class SnapcastClient {
   int sock_{-1};
   int64_t last_scan_us_{0};  // last mDNS scan, rate-limits re-scans on reconnect
   std::string active_host_;  // host of the current session (config or mDNS result)
+  // FNV-1a of the active session's "host:port" — identifies which server clock a
+  // shared TSF mapping refers to
+  uint32_t server_id_hash_{0};
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  int64_t last_peer_refresh_us_{0};  // TSF unicast roster refresh (network task)
+#endif
   uint16_t next_message_id_{0};
   bool stream_active_{false};
   int64_t last_chunk_us_{0};
@@ -364,6 +396,11 @@ class SnapcastClient {
   // Hardware clock steering; owned here, driven by the player task's servo. The
   // speaker callback thread only pokes invalidate_baseline() (atomic flag).
   std::unique_ptr<RateLock> rate_lock_;
+#endif
+
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  // TSF group sync: serviced by the network task, offset queried by the player task
+  std::unique_ptr<TsfSync> tsf_sync_;
 #endif
 
   // --- Player task locals ---

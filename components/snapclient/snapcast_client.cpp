@@ -4,6 +4,10 @@
 
 #include "esphome/core/log.h"
 
+#ifdef SNAPCLIENT_TSF_ACTIVE
+#include "esphome/components/json/json_util.h"
+#endif
+
 #include <esp_timer.h>
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
@@ -89,6 +93,11 @@ static constexpr int64_t PIPELINE_FLUSH_GAP_US = 500000;
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
 
+#ifdef SNAPCLIENT_TSF_ACTIVE
+// TSF unicast roster refresh cadence (only while no stream is active; blocking RPC)
+static constexpr int64_t TSF_PEER_REFRESH_US = 60000000;
+#endif
+
 // Time-sync RTT gating (see handle_time_reply_)
 static constexpr int64_t RTT_GATE_US = 20000;      // reject samples this far above the floor
 static constexpr int64_t RTT_FLOOR_LEAK_US = 500;  // floor rises this much per sample (~0.5 ms/s)
@@ -117,6 +126,13 @@ bool SnapcastClient::start() {
 
 #ifdef USE_SNAPCLIENT_RATE_LOCK
   this->rate_lock_ = std::make_unique<RateLock>(this->config_.rate_lock_i2s_port);
+#endif
+
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  // Plausibility gate mirrors the hard-resync threshold: a shared mapping that far
+  // from our own estimate would hard-resync us -- reject it instead
+  this->tsf_sync_ =
+      std::make_unique<TsfSync>(static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000);
 #endif
 
   this->event_queue_ = xQueueCreate(8, sizeof(Event));
@@ -345,6 +361,10 @@ void SnapcastClient::connection_session_() {
     ESP_LOGI(TAG, "Discovered snapserver at %s:%u", host.c_str(), port);
   }
   this->active_host_ = host;
+  this->server_id_hash_ = fnv1_hash(host + ":" + std::to_string(port));
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  this->last_peer_refresh_us_ = 0;  // fresh roster per session
+#endif
 
   if (!this->connect_socket_(host, port)) {
     this->close_socket_();
@@ -657,6 +677,34 @@ void SnapcastClient::service_tx_() {
     ESP_LOGD(TAG, "Stream idle for %" PRIu32 " ms, ending stream", this->config_.stream_idle_timeout_ms);
     this->set_stream_active_(false);
   }
+
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  if (this->tsf_sync_ != nullptr) {
+    // Unicast roster: once at session start, then refreshed only off-stream (the
+    // RPC blocks up to ~2 s, which mid-stream would starve the playout buffer)
+    if (this->last_peer_refresh_us_ == 0 ||
+        (!this->stream_active_ && now - this->last_peer_refresh_us_ >= TSF_PEER_REFRESH_US)) {
+      this->refresh_tsf_peers_();
+    }
+    // Elections/beacons only while a stream is active: that is when deadlines are
+    // computed AND when the hub holds high-performance wifi. While idle, modem
+    // power save makes TSF reads fail intermittently (observed: sporadic beacons
+    // and "TSF unreadable" role flapping on an idle pair). Roles freeze across
+    // idle gaps; the leader resumes beaconing on the first active tick, and stale
+    // mappings expire into the Kalman fallback on their own.
+    if (this->stream_active_) {
+      TsfSync::Estimate est;
+      this->filter_mutex_.lock();
+      est.valid = this->time_filter_.has_estimate();
+      if (est.valid) {
+        est.offset_ms = this->time_filter_.get_offset(now / 1000.0);
+        est.drift = this->time_filter_.get_drift();
+      }
+      this->filter_mutex_.unlock();
+      this->tsf_sync_->service(now, est, this->server_id_hash_);
+    }
+  }
+#endif
 }
 
 // THREAD CONTEXT: Network task. A short-lived connection to the JSON-RPC control
@@ -699,6 +747,96 @@ void SnapcastClient::send_set_latency_rpc_(int32_t latency_ms) {
   }
   freeaddrinfo(res);
 }
+
+#ifdef SNAPCLIENT_TSF_ACTIVE
+// THREAD CONTEXT: Network task. Fetches the server's client roster so the TSF
+// leader can unicast beacons to every peer -- client-to-client multicast is
+// unreliable on many APs (isolation, IGMP snooping, mesh filtering), while unicast
+// works wherever snapcast itself does. Blocking (1 s timeouts), so callers only
+// invoke it while no stream is active; the session-start call is absorbed by the
+// playout buffer.
+void SnapcastClient::refresh_tsf_peers_() {
+  this->last_peer_refresh_us_ = now_us();  // set even on failure: no hammering
+  if (this->active_host_.empty() || this->tsf_sync_ == nullptr) {
+    return;
+  }
+  struct addrinfo hints = {};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+  struct addrinfo *res = nullptr;
+  if (getaddrinfo(this->active_host_.c_str(), "1705", &hints, &res) != 0 || res == nullptr) {
+    return;
+  }
+  std::string response;
+  int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+  if (sock >= 0) {
+    struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (connect(sock, res->ai_addr, res->ai_addrlen) == 0) {
+      static const char REQ[] = "{\"id\":2,\"jsonrpc\":\"2.0\",\"method\":\"Server.GetStatus\"}\r\n";
+      if (send(sock, REQ, sizeof(REQ) - 1, 0) == static_cast<ssize_t>(sizeof(REQ) - 1)) {
+        // Newline-delimited JSON-RPC; the full status can be several KB
+        char buf[512];
+        response.reserve(2048);
+        while (response.size() < 24576) {
+          const int n = recv(sock, buf, sizeof(buf), 0);
+          if (n <= 0) {
+            break;
+          }
+          response.append(buf, n);
+          if (memchr(buf, '\n', n) != nullptr) {
+            break;
+          }
+        }
+      }
+    }
+    close(sock);
+  }
+  freeaddrinfo(res);
+  if (response.empty()) {
+    ESP_LOGD(TAG, "Server.GetStatus fetch failed; TSF peer roster unchanged");
+    return;
+  }
+
+  // Filtered parse: keep only connected + host.ip of each client
+  JsonDocument filter;
+  filter["result"]["server"]["groups"][0]["clients"][0]["connected"] = true;
+  filter["result"]["server"]["groups"][0]["clients"][0]["host"]["ip"] = true;
+  JsonDocument doc;
+  if (deserializeJson(doc, response, DeserializationOption::Filter(filter)) != DeserializationError::Ok) {
+    ESP_LOGD(TAG, "Server.GetStatus parse failed; TSF peer roster unchanged");
+    return;
+  }
+  std::vector<uint32_t> peers;
+  // Implicit JsonArray/JsonVariant conversions: portable across ArduinoJson 7.x
+  // (as<JsonArray>() on nested member proxies fails to compile on some versions);
+  // a null array iterates as empty
+  JsonArray groups = doc["result"]["server"]["groups"];
+  for (JsonVariant group : groups) {
+    JsonArray clients = group["clients"];
+    for (JsonVariant client : clients) {
+      if (!(client["connected"] | false)) {
+        continue;
+      }
+      const char *ip = client["host"]["ip"];
+      if (ip == nullptr) {
+        continue;
+      }
+      if (strncmp(ip, "::ffff:", 7) == 0) {
+        ip += 7;  // snapserver reports IPv4-mapped IPv6 addresses
+      }
+      const in_addr_t addr = inet_addr(ip);
+      if (addr == INADDR_NONE) {
+        continue;  // plain IPv6 or garbage
+      }
+      // Our own address may be included; the beacon's own-mac check drops it
+      peers.push_back(addr);
+    }
+  }
+  this->tsf_sync_->set_peers(std::move(peers));
+}
+#endif
 
 void SnapcastClient::handle_time_reply_(const BaseMessage &base, const uint8_t *payload, size_t len, int64_t recv_us) {
   TimePayload time_payload;
@@ -1035,12 +1173,23 @@ void SnapcastClient::player_task_() {
         snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm", this->rate_lock_->applied_ppm());
       }
 #endif
+      char tsf_str[32] = "";
+#ifdef SNAPCLIENT_TSF_ACTIVE
+      if (this->tsf_sync_ != nullptr) {
+        const TsfSync::Role role = this->tsf_sync_->role();
+        if (role == TsfSync::Role::LEADER) {
+          snprintf(tsf_str, sizeof(tsf_str), ", tsf=leader(peers %u)", this->tsf_sync_->peer_count());
+        } else if (role == TsfSync::Role::FOLLOWER) {
+          snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs)", this->tsf_sync_->mapping_age_s(now_us()));
+        }
+      }
+#endif
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, max feedback gap %" PRId64
-               " ms, buffered %" PRIu32 " ms%s over %" PRIu32 " chunks",
+               " ms, buffered %" PRIu32 " ms%s%s over %" PRIu32 " chunks",
                err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
-               hard_resyncs, max_gap_us / 1000, buffered_ms, trim_str, err_count);
+               hard_resyncs, max_gap_us / 1000, buffered_ms, trim_str, tsf_str, err_count);
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
@@ -1198,6 +1347,17 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
                                this->server_latency_ms_.load(std::memory_order_relaxed) -
                                this->static_delay_ms_.load(std::memory_order_relaxed)) *
       1000;
+
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  // TSF group sync: prefer the AP-shared server->TSF mapping so every same-AP
+  // client derives identical deadlines (estimate wander becomes common-mode)
+  if (this->tsf_sync_ != nullptr) {
+    int64_t shared_offset_us;
+    if (this->tsf_sync_->shared_server_offset_us(now_us(), shared_offset_us)) {
+      return rec.server_ts_us + buffer_us - shared_offset_us;
+    }
+  }
+#endif
 
   this->filter_mutex_.lock();
   const double offset_ms = this->time_filter_.has_estimate() ? this->time_filter_.get_offset(now_us() / 1000.0) : 0.0;
