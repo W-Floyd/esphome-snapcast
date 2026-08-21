@@ -13,12 +13,17 @@ API (reverse-engineered from the router's own web UI):
     POST https://<router>/ubus        (JSON-RPC 2.0, self-signed TLS)
     {"jsonrpc":"2.0","id":"1","method":"call",
      "params":["<session>", "data_repo.webinfo", "get_topology", {}]}
-The session token is the only credential (no cookie/header). Grab one from the
-router UI's devtools (Network -> any /ubus POST -> first param), or try --login.
 
-    python3 scripts/ap-stations.py --session <token>
-    python3 scripts/ap-stations.py --session <token> --watch 10   # correlate with logs
-    python3 scripts/ap-stations.py --from-json topology.json      # offline
+Auth: the LAN UI grants a session for an ANONYMOUS login -- blank username and
+password against the null session -- so no credentials are needed and sessions
+(300 s timeout) are obtained automatically:
+    params: ["00000000000000000000000000000000","session","login",
+             {"username":"","password":""}]  -> result.ubus_rpc_session
+
+    python3 scripts/ap-stations.py                       # auto-login
+    python3 scripts/ap-stations.py --watch 10            # correlate with speaker logs
+    python3 scripts/ap-stations.py --from-json topo.json # offline
+    python3 scripts/ap-stations.py --session <token>     # reuse a UI session
 
 Airtime share is estimated as 1/uplink + 1/downlink normalized across stations:
 a first-order model of who is eating the channel, good enough to rank offenders.
@@ -60,7 +65,8 @@ def ubus(host, session, obj, func, args=None):
     return result
 
 
-def login(host, username, password):
+def login(host, username="", password=""):
+    """Anonymous by default: the LAN UI itself logs in with blank credentials."""
     res = ubus(host, NULL_SESSION, "session", "login",
                {"username": username, "password": password})
     token = res.get("ubus_rpc_session")
@@ -134,9 +140,9 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", default="192.168.1.1")
-    ap.add_argument("--session", help="ubus session token (from the router UI's devtools)")
+    ap.add_argument("--session", help="reuse a ubus session token instead of logging in")
     ap.add_argument("--login", nargs=2, metavar=("USER", "PASS"),
-                    help="try a standard ubus session login instead")
+                    help="credentials, if this router's UI needs them (default: anonymous)")
     ap.add_argument("--from-json", help="parse a saved get_topology result instead of querying")
     ap.add_argument("--watch", type=float, metavar="SECONDS",
                     help="poll forever at this interval, timestamped for log correlation")
@@ -147,16 +153,16 @@ def main():
         report(stations(json.load(open(args.from_json))), args.brief)
         return
 
-    session = args.session
-    if not session and args.login:
-        session = login(args.host, *args.login)
-        print(f"session: {session}")
-    if not session:
-        ap.error("need --session, --login, or --from-json")
+    session = args.session or login(args.host, *(args.login or ("", "")))
 
     while True:
         try:
-            topo = ubus(args.host, session, "data_repo.webinfo", "get_topology")
+            try:
+                topo = ubus(args.host, session, "data_repo.webinfo", "get_topology")
+            except RuntimeError:
+                # Sessions expire after 300 s; re-login once and retry
+                session = login(args.host, *(args.login or ("", "")))
+                topo = ubus(args.host, session, "data_repo.webinfo", "get_topology")
             print(f"\n===== {time.strftime('%H:%M:%S')} =====")
             report(stations(topo), args.brief)
         except Exception as exc:  # keep a --watch session alive across hiccups
