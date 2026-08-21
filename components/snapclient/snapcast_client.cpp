@@ -50,6 +50,10 @@ static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 // oscillation amplitude and produced audible warble (~1100 splices/s, observed).
 static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
 
+// Steering size while muted pre-convergence (~7 ms/s); audibility is not a
+// constraint through silence, so lock happens in ~1-2 s instead of up to ~10 s
+static constexpr uint32_t STARTUP_STEER_FRAMES = 8;
+
 // Median window for the steering servo's error signal (~0.4 s of chunks)
 static constexpr size_t MEDIAN_WINDOW = 15;
 
@@ -914,12 +918,19 @@ void SnapcastClient::player_task_() {
                  (steer_dir < 0 && median_err_us > -engage_us / 2)) {
         steer_dir = 0;
       }
+      // While muted (pre-convergence) audibility doesn't constrain splice size, so
+      // steer hard to reach the band quickly instead of crawling in at ~0.9 ms/s
+      const uint32_t steer_frames = converged ? 1 : STARTUP_STEER_FRAMES;
       if (steer_dir > 0) {
-        drop_frames = 1;
-        soft_dropped_frames++;
+        drop_frames = steer_frames;
+        soft_dropped_frames += steer_frames;
       } else if (steer_dir < 0) {
-        soft_inserted_frames++;
-        this->push_repeat_frame_(rec.params);
+        soft_inserted_frames += steer_frames;
+        if (converged) {
+          this->push_repeat_frame_(rec.params);
+        } else {
+          this->push_silence_(steer_frames, rec.params);
+        }
       }
     }
 
