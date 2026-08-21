@@ -17,6 +17,10 @@
 esphome:
   name: snapclient-supermini
   friendly_name: Snapclient SuperMini
+  # Fleet-friendly: appends the MAC's last 3 bytes to the node/friendly name, so many
+  # devices can share this config and stay distinguishable in HA, mDNS, and on the
+  # snapserver (our Hello HostName derives from the friendly name)
+  name_add_mac_suffix: true
   includes:
     - <esp_wifi.h>  # for the WiFi TX Power slider's esp_wifi_set_max_tx_power call
 

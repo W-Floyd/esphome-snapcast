@@ -18,11 +18,8 @@ void SnapclientHub::setup() {
   SnapcastClientConfig config;
   config.server_host = this->server_host_;
   config.server_port = this->server_port_;
-  config.client_id = get_mac_address_pretty();
   // Hello HostName, which the server uses as the client's default display name:
-  // explicit `name:` config > the device's friendly_name > the node name. The MAC is
-  // appended so fleets of devices sharing one config stay distinguishable server-side
-  // (the server keys clients by MAC regardless; this only seeds the display name).
+  // explicit `name:` config > the device's friendly_name > the node name.
   if (!this->client_name_.empty()) {
     config.hostname = this->client_name_;
   } else if (!App.get_friendly_name().empty()) {
@@ -30,7 +27,7 @@ void SnapclientHub::setup() {
   } else {
     config.hostname = App.get_name();
   }
-  config.hostname += " " + config.client_id;
+  config.client_id = get_mac_address_pretty();
   config.buffer_size = this->buffer_size_;
   config.time_sync_interval_ms = this->time_sync_interval_ms_;
   config.hard_resync_threshold_ms = this->hard_resync_threshold_ms_;
