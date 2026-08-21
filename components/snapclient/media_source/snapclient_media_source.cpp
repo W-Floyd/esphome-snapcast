@@ -22,14 +22,14 @@ void SnapclientMediaSource::setup() {
 
   this->parent_->add_server_settings_callback([this](uint8_t volume, bool muted) {
     // Track the server's current belief so notify_volume_changed / notify_mute_changed
-    // don't echo the same values straight back as a ClientInfo message. Also sync the
-    // local mirror: a later mute-only ClientInfo must carry the current volume.
+    // don't echo the same values straight back as a ClientInfo message.
     this->last_server_volume_ = volume;
     this->last_server_muted_ = muted;
-    this->local_volume_ = volume;
-    this->local_muted_ = muted;
-    this->apply_server_volume_(volume);
-    this->request_mute_(muted);
+    // Coalesce application: multiple settings events can drain in one main loop, and
+    // applying each one separately queues deferred requests that then execute against
+    // stale bookkeeping (a superseded mute/volume misread as a genuine local change).
+    // Only ever apply the latest state, once.
+    this->set_timeout("apply_server_settings", 0, [this]() { this->apply_server_state_(); });
   });
 
   // A changed volume curve remaps the current slider position to a new gain
@@ -108,6 +108,36 @@ void SnapclientMediaSource::set_playback_state_(media_source::MediaSourceState s
   this->set_state_(state);
 }
 
+// THREAD CONTEXT: Main loop (coalescing timeout). Applies the latest server-pushed
+// state — mute immediately, volume subject to the local-wins-recently grace window:
+// while the user is actively dragging the local slider, server pushes (group-volume
+// recalculations, in-flight echoes of our own reports) would yank it back mid-drag.
+// Deferred application retries until the drag has been quiet for the window; the
+// latest value still wins, so a genuine concurrent server change is delayed, not lost.
+void SnapclientMediaSource::apply_server_state_() {
+  if (this->last_server_volume_ < 0) {
+    return;
+  }
+  this->local_muted_ = this->last_server_muted_ == 1;
+
+  const uint32_t since_local = millis() - this->last_local_volume_ms_;
+  if (this->last_local_volume_ms_ != 0 && since_local < LOCAL_VOLUME_GRACE_MS) {
+    // Volume deferred; mute can apply alone (no volume request, so the orchestrator's
+    // unmute-on-volume-set below is not triggered)
+    this->request_mute_(this->local_muted_);
+    this->set_timeout("apply_server_settings", LOCAL_VOLUME_GRACE_MS - since_local,
+                      [this]() { this->apply_server_state_(); });
+    return;
+  }
+
+  // Order is load-bearing: the orchestrator's set_volume_ force-unmutes on any
+  // non-zero volume, so the mute request must be queued after the volume request
+  // to end up as the final state.
+  this->local_volume_ = static_cast<uint8_t>(this->last_server_volume_);
+  this->apply_server_volume_(this->local_volume_);
+  this->request_mute_(this->local_muted_);
+}
+
 // THREAD CONTEXT: Main loop (server settings / volume curve callbacks)
 void SnapclientMediaSource::apply_server_volume_(uint8_t volume_percent) {
   // The Snapcast slider is a position; the orchestrator volume is an amplitude gain.
@@ -124,6 +154,7 @@ void SnapclientMediaSource::notify_volume_changed(float volume) {
     return;
   }
   // A local (HA slider) change: report the equivalent slider position to the server
+  this->last_local_volume_ms_ = millis();
   const float slider = this->parent_->get_volume_curve().inverse(volume);
   const int volume_percent = static_cast<int>(std::roundf(slider * 100.0f));
   this->local_volume_ = static_cast<uint8_t>(std::clamp(volume_percent, 0, 100));

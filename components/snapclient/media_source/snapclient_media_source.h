@@ -43,6 +43,10 @@ class SnapclientMediaSource final : public SnapclientChild,
   /// @brief Updates the source state and keeps the client's output-active flag in step.
   void set_playback_state_(media_source::MediaSourceState state);
 
+  /// @brief Applies the latest server-pushed volume/mute state, coalesced to once
+  /// per loop and volume-gated by the local-drag grace window.
+  void apply_server_state_();
+
   /// @brief Maps a server volume slider position through the volume curve and
   /// requests the resulting gain from the orchestrator.
   void apply_server_volume_(uint8_t volume_percent);
@@ -56,6 +60,11 @@ class SnapclientMediaSource final : public SnapclientChild,
   // The exact gain we last requested from the orchestrator; a notify with (almost)
   // this value is our own request echoing back, not a user change.
   float last_requested_gain_{-1.0f};
+
+  // Local-wins-recently: server volume pushes are deferred while a local slider drag
+  // is in flight (see the server settings callback).
+  static constexpr uint32_t LOCAL_VOLUME_GRACE_MS = 1500;
+  uint32_t last_local_volume_ms_{0};
 
   // Local state mirrored from the orchestrator, reported to the server on change
   uint8_t local_volume_{100};
