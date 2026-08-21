@@ -73,6 +73,10 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   void set_channel_mode(ChannelMode mode);
   ChannelMode get_channel_mode() const { return this->channel_mode_; }
 
+  /// @brief Output polarity inversion (none / left / right / both). Safe at runtime.
+  void set_phase_mode(PhaseMode mode);
+  PhaseMode get_phase_mode() const { return this->phase_mode_; }
+
   /// @brief Volume taper between the Snapcast volume slider and the speaker gain.
   /// 0 dB = linear (off). Fires the volume-curve callbacks so the media source
   /// re-applies the current volume with the new curve.
@@ -126,6 +130,7 @@ class SnapclientHub final : public Component, public SnapcastClientListener {
   int32_t pending_static_delay_ms_{0};
 
   ChannelMode channel_mode_{ChannelMode::STEREO};
+  PhaseMode phase_mode_{PhaseMode::NONE};
   VolumeCurve volume_curve_{};
 
   // Callback fan-out to child components

@@ -169,6 +169,12 @@ select:
   - platform: snapclient
     snapclient_id: snap
     name: Channel Mode
+  # Polarity inversion (None / Left / Right / Both) — fixes an out-of-phase driver
+  # in software; an inverted speaker in a synchronized pair cancels bass
+  - platform: snapclient
+    type: phase
+    snapclient_id: snap
+    name: Phase
 # Pin the client to whichever AP it is currently connected to — no hardcoded BSSIDs.
 # Mid-stream roam scans take the radio off-channel for hundreds of ms and starve
 # playback; roaming is already suppressed while streaming, and the lock removes AP

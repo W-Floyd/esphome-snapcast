@@ -93,6 +93,7 @@ media_player:
 | `hard_resync_threshold` | `50ms` | Sync error beyond which chunks are dropped / silence inserted |
 | `stream_idle_timeout` | `3s` | No wire chunks for this long ⇒ stream ends |
 | `channel_mode` | `stereo` | Boot default routing: `stereo`, `left`, `right`, `mono` |
+| `phase_invert` | `none` | Boot default polarity inversion: `none`, `left`, `right`, `both` |
 | `static_delay` (media_source) | `0ms` | Per-device latency trim, like `snapclient --latency` |
 
 ### Entities
@@ -101,6 +102,10 @@ media_player:
 select:
   - platform: snapclient
     name: Channel Mode      # Stereo / Left / Right / Mono, persisted; overrides channel_mode
+  - platform: snapclient
+    type: phase
+    name: Phase             # polarity inversion: None / Left / Right / Both, persisted;
+                            # overrides phase_invert (fixes an out-of-phase driver in software)
 
 number:
   - platform: snapclient

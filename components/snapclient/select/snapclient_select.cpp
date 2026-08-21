@@ -9,8 +9,8 @@ namespace esphome::snapclient {
 
 static const char *const TAG = "snapclient.select";
 
-void SnapclientChannelModeSelect::setup() {
-  uint8_t index = static_cast<uint8_t>(this->parent_->get_channel_mode());
+void SnapclientIndexedSelect::setup() {
+  uint8_t index = this->initial_index_();
   if (this->restore_value_) {
     this->pref_ = global_preferences->make_preference<uint8_t>(this->get_object_id_hash());
     uint8_t restored;
@@ -21,10 +21,8 @@ void SnapclientChannelModeSelect::setup() {
   this->apply_(index);
 }
 
-void SnapclientChannelModeSelect::dump_config() { LOG_SELECT("", "Snapclient Channel Mode Select", this); }
-
 // THREAD CONTEXT: Main loop (invoked by the select framework)
-void SnapclientChannelModeSelect::control(const std::string &value) {
+void SnapclientIndexedSelect::control(const std::string &value) {
   auto index = this->index_of(value);
   if (!index.has_value()) {
     return;
@@ -36,11 +34,15 @@ void SnapclientChannelModeSelect::control(const std::string &value) {
   }
 }
 
-void SnapclientChannelModeSelect::apply_(uint8_t index) {
-  // Option order matches the ChannelMode enum (and the reference dsp_channel_mode_t)
-  this->parent_->set_channel_mode(static_cast<ChannelMode>(index));
+void SnapclientIndexedSelect::apply_(uint8_t index) {
+  // Option order matches the corresponding client enum
+  this->apply_index_(index);
   this->publish_state(this->traits.get_options()[index]);
 }
+
+void SnapclientChannelModeSelect::dump_config() { LOG_SELECT("", "Snapclient Channel Mode Select", this); }
+
+void SnapclientPhaseSelect::dump_config() { LOG_SELECT("", "Snapclient Phase Select", this); }
 
 }  // namespace esphome::snapclient
 

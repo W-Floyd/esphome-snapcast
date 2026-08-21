@@ -33,6 +33,15 @@ CHANNEL_MODES = {
     "mono": ChannelMode.MONO,
 }
 
+PhaseMode = snapclient_ns.enum("PhaseMode", is_class=True)
+PHASE_MODES = {
+    "none": PhaseMode.NONE,
+    "left": PhaseMode.LEFT,
+    "right": PhaseMode.RIGHT,
+    "both": PhaseMode.BOTH,
+}
+CONF_PHASE_INVERT = "phase_invert"
+
 
 def _request_networking(config: ConfigType) -> ConfigType:
     """Request the networking features synchronized streaming needs."""
@@ -73,9 +82,12 @@ CONFIG_SCHEMA = cv.All(
                     max=cv.TimePeriod(milliseconds=1000),
                 ),
             ),
-            # Boot default; a snapclient channel-mode select entity overrides it
+            # Boot defaults; the snapclient select entities override them
             cv.Optional(CONF_CHANNEL_MODE, default="stereo"): cv.enum(
                 CHANNEL_MODES, lower=True
+            ),
+            cv.Optional(CONF_PHASE_INVERT, default="none"): cv.enum(
+                PHASE_MODES, lower=True
             ),
             cv.Optional(CONF_STREAM_IDLE_TIMEOUT, default="3s"): cv.All(
                 cv.positive_time_period_milliseconds,
@@ -116,6 +128,7 @@ async def to_code(config: ConfigType) -> None:
     )
 
     cg.add(var.set_channel_mode(config[CONF_CHANNEL_MODE]))
+    cg.add(var.set_phase_mode(config[CONF_PHASE_INVERT]))
 
     if config[CONF_FLAC]:
         # snapserver's default stream codec; pulls micro_flac from esp-audio-libs

@@ -898,35 +898,65 @@ uint32_t SnapcastClient::push_silence_(uint32_t frames, const StreamParams &para
   return pushed;
 }
 
+// Polarity inversion with INT16_MIN clamp (negating INT16_MIN overflows)
+static inline int16_t invert_sample(int16_t s) { return s == INT16_MIN ? INT16_MAX : static_cast<int16_t>(-s); }
+
 // THREAD CONTEXT: Player task. Slices are always frame-aligned: chunk sizes and
 // SLICE_BUFFER_SIZE are multiples of the frame size, and reads are sequential.
 void SnapcastClient::apply_channel_mode_(uint8_t *data, size_t len, const StreamParams &params) {
-  const auto mode = static_cast<ChannelMode>(this->channel_mode_.load(std::memory_order_relaxed));
-  if (mode == ChannelMode::STEREO || params.channels != 2 || params.bits_per_sample != 16) {
+  if (params.bits_per_sample != 16) {
     return;
   }
   auto *samples = reinterpret_cast<int16_t *>(data);
-  const size_t frames = len / 4;
-  switch (mode) {
-    case ChannelMode::LEFT_ONLY:
+
+  // Channel routing first: phase inversion below refers to the *output* channels
+  const auto mode = static_cast<ChannelMode>(this->channel_mode_.load(std::memory_order_relaxed));
+  if (mode != ChannelMode::STEREO && params.channels == 2) {
+    const size_t frames = len / 4;
+    switch (mode) {
+      case ChannelMode::LEFT_ONLY:
+        for (size_t i = 0; i < frames; i++) {
+          samples[2 * i + 1] = samples[2 * i];
+        }
+        break;
+      case ChannelMode::RIGHT_ONLY:
+        for (size_t i = 0; i < frames; i++) {
+          samples[2 * i] = samples[2 * i + 1];
+        }
+        break;
+      case ChannelMode::MONO:
+        for (size_t i = 0; i < frames; i++) {
+          const int16_t mixed = static_cast<int16_t>((static_cast<int32_t>(samples[2 * i]) + samples[2 * i + 1]) / 2);
+          samples[2 * i] = mixed;
+          samples[2 * i + 1] = mixed;
+        }
+        break;
+      default:
+        break;
+    }
+  }
+
+  const auto phase = static_cast<PhaseMode>(this->phase_mode_.load(std::memory_order_relaxed));
+  if (phase != PhaseMode::NONE) {
+    if (params.channels == 2) {
+      const size_t frames = len / 4;
+      const bool left = phase != PhaseMode::RIGHT;
+      const bool right = phase != PhaseMode::LEFT;
       for (size_t i = 0; i < frames; i++) {
-        samples[2 * i + 1] = samples[2 * i];
+        if (left) {
+          samples[2 * i] = invert_sample(samples[2 * i]);
+        }
+        if (right) {
+          samples[2 * i + 1] = invert_sample(samples[2 * i + 1]);
+        }
       }
-      break;
-    case ChannelMode::RIGHT_ONLY:
-      for (size_t i = 0; i < frames; i++) {
-        samples[2 * i] = samples[2 * i + 1];
+    } else if (params.channels == 1) {
+      // Mono has no L/R distinction; any inversion setting inverts the one channel
+      const size_t n = len / 2;
+      for (size_t i = 0; i < n; i++) {
+        samples[i] = invert_sample(samples[i]);
       }
-      break;
-    case ChannelMode::MONO:
-      for (size_t i = 0; i < frames; i++) {
-        const int16_t mixed = static_cast<int16_t>((static_cast<int32_t>(samples[2 * i]) + samples[2 * i + 1]) / 2);
-        samples[2 * i] = mixed;
-        samples[2 * i + 1] = mixed;
-      }
-      break;
-    default:
-      break;
+    }
   }
 }
 

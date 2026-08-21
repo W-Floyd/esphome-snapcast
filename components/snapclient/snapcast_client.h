@@ -46,6 +46,15 @@ enum class ChannelMode : uint8_t {
   MONO = 3,        // Mix L+R to mono, route to both outputs
 };
 
+/// @brief Output polarity inversion, for correcting out-of-phase drivers in software
+/// (one inverted speaker in a synchronized pair cancels bass with its partner).
+enum class PhaseMode : uint8_t {
+  NONE = 0,   // Normal polarity
+  LEFT = 1,   // Invert the left channel (any non-NONE inverts a mono stream)
+  RIGHT = 2,  // Invert the right channel
+  BOTH = 3,   // Invert both channels
+};
+
 /// @brief Decoded stream format of the current Snapcast stream.
 struct StreamParams {
   uint32_t sample_rate{0};
@@ -122,6 +131,12 @@ class SnapcastClient {
   /// pushed, so it may be changed at any time without disturbing sync accounting.
   void set_channel_mode(ChannelMode mode) {
     this->channel_mode_.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
+  }
+
+  /// @brief Output polarity inversion; same in-place push-path transform as
+  /// set_channel_mode, safe to change at any time.
+  void set_phase_mode(PhaseMode mode) {
+    this->phase_mode_.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
   }
 
   /// @brief Reports a local volume/mute change to the server via a ClientInfo message.
@@ -202,7 +217,8 @@ class SnapcastClient {
   uint32_t push_silence_(uint32_t frames, const StreamParams &params);
   /// Pushes @p bytes from the ring downstream, dropping @p drop_frames from the front.
   void push_chunk_(const ChunkRecord &rec, uint32_t drop_frames);
-  /// @brief Applies the configured channel routing in-place to a frame-aligned slice.
+  /// @brief Applies the configured channel routing and polarity inversion in-place
+  /// to a frame-aligned slice.
   void apply_channel_mode_(uint8_t *data, size_t len, const StreamParams &params);
 
   SnapcastClientConfig config_;
@@ -223,6 +239,7 @@ class SnapcastClient {
   std::atomic<bool> output_active_{false};
   std::atomic<int32_t> static_delay_ms_{0};
   std::atomic<uint8_t> channel_mode_{static_cast<uint8_t>(ChannelMode::STEREO)};
+  std::atomic<uint8_t> phase_mode_{static_cast<uint8_t>(PhaseMode::NONE)};
 
   // Server settings shadow used by the tasks (buffer_ms/latency for deadlines).
   std::atomic<int32_t> buffer_ms_{1000};

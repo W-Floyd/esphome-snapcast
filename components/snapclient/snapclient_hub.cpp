@@ -40,6 +40,7 @@ void SnapclientHub::setup() {
   }
   this->client_->set_static_delay_ms(this->pending_static_delay_ms_);
   this->client_->set_channel_mode(this->channel_mode_);
+  this->client_->set_phase_mode(this->phase_mode_);
 
   if (!this->client_->start()) {
     ESP_LOGE(TAG, "Failed to start Snapcast client");
@@ -100,6 +101,13 @@ void SnapclientHub::set_channel_mode(ChannelMode mode) {
   this->channel_mode_ = mode;
   if (this->client_ != nullptr) {
     this->client_->set_channel_mode(mode);
+  }
+}
+
+void SnapclientHub::set_phase_mode(PhaseMode mode) {
+  this->phase_mode_ = mode;
+  if (this->client_ != nullptr) {
+    this->client_->set_phase_mode(mode);
   }
 }
 
