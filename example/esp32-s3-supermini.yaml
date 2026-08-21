@@ -258,8 +258,18 @@ number:
     initial_value: 8.5
     set_action:
       - lambda: |-
-          esp_wifi_set_max_tx_power((int8_t)(x * 4));
-          ESP_LOGI("wifi_tx", "WiFi TX power set to %.2f dBm", x);
+          // The request is in 0.25 dBm units and the driver QUANTIZES it (esp_wifi.h:
+          // set [80,84] -> 80 = 20 dBm, [34,43] -> 34 = 8.5 dBm), then clamps to the
+          // PHY init data bin and the country's max_tx_power. So never trust the
+          // request: log what the driver actually accepted. If the readback is high
+          // but the AP's RSSI for this device does not move, the extra power is being
+          // reflected by a badly matched antenna rather than radiated.
+          const int8_t want = (int8_t) (x * 4);
+          const esp_err_t err = esp_wifi_set_max_tx_power(want);
+          int8_t got = 0;
+          esp_wifi_get_max_tx_power(&got);
+          ESP_LOGI("wifi_tx", "TX power: requested %.2f dBm -> %s; driver reports %.2f dBm",
+                   x, esp_err_to_name(err), got / 4.0f);
 
 # Onboard WS2812 as a play-state indicator
 light:
