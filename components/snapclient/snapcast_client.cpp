@@ -1133,8 +1133,9 @@ void SnapcastClient::player_task_() {
   bool rate_lock_ok = this->rate_lock_ != nullptr;
   uint32_t rate_lock_rate = 0;
 #endif
-  // Mute-until-synced: real audio flows only after the first in-band median
+  // Mute-until-synced: real audio flows only after a full window of in-band medians
   bool converged = false;
+  uint32_t in_band_chunks = 0;
   int64_t last_resync_log_us = 0;
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
@@ -1358,12 +1359,19 @@ void SnapcastClient::player_task_() {
       // is far faster than clock steering could ever be.
       if (converged && rate_lock_ok) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
-        trim_integral_ppm = std::clamp(
-            trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -TRIM_CLAMP_PPM,
-            TRIM_CLAMP_PPM);
-        const float trim_ppm =
-            std::clamp(TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us) + trim_integral_ppm, -TRIM_CLAMP_PPM,
-                       TRIM_CLAMP_PPM);
+        const float p_term = TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us);
+        // Conditional integration (anti-windup): winding the integral while the
+        // output rails just schedules a rail-to-rail relaxation oscillation
+        // (observed post-boot: trim flipping +-500 ppm with +-5 ms medians for
+        // ~90 s, with audible correction bursts). Freeze the integral whenever the
+        // output is saturated in the error's own direction.
+        const float unclamped = p_term + trim_integral_ppm;
+        if (std::abs(unclamped) < TRIM_CLAMP_PPM || (unclamped > 0.0f) != (median_err_us > 0)) {
+          trim_integral_ppm = std::clamp(
+              trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -TRIM_CLAMP_PPM,
+              TRIM_CLAMP_PPM);
+        }
+        const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -TRIM_CLAMP_PPM, TRIM_CLAMP_PPM);
         trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
         if (!trim_holds) {
           rate_lock_ok = false;
@@ -1391,12 +1399,28 @@ void SnapcastClient::player_task_() {
 
     // Mute-until-synced (reference behavior): convergence corrections are chunky and
     // audible (drops of 14 frames/chunk in the proportional band), so the audio is
-    // replaced with silence until the median error first lands inside the servo
-    // band. Hard resyncs re-mute, turning recovery storms into silent gaps.
-    if (!converged && err_window_filled == MEDIAN_WINDOW &&
-        std::abs(median_err_us) <= this->config_.sync_deadband_us) {
-      converged = true;
-      ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us), unmuting", median_err_us);
+    // replaced with silence until the median error holds inside the servo band for a
+    // full median window -- a single in-band median mid-convergence is a transient
+    // (observed: unmuting on one produced ~90 s of audible post-unmute corrections).
+    // Hard resyncs re-mute, turning recovery storms into silent gaps.
+    if (std::abs(median_err_us) <= this->config_.sync_deadband_us) {
+#ifdef SNAPCLIENT_TSF_ACTIVE
+      // Don't unmute onto a provisional timebase: a follower still on its Kalman
+      // fallback (leader's mapping rejected while our own estimate is raw) will
+      // step by up to the plausibility bound when it finally adopts the shared
+      // mapping -- audible corrections right after unmute on every speaker join.
+      const bool timebase_settled = this->tsf_sync_ == nullptr ||
+                                    this->tsf_sync_->role() != TsfSync::Role::FOLLOWER ||
+                                    this->deadline_on_shared_tsf_;
+#else
+      const bool timebase_settled = true;
+#endif
+      if (!converged && err_window_filled == MEDIAN_WINDOW && timebase_settled && ++in_band_chunks >= MEDIAN_WINDOW) {
+        converged = true;
+        ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us), unmuting", median_err_us);
+      }
+    } else {
+      in_band_chunks = 0;
     }
 
     this->push_chunk_(rec, drop_frames, !converged);
@@ -1439,8 +1463,10 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
   if (this->tsf_sync_ != nullptr) {
     int64_t shared_offset_us;
     if (this->tsf_sync_->shared_server_offset_us(now_us(), shared_offset_us)) {
+      this->deadline_on_shared_tsf_ = true;
       return rec.server_ts_us + buffer_us - shared_offset_us;
     }
+    this->deadline_on_shared_tsf_ = false;
   }
 #endif
 

@@ -414,6 +414,11 @@ class SnapcastClient {
   std::unique_ptr<ControlSession> control_session_;
 
   // --- Player task locals ---
+#ifdef SNAPCLIENT_TSF_ACTIVE
+  // Whether the last chunk deadline came from the shared TSF mapping (vs the
+  // per-device Kalman fallback); gates unmute so joins land on the final timebase
+  bool deadline_on_shared_tsf_{false};
+#endif
   std::unique_ptr<uint8_t[]> slice_buffer_;
   static constexpr size_t SLICE_BUFFER_SIZE = 4096;
   // Most recent pushed frame, for click-free servo insertion (player task only)
