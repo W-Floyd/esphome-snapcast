@@ -136,7 +136,7 @@ builds and flashes in one step:
 scripts/flash.sh --usb                      # serial: auto-detects the ESP32 port
 scripts/flash.sh 192.168.1.42 kitchen.local # ESPHome OTA, multiple devices, -p for parallel
 scripts/flash.sh --docker --usb             # build in ghcr.io/esphome/esphome, flash from host
-scripts/flash.sh -c example/snapclient-example.yaml --usb --log
+scripts/flash.sh -c example/snapclient-example.yaml --usb
 ```
 
 Docker note: mount the **repo root** (so `external_components: path: ../components`

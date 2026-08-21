@@ -7,7 +7,7 @@ set -euo pipefail
 usage() {
     cat <<EOF
 Usage: $(basename "$0") [-c config.yaml] [--docker] <device> [device...]
-       $(basename "$0") [-c config.yaml] [--docker] --usb [--port <port>] [--log]
+       $(basename "$0") [-c config.yaml] [--docker] --usb [--port <port>]
 
 Build the config, then flash it.
 
@@ -26,7 +26,8 @@ Options:
   -p, --parallel       flash all OTA devices concurrently
   --usb                serial flash mode
   --port <port>        serial port for USB mode (auto-detected if omitted)
-  --log                stream device logs after flashing
+  --no-log             don't stream device logs after flashing (logs stream by
+                       default when flashing a single device)
   -h, --help           show this help
 EOF
     exit 1
@@ -36,7 +37,7 @@ CONFIG="example/esp32-s3-supermini.yaml"
 DOCKER=0
 USB=0
 PORT=""
-LOG=0
+LOG=1
 PARALLEL=0
 
 while [[ $# -gt 0 ]]; do
@@ -46,7 +47,8 @@ while [[ $# -gt 0 ]]; do
         -p|--parallel) PARALLEL=1; shift ;;
         --usb) USB=1; shift ;;
         --port) PORT="${2:?--port requires an argument}"; shift 2 ;;
-        --log) LOG=1; shift ;;
+        --log) LOG=1; shift ;;  # kept for compatibility; logging is the default
+        --no-log) LOG=0; shift ;;
         -h|--help) usage ;;
         -*) echo "ERROR: unknown option $1" >&2; usage ;;
         *) break ;;
