@@ -40,6 +40,7 @@ PORT=""
 LOG=1
 PARALLEL=0
 
+ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c|--config) CONFIG="${2:?--config requires an argument}"; shift 2 ;;
@@ -50,10 +51,12 @@ while [[ $# -gt 0 ]]; do
         --log) LOG=1; shift ;;  # kept for compatibility; logging is the default
         --no-log) LOG=0; shift ;;
         -h|--help) usage ;;
+        --) shift; ARGS+=("$@"); break ;;
         -*) echo "ERROR: unknown option $1" >&2; usage ;;
-        *) break ;;
+        *) ARGS+=("$1"); shift ;;  # devices may be interleaved with options
     esac
 done
+set -- ${ARGS[@]+"${ARGS[@]}"}
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${REPO_ROOT}"
@@ -117,6 +120,38 @@ else
     esphome compile "${CONFIG}"
 fi
 
+# ── Resolve the firmware binary ───────────────────────────────────────────────
+
+# A Docker build records container-side paths (/config/...) in esphome's storage
+# JSON, and the host `esphome upload` reads the firmware path straight out of it.
+# Translate that prefix back to the repo root and pass the binary explicitly, so
+# host flashing never chases a /config path that only exists inside the image.
+BIN=""
+resolve_bin() {
+    local storage="$(dirname "${CONFIG}")/.esphome/storage/$(basename "${CONFIG}").json"
+    [[ -f "${storage}" ]] || return 1
+    python3 - "${storage}" "${REPO_ROOT}" <<'PYEOF'
+import json, sys
+storage, root = sys.argv[1], sys.argv[2]
+path = json.load(open(storage)).get("firmware_bin_path", "")
+if path.startswith("/config/"):
+    path = root + path[len("/config"):]
+if not path:
+    sys.exit(1)
+print(path)
+PYEOF
+}
+
+if BIN=$(resolve_bin) && [[ -f "${BIN}" ]]; then
+    echo "==> Firmware: ${BIN}"
+else
+    echo "WARNING: could not resolve firmware path; letting esphome pick it" >&2
+    BIN=""
+fi
+
+FILE_ARG=()
+[[ -n "${BIN}" ]] && FILE_ARG=(--file "${BIN}")
+
 # ── Flash ─────────────────────────────────────────────────────────────────────
 
 if [[ "${USB}" -eq 1 ]]; then
@@ -126,7 +161,7 @@ if [[ "${USB}" -eq 1 ]]; then
         echo "    found: ${PORT}"
     fi
     echo "==> Flashing via ${PORT}..."
-    esphome upload "${CONFIG}" --device "${PORT}"
+    esphome upload "${CONFIG}" --device "${PORT}" ${FILE_ARG[@]+"${FILE_ARG[@]}"}
     if [[ "${LOG}" -eq 1 ]]; then
         exec esphome logs "${CONFIG}" --device "${PORT}"
     fi
@@ -137,7 +172,7 @@ flash_device() {
     local device="$1"
     echo ""
     echo "══ ${device} ════════════════════════════════════════════"
-    esphome upload "${CONFIG}" --device "${device}"
+    esphome upload "${CONFIG}" --device "${device}" ${FILE_ARG[@]+"${FILE_ARG[@]}"}
 }
 
 FAILED=()
