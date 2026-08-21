@@ -40,6 +40,9 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
+  # SuperMini boards have a poorly matched antenna that distorts at full TX power,
+  # causing "Auth Expired" loops even at full RX bars. Reduced power is the known fix.
+  output_power: 8.5dB
 
 external_components:
   - source:
