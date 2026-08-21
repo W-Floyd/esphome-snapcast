@@ -715,12 +715,14 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
   const double offset_ms = this->time_filter_.has_estimate() ? this->time_filter_.get_offset(now_us() / 1000.0) : 0.0;
   this->filter_mutex_.unlock();
 
+  // Effective playout buffer, matching the reference client (controller.cpp):
+  // max(0, bufferMs - serverLatency - localLatency)
   const int64_t buffer_us =
-      static_cast<int64_t>(this->buffer_ms_.load(std::memory_order_relaxed) -
-                           this->server_latency_ms_.load(std::memory_order_relaxed)) *
+      std::max<int64_t>(0, static_cast<int64_t>(this->buffer_ms_.load(std::memory_order_relaxed)) -
+                               this->server_latency_ms_.load(std::memory_order_relaxed) -
+                               this->static_delay_ms_.load(std::memory_order_relaxed)) *
       1000;
-  return rec.server_ts_us + buffer_us - static_cast<int64_t>(offset_ms * 1000.0) -
-         static_cast<int64_t>(this->static_delay_ms_.load(std::memory_order_relaxed)) * 1000;
+  return rec.server_ts_us + buffer_us - static_cast<int64_t>(offset_ms * 1000.0);
 }
 
 void SnapcastClient::discard_ring_bytes_(size_t bytes) {
