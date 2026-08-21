@@ -262,7 +262,9 @@ void ControlSession::parse_server_(const void *server_variant) {
     JsonArray clients = group["clients"];
     for (JsonVariant client : clients) {
       const char *cid = client["id"];
-      if (cid != nullptr && this->client_id_ == cid) {
+      // Case-insensitive: we send the pretty (uppercase) MAC as our Hello ID, but
+      // snapserver reports client ids as lowercase MACs in its status
+      if (cid != nullptr && strcasecmp(cid, this->client_id_.c_str()) == 0) {
         mine = true;
       }
       if (!(client["connected"] | false)) {
@@ -285,6 +287,13 @@ void ControlSession::parse_server_(const void *server_variant) {
       my_stream = sid != nullptr ? sid : "";
       const char *gid = group["id"];
       my_group = gid != nullptr ? gid : "";
+    }
+  }
+  if (my_stream != this->stream_id_ || my_group != this->group_id_) {
+    if (my_group.empty()) {
+      ESP_LOGW(TAG, "This client not found in server status (id '%s'); no metadata", this->client_id_.c_str());
+    } else {
+      ESP_LOGD(TAG, "This client: group '%s', stream '%s'", my_group.c_str(), my_stream.c_str());
     }
   }
   this->group_id_ = my_group;
