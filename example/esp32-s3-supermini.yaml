@@ -1,9 +1,10 @@
 # Snapcast player on an ESP32-S3 SuperMini (ESP32-S3FH4R2: 4 MB flash, 2 MB quad PSRAM)
-# wired to an I2S DAC (PCM5102A / MAX98357A style):
+# wired to an I2S DAC (PCM5102A / MAX98357A style), matching the Speakeasy OTS /
+# Lowcost PCB pinout:
 #
+#   GPIO4  -> LCK  (word select / LR clock)
 #   GPIO5  -> BCK  (bit clock)
-#   GPIO6  -> LCK  (word select / LR clock)
-#   GPIO7  -> DIN  (data)
+#   GPIO6  -> DIN  (data)
 #
 # Any free GPIOs work; adjust below to your wiring. The onboard WS2812 (GPIO48)
 # doubles as a play-state indicator.
@@ -55,15 +56,15 @@ media_source:
 
 i2s_audio:
   - id: i2s_out
+    i2s_lrclk_pin: GPIO4
     i2s_bclk_pin: GPIO5
-    i2s_lrclk_pin: GPIO6
 
 speaker:
   - platform: i2s_audio
     id: dac_speaker
     i2s_audio_id: i2s_out
     dac_type: external
-    i2s_dout_pin: GPIO7
+    i2s_dout_pin: GPIO6
     sample_rate: 48000  # match the snapserver stream rate for exact sync feedback
     channel: stereo
     buffer_duration: 100ms
