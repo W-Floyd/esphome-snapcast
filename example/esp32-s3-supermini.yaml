@@ -19,22 +19,6 @@ esphome:
   friendly_name: Snapclient SuperMini
   includes:
     - <esp_wifi.h>  # for the WiFi TX Power slider's esp_wifi_set_max_tx_power call
-  on_boot:
-    # Re-apply a persisted AP lock before wifi starts connecting (wifi setup
-    # priority is 250; globals restore earlier)
-    - priority: 251
-      then:
-        - lambda: |-
-            if (id(locked_bssid) != 0) {
-              wifi::bssid_t bssid;
-              uint64_t packed = id(locked_bssid);
-              for (int i = 5; i >= 0; i--) { bssid[i] = packed & 0xFF; packed >>= 8; }
-              wifi::WiFiAP ap = wifi::global_wifi_component->get_sta();
-              ap.set_bssid(bssid);
-              wifi::global_wifi_component->set_sta(ap);
-              ESP_LOGI("wifi_lock", "Restored AP lock to %02X:%02X:%02X:%02X:%02X:%02X",
-                       bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-            }
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -61,6 +45,31 @@ wifi:
   # SuperMini boards have a poorly matched antenna that distorts at full TX power,
   # causing "Auth Expired" loops even at full RX bars. Reduced power is the known fix.
   output_power: 8.5dB
+  on_connect:
+    # Re-apply a persisted AP lock. This must run from on_connect, never before the
+    # first connection: get_sta() returns the AP *selected during connection* and is
+    # an empty config until then — stamping a BSSID onto it would wipe the real
+    # credentials. First connect is therefore unlocked; if it landed on the wrong AP,
+    # this locks and reconnects once.
+    - lambda: |-
+        if (id(locked_bssid) == 0)
+          return;
+        auto *w = wifi::global_wifi_component;
+        wifi::bssid_t target;
+        uint64_t packed = id(locked_bssid);
+        for (int i = 5; i >= 0; i--) { target[i] = packed & 0xFF; packed >>= 8; }
+        wifi::WiFiAP ap = w->get_sta();
+        if (ap.get_ssid().empty()) {
+          ESP_LOGW("wifi_lock", "No selected STA config; not applying lock");
+          return;
+        }
+        ap.set_bssid(target);
+        w->set_sta(ap);
+        if (w->wifi_bssid() != target) {
+          ESP_LOGI("wifi_lock", "Connected to wrong AP; reconnecting to locked %02X:%02X:%02X:%02X:%02X:%02X",
+                   target[0], target[1], target[2], target[3], target[4], target[5]);
+          w->retry_connect();
+        }
 
 external_components:
   - source:
@@ -180,11 +189,15 @@ switch:
             ESP_LOGW("wifi_lock", "Not connected; nothing to lock to");
             return;
           }
+          wifi::WiFiAP ap = w->get_sta();
+          if (ap.get_ssid().empty()) {
+            ESP_LOGW("wifi_lock", "No selected STA config; not locking");
+            return;
+          }
           wifi::bssid_t bssid = w->wifi_bssid();
           uint64_t packed = 0;
           for (uint8_t b : bssid) packed = (packed << 8) | b;
           id(locked_bssid) = packed;
-          wifi::WiFiAP ap = w->get_sta();
           ap.set_bssid(bssid);
           w->set_sta(ap);
           ESP_LOGI("wifi_lock", "Locked to current AP %02X:%02X:%02X:%02X:%02X:%02X",
