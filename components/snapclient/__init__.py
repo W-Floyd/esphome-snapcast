@@ -77,11 +77,11 @@ CONFIG_SCHEMA = cv.All(
                     max=cv.TimePeriod(seconds=60),
                 ),
             ),
-            # Smoothed sync error below which no correction is applied. Tight by
-            # default so synchronized stereo pairs hold their image (localization
-            # hears sub-millisecond inter-speaker shifts); raise it if a device logs
-            # constant corrections on a very jittery link.
-            cv.Optional(CONF_SYNC_DEADBAND, default="500us"): cv.All(
+            # Median sync error at which the steering servo engages (disengaging at
+            # half). The reference esp32 snapclient uses 128us; steering trims one
+            # frame per chunk, holding a stereo pair's image pinned. Raise on very
+            # jittery links if corrections chatter.
+            cv.Optional(CONF_SYNC_DEADBAND, default="128us"): cv.All(
                 cv.positive_time_period_microseconds,
                 cv.Range(
                     min=cv.TimePeriod(microseconds=100),

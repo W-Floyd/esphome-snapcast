@@ -36,11 +36,10 @@ struct SnapcastClientConfig {
   uint32_t time_sync_interval_ms{1000};
   uint32_t hard_resync_threshold_ms{50};
   uint32_t stream_idle_timeout_ms{3000};
-  // Smoothed sync error below which no correction is applied. Kept tight by default
-  // so synchronized stereo pairs hold their image (each device drifting freely inside
-  // its own deadband wanders it); corrections are ~45 us events, so the chatter cost
-  // of a tight deadband is inaudible.
-  int64_t sync_deadband_us{500};
+  // Median sync error at which the steering servo engages (disengages at half).
+  // Reference esp32 snapclient uses 128 us; single-frame steering splices are ~23 us
+  // events, inaudible.
+  int64_t sync_deadband_us{128};
 };
 
 /// @brief Output channel routing, matching esp32 snapclient's dsp_channel_mode_t.
@@ -265,11 +264,20 @@ class SnapcastClient {
   int64_t min_rtt_us_{INT64_MAX / 2};
 
   // Playout feedback: written from the speaker callback thread, read by the player task.
+  // In addition to the raw last-callback state, an exponentially-weighted linear
+  // regression estimates the DAC clock (frame index -> system time): the speaker
+  // reports frames in DMA-sized bursts (~10 ms quantization), and predicting from the
+  // raw last callback carries that quantization as sync noise. The fitted line is
+  // smooth to microsecond scale, which is what allows reference-grade (~100 us)
+  // steering thresholds. Ported concept from esp32 snapclient's sample-accurate age.
   Mutex playout_mutex_;
   bool playout_valid_{false};
   int64_t played_frames_total_{0};
   int64_t played_last_ts_us_{0};
   int64_t pushed_frames_total_{0};
+  double fb_mean_frames_{0.0};
+  double fb_mean_ts_{0.0};
+  uint32_t fb_samples_{0};
   // Longest interval between playback feedback callbacks in the current diagnostics
   // window; read-and-reset by the player task's periodic sync report
   int64_t max_feedback_gap_us_{0};

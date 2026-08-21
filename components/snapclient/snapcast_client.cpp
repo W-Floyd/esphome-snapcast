@@ -44,17 +44,18 @@ static constexpr int64_t STARTUP_LEAD_US = 150000;
 // chunk) are inserted/dropped per chunk, inaudible but converging ~8 ms per second.
 static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 
-// Soft corrections only fire when the smoothed error exceeds this deadband. The raw
-// per-chunk error carries feedback quantization noise (the speaker reports written
-// frames in DMA-buffer-sized bursts); correcting on it would insert/drop frames on
-// nearly every chunk — a constant stream of tiny waveform discontinuities, audible
-// as micro-stutter. The reference snapclient median-filters over long windows for
-// the same reason.
-// (Configurable via SnapcastClientConfig::sync_deadband_us; this is the default.)
-static constexpr int64_t SOFT_CORRECTION_DEADBAND_US = 2000;
-// Above this error, trade a little audibility for fast convergence (post-stall
-// catch-up); below it, corrections stay at an inaudible 1-2 frames per chunk.
-static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
+// Above this median error, correct proportionally (fast convergence and clock skew
+// beyond the single-frame servo's ~875 ppm capacity); below it, the steering servo
+// trims single frames. Hardware medians sit far below this in steady state.
+static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 3000;
+
+// Median window for the steering servo's error signal (~0.4 s of chunks)
+static constexpr size_t MEDIAN_WINDOW = 15;
+
+// A playback-feedback gap this long means the pipeline stopped (and flushed its
+// buffers on restart); triggers the frame-accounting re-baseline in
+// notify_audio_played()
+static constexpr int64_t PIPELINE_FLUSH_GAP_US = 500000;
 
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
@@ -140,6 +141,7 @@ void SnapcastClient::set_output_active(bool active) {
     this->playout_valid_ = false;
     this->played_frames_total_ = 0;
     this->pushed_frames_total_ = 0;
+    this->fb_samples_ = 0;
     this->playout_mutex_.unlock();
   }
   this->output_active_.store(active, std::memory_order_relaxed);
@@ -160,11 +162,39 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   if (this->playout_valid_) {
     // A gap well beyond the speaker's DMA cadence means the DAC was starved
     // (pipeline underrun); surfaced in the periodic sync report for diagnostics
-    this->max_feedback_gap_us_ = std::max(this->max_feedback_gap_us_, timestamp_us - this->played_last_ts_us_);
+    const int64_t gap = timestamp_us - this->played_last_ts_us_;
+    this->max_feedback_gap_us_ = std::max(this->max_feedback_gap_us_, gap);
+    if (gap > PIPELINE_FLUSH_GAP_US) {
+      // The pipeline stopped and restarted; the orchestrator recreates its ring on
+      // restart, silently DISCARDING pushed-but-unplayed frames. Without this
+      // re-baseline, those frames stay counted as queued and the prediction is
+      // permanently late by the discarded amount — every chunk hard-drops, which
+      // starves the pipeline into another flush: an unrecoverable death spiral.
+      // At resume the pipeline is empty, so played == pushed is ground truth.
+      this->pushed_frames_total_ = this->played_frames_total_ + frames;
+      this->fb_samples_ = 0;
+    }
   }
   this->played_frames_total_ += frames;
   this->played_last_ts_us_ = timestamp_us;
   this->playout_valid_ = true;
+
+  // Exponentially-weighted means of (frame index, DAC time); see the member comment.
+  // Prediction extrapolates through this pivot along the exact nominal sample rate:
+  // fitting a slope too would amplify its estimation noise over the pivot-to-now
+  // lever arm into millisecond wobble, while real DAC-vs-esp_timer clock drift only
+  // moves the pivot slowly — which the steering servo absorbs by design.
+  constexpr double ALPHA = 1.0 / 64.0;
+  const double f = static_cast<double>(this->played_frames_total_);
+  const double t = static_cast<double>(timestamp_us);
+  if (this->fb_samples_ == 0) {
+    this->fb_mean_frames_ = f;
+    this->fb_mean_ts_ = t;
+  } else {
+    this->fb_mean_frames_ += ALPHA * (f - this->fb_mean_frames_);
+    this->fb_mean_ts_ += ALPHA * (t - this->fb_mean_ts_);
+  }
+  this->fb_samples_++;
   this->playout_mutex_.unlock();
 }
 
@@ -714,9 +744,18 @@ void SnapcastClient::player_task_() {
   uint32_t soft_dropped_frames = 0;
   uint32_t soft_inserted_frames = 0;
   uint32_t hard_resyncs = 0;
-  // EWMA of the sync error (~1 s time constant at 24 ms chunks); soft corrections
-  // act on this, not the noisy per-chunk error
-  int64_t err_ewma_us = 0;
+  // Median of recent sync errors (rejects residual feedback spikes better than a
+  // mean); the steering servo acts on this, not the raw per-chunk error. Same design
+  // as the esp32 snapclient reference (99/19-sample medians on a sample-accurate age).
+  int64_t err_window[MEDIAN_WINDOW];
+  size_t err_window_idx = 0;
+  size_t err_window_filled = 0;
+  // Bang-bang steering with hysteresis, ported from the reference: while engaged,
+  // trim exactly one frame per chunk (~950 ppm) until the median crosses back inside
+  // the disengage threshold. Holds the error near zero continuously instead of
+  // letting it random-walk inside a deadband — a free-walking deadband is exactly
+  // what wanders the stereo image between two paired devices.
+  int8_t steer_dir = 0;
   int64_t last_resync_log_us = 0;
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
@@ -770,7 +809,20 @@ void SnapcastClient::player_task_() {
 
     err_accum_us += error_us;
     err_peak_us = std::max(err_peak_us, std::abs(error_us));
-    err_ewma_us += (error_us - err_ewma_us) / 8;
+
+    err_window[err_window_idx] = error_us;
+    err_window_idx = (err_window_idx + 1) % MEDIAN_WINDOW;
+    if (err_window_filled < MEDIAN_WINDOW) {
+      err_window_filled++;
+    }
+    int64_t median_err_us = error_us;
+    if (err_window_filled == MEDIAN_WINDOW) {
+      int64_t sorted[MEDIAN_WINDOW];
+      memcpy(sorted, err_window, sizeof(sorted));
+      std::nth_element(sorted, sorted + MEDIAN_WINDOW / 2, sorted + MEDIAN_WINDOW);
+      median_err_us = sorted[MEDIAN_WINDOW / 2];
+    }
+
     if (++err_count >= 128) {
       int64_t max_gap_us;
       this->playout_mutex_.lock();
@@ -781,10 +833,10 @@ void SnapcastClient::player_task_() {
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
       ESP_LOGD(TAG,
-               "Sync: avg %" PRId64 " us, peak %" PRId64 " us, ewma %" PRId64
+               "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, max feedback gap %" PRId64
                " ms, buffered %" PRIu32 " ms over %" PRIu32 " chunks",
-               err_accum_us / err_count, err_peak_us, err_ewma_us, soft_dropped_frames, soft_inserted_frames,
+               err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
                hard_resyncs, max_gap_us / 1000, buffered_ms, err_count);
       err_accum_us = 0;
       err_peak_us = 0;
@@ -806,7 +858,8 @@ void SnapcastClient::player_task_() {
         ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunks (throttled log)", error_us / 1000);
       }
       hard_resyncs++;
-      err_ewma_us = 0;
+      err_window_filled = 0;
+      steer_dir = 0;
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
@@ -822,31 +875,46 @@ void SnapcastClient::player_task_() {
         ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms early, inserting silence (throttled log)", -error_us / 1000);
       }
       hard_resyncs++;
-      err_ewma_us = 0;
+      err_window_filled = 0;
+      steer_dir = 0;
       this->push_silence_(fill, rec.params);
-    } else if (std::abs(err_ewma_us) > this->config_.sync_deadband_us) {
-      // Soft correction: drop (late) or pad (early) a tiny number of frames per
-      // chunk. Gated on the smoothed error so feedback quantization noise doesn't
-      // trigger a correction on every chunk (audible as micro-stutter); genuine
-      // clock drift accumulates in the EWMA and is corrected in short bursts.
-      const int32_t adjust_frames = static_cast<int32_t>(err_ewma_us * static_cast<int64_t>(rec.params.sample_rate) /
-                                                         1000000);
-      // Two-stage limit: gentle 2-frame (~45 us) trims for steady-state clock/
-      // resampler drift — far below audibility — but frames/32 catch-up bursts
-      // (~33 ms/s convergence) while more than SOFT_CORRECTION_AGGRESSIVE_US off,
-      // so a post-stall backlog doesn't leave playback audibly behind for long
-      const int32_t max_adjust = std::abs(err_ewma_us) > SOFT_CORRECTION_AGGRESSIVE_US
-                                     ? std::max<int32_t>(1, frames / (SOFT_CORRECTION_DIVISOR / 4))
-                                     : 2;
+    } else if (std::abs(median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US) {
+      // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
+      // doesn't leave playback audibly behind for long
+      const int32_t adjust_frames =
+          static_cast<int32_t>(median_err_us * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
+      const int32_t max_adjust = std::max<int32_t>(1, frames / (SOFT_CORRECTION_DIVISOR / 4));
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
       if (adjust > 0) {
         drop_frames = adjust;
         soft_dropped_frames += adjust;
-        err_ewma_us -= static_cast<int64_t>(adjust) * 1000000 / rec.params.sample_rate;
       } else if (adjust < 0) {
         soft_inserted_frames += -adjust;
-        err_ewma_us += static_cast<int64_t>(-adjust) * 1000000 / rec.params.sample_rate;
         this->push_silence_(-adjust, rec.params);
+      }
+      steer_dir = 0;
+    } else if (err_window_filled == MEDIAN_WINDOW) {
+      // Steering servo (reference design): engage when the median error exceeds
+      // sync_deadband, then trim exactly one frame (~23 us splice, inaudible) per
+      // chunk until it crosses back inside half the threshold. Continuous hold near
+      // zero is what keeps a stereo pair's image pinned.
+      const int64_t engage_us = this->config_.sync_deadband_us;
+      if (steer_dir == 0) {
+        if (median_err_us > engage_us) {
+          steer_dir = 1;
+        } else if (median_err_us < -engage_us) {
+          steer_dir = -1;
+        }
+      } else if ((steer_dir > 0 && median_err_us < engage_us / 2) ||
+                 (steer_dir < 0 && median_err_us > -engage_us / 2)) {
+        steer_dir = 0;
+      }
+      if (steer_dir > 0) {
+        drop_frames = 1;
+        soft_dropped_frames++;
+      } else if (steer_dir < 0) {
+        soft_inserted_frames++;
+        this->push_silence_(1, rec.params);
       }
     }
 
@@ -859,8 +927,17 @@ int64_t SnapcastClient::predict_next_play_us_(uint32_t sample_rate) {
   this->playout_mutex_.lock();
   int64_t predicted = -1;
   if (this->playout_valid_) {
-    const int64_t queued_frames = this->pushed_frames_total_ - this->played_frames_total_;
-    predicted = this->played_last_ts_us_ + queued_frames * 1000000 / static_cast<int64_t>(sample_rate);
+    const double nominal_slope = 1e6 / static_cast<double>(sample_rate);
+    if (this->fb_samples_ >= 8) {
+      // Smoothed pivot + exact nominal slope: averages away feedback quantization
+      // without a fitted slope's lever-arm instability (see notify_audio_played)
+      predicted = static_cast<int64_t>(
+          this->fb_mean_ts_ +
+          nominal_slope * (static_cast<double>(this->pushed_frames_total_) - this->fb_mean_frames_));
+    } else {
+      const int64_t queued_frames = this->pushed_frames_total_ - this->played_frames_total_;
+      predicted = this->played_last_ts_us_ + queued_frames * 1000000 / static_cast<int64_t>(sample_rate);
+    }
   }
   this->playout_mutex_.unlock();
   return predicted;
