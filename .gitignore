@@ -1,0 +1,6 @@
+example/.esphome/
+tests/.esphome/
+tests/compile*.log
+example/secrets.yaml
+__pycache__/
+.DS_Store

@@ -1,0 +1,58 @@
+# QEMU integration test: runs the real snapclient firmware on an emulated ESP32
+# (espressif QEMU, OpenCores ethernet) against a snapserver on the host.
+#
+#   qemu-system-xtensa -nographic -M esp32 -m 4M \
+#     -drive file=flash.bin,if=mtd,format=raw \
+#     -nic user,model=open_eth
+#
+# QEMU user-mode NAT exposes the host at 10.0.2.2. QEMU has no I2S device, so the
+# virtual_speaker component consumes the audio at exactly the sample rate and provides
+# the DAC-write feedback the sync engine instruments.
+esphome:
+  name: snapclient-qemu
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  baud_rate: 115200
+
+ethernet:
+  type: OPENETH
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  - source:
+      type: local
+      path: components
+
+snapclient:
+  id: snap
+  server: 10.0.2.2  # the host, via QEMU user-mode NAT
+  buffer_size: 65536  # no PSRAM on the emulated ESP32; ~340 ms of 48 kHz stereo
+
+media_source:
+  - platform: snapclient
+    id: snap_source
+    snapclient_id: snap
+
+speaker:
+  - platform: virtual_speaker
+    id: vspeaker
+    sample_rate: 48000
+    num_channels: 2
+
+media_player:
+  - platform: speaker_source
+    name: QEMU Media Player
+    media_pipeline:
+      speaker: vspeaker
+      sources:
+        - snap_source
+      sample_rate: 48000
+      num_channels: 2

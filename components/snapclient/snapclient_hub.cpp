@@ -1,0 +1,132 @@
+#include "snapclient_hub.h"
+
+#ifdef USE_ESP32
+
+#include "esphome/components/network/util.h"
+#ifdef USE_WIFI
+#include "esphome/components/wifi/wifi_component.h"
+#endif
+
+#include "esphome/core/application.h"
+#include "esphome/core/log.h"
+
+namespace esphome::snapclient {
+
+static const char *const TAG = "snapclient.hub";
+
+void SnapclientHub::setup() {
+  SnapcastClientConfig config;
+  config.server_host = this->server_host_;
+  config.server_port = this->server_port_;
+  config.hostname = this->client_name_.empty() ? App.get_name() : this->client_name_;
+  config.client_id = get_mac_address_pretty();
+  config.buffer_size = this->buffer_size_;
+  config.time_sync_interval_ms = this->time_sync_interval_ms_;
+  config.hard_resync_threshold_ms = this->hard_resync_threshold_ms_;
+  config.stream_idle_timeout_ms = this->stream_idle_timeout_ms_;
+
+  this->client_ = std::make_unique<SnapcastClient>(std::move(config));
+  this->client_->set_listener(this);
+  if (this->pending_audio_listener_ != nullptr) {
+    this->client_->set_audio_listener(this->pending_audio_listener_);
+  }
+  this->client_->set_static_delay_ms(this->pending_static_delay_ms_);
+
+  if (!this->client_->start()) {
+    ESP_LOGE(TAG, "Failed to start Snapcast client");
+    this->mark_failed();
+    return;
+  }
+}
+
+void SnapclientHub::loop() {
+  // network::is_connected() is main-loop-only; mirror it into the client's tasks
+  this->client_->set_network_ready(network::is_connected());
+  this->client_->loop();
+}
+
+void SnapclientHub::dump_config() {
+  ESP_LOGCONFIG(TAG,
+                "Snapclient Hub:\n"
+                "  Server: %s:%u\n"
+                "  Client ID: %s\n"
+                "  Buffer size: %zu bytes\n"
+                "  Time sync interval: %" PRIu32 " ms\n"
+                "  Hard resync threshold: %" PRIu32 " ms\n"
+                "  Stream idle timeout: %" PRIu32 " ms",
+                this->server_host_.c_str(), this->server_port_, get_mac_address_pretty().c_str(), this->buffer_size_,
+                this->time_sync_interval_ms_, this->hard_resync_threshold_ms_, this->stream_idle_timeout_ms_);
+  if (this->client_ != nullptr && this->client_->is_connected()) {
+    ESP_LOGCONFIG(TAG, "  Connected, clock offset: %.2f ms", this->client_->get_clock_offset_ms());
+  }
+}
+
+// --- Child component API ---
+// THREAD CONTEXT: Main loop (invoked from snapclient components)
+
+void SnapclientHub::set_audio_listener(SnapcastAudioListener *audio_listener) {
+  this->pending_audio_listener_ = audio_listener;
+  if (this->client_ != nullptr) {
+    this->client_->set_audio_listener(audio_listener);
+  }
+}
+
+void SnapclientHub::set_output_active(bool active) {
+  if (this->client_ != nullptr) {
+    this->client_->set_output_active(active);
+  }
+}
+
+void SnapclientHub::set_static_delay_ms(int32_t delay_ms) {
+  this->pending_static_delay_ms_ = delay_ms;
+  if (this->client_ != nullptr) {
+    this->client_->set_static_delay_ms(delay_ms);
+  }
+}
+
+void SnapclientHub::send_client_volume(uint8_t volume_percent, bool muted) {
+  if (this->client_ != nullptr) {
+    this->client_->send_client_info(volume_percent, muted);
+  }
+}
+
+// THREAD CONTEXT: Speaker playback callback thread (forwarded from the media source);
+// SnapcastClient::notify_audio_played is internally synchronized.
+void SnapclientHub::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
+  if (this->client_ != nullptr) {
+    this->client_->notify_audio_played(frames, timestamp_us);
+  }
+}
+
+// --- SnapcastClientListener overrides ---
+// THREAD CONTEXT: Main loop (dispatched from client_->loop())
+
+void SnapclientHub::on_connection_changed(bool connected) { this->connection_callbacks_.call(connected); }
+
+void SnapclientHub::on_server_settings(const ServerSettings &settings) {
+  this->server_settings_callbacks_.call(settings.volume, settings.muted);
+}
+
+void SnapclientHub::on_stream_start(const StreamParams &params) {
+#ifdef USE_WIFI
+  // Streaming needs low-latency wifi; modem power save adds tens of ms of jitter
+  if (wifi::global_wifi_component != nullptr) {
+    wifi::global_wifi_component->request_high_performance();
+  }
+#endif
+  this->stream_state_callbacks_.call(true, params);
+}
+
+void SnapclientHub::on_stream_end() {
+#ifdef USE_WIFI
+  if (wifi::global_wifi_component != nullptr) {
+    wifi::global_wifi_component->release_high_performance();
+  }
+#endif
+  StreamParams empty{};
+  this->stream_state_callbacks_.call(false, empty);
+}
+
+}  // namespace esphome::snapclient
+
+#endif  // USE_ESP32

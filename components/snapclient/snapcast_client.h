@@ -1,0 +1,256 @@
+#pragma once
+
+#include "esphome/core/defines.h"
+
+#ifdef USE_ESP32
+
+#include "snapcast_proto.h"
+#include "time_filter.h"
+
+#include "esphome/components/ring_buffer/ring_buffer.h"
+#include "esphome/core/helpers.h"
+
+#ifdef USE_SNAPCLIENT_FLAC
+#include <micro_flac/flac_decoder.h>
+#endif
+
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
+#include <freertos/task.h>
+
+#include <atomic>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <vector>
+
+namespace esphome::snapclient {
+
+/// @brief Compile-time configuration for SnapcastClient, built by the hub's codegen setters.
+struct SnapcastClientConfig {
+  std::string server_host;
+  uint16_t server_port{1704};
+  std::string hostname;   // Hello HostName (display name basis on the server)
+  std::string client_id;  // Hello MAC/ID; the pretty MAC address
+  size_t buffer_size{524288};
+  uint32_t time_sync_interval_ms{1000};
+  uint32_t hard_resync_threshold_ms{50};
+  uint32_t stream_idle_timeout_ms{3000};
+};
+
+/// @brief Decoded stream format of the current Snapcast stream.
+struct StreamParams {
+  uint32_t sample_rate{0};
+  uint8_t bits_per_sample{0};
+  uint8_t channels{0};
+
+  uint32_t frame_bytes() const { return static_cast<uint32_t>(this->channels) * (this->bits_per_sample / 8); }
+  bool valid() const { return this->sample_rate != 0 && this->bits_per_sample != 0 && this->channels != 0; }
+};
+
+/// @brief Events the client pushes to its listener.
+///
+/// All callbacks fire on the main loop thread, dispatched from SnapcastClient::loop();
+/// the background tasks only enqueue.
+class SnapcastClientListener {
+ public:
+  virtual void on_connection_changed(bool connected) = 0;
+  virtual void on_server_settings(const ServerSettings &settings) = 0;
+  virtual void on_stream_start(const StreamParams &params) = 0;
+  virtual void on_stream_end() = 0;
+};
+
+/// @brief Sink for synchronized PCM audio.
+///
+/// on_audio_write is called from the client's player task and may block up to
+/// timeout_ms (downstream backpressure). Return the number of bytes accepted;
+/// returning 0 while inactive lets the client discard in-sync instead of stalling.
+class SnapcastAudioListener {
+ public:
+  virtual size_t on_audio_write(const uint8_t *data, size_t length, uint32_t timeout_ms,
+                                const StreamParams &params) = 0;
+};
+
+/// @brief Native Snapcast client core.
+///
+/// Structured like sendspin-cpp's SendspinClient: a plain class owned by the ESPHome
+/// hub component, with listener interfaces for library -> user events and exposed
+/// methods for user -> library calls. Runs two FreeRTOS tasks:
+///
+///  - Network task: TCP connection, Hello handshake, message framing, time sync
+///    (Kalman-filtered clock offset), decode (PCM/FLAC) into a timestamped PCM buffer.
+///  - Player task: pops timestamped chunks, computes the local playout deadline from
+///    the clock offset and the server's buffer/latency settings, corrects against the
+///    DAC feedback from notify_audio_played(), and pushes PCM to the audio listener.
+class SnapcastClient {
+ public:
+  explicit SnapcastClient(SnapcastClientConfig config) : config_(std::move(config)) {}
+  ~SnapcastClient();
+
+  void set_listener(SnapcastClientListener *listener) { this->listener_ = listener; }
+  void set_audio_listener(SnapcastAudioListener *audio_listener) { this->audio_listener_ = audio_listener; }
+
+  /// @brief Allocates buffers and starts the background tasks.
+  /// @return false if an allocation or task creation failed.
+  bool start();
+
+  /// @brief Dispatches queued task events to the listener. Call from the main loop.
+  void loop();
+
+  // --- Main-loop-thread inputs ---
+
+  /// @brief Mirrors ESPHome's network readiness into the tasks (network::is_connected
+  /// is not safe to call off the main loop).
+  void set_network_ready(bool ready) { this->network_ready_.store(ready, std::memory_order_relaxed); }
+
+  /// @brief Enables/disables audio output. While disabled, the player task discards
+  /// chunks at their deadline so playback resumes in sync when re-enabled.
+  void set_output_active(bool active);
+
+  /// @brief Per-device latency trim, subtracted from every chunk deadline.
+  void set_static_delay_ms(int32_t delay_ms) { this->static_delay_ms_.store(delay_ms, std::memory_order_relaxed); }
+
+  /// @brief Reports a local volume/mute change to the server via a ClientInfo message.
+  void send_client_info(uint8_t volume_percent, bool muted);
+
+  // --- Playback feedback ---
+
+  /// @brief Feed DAC-write feedback from the speaker's audio output callback.
+  /// THREAD CONTEXT: speaker task; internally synchronized.
+  void notify_audio_played(uint32_t frames, int64_t timestamp_us);
+
+  // --- Diagnostics (main loop) ---
+
+  bool is_connected() const { return this->connected_.load(std::memory_order_relaxed); }
+  /// @brief Current server-minus-client clock offset estimate in ms.
+  float get_clock_offset_ms();
+  const ServerSettings &get_server_settings() const { return this->settings_main_; }
+
+ protected:
+  // Fixed-size record describing one decoded chunk resident in the PCM ring buffer.
+  // Records are posted to the player task strictly after their PCM bytes are written,
+  // so a popped record's bytes are always fully readable.
+  struct ChunkRecord {
+    int64_t server_ts_us;
+    uint32_t bytes;
+    StreamParams params;
+  };
+
+  enum class EventType : uint8_t { CONNECTED, DISCONNECTED, SERVER_SETTINGS, STREAM_START, STREAM_END };
+  struct Event {
+    EventType type;
+    ServerSettings settings;
+    StreamParams params;
+  };
+
+  static void network_task_trampoline(void *arg) { static_cast<SnapcastClient *>(arg)->network_task_(); }
+  static void player_task_trampoline(void *arg) { static_cast<SnapcastClient *>(arg)->player_task_(); }
+
+  // --- Network task ---
+  void network_task_();
+  /// One connection lifetime: connect, hello, pump until error/shutdown.
+  void connection_session_();
+  bool connect_socket_();
+  bool send_message_(MessageType type, const uint8_t *payload, size_t len, uint16_t refers_to = 0);
+  /// Reads exactly @p len bytes; false on error/close/shutdown. Services periodic
+  /// TX (time sync, ClientInfo, idle detection) while waiting for data.
+  bool recv_exact_(uint8_t *buf, size_t len);
+  /// Sends due time-sync requests / pending ClientInfo and runs the stream idle check.
+  void service_tx_();
+  void handle_codec_header_(const uint8_t *payload, size_t len);
+  void handle_wire_chunk_(const uint8_t *payload, size_t len);
+  void handle_time_reply_(const BaseMessage &base, const uint8_t *payload, size_t len, int64_t recv_us);
+  /// Writes decoded PCM + its record to the player, blocking on backpressure.
+  void emit_pcm_(const uint8_t *data, size_t len, int64_t server_ts_us);
+  void post_event_(const Event &event);
+  void set_stream_active_(bool active);
+  void close_socket_();
+
+#ifdef USE_SNAPCLIENT_FLAC
+  /// Runs buffered FLAC input through the decoder, emitting PCM stamped with @p server_ts_us
+  /// (or announcing the stream on header completion when @p server_ts_us < 0).
+  void decode_flac_input_(int64_t server_ts_us);
+#endif
+
+  // --- Player task ---
+  void player_task_();
+  /// @return the predicted DAC time (µs) of the next frame pushed downstream, or -1 if
+  /// no playback feedback has arrived yet.
+  int64_t predict_next_play_us_(uint32_t sample_rate);
+  /// Computes the local deadline for a chunk record.
+  int64_t chunk_deadline_us_(const ChunkRecord &rec);
+  /// Reads @p bytes from the PCM ring and discards them.
+  void discard_ring_bytes_(size_t bytes);
+  /// Pushes silence downstream. @return frames actually pushed.
+  uint32_t push_silence_(uint32_t frames, const StreamParams &params);
+  /// Pushes @p bytes from the ring downstream, dropping @p drop_frames from the front.
+  void push_chunk_(const ChunkRecord &rec, uint32_t drop_frames);
+
+  SnapcastClientConfig config_;
+  SnapcastClientListener *listener_{nullptr};
+  SnapcastAudioListener *audio_listener_{nullptr};
+
+  TaskHandle_t network_task_handle_{nullptr};
+  TaskHandle_t player_task_handle_{nullptr};
+  std::atomic<bool> shutdown_{false};
+
+  QueueHandle_t event_queue_{nullptr};
+  QueueHandle_t record_queue_{nullptr};
+  std::unique_ptr<ring_buffer::RingBuffer> pcm_ring_;
+
+  // --- Shared state ---
+  std::atomic<bool> network_ready_{false};
+  std::atomic<bool> connected_{false};
+  std::atomic<bool> output_active_{false};
+  std::atomic<int32_t> static_delay_ms_{0};
+
+  // Server settings shadow used by the tasks (buffer_ms/latency for deadlines).
+  std::atomic<int32_t> buffer_ms_{1000};
+  std::atomic<int32_t> server_latency_ms_{0};
+  // Main-loop copy for diagnostics.
+  ServerSettings settings_main_{};
+
+  // Pending ClientInfo, written by the main loop and consumed by the network task.
+  Mutex client_info_mutex_;
+  bool client_info_dirty_{false};
+  uint8_t client_info_volume_{100};
+  bool client_info_muted_{false};
+
+  // Clock offset filter: fed by the network task, read by the player task + main loop.
+  Mutex filter_mutex_;
+  KalmanTimeFilter time_filter_;
+
+  // Playout feedback: written from the speaker callback thread, read by the player task.
+  Mutex playout_mutex_;
+  bool playout_valid_{false};
+  int64_t played_frames_total_{0};
+  int64_t played_last_ts_us_{0};
+  int64_t pushed_frames_total_{0};
+
+  // --- Network task locals ---
+  int sock_{-1};
+  uint16_t next_message_id_{0};
+  bool stream_active_{false};
+  int64_t last_chunk_us_{0};
+  int64_t next_time_sync_us_{0};
+  uint32_t time_sync_burst_remaining_{0};
+  std::vector<uint8_t> rx_buffer_;
+  StreamParams stream_params_{};
+
+  enum class Codec : uint8_t { NONE, PCM, FLAC };
+  Codec codec_{Codec::NONE};
+#ifdef USE_SNAPCLIENT_FLAC
+  std::unique_ptr<micro_flac::FLACDecoder> flac_decoder_;
+  std::vector<uint8_t> flac_input_;    // undecoded input carry-over across chunks
+  std::vector<uint8_t> flac_output_;   // one decoded FLAC frame
+  bool flac_header_done_{false};
+#endif
+
+  // --- Player task locals ---
+  std::unique_ptr<uint8_t[]> slice_buffer_;
+  static constexpr size_t SLICE_BUFFER_SIZE = 4096;
+};
+
+}  // namespace esphome::snapclient
+
+#endif  // USE_ESP32
