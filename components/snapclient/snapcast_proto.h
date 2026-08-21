@@ -50,15 +50,16 @@ struct BaseMessage {
   static BaseMessage deserialize(const uint8_t *in);
 };
 
-/// ServerSettings payload (JSON).
+/// ServerSettings payload: a 4-byte length prefix followed by JSON.
 struct ServerSettings {
   int32_t buffer_ms{1000};
   int32_t latency{0};
   uint8_t volume{100};  // percent
   bool muted{false};
 
+  /// @param payload The raw message payload, including the length prefix.
   /// @return true on successful parse.
-  static bool parse(const char *json, size_t len, ServerSettings &out);
+  static bool parse(const uint8_t *payload, size_t len, ServerSettings &out);
 };
 
 /// CodecHeader payload view: codec name + codec-specific initialization blob.

@@ -229,7 +229,7 @@ void SnapcastClient::connection_session_() {
         break;
       case MessageType::SERVER_SETTINGS: {
         ServerSettings settings;
-        if (ServerSettings::parse(reinterpret_cast<const char *>(this->rx_buffer_.data()), base.size, settings)) {
+        if (ServerSettings::parse(this->rx_buffer_.data(), base.size, settings)) {
           ESP_LOGD(TAG, "Server settings: buffer=%" PRId32 " ms latency=%" PRId32 " ms volume=%u%% muted=%s",
                    settings.buffer_ms, settings.latency, settings.volume, YESNO(settings.muted));
           this->buffer_ms_.store(settings.buffer_ms, std::memory_order_relaxed);

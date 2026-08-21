@@ -52,9 +52,18 @@ BaseMessage BaseMessage::deserialize(const uint8_t *in) {
   return msg;
 }
 
-bool ServerSettings::parse(const char *json, size_t len, ServerSettings &out) {
+bool ServerSettings::parse(const uint8_t *payload, size_t len, ServerSettings &out) {
+  // Like all Snapcast JSON payloads, the JSON is preceded by a 4-byte length prefix
+  if (len < 4) {
+    return false;
+  }
+  const uint32_t json_len = read_u32(payload);
+  if (json_len > len - 4) {
+    return false;
+  }
   JsonDocument doc;
-  if (deserializeJson(doc, json, len) != DeserializationError::Ok || !doc.is<JsonObjectConst>()) {
+  if (deserializeJson(doc, reinterpret_cast<const char *>(payload + 4), json_len) != DeserializationError::Ok ||
+      !doc.is<JsonObjectConst>()) {
     return false;
   }
   JsonObjectConst root = doc.as<JsonObjectConst>();
