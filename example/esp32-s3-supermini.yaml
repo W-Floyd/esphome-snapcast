@@ -146,13 +146,15 @@ media_player:
           decibel_reduction: 0
           duration: 1.0s
 
-# Channel routing (Stereo / Left / Right / Mono), e.g. for using two devices as a
-# synchronized L/R pair. Persisted across reboots.
+# Channel routing, e.g. for using two devices as a synchronized L/R pair.
+# Persisted across reboots. mono_dac (MAX98357A sums L+R in analog) collapses the
+# options to Mix / Left / Right — "Stereo" would just be an undefined analog mix.
 select:
   - platform: snapclient
     type: channel_mode
     snapclient_id: snap
     name: Channel Mode
+    mono_dac: true
   # Polarity inversion — fixes an out-of-phase driver in software; an inverted
   # speaker in a synchronized pair cancels bass. mono_dac collapses the options to
   # None / Inverted: the MAX98357A analog-sums L+R, so single-side inversion of

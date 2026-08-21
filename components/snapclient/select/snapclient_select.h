@@ -53,15 +53,43 @@ class SnapclientIndexedSelect : public SnapclientChild, public select::Select {
 ///
 /// The equivalent of esp32 snapclient's web-UI channel mode: switchable at runtime
 /// (e.g. two devices sharing a stereo stream as a L/R pair).
+///
+/// With `mono_dac: true` (MAX98357A-style summing amps) the options collapse to
+/// Mix / Left / Right: "Stereo" would just be an analog (L+R)/2 anyway, so the
+/// defined digital mix (MONO) stands in for it and the redundant entry disappears.
 class SnapclientChannelModeSelect final : public SnapclientIndexedSelect {
  public:
   void dump_config() override;
 
+  void set_mono_dac(bool mono) { this->mono_dac_ = mono; }
+
  protected:
   void apply_index_(uint8_t index) override {
-    this->parent_->set_channel_mode(static_cast<ChannelMode>(index));
+    ChannelMode mode;
+    if (this->mono_dac_) {
+      // Options: Mix / Left / Right
+      mode = index == 0 ? ChannelMode::MONO : (index == 1 ? ChannelMode::LEFT_ONLY : ChannelMode::RIGHT_ONLY);
+    } else {
+      mode = static_cast<ChannelMode>(index);
+    }
+    this->parent_->set_channel_mode(mode);
   }
-  uint8_t initial_index_() const override { return static_cast<uint8_t>(this->parent_->get_channel_mode()); }
+  uint8_t initial_index_() const override {
+    const ChannelMode mode = this->parent_->get_channel_mode();
+    if (this->mono_dac_) {
+      switch (mode) {
+        case ChannelMode::LEFT_ONLY:
+          return 1;
+        case ChannelMode::RIGHT_ONLY:
+          return 2;
+        default:
+          return 0;  // MONO, and STEREO folds into Mix
+      }
+    }
+    return static_cast<uint8_t>(mode);
+  }
+
+  bool mono_dac_{false};
 };
 
 /// @brief Output polarity inversion, for correcting an out-of-phase driver in

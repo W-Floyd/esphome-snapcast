@@ -17,9 +17,17 @@ CONF_SERVER = "server"
 CHANNEL_MODE_OPTIONS = ["Stereo", "Left", "Right", "Mono"]
 PHASE_OPTIONS = ["None", "Left", "Right", "Both"]
 # Mono-summing amps (MAX98357A style) analog-mix L+R: inverting one side of
-# duplicated content cancels to silence, so only whole-program inversion is offered
+# duplicated content cancels to silence, so only whole-program inversion is offered;
+# "Stereo" is just an undefined analog (L+R)/2, so the digital Mix stands in for it
 PHASE_OPTIONS_MONO = ["None", "Inverted"]
+CHANNEL_MODE_OPTIONS_MONO = ["Mix", "Left", "Right"]
 CONF_MONO_DAC = "mono_dac"
+
+_MONO_DAC_EXTENSION = {
+    # Set for MAX98357A-style mono-summing amps; collapses the options to the
+    # combinations that are meaningful on a single summed output
+    cv.Optional(CONF_MONO_DAC, default=False): cv.boolean,
+}
 
 SnapclientChannelModeSelect = snapclient_ns.class_(
     "SnapclientChannelModeSelect", cg.Component, select.Select
@@ -54,14 +62,9 @@ CONFIG_SCHEMA = cv.All(
         {
             CONF_CHANNEL_MODE: _select_schema(
                 SnapclientChannelModeSelect, "mdi:speaker-multiple"
-            ),
+            ).extend(_MONO_DAC_EXTENSION),
             CONF_PHASE: _select_schema(SnapclientPhaseSelect, "mdi:sine-wave").extend(
-                {
-                    # Set for MAX98357A-style mono-summing amps: single-side
-                    # inversion would cancel to silence, so the options collapse
-                    # to None / Inverted
-                    cv.Optional(CONF_MONO_DAC, default=False): cv.boolean,
-                }
+                _MONO_DAC_EXTENSION
             ),
             # Discovered-server picker: "Automatic" + one option per snapserver found
             # via mDNS; selecting one overrides the connection target (a manual
@@ -102,9 +105,13 @@ async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
     options = _OPTIONS[config[CONF_TYPE]]
-    if config[CONF_TYPE] == CONF_PHASE:
+    if config[CONF_TYPE] in (CONF_PHASE, CONF_CHANNEL_MODE):
         if config[CONF_MONO_DAC]:
-            options = PHASE_OPTIONS_MONO
+            options = (
+                PHASE_OPTIONS_MONO
+                if config[CONF_TYPE] == CONF_PHASE
+                else CHANNEL_MODE_OPTIONS_MONO
+            )
         cg.add(var.set_mono_dac(config[CONF_MONO_DAC]))
     await select.register_select(var, config, options=options)
 
