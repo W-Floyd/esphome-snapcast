@@ -1418,7 +1418,12 @@ void SnapcastClient::player_task_() {
     // full median window -- a single in-band median mid-convergence is a transient
     // (observed: unmuting on one produced ~90 s of audible post-unmute corrections).
     // Hard resyncs re-mute, turning recovery storms into silent gaps.
-    if (std::abs(median_err_us) <= this->config_.sync_deadband_us) {
+    // Unmute needs "no audible corrections pending", not servo-engagement
+    // precision: fine-stage medians routinely wobble past the deadband while the
+    // PI settles, and requiring consecutive sub-deadband medians stretched
+    // post-boot mutes to ~20 s of counter resets. Corrections inside 2x deadband
+    // are trim-only and inaudible.
+    if (std::abs(median_err_us) <= 2 * this->config_.sync_deadband_us) {
 #ifdef SNAPCLIENT_TSF_ACTIVE
       // Don't unmute onto a provisional timebase: a follower still on its Kalman
       // fallback (leader's mapping rejected while our own estimate is raw) will
