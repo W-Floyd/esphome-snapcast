@@ -49,31 +49,6 @@ wifi:
   # SuperMini boards have a poorly matched antenna that distorts at full TX power,
   # causing "Auth Expired" loops even at full RX bars. Reduced power is the known fix.
   output_power: 8.5dB
-  on_connect:
-    # Re-apply a persisted AP lock. This must run from on_connect, never before the
-    # first connection: get_sta() returns the AP *selected during connection* and is
-    # an empty config until then — stamping a BSSID onto it would wipe the real
-    # credentials. First connect is therefore unlocked; if it landed on the wrong AP,
-    # this locks and reconnects once.
-    - lambda: |-
-        if (id(locked_bssid) == 0)
-          return;
-        auto *w = wifi::global_wifi_component;
-        wifi::bssid_t target;
-        uint64_t packed = id(locked_bssid);
-        for (int i = 5; i >= 0; i--) { target[i] = packed & 0xFF; packed >>= 8; }
-        wifi::WiFiAP ap = w->get_sta();
-        if (ap.get_ssid().empty()) {
-          ESP_LOGW("wifi_lock", "No selected STA config; not applying lock");
-          return;
-        }
-        ap.set_bssid(target);
-        w->set_sta(ap);
-        if (w->wifi_bssid() != target) {
-          ESP_LOGI("wifi_lock", "Connected to wrong AP; reconnecting to locked %02X:%02X:%02X:%02X:%02X:%02X",
-                   target[0], target[1], target[2], target[3], target[4], target[5]);
-          w->retry_connect();
-        }
 
 external_components:
   - source:
@@ -88,6 +63,14 @@ snapclient:
   # server: 192.168.1.10 # omit to auto-discover via mDNS (_snapcast._tcp)
   # buffer_size: 524288  # fits comfortably in the 2 MB PSRAM
   # static_delay is set on the media_source below
+  # Hardware rate lock (opt-in): steady-state sync corrections steer the I2S clock
+  # divider instead of splicing frames; splices remain the fallback
+  rate_lock:
+    i2s_port: 0  # the i2s_out bus below
+  # TSF group sync (opt-in): same-AP clients share one server->TSF mapping, pinning
+  # their mutual sync to the AP's beacon timebase (~us). Falls back to the per-device
+  # time-sync estimate when alone, roaming, or multicast-blocked.
+  tsf_sync: true
 
 media_source:
   # Synchronized multiroom audio
@@ -176,63 +159,33 @@ select:
     type: phase
     snapclient_id: snap
     name: Phase
-# Pin the client to whichever AP it is currently connected to — no hardcoded BSSIDs.
-# Mid-stream roam scans take the radio off-channel for hundreds of ms and starve
-# playback; roaming is already suppressed while streaming, and the lock removes AP
-# switching entirely. The captured BSSID persists across reboots (0 = auto).
-globals:
-  - id: locked_bssid
-    type: uint64_t
-    restore_value: true
-    initial_value: '0'
+  # Discovered snapservers ("Automatic" + one entry per mDNS result); picking one
+  # overrides the connection target. The manual Server text below outranks it.
+  - platform: snapclient
+    type: server
+    snapclient_id: snap
+    name: Server
+  # Pin the client to one AP of the SSID ("Automatic" + BSSIDs from wifi scans).
+  # Mid-stream roam scans take the radio off-channel for hundreds of ms and starve
+  # playback; roaming is already suppressed while streaming, and a pinned AP removes
+  # switching entirely (and guarantees a stereo pair shares one TSF timebase).
+  - platform: snapclient
+    type: bssid
+    name: Access Point
 
-switch:
-  - platform: template
-    name: Lock to Current AP
-    id: ap_lock_switch
-    icon: mdi:router-wireless-settings
-    entity_category: config
-    # State comes from the persisted global; never restore-and-replay the actions at
-    # boot (a replayed turn_off ran set_sta() on the empty pre-connect config and
-    # wiped the wifi credentials)
-    restore_mode: DISABLED
-    lambda: return id(locked_bssid) != 0;
-    turn_on_action:
-      - lambda: |-
-          auto *w = wifi::global_wifi_component;
-          if (!w->is_connected()) {
-            ESP_LOGW("wifi_lock", "Not connected; nothing to lock to");
-            return;
-          }
-          wifi::WiFiAP ap = w->get_sta();
-          if (ap.get_ssid().empty()) {
-            ESP_LOGW("wifi_lock", "No selected STA config; not locking");
-            return;
-          }
-          wifi::bssid_t bssid = w->wifi_bssid();
-          uint64_t packed = 0;
-          for (uint8_t b : bssid) packed = (packed << 8) | b;
-          id(locked_bssid) = packed;
-          ap.set_bssid(bssid);
-          w->set_sta(ap);
-          ESP_LOGI("wifi_lock", "Locked to current AP %02X:%02X:%02X:%02X:%02X:%02X",
-                   bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-    turn_off_action:
-      - lambda: |-
-          id(locked_bssid) = 0;
-          auto *w = wifi::global_wifi_component;
-          wifi::WiFiAP ap = w->get_sta();
-          if (ap.get_ssid().empty()) {
-            // Nothing selected yet (e.g. before first connect): the lock was never
-            // applied this session, clearing the global is enough
-            return;
-          }
-          ap.clear_bssid();
-          w->set_sta(ap);
-          ESP_LOGI("wifi_lock", "AP lock cleared (auto selection)");
+text:
+  # Manual server override ("host" or "host:port", empty = none); highest precedence
+  - platform: snapclient
+    snapclient_id: snap
+    name: Server Override
 
 text_sensor:
-  # Shows which AP the device is on (and thus what the lock would capture)
+  # TSF group-sync role: Leader / Follower / Inactive
+  - platform: snapclient
+    type: tsf_role
+    snapclient_id: snap
+    name: TSF Role
+  # Shows which AP the device is on (what the Access Point select would pin)
   - platform: wifi_info
     bssid:
       name: WiFi BSSID
