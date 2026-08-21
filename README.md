@@ -101,6 +101,7 @@ media_player:
 ```yaml
 select:
   - platform: snapclient
+    type: channel_mode
     name: Channel Mode      # Stereo / Left / Right / Mono, persisted; overrides channel_mode
   - platform: snapclient
     type: phase

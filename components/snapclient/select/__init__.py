@@ -45,7 +45,6 @@ CONFIG_SCHEMA = cv.All(
             ),
             CONF_PHASE: _select_schema(SnapclientPhaseSelect, "mdi:sine-wave"),
         },
-        default_type=CONF_CHANNEL_MODE,
     ),
     cv.only_on_esp32,
 )

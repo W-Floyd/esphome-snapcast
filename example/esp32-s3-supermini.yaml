@@ -167,6 +167,7 @@ media_player:
 # synchronized L/R pair. Persisted across reboots.
 select:
   - platform: snapclient
+    type: channel_mode
     snapclient_id: snap
     name: Channel Mode
   # Polarity inversion (None / Left / Right / Both) — fixes an out-of-phase driver
