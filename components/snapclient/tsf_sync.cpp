@@ -46,10 +46,16 @@ static constexpr int64_t RATE_WINDOW_US = 4000000;
 // The published mapping is slew-limited toward the live Kalman estimate: anchoring
 // each beacon to the instantaneous estimate broadcast its sample-to-sample jitter
 // (~±100-300 us) as 1 Hz deadline steps that every member's servo then chased
-// (observed: trim swinging hundreds of ppm). The slewed line low-passes the jitter;
-// genuine estimate steps (reconnect, re-baseline) snap through instead.
-static constexpr int64_t TMS_SLEW_MAX_US = 50;   // per beacon (~50 us/s)
-static constexpr int64_t TMS_SNAP_US = 5000;
+// (observed: trim swinging hundreds of ppm). The slewed line low-passes the jitter.
+// Large estimate moves ramp at a faster (but still continuous) rate rather than
+// snapping: a snap is a step every member chases clamp-limited and slightly
+// time-offset from its peers (observed: ~6 ms snap -> ~2 ms differential for ~10 s),
+// while a shared ramp keeps the pair identical throughout. Only implausibly large
+// deltas (broken mapping / reconnect re-baseline) snap through.
+static constexpr int64_t TMS_SLEW_MAX_US = 50;        // per beacon (~50 us/s), steady state
+static constexpr int64_t TMS_SLEW_CATCHUP_US = 300;   // per beacon, once |delta| > 1 ms
+static constexpr int64_t TMS_CATCHUP_THRESHOLD_US = 1000;
+static constexpr int64_t TMS_SNAP_US = 20000;
 
 // All ESP32 variants are little-endian; fields are sent raw (no htonl)
 struct __attribute__((packed)) TsfPacket {
@@ -323,7 +329,8 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
                                                    static_cast<double>(tsf_now - this->pub_tsf_base_));
     const int64_t delta = tms_target - tms_expected;
     if (std::abs(delta) <= TMS_SNAP_US) {
-      tms_pub = tms_expected + std::clamp<int64_t>(delta, -TMS_SLEW_MAX_US, TMS_SLEW_MAX_US);
+      const int64_t slew = std::abs(delta) > TMS_CATCHUP_THRESHOLD_US ? TMS_SLEW_CATCHUP_US : TMS_SLEW_MAX_US;
+      tms_pub = tms_expected + std::clamp<int64_t>(delta, -slew, slew);
     }
   }
   this->pub_valid_ = true;
