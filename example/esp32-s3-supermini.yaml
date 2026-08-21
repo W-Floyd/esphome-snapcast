@@ -17,6 +17,8 @@
 esphome:
   name: snapclient-supermini
   friendly_name: Snapclient SuperMini
+  includes:
+    - <esp_wifi.h>  # for the WiFi TX Power slider's esp_wifi_set_max_tx_power call
 
 esp32:
   board: esp32-s3-devkitc-1
@@ -138,6 +140,29 @@ select:
   - platform: snapclient
     snapclient_id: snap
     name: Channel Mode
+
+# Runtime WiFi TX power tuning (pattern from speakeasy's wifi-9ramp.yaml). SuperMini
+# antennas distort at high power, so LOWER often connects better; find the sweet spot
+# from HA without reflashing. Persisted; wifi.output_power above only covers boot
+# until this restores. (Speakeasy's step-up-on-disconnect ramp is deliberately not
+# copied: on this board raising power is usually what breaks the link.)
+number:
+  - platform: template
+    name: WiFi TX Power
+    id: wifi_tx_power
+    icon: mdi:wifi-strength-2
+    entity_category: config
+    unit_of_measurement: dBm
+    min_value: 2.0
+    max_value: 20.5
+    step: 0.25
+    optimistic: true
+    restore_value: true
+    initial_value: 8.5
+    set_action:
+      - lambda: |-
+          esp_wifi_set_max_tx_power((int8_t)(x * 4));
+          ESP_LOGI("wifi_tx", "WiFi TX power set to %.2f dBm", x);
 
 # Onboard WS2812 as a play-state indicator
 light:
