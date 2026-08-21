@@ -44,13 +44,14 @@ static constexpr int64_t STARTUP_LEAD_US = 150000;
 // chunk) are inserted/dropped per chunk, inaudible but converging ~8 ms per second.
 static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 
-// Above this median error, correct proportionally (fast convergence and clock skew
-// beyond the single-frame servo's ~875 ppm capacity); below it, the steering servo
-// trims single frames. Hardware medians sit far below this in steady state.
-static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 3000;
+// Above this median error, correct proportionally (post-stall catch-up); below it,
+// the steering servo trims single frames. Must sit well above the measurement noise
+// and its lag dynamics: a lower threshold put proportional gain inside the loop's
+// oscillation amplitude and produced audible warble (~1100 splices/s, observed).
+static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
 
-// Median window for the steering servo's error signal (~0.8 s of chunks)
-static constexpr size_t MEDIAN_WINDOW = 31;
+// Median window for the steering servo's error signal (~0.4 s of chunks)
+static constexpr size_t MEDIAN_WINDOW = 15;
 
 // A playback-feedback gap this long means the pipeline stopped (and flushed its
 // buffers on restart); triggers the frame-accounting re-baseline in
@@ -184,8 +185,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   // fitting a slope too would amplify its estimation noise over the pivot-to-now
   // lever arm into millisecond wobble, while real DAC-vs-esp_timer clock drift only
   // moves the pivot slowly — which the steering servo absorbs by design.
-  // ~2.5 s memory: hardware feedback noise must average to well below the servo band
-  constexpr double ALPHA = 1.0 / 256.0;
+  constexpr double ALPHA = 1.0 / 64.0;
   const double f = static_cast<double>(this->played_frames_total_);
   const double t = static_cast<double>(timestamp_us);
   if (this->fb_samples_ == 0) {
