@@ -30,7 +30,11 @@ through ESPHome's own audio stack — so announcements, volume, mixing, and any
   L/R pair) — via a `select` entity or the hub's `channel_mode` option, persisted.
 - Volume taper: an optional exponential volume curve (configurable dB range, like the
   esp32 snapclient's) between the Snapcast slider and the speaker gain, exposed as a
-  `number` slider entity, persisted.
+  `number` slider entity, persisted. **Leave it at 0 for normal setups**: ESPHome's
+  speaker stack is already perceptual (i2s software volume maps the slider linearly
+  in dB over a 49 dB range, and audio_dac drivers write dB-scaled registers), so the
+  curve is only for output paths with truly linear volume — enabling it on top of the
+  built-in taper double-applies the log curve.
 - Wifi power save is disabled only while a stream is playing.
 
 ## Requirements
@@ -100,8 +104,8 @@ select:
 
 number:
   - platform: snapclient
-    name: Volume Curve      # dB range of the volume taper; 0 = linear/off, reference uses 60
-    # initial_value: 60
+    name: Volume Curve      # dB range of the extra volume taper; 0 = off (recommended —
+                            # ESPHome speakers already apply a 49 dB perceptual taper)
 ```
 
 ### Sync accuracy notes

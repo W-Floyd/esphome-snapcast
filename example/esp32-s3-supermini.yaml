@@ -136,13 +136,13 @@ select:
     snapclient_id: snap
     name: Channel Mode
 
-# Volume taper: how many dB the Snapcast volume slider spans (0 = linear/off; the
-# esp32 snapclient reference ships with 60). Persisted across reboots.
+# Extra volume taper in dB (0 = off). Leave at 0 here: the i2s speaker's software
+# volume already maps the slider perceptually (linear-in-dB over 49 dB); this curve
+# is only for output paths with truly linear volume. Persisted across reboots.
 number:
   - platform: snapclient
     snapclient_id: snap
     name: Volume Curve
-    # initial_value: 60
 
 # Onboard WS2812 as a play-state indicator
 light:
