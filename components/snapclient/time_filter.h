@@ -120,6 +120,11 @@ class KalmanTimeFilter {
   /// @brief True once at least one measurement has been inserted.
   bool has_estimate() const { return this->count_ > 0; }
 
+  /// @brief True once enough measurements have been absorbed that the estimate is
+  /// past its raw initial phase (the first sample sets the offset directly and can
+  /// be off by 100+ ms under congestion).
+  bool is_settled() const { return this->count_ >= MIN_SAMPLES; }
+
   /// @brief Drift estimate (offset ms per client ms, dimensionless — equivalently
   /// ppm×1e-6); 0.0 until statistically significant, matching get_offset()'s gating.
   double get_drift() const { return this->use_drift_ ? this->drift_ : 0.0; }

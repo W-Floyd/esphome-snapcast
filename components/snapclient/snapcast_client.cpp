@@ -750,6 +750,7 @@ void SnapcastClient::service_tx_() {
       this->filter_mutex_.lock();
       est.valid = this->time_filter_.has_estimate();
       if (est.valid) {
+        est.mature = this->time_filter_.is_settled() && this->time_sync_burst_remaining_ == 0;
         est.offset_ms = this->time_filter_.get_offset(now / 1000.0);
         est.drift = this->time_filter_.get_drift();
       }

@@ -35,6 +35,10 @@ class TsfSync {
  public:
   struct Estimate {
     bool valid{false};
+    // Settled enough to PUBLISH: a fresh estimate can be 100+ ms off and converge
+    // in large steps -- a leader broadcasting those steps drags the whole group
+    // through hard resyncs (observed fleet-wide after a simultaneous reflash)
+    bool mature{false};
     double offset_ms{0.0};  // server − client, ms (Kalman)
     double drift{0.0};      // offset ms per client ms (Kalman; 0 if insignificant)
   };

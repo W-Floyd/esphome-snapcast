@@ -417,8 +417,11 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
 
   const Role role = this->role_.load(std::memory_order_relaxed);
   if (role == Role::LEADER) {
-    if (!est.valid) {
-      this->reset_("estimate lost");
+    if (!est.valid || !est.mature) {
+      // Never publish an unsettled estimate (e.g. after a reconnect restarts the
+      // time-sync burst): a mature peer takes over, or leadership resumes once
+      // our estimate settles
+      this->reset_("estimate not settled");
       return;
     }
     if (local_now_us - this->last_tx_us_ >= BEACON_INTERVAL_US) {
@@ -428,11 +431,13 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
   }
 
   // Takeover: silence beyond the timeout plus a per-MAC stagger (lower MACs move
-  // first, so the winner usually claims before anyone else's timer fires)
+  // first, so the winner usually claims before anyone else's timer fires). Only a
+  // settled estimate may lead: a raw one converges in 100+ ms steps that would be
+  // broadcast as mapping snaps, dragging every follower through hard resyncs.
   const int64_t stagger = static_cast<int64_t>(this->my_mac_[5] & 0x0F) * STAGGER_STEP_US;
   const bool silence =
       this->last_rx_us_ == 0 || (local_now_us - this->last_rx_us_) > LEADER_TIMEOUT_US + stagger;
-  if (silence && est.valid) {
+  if (silence && est.valid && est.mature) {
     ESP_LOGI(TAG, "Assuming TSF leadership");
     this->role_.store(Role::LEADER, std::memory_order_relaxed);
     this->broadcast_(local_now_us, est, server_id_hash);
