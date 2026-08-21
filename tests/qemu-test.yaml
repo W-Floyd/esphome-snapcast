@@ -20,6 +20,11 @@ logger:
   level: DEBUG
   baud_rate: 115200
 
+# Native API for host-side state inspection in tests: forward guest port 6053 with
+#   -nic user,model=open_eth,hostfwd=tcp::6053-:6053
+# and subscribe with aioesphomeapi to watch entity states (volume/mute propagation).
+api:
+
 ethernet:
   type: OPENETH
 

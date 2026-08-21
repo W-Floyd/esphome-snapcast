@@ -21,10 +21,13 @@ void SnapclientMediaSource::setup() {
   this->parent_->set_static_delay_ms(this->static_delay_ms_);
 
   this->parent_->add_server_settings_callback([this](uint8_t volume, bool muted) {
-    // Remember what the server pushed so notify_volume_changed / notify_mute_changed
-    // don't echo the same values straight back as a ClientInfo message.
+    // Track the server's current belief so notify_volume_changed / notify_mute_changed
+    // don't echo the same values straight back as a ClientInfo message. Also sync the
+    // local mirror: a later mute-only ClientInfo must carry the current volume.
     this->last_server_volume_ = volume;
     this->last_server_muted_ = muted;
+    this->local_volume_ = volume;
+    this->local_muted_ = muted;
     this->apply_server_volume_(volume);
     this->request_mute_(muted);
   });
@@ -126,14 +129,23 @@ void SnapclientMediaSource::notify_volume_changed(float volume) {
   this->local_volume_ = static_cast<uint8_t>(std::clamp(volume_percent, 0, 100));
   if (volume_percent != this->last_server_volume_) {
     this->parent_->send_client_volume(this->local_volume_, this->local_muted_);
+    // The server does not echo ServerSettings back for ClientInfo updates, so record
+    // its new belief here — otherwise the next change back would look like an echo.
+    this->last_server_volume_ = this->local_volume_;
   }
 }
 
 // THREAD CONTEXT: Main loop (orchestrator -> source notification)
 void SnapclientMediaSource::notify_mute_changed(bool is_muted) {
   this->local_muted_ = is_muted;
-  if (static_cast<int>(is_muted) != this->last_server_muted_) {
+  const bool report = static_cast<int>(is_muted) != this->last_server_muted_;
+  ESP_LOGD(TAG, "notify_mute_changed: muted=%d last_server=%d -> %s", is_muted, this->last_server_muted_,
+           report ? "reporting" : "echo, skipping");
+  if (report) {
     this->parent_->send_client_volume(this->local_volume_, this->local_muted_);
+    // The server does not echo ServerSettings back for ClientInfo updates, so record
+    // its new belief here — otherwise unmuting after muting would look like an echo.
+    this->last_server_muted_ = static_cast<int>(is_muted);
   }
 }
 
