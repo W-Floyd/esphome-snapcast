@@ -23,12 +23,27 @@ Crash lines are passed through verbatim (undecoded). To symbolize one:
 
 import argparse
 import datetime
+import errno
+import os
+import select
 import subprocess
 import sys
+import time
 
 
 def stamp():
     return datetime.datetime.now().strftime("[%H:%M:%S.%f")[:-3] + "]"
+
+
+def resolve(device):
+    """macOS: /dev/tty.* is the dial-in device and blocks on carrier-detect
+    ("Device not configured" on USB CDC); /dev/cu.* is the call-out device."""
+    base = os.path.basename(device)
+    if base.startswith("tty."):
+        callout = os.path.join(os.path.dirname(device), "cu." + base[4:])
+        if os.path.exists(callout):
+            return callout
+    return device
 
 
 def main():
@@ -39,29 +54,65 @@ def main():
     ap.add_argument("--out", help="also append to this file (like `| tee`)")
     args = ap.parse_args()
 
-    # ESP32-S3 USB-serial-JTAG ignores the baud rate, but a real UART bridge does not
-    subprocess.run(["stty", "-f", args.device, args.baud, "raw", "-echo"], check=True)
+    device = resolve(args.device)
+    if device != args.device:
+        print(f"{stamp()} using {device} (macOS call-out device)", file=sys.stderr)
 
     sink = open(args.out, "a", buffering=1) if args.out else None
     pending = b""
+    fd = None
     try:
-        with open(args.device, "rb", buffering=0) as port:
-            while True:
-                chunk = port.read(256)
-                if not chunk:
+        while True:
+            if fd is None:
+                # A reboot or a flash makes the USB CDC device vanish and return;
+                # keep waiting for it instead of exiting (watching reboots is the
+                # whole point).
+                if not os.path.exists(device):
+                    time.sleep(0.5)
                     continue
-                pending += chunk
-                while b"\n" in pending:
-                    raw, pending = pending.split(b"\n", 1)
-                    line = stamp() + raw.rstrip(b"\r").decode("utf-8", "replace")
-                    print(line, flush=True)
-                    if sink is not None:
-                        sink.write(line + "\n")
+                try:
+                    # O_NONBLOCK so the open itself cannot block on carrier-detect
+                    fd = os.open(device, os.O_RDONLY | os.O_NONBLOCK | os.O_NOCTTY)
+                except OSError as exc:
+                    if exc.errno in (errno.ENXIO, errno.EBUSY, errno.ENOENT, errno.EIO):
+                        time.sleep(0.5)
+                        continue
+                    raise
+                # USB-serial-JTAG ignores baud; a real UART bridge does not.
+                # -hupcl/clocal: do NOT drop DTR on close and ignore modem lines --
+                # DTR/RTS transitions are exactly how esptool resets an ESP32 and
+                # drives it into ROM download mode, so a logger must never toggle them.
+                subprocess.run(["stty", "-f", device, args.baud, "raw", "-echo", "-hupcl", "clocal"],
+                               check=False, capture_output=True)
+                print(f"{stamp()} --- serial attached ---", flush=True)
+
+            select.select([fd], [], [], 1.0)
+            try:
+                chunk = os.read(fd, 512)
+            except OSError as exc:
+                if exc.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                    continue
+                print(f"{stamp()} --- serial detached ({exc.strerror}) ---", flush=True)
+                os.close(fd)
+                fd = None
+                continue
+            if not chunk:  # EOF: device reset
+                print(f"{stamp()} --- serial detached (EOF) ---", flush=True)
+                os.close(fd)
+                fd = None
+                continue
+            pending += chunk
+            while b"\n" in pending:
+                raw, pending = pending.split(b"\n", 1)
+                line = stamp() + raw.rstrip(b"\r").decode("utf-8", "replace")
+                print(line, flush=True)
+                if sink is not None:
+                    sink.write(line + "\n")
     except KeyboardInterrupt:
         pass
-    except OSError as exc:  # device unplugged / reset during flashing
-        print(f"{stamp()} serial closed: {exc}", file=sys.stderr)
     finally:
+        if fd is not None:
+            os.close(fd)
         if sink is not None:
             sink.close()
 
