@@ -25,8 +25,14 @@ password against the null session -- so no credentials are needed and sessions
     python3 scripts/ap-stations.py --from-json topo.json # offline
     python3 scripts/ap-stations.py --session <token>     # reuse a UI session
 
-Airtime share is estimated as 1/uplink + 1/downlink normalized across stations:
-a first-order model of who is eating the channel, good enough to rank offenders.
+The "cost/byte" column is 1/uplink + 1/downlink normalized across the radio: it
+ranks how expensive each station's traffic is *per byte*, NOT its total airtime.
+A slow station only actually hurts if it transmits often -- a 1 Mbps sensor
+sending a packet a minute is harmless, while a 1 Mbps device streaming audio or
+BLE-proxy telemetry is ruinous. This router's Data Elements counters
+(network.wireless.get_DataElements) do expose byte/packet totals but populate
+utilization inconsistently, so weigh a flagged station by whether it plausibly
+carries continuous traffic before chasing it.
 """
 
 import argparse
@@ -115,25 +121,26 @@ def report(rows, brief=False):
 
     for radio in sorted(by_radio, key=lambda x: ("2.4" not in x, x)):
         group = sorted(by_radio[radio], key=lambda r: (r["up"] or 0))
-        # first-order airtime model: cost ~ 1/rate, normalized within the radio
+        # cost PER BYTE ~ 1/rate, normalized within the radio (not total airtime)
         costs = [(1 / (r["up"] or 1) + 1 / (r["down"] or 1)) for r in group]
         total = sum(costs) or 1
         slow = [r for r in group if min(r["up"] or 999, r["down"] or 999) <= SLOW_MBPS]
         print(f"\n--- {radio}: {len(group)} stations, {len(slow)} slow (<= {SLOW_MBPS} Mbps) ---")
         if brief:
             continue
-        print(f"{'rssi':>5s} {'up':>5s} {'down':>5s} {'airtime':>8s}  station")
+        print(f"{'rssi':>5s} {'up':>5s} {'down':>5s} {'cost/byte':>10s}  station")
         for r, cost in zip(group, costs):
             share = 100 * cost / total
-            flag = "  <-- RATE ANOMALY: taxes every station on this radio" if r in slow else ""
+            flag = "  <-- legacy rates: costly IF it carries real traffic" if r in slow else ""
             print(f"{r['rssi'] if r['rssi'] is not None else '?':>5} "
                   f"{r['up'] if r['up'] is not None else '?':>5} "
                   f"{r['down'] if r['down'] is not None else '?':>5} "
-                  f"{share:7.1f}%  {r['name'][:36]:36s}{flag}")
+                  f"{share:9.1f}%  {r['name'][:36]:36s}{flag}")
         if slow:
             worst = max(zip(group, costs), key=lambda p: p[1])[0]
-            print(f"      -> biggest airtime consumer: {worst['name']} "
-                  f"({worst['up']}/{worst['down']} Mbps at {worst['rssi']} dBm)")
+            print(f"      -> most expensive per byte: {worst['name']} "
+                  f"({worst['up']}/{worst['down']} Mbps at {worst['rssi']} dBm) "
+                  f"-- confirm it actually transmits before acting")
 
 
 def main():
