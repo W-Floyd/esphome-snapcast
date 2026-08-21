@@ -757,6 +757,8 @@ void SnapcastClient::player_task_() {
   // letting it random-walk inside a deadband — a free-walking deadband is exactly
   // what wanders the stereo image between two paired devices.
   int8_t steer_dir = 0;
+  // Mute-until-synced: real audio flows only after the first in-band median
+  bool converged = false;
   int64_t last_resync_log_us = 0;
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
@@ -802,7 +804,7 @@ void SnapcastClient::player_task_() {
           ESP_LOGW(TAG, "Starting playback before first time sync; expect a hard resync");
         }
       }
-      this->push_chunk_(rec, 0);
+      this->push_chunk_(rec, 0, true);
       continue;
     }
 
@@ -861,6 +863,7 @@ void SnapcastClient::player_task_() {
       hard_resyncs++;
       err_window_filled = 0;
       steer_dir = 0;
+      converged = false;
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
@@ -878,6 +881,7 @@ void SnapcastClient::player_task_() {
       hard_resyncs++;
       err_window_filled = 0;
       steer_dir = 0;
+      converged = false;
       this->push_silence_(fill, rec.params);
     } else if (std::abs(median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US) {
       // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
@@ -919,7 +923,17 @@ void SnapcastClient::player_task_() {
       }
     }
 
-    this->push_chunk_(rec, drop_frames);
+    // Mute-until-synced (reference behavior): convergence corrections are chunky and
+    // audible (drops of 14 frames/chunk in the proportional band), so the audio is
+    // replaced with silence until the median error first lands inside the servo
+    // band. Hard resyncs re-mute, turning recovery storms into silent gaps.
+    if (!converged && err_window_filled == MEDIAN_WINDOW &&
+        std::abs(median_err_us) <= this->config_.sync_deadband_us) {
+      converged = true;
+      ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us), unmuting", median_err_us);
+    }
+
+    this->push_chunk_(rec, drop_frames, !converged);
   }
   vTaskDelete(nullptr);
 }
@@ -1078,7 +1092,7 @@ void SnapcastClient::push_repeat_frame_(const StreamParams &params) {
   this->playout_mutex_.unlock();
 }
 
-void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames) {
+void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, bool silent) {
   const uint32_t frame_bytes = rec.params.frame_bytes();
   size_t remaining = rec.bytes;
   size_t skip = std::min<size_t>(static_cast<size_t>(drop_frames) * frame_bytes, remaining);
@@ -1091,6 +1105,9 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames) {
     }
     remaining -= got;
 
+    if (silent) {
+      memset(this->slice_buffer_.get(), 0, got);
+    }
     this->apply_channel_mode_(this->slice_buffer_.get(), got, rec.params);
 
     // Cache the slice's final frame (post-transform) for click-free servo insertion

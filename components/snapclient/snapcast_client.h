@@ -224,7 +224,10 @@ class SnapcastClient {
   /// frame is a hard amplitude step. Falls back to silence when no frame is cached.
   void push_repeat_frame_(const StreamParams &params);
   /// Pushes @p bytes from the ring downstream, dropping @p drop_frames from the front.
-  void push_chunk_(const ChunkRecord &rec, uint32_t drop_frames);
+  /// @p silent replaces the audio with zeros (timing preserved): played during sync
+  /// convergence so correction splices are inaudible, like the reference's mute-
+  /// until-synced.
+  void push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, bool silent);
   /// @brief Applies the configured channel routing and polarity inversion in-place
   /// to a frame-aligned slice.
   void apply_channel_mode_(uint8_t *data, size_t len, const StreamParams &params);
