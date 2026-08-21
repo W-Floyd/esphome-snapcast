@@ -42,6 +42,14 @@ static constexpr int64_t STARTUP_LEAD_US = 150000;
 // chunk) are inserted/dropped per chunk, inaudible but converging ~8 ms per second.
 static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 
+// Soft corrections only fire when the smoothed error exceeds this deadband. The raw
+// per-chunk error carries feedback quantization noise (the speaker reports written
+// frames in DMA-buffer-sized bursts); correcting on it would insert/drop frames on
+// nearly every chunk — a constant stream of tiny waveform discontinuities, audible
+// as micro-stutter. The reference snapclient median-filters over long windows for
+// the same reason.
+static constexpr int64_t SOFT_CORRECTION_DEADBAND_US = 2000;
+
 static inline int64_t now_us() { return esp_timer_get_time(); }
 
 SnapcastClient::~SnapcastClient() {
@@ -136,6 +144,11 @@ void SnapcastClient::send_client_info(uint8_t volume_percent, bool muted) {
 // THREAD CONTEXT: Speaker playback callback thread
 void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
   this->playout_mutex_.lock();
+  if (this->playout_valid_) {
+    // A gap well beyond the speaker's DMA cadence means the DAC was starved
+    // (pipeline underrun); surfaced in the periodic sync report for diagnostics
+    this->max_feedback_gap_us_ = std::max(this->max_feedback_gap_us_, timestamp_us - this->played_last_ts_us_);
+  }
   this->played_frames_total_ += frames;
   this->played_last_ts_us_ = timestamp_us;
   this->playout_valid_ = true;
@@ -659,6 +672,13 @@ void SnapcastClient::player_task_() {
   int64_t err_accum_us = 0;
   int64_t err_peak_us = 0;
   uint32_t err_count = 0;
+  // Per-window stutter forensics: how often each correction mechanism fired
+  uint32_t soft_dropped_frames = 0;
+  uint32_t soft_inserted_frames = 0;
+  uint32_t hard_resyncs = 0;
+  // EWMA of the sync error (~1 s time constant at 24 ms chunks); soft corrections
+  // act on this, not the noisy per-chunk error
+  int64_t err_ewma_us = 0;
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -711,17 +731,32 @@ void SnapcastClient::player_task_() {
 
     err_accum_us += error_us;
     err_peak_us = std::max(err_peak_us, std::abs(error_us));
+    err_ewma_us += (error_us - err_ewma_us) / 8;
     if (++err_count >= 128) {
-      ESP_LOGD(TAG, "Sync error: avg %" PRId64 " us, peak %" PRId64 " us over %" PRIu32 " chunks",
-               err_accum_us / err_count, err_peak_us, err_count);
+      int64_t max_gap_us;
+      this->playout_mutex_.lock();
+      max_gap_us = this->max_feedback_gap_us_;
+      this->max_feedback_gap_us_ = 0;
+      this->playout_mutex_.unlock();
+      ESP_LOGD(TAG,
+               "Sync: avg %" PRId64 " us, peak %" PRId64 " us, ewma %" PRId64
+               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, max feedback gap %" PRId64
+               " ms over %" PRIu32 " chunks",
+               err_accum_us / err_count, err_peak_us, err_ewma_us, soft_dropped_frames, soft_inserted_frames,
+               hard_resyncs, max_gap_us / 1000, err_count);
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
+      soft_dropped_frames = 0;
+      soft_inserted_frames = 0;
+      hard_resyncs = 0;
     }
 
     if (error_us > hard_us) {
       // Hard resync, late: drop whole chunks until we catch back up
       ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunk", error_us / 1000);
+      hard_resyncs++;
+      err_ewma_us = 0;
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
@@ -734,17 +769,25 @@ void SnapcastClient::player_task_() {
       const uint32_t fill = std::min<int64_t>(gap_frames, rec.params.sample_rate / 2);
       ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms early, inserting %" PRIu32 " frames of silence", -error_us / 1000,
                fill);
+      hard_resyncs++;
+      err_ewma_us = 0;
       this->push_silence_(fill, rec.params);
-    } else if (error_us != 0) {
-      // Soft correction: drop (late) or pad (early) a tiny, inaudible number of
-      // frames per chunk
-      const int32_t adjust_frames = static_cast<int32_t>(error_us * static_cast<int64_t>(rec.params.sample_rate) /
+    } else if (std::abs(err_ewma_us) > SOFT_CORRECTION_DEADBAND_US) {
+      // Soft correction: drop (late) or pad (early) a tiny number of frames per
+      // chunk. Gated on the smoothed error so feedback quantization noise doesn't
+      // trigger a correction on every chunk (audible as micro-stutter); genuine
+      // clock drift accumulates in the EWMA and is corrected in short bursts.
+      const int32_t adjust_frames = static_cast<int32_t>(err_ewma_us * static_cast<int64_t>(rec.params.sample_rate) /
                                                          1000000);
       const int32_t max_adjust = std::max<int32_t>(1, frames / SOFT_CORRECTION_DIVISOR);
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
       if (adjust > 0) {
         drop_frames = adjust;
+        soft_dropped_frames += adjust;
+        err_ewma_us -= static_cast<int64_t>(adjust) * 1000000 / rec.params.sample_rate;
       } else if (adjust < 0) {
+        soft_inserted_frames += -adjust;
+        err_ewma_us += static_cast<int64_t>(-adjust) * 1000000 / rec.params.sample_rate;
         this->push_silence_(-adjust, rec.params);
       }
     }

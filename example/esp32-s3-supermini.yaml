@@ -32,7 +32,7 @@ psram:
   speed: 80MHz
 
 logger:
-  level: INFO
+  level: DEBUG
 
 api:
 

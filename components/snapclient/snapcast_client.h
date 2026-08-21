@@ -246,6 +246,9 @@ class SnapcastClient {
   int64_t played_frames_total_{0};
   int64_t played_last_ts_us_{0};
   int64_t pushed_frames_total_{0};
+  // Longest interval between playback feedback callbacks in the current diagnostics
+  // window; read-and-reset by the player task's periodic sync report
+  int64_t max_feedback_gap_us_{0};
 
   // --- Network task locals ---
   int sock_{-1};
