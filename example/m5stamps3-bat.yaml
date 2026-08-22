@@ -23,12 +23,59 @@ substitutions:
   pin_lrclk: GPIO4
   pin_bclk: GPIO5
   pin_dout: GPIO6
-  pin_led: GPIO21
+  # The WS2812 hangs off the M5PM1 (PY_LED_PP / PY_LED_EN), not a plain GPIO, so the
+  # base's esp32_rmt_led_strip cannot drive it. Pointed at an unused pad; the LED needs
+  # the m5pm1 neopixel platform instead, which is not wired up here.
+  # NOTE GPIO48/47 are the M5PM1's I2C bus on this board -- do not reuse them.
+  pin_led: GPIO2
 
 packages:
   base: !include snapclient-base.yaml
 
-# No wifi.output_power on purpose: this module has not shown the SuperMini's antenna
-# distortion, so it boots at the PHY maximum like any stock ESPHome board. The runtime
-# "WiFi TX Power" number can still trim it down, and the 20 dBm PHY ceiling is set in
-# the base regardless.
+# The DAC needs 5 V, and on this board EXT_5V is gated by the M5PM1 power-management IC
+# rather than being a passive USB VBUS tap: it is driven by 5VOUT_EN, which is the PMIC's
+# own GPIO1. Sourced from USB-C or DC 5 V -- if the board is powered only through the 3V3
+# interface, EXT_5V cannot output at all.
+#
+# Done with four register writes rather than an external component: the available one
+# (GitNik1/esphome-m5pm1) includes binary_sensor and output headers unconditionally
+# without auto-loading them, so it fails to compile unless those platforms happen to be
+# configured. Register map from m5stack/M5PM1 (M5PM1.h).
+i2c:
+  - id: pmic_bus
+    sda: GPIO48   # NOTE: the PMIC's I2C bus. Not free GPIO -- do not reuse for the DAC.
+    scl: GPIO47
+    frequency: 400kHz
+
+esphome:
+  on_boot:
+    # After the i2c bus is up, before wifi/audio start needing the rail
+    - priority: 600
+      then:
+        - lambda: |-
+            static constexpr uint8_t ADDR = 0x6E;
+            static constexpr uint8_t GPIO1 = 1 << 1;
+            auto *bus = id(pmic_bus);
+            // Read-modify-write: every one of these registers packs all five PMIC GPIOs,
+            // so a blind write would reconfigure the LED enable and the wake pin too.
+            auto rmw = [bus](uint8_t reg, uint8_t mask, uint8_t bits) -> bool {
+              uint8_t r = reg;
+              uint8_t cur = 0;
+              if (bus->write(ADDR, &r, 1) != i2c::ERROR_OK) return false;
+              if (bus->read(ADDR, &cur, 1) != i2c::ERROR_OK) return false;
+              uint8_t buf[2] = {reg, static_cast<uint8_t>((cur & ~mask) | (bits & mask))};
+              return bus->write(ADDR, buf, 2) == i2c::ERROR_OK;
+            };
+            // FUNC0 0x16 bits[3:2] = GPIO1 function, 00 = plain GPIO (11 would be ADC1)
+            bool ok = rmw(0x16, 0b1100, 0b0000);
+            // DRV 0x13 bit1 = 0 -> push-pull (1 would be open-drain, which cannot source)
+            ok = rmw(0x13, GPIO1, 0) && ok;
+            // MODE 0x10 bit1 = 1 -> output
+            ok = rmw(0x10, GPIO1, GPIO1) && ok;
+            // OUT 0x11 bit1 = 1 -> high, enabling EXT_5V
+            ok = rmw(0x11, GPIO1, GPIO1) && ok;
+            if (ok) {
+              ESP_LOGI("m5pm1", "EXT_5V enabled for the DAC");
+            } else {
+              ESP_LOGE("m5pm1", "Failed to enable EXT_5V; the DAC has no rail and will be silent");
+            }
