@@ -1348,6 +1348,13 @@ void SnapcastClient::player_task_() {
       if (have_fill) {
         ESP_LOGD(TAG, "Re-baseline anchored to measured fill: %" PRId64 " frames (%" PRId64 " ms)", in_flight_frames,
                  in_flight_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
+      } else {
+        // Log the FALLBACK too. Without this the two cases are indistinguishable in a
+        // log -- a silent fallback looks exactly like the feature working, which is
+        // how the first flash of this code read as "no starvations to anchor" when in
+        // fact every one of ~120 starvations had taken this branch.
+        ESP_LOGW(TAG, "Re-baseline could not read the pipeline fill; assuming empty (listener=%d)",
+                 this->audio_listener_ != nullptr ? 1 : 0);
       }
       err_window_filled = 0;
       steer_dir = 0;
