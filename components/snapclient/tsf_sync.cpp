@@ -84,10 +84,15 @@ static constexpr int64_t MAX_EXTRAPOLATION_US = 10000000;
 static constexpr int64_t SANDWICH_MAX_US = 50;
 static constexpr int64_t SANDWICH_LOOSE_MAX_US = 400;
 static constexpr int SANDWICH_ATTEMPTS = 5;
-// A read wider than this is not allowed to update the offset filter: with best-of-5
-// landing at 42-50 us on healthy hardware, anything past here is genuine interference
-// rather than the call's own cost.
-static constexpr int64_t SANDWICH_TRUST_US = 70;
+// A read wider than this is not allowed to update the offset filter.
+//
+// MUST stay above the widest NORMAL bracket any device achieves, not just the best. The
+// call cost is per-device: three devices read 46-50 us while a fourth read 83 us median
+// with excursions to 122. At a 70 us threshold that fourth device had every sample
+// rejected, so its offset filter never updated at all -- frozen at its first value while
+// the true offset drifted away from it, which is a slowly growing error of tens of ms.
+// Excluding noisy samples is only useful if the device still has samples left.
+static constexpr int64_t SANDWICH_TRUST_US = 200;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 
