@@ -151,15 +151,26 @@ media_player:
         - snap_source
         - media_http_source
       # Match the snapserver stream format so the DAC feedback used for
-      # synchronization counts frames 1:1 with what the snapclient source pushes
-      sample_rate: 48000
+      # synchronization counts frames 1:1 with what the snapclient source pushes.
+      # This said 48000 while the server streams 44100 ("Stream started: 44100 Hz,
+      # 16 bit, 2 ch", corroborated by the rate lock computing its divider for
+      # 44100 Hz x256), so the claim in this comment was simply untrue.
+      sample_rate: 44100
       num_channels: 2
     announcement_pipeline:
       speaker: announcement_mixer_input
       sources:
         - announcement_http_source
-      sample_rate: 48000
-      num_channels: 1
+      # MUST match the media pipeline exactly: the mixer neither resamples nor
+      # up-mixes, so any difference makes an announcement unmixable. This was
+      # 48000/mono against a 44100/stereo stream and mismatched on BOTH axes: HA's
+      # ffmpeg_proxy transcodes to whatever the pipeline asks for, so it faithfully
+      # delivered mono at the wrong rate and the mixer rejected it with
+      # "Incompatible audio streams". The media player then stuck in ANNOUNCING and
+      # retried forever -- 1742 ring buffers in under two minutes, ~16/s, error flag
+      # never cleared, needing a reboot to clear.
+      sample_rate: 44100
+      num_channels: 2
     # Duck the music under announcements instead of pausing it; Snapcast keeps
     # playing (and stays in sync) at reduced volume, then ramps back up
     on_announcement:
