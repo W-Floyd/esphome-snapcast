@@ -59,25 +59,18 @@ static constexpr uint32_t SOFT_CORRECTION_DIVISOR = 128;
 // oscillation amplitude and produced audible warble (~1100 splices/s, observed).
 static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
 
-// Steering size while muted pre-convergence; audibility is not a constraint
-// through silence, so steer hard to reach the fine band quickly. Measured on
-// hardware: the coarse phase of a mid-stream re-lock (50 ms -> 2 ms) ran at
-// ~12.5 ms/s and took ~4 s of the 13 s silence. 8 frames per ~27 ms chunk is
-// only ~7 ms/s; a bigger splice is equally silent, so the coarse phase is
-// pointlessly slow at 8.
-static constexpr uint32_t STARTUP_STEER_FRAMES = 48;
+// Steering size while muted pre-convergence (~7 ms/s); audibility is not a
+// constraint through silence, so lock happens in ~1-2 s instead of up to ~10 s.
+//
+// Do not raise this to speed up the coarse phase without measuring the whole
+// convergence: it was tried at 48 alongside higher muted trim gains and the fine
+// stage got WORSE, not better -- 12 s of a 26 s boot, with the median moving away
+// from zero (1010 -> 1376 -> 1804 us) before overshooting, then drifting steadily
+// past the deadband after unmute. Two of four devices never recovered at all.
+static constexpr uint32_t STARTUP_STEER_FRAMES = 8;
 
 // Median window for the steering servo's error signal (~0.4 s of chunks)
 static constexpr size_t MEDIAN_WINDOW = 15;
-
-// Median window while muted. The fine stage's settling time is set by the
-// measurement lag, not by the trim clamp: the loop is an integrator, so
-// tau = 1/KP, and KP is bounded by the ~0.85 s lag for phase margin. This window
-// is only the smaller share of that lag (~0.2 s of it); the feedback-pivot EWMA
-// is ~0.64 s and is cut alongside it in notify_audio_played(). Both together are
-// what make MUTED_TRIM_KP_SCALE stable -- shortening this one alone would not.
-// A noisier median only costs inaudible corrections through silence.
-static constexpr size_t MEDIAN_WINDOW_MUTED = 5;
 
 // Median error below which our playout counts as tracking the timebase, reported
 // to the TSF layer for leader eligibility. Generous: this gates "am I fit to
@@ -102,17 +95,23 @@ static constexpr float TRIM_KP_PPM_PER_US = 0.5f;
 static constexpr float TRIM_KI_PPM_PER_US_S = 0.0625f;
 static constexpr float TRIM_CLAMP_PPM = 500.0f;
 
-// While muted the gains come off the leash. Nothing about the steady-state tuning
-// applies through silence: 500 ppm is an audibility bound (0.05% pitch, well
-// under the ~0.5% JND) and KP = 0.5 is a phase-margin bound against the ~0.85 s
-// measurement lag. Muted, that lag drops to ~0.23 s (feedback EWMA 1/8 instead of
-// 1/64, plus MEDIAN_WINDOW_MUTED), so KP*2.5 = 1.25 sits at ~73 deg phase margin
-// -- better than the 50 deg the steady-state tuning runs at. Measured: the fine
-// stage (2 ms -> unmute band) is tau = 1/KP = 2 s, ~5 s of a 13 s re-lock; at
-// KP*2.5 that becomes ~0.8 s. KI stays at KP^2/4 (critically damped) so the
-// integral still absorbs the crystal offset without overshoot.
-static constexpr float MUTED_TRIM_KP_SCALE = 2.5f;
-static constexpr float MUTED_TRIM_CLAMP_PPM = 3000.0f;
+// REVERTED: raising these while muted made convergence worse, not better.
+//
+// The reasoning was that neither bound applies through silence -- 500 ppm is an
+// audibility bound (0.05% pitch, well under the ~0.5% JND) and KP = 0.5 is a
+// phase-margin bound -- so muted, with the loop lag cut, KP could go to 1.25 at
+// ~73 deg margin and the clamp to 3000 ppm. That lag figure was the flaw: it was
+// derived from the feedback EWMA being ~0.64 s, which assumed callbacks arrive
+// every ~10 ms, inferred from a "max feedback gap 10 ms" log line rather than
+// measured. If the real interval is longer the lag is larger and KP = 1.25 sits
+// below the margin claimed.
+//
+// Measured on hardware with KP*2.5 / 3000 ppm / a 5-sample muted median: the fine
+// stage it was meant to shorten took 12 s of a 26 s boot and OSCILLATED -- median
+// 1010 -> 1376 -> 1804 us moving away from zero, overshoot to -642, then a steady
+// post-unmute drift to +2334 us and climbing. Two of four devices never converged
+// at all. Do not retry without first MEASURING the feedback callback interval and
+// the resulting loop lag.
 #endif
 
 // A playback-feedback gap this long means the pipeline stopped (and flushed its
@@ -347,21 +346,20 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   // fitting a slope too would amplify its estimation noise over the pivot-to-now
   // lever arm into millisecond wobble, while real DAC-vs-esp_timer clock drift only
   // moves the pivot slowly — which the steering servo absorbs by design.
-  // Feedback arrives roughly every 10 ms, so 1/64 is a ~0.64 s time constant --
-  // about three quarters of the ~0.85 s total loop lag that bounds the trim gain
-  // for phase margin. While muted, run 1/8 (~80 ms) instead: the pivot gets
-  // noisier, but noise only costs corrections nobody can hear, and cutting this
-  // term is what actually makes MUTED_TRIM_KP_SCALE stable (shortening the median
-  // window alone only removes the smaller ~0.2 s share).
-  const double alpha = this->fast_feedback_.load(std::memory_order_relaxed) ? 1.0 / 8.0 : 1.0 / 64.0;
+  // This is the dominant term in the loop lag that bounds the trim gain for phase
+  // margin. A muted-only 1/8 was tried, to buy a higher muted KP; convergence got
+  // worse and it was reverted (see the trim-gain comment). Note the time constant
+  // depends on the callback interval, which has never actually been measured --
+  // measure it before deriving any gain from this value.
+  constexpr double ALPHA = 1.0 / 64.0;
   const double f = static_cast<double>(this->played_frames_total_);
   const double t = static_cast<double>(timestamp_us);
   if (this->fb_samples_ == 0) {
     this->fb_mean_frames_ = f;
     this->fb_mean_ts_ = t;
   } else {
-    this->fb_mean_frames_ += alpha * (f - this->fb_mean_frames_);
-    this->fb_mean_ts_ += alpha * (t - this->fb_mean_ts_);
+    this->fb_mean_frames_ += ALPHA * (f - this->fb_mean_frames_);
+    this->fb_mean_ts_ += ALPHA * (t - this->fb_mean_ts_);
   }
   this->fb_samples_++;
   this->playout_mutex_.unlock();
@@ -1295,23 +1293,13 @@ void SnapcastClient::player_task_() {
     if (err_window_filled < MEDIAN_WINDOW) {
       err_window_filled++;
     }
-    // Muted convergence medians over a shorter window: the fine stage settles at
-    // tau = 1/KP and KP is capped by the measurement lag, so trading median
-    // smoothness for lag is what makes the muted gains usable. Only the most
-    // recent window_len samples of the ring are used.
-    const size_t window_len = converged ? MEDIAN_WINDOW : MEDIAN_WINDOW_MUTED;
-    this->fast_feedback_.store(!converged, std::memory_order_relaxed);
     int64_t median_err_us = error_us;
-    if (err_window_filled >= window_len) {
+    if (err_window_filled == MEDIAN_WINDOW) {
       int64_t sorted[MEDIAN_WINDOW];
-      for (size_t i = 0; i < window_len; i++) {
-        // err_window_idx already points one past the newest sample
-        sorted[i] = err_window[(err_window_idx + MEDIAN_WINDOW - 1 - i) % MEDIAN_WINDOW];
-      }
-      std::nth_element(sorted, sorted + window_len / 2, sorted + window_len);
-      median_err_us = sorted[window_len / 2];
+      memcpy(sorted, err_window, sizeof(sorted));
+      std::nth_element(sorted, sorted + MEDIAN_WINDOW / 2, sorted + MEDIAN_WINDOW);
+      median_err_us = sorted[MEDIAN_WINDOW / 2];
     }
-    const bool window_ready = err_window_filled >= window_len;
 
     if (++err_count >= 128) {
       int64_t max_gap_us;
@@ -1421,7 +1409,7 @@ void SnapcastClient::player_task_() {
         this->push_silence_(-adjust, rec.params);
       }
       steer_dir = 0;
-    } else if (window_ready) {
+    } else if (err_window_filled == MEDIAN_WINDOW) {
       // Steering servo (reference design): engage when the median error exceeds
       // sync_deadband, then trim exactly one frame (~23 us splice, inaudible) per
       // chunk until it crosses back inside half the threshold. Continuous hold near
@@ -1448,32 +1436,19 @@ void SnapcastClient::player_task_() {
       // settles inside the band instead of splice-limit-cycling around it.
       if (rate_lock_ok && (converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
-        // Muted: higher gain and a wider rail. The rail is an audibility bound so
-        // silence lifts it outright; the gain is a phase-margin bound, affordable
-        // only because the muted path also cuts the loop lag (feedback EWMA +
-        // MEDIAN_WINDOW_MUTED). KI tracks KP^2/4 to stay critically damped.
-        const float kp = converged ? TRIM_KP_PPM_PER_US : TRIM_KP_PPM_PER_US * MUTED_TRIM_KP_SCALE;
-        const float ki = kp * kp / 4.0f;
-        const float clamp_ppm = converged ? TRIM_CLAMP_PPM : MUTED_TRIM_CLAMP_PPM;
-        const float p_term = kp * static_cast<float>(median_err_us);
+        const float p_term = TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us);
         // Conditional integration (anti-windup): winding the integral while the
         // output rails just schedules a rail-to-rail relaxation oscillation
         // (observed post-boot: trim flipping +-500 ppm with +-5 ms medians for
         // ~90 s, with audible correction bursts). Freeze the integral whenever the
         // output is saturated in the error's own direction.
         const float unclamped = p_term + trim_integral_ppm;
-        if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (median_err_us > 0)) {
-          trim_integral_ppm =
-              std::clamp(trim_integral_ppm + ki * static_cast<float>(median_err_us) * dt_s, -clamp_ppm, clamp_ppm);
+        if (std::abs(unclamped) < TRIM_CLAMP_PPM || (unclamped > 0.0f) != (median_err_us > 0)) {
+          trim_integral_ppm = std::clamp(
+              trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -TRIM_CLAMP_PPM,
+              TRIM_CLAMP_PPM);
         }
-        // The integral persists across the unmute, so bring it back inside the
-        // steady-state rail here rather than letting a muted-era value ride: it
-        // converges to the crystal offset, which is far inside +-500 ppm, and a
-        // railed hand-back would step the rate audibly at the unmute.
-        if (converged) {
-          trim_integral_ppm = std::clamp(trim_integral_ppm, -TRIM_CLAMP_PPM, TRIM_CLAMP_PPM);
-        }
-        const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -clamp_ppm, clamp_ppm);
+        const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -TRIM_CLAMP_PPM, TRIM_CLAMP_PPM);
         trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
         if (!trim_holds) {
           rate_lock_ok = false;
@@ -1506,7 +1481,7 @@ void SnapcastClient::player_task_() {
     // is diverged (observed: a device stuck in a degraded buffer state kept
     // leading, with every peer following its mapping)
     if (this->tsf_sync_ != nullptr) {
-      this->tsf_sync_->set_playout_healthy(converged && window_ready &&
+      this->tsf_sync_->set_playout_healthy(converged && err_window_filled == MEDIAN_WINDOW &&
                                            std::abs(median_err_us) < PLAYOUT_HEALTHY_US);
     }
 #endif

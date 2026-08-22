@@ -380,10 +380,6 @@ class SnapcastClient {
   // consumed by the player task, which re-baselines playout from scratch. The latch
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
   std::atomic<bool> pipeline_starved_{false};
-  // Muted convergence: smooth the feedback pivot far less aggressively, trading
-  // estimate noise (inaudible through silence) for the loop lag that caps the
-  // trim gain. Set by the player task, read by notify_audio_played().
-  std::atomic<bool> fast_feedback_{true};
   bool starved_latched_{false};
 
   // --- Network task locals ---
