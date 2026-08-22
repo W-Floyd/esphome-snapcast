@@ -226,6 +226,12 @@ static constexpr int64_t KEEPALIVE_MAX_US = 10000000;
 
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
+// How long the stream may stay staler than the server's whole buffer before the
+// player gives up on it and forces a reconnect. Long enough that a burst of
+// congestion which TCP eventually outruns is ridden out rather than punished
+// (recovery needs delivery faster than real time, which a clearing radio provides
+// in well under a second), short enough that the silent spiral is bounded.
+static constexpr int64_t STALE_BAILOUT_US = 3000000;
 
 #ifdef SNAPCLIENT_TSF_ACTIVE
 // TSF unicast roster refresh cadence (only while no stream is active; blocking RPC)
@@ -1314,6 +1320,8 @@ void SnapcastClient::player_task_() {
   bool converged = false;
   uint32_t in_band_chunks = 0;
   int64_t last_resync_log_us = 0;
+  // When the stream first went staler than the server's buffer, 0 while it is not
+  int64_t stale_since_us = 0;
   // Format of the last chunk played, for keepalive silence during a delivery gap
   StreamParams keepalive_params{};
   int64_t keepalive_pushed_us = 0;
@@ -1656,6 +1664,37 @@ void SnapcastClient::player_task_() {
       hard_resyncs = 0;
       trim_samples = 0;
       trim_railed = 0;
+    }
+
+    // Bail out of a backlog that cannot be caught up. Dropping chunks only closes a
+    // gap when chunks arrive FASTER than real time; when the radio is the bottleneck
+    // the client receives a trickle, discards all of it, and stays exactly as far
+    // behind. Lateness then grows linearly for as long as the congestion lasts
+    // (observed on hardware: 456 ms -> 18.4 s over 19 s, no recovery, no sync reports
+    // because fewer than one report's worth of chunks arrived in that time).
+    //
+    // Past the server's own bufferMs every chunk still in flight is stale by
+    // definition, so there is nothing left worth playing toward. Reconnecting resets
+    // the stream to now: ~1-2 s of silence against an unbounded silent spiral. The
+    // ring's remaining stale chunks are not purged -- the player discards them on the
+    // next passes, which costs no pushes and drains in well under the reconnect.
+    const int64_t stale_us =
+        std::max<int64_t>(static_cast<int64_t>(this->buffer_ms_.load(std::memory_order_relaxed)),
+                          static_cast<int64_t>(this->config_.hard_resync_threshold_ms)) *
+        1000;
+    if (error_us > stale_us) {
+      if (stale_since_us == 0) {
+        stale_since_us = now_us();
+      } else if (now_us() - stale_since_us >= STALE_BAILOUT_US) {
+        ESP_LOGW(TAG, "Stream %" PRId64 " ms late for %" PRId64 " s and not catching up: reconnecting",
+                 error_us / 1000, STALE_BAILOUT_US / 1000000);
+        stale_since_us = 0;
+        // Breaks recv_exact_ out of the session; the network task reconnects with no
+        // backoff, and connection_session_() clears the flag and resets the time filter
+        this->reconnect_requested_.store(true, std::memory_order_relaxed);
+      }
+    } else {
+      stale_since_us = 0;
     }
 
     // Hard-resync logging is throttled to one line per RESYNC_LOG_INTERVAL_US: during
