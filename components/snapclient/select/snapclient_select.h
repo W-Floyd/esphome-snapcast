@@ -46,6 +46,12 @@ class SnapclientIndexedSelect : public SnapclientChild, public select::Select {
   virtual uint8_t initial_index_() const = 0;
 
   bool restore_value_{true};
+  // A pin is a PREFERENCE, not a requirement: wifi's set_bssid() will refuse to
+  // associate with anything else, so an AP that is gone, overloaded, or simply out of
+  // range leaves the client unable to connect at all rather than degraded. Track how
+  // long we have been pinned-but-disconnected and drop the constraint past a timeout.
+  uint32_t pinned_since_ms_{0};  // 0 = not waiting on a pinned connect
+  bool pin_released_{false};     // pin dropped after timing out; re-armed on next drop
   ESPPreferenceObject pref_;
 };
 
@@ -149,6 +155,12 @@ class SnapclientServerSelect final : public SnapclientChild, public SnapclientDy
     char value[65];
   };
   bool restore_value_{true};
+  // A pin is a PREFERENCE, not a requirement: wifi's set_bssid() will refuse to
+  // associate with anything else, so an AP that is gone, overloaded, or simply out of
+  // range leaves the client unable to connect at all rather than degraded. Track how
+  // long we have been pinned-but-disconnected and drop the constraint past a timeout.
+  uint32_t pinned_since_ms_{0};  // 0 = not waiting on a pinned connect
+  bool pin_released_{false};     // pin dropped after timing out; re-armed on next drop
   ESPPreferenceObject pref_;
 };
 
@@ -179,6 +191,7 @@ class SnapclientBssidSelect final : public Component,
   // THREAD CONTEXT: main loop (wifi component's loop)
   void on_wifi_scan_results(const wifi::wifi_scan_vector_t<wifi::WiFiScanResult> &results) override;
   void on_wifi_connect_state(StringRef ssid, std::span<const uint8_t, 6> bssid) override;
+  void loop() override;
 
  protected:
   void control(const std::string &value) override;
@@ -186,13 +199,23 @@ class SnapclientBssidSelect final : public Component,
   void apply_lock_();
   void rebuild_options_();
 
-  std::string desired_;        // pinned BSSID string; empty = automatic
+  /// @brief Drops the pin so wifi can associate with any AP on the SSID.
+  /// The selection is remembered; only the constraint handed to wifi is released.
+  void release_pin_(const char *reason);
+
+  std::string desired_;        // preferred BSSID string; empty = automatic
   std::string network_ssid_;   // SSID of the current connection (connect listener)
   std::vector<std::pair<std::string, std::string>> scan_snapshot_;  // (ssid, bssid)
   struct StoredOption {
     char value[18];
   };
   bool restore_value_{true};
+  // A pin is a PREFERENCE, not a requirement: wifi's set_bssid() will refuse to
+  // associate with anything else, so an AP that is gone, overloaded, or simply out of
+  // range leaves the client unable to connect at all rather than degraded. Track how
+  // long we have been pinned-but-disconnected and drop the constraint past a timeout.
+  uint32_t pinned_since_ms_{0};  // 0 = not waiting on a pinned connect
+  bool pin_released_{false};     // pin dropped after timing out; re-armed on next drop
   ESPPreferenceObject pref_;
 };
 #endif  // SNAPCLIENT_BSSID_SELECT

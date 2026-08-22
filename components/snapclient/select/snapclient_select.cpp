@@ -195,6 +195,9 @@ void SnapclientBssidSelect::setup() {
 void SnapclientBssidSelect::control(const std::string &value) {
   wifi::bssid_t parsed;
   this->desired_ = (value != AUTOMATIC_OPTION && parse_bssid(value, parsed)) ? value : "";
+  // An explicit choice always gets a fresh attempt, even if a previous one timed out
+  this->pin_released_ = false;
+  this->pinned_since_ms_ = 0;
   if (this->restore_value_) {
     StoredOption stored{};
     strncpy(stored.value, this->desired_.c_str(), sizeof(stored.value) - 1);
@@ -202,6 +205,41 @@ void SnapclientBssidSelect::control(const std::string &value) {
   }
   this->apply_lock_();
   this->rebuild_options_();
+}
+
+// How long to wait for the preferred AP before falling back to any AP on the SSID.
+// Long enough to cover a normal associate plus a retry, short enough that a missing AP
+// does not strand the device.
+static constexpr uint32_t PIN_FALLBACK_MS = 20000;
+
+void SnapclientBssidSelect::release_pin_(const char *reason) {
+  auto *w = wifi::global_wifi_component;
+  if (w == nullptr) {
+    return;
+  }
+  wifi::WiFiAP sta = w->get_sta();
+  if (sta.get_ssid().empty()) {
+    return;
+  }
+  sta.clear_bssid();
+  w->set_sta(sta);
+  this->pin_released_ = true;
+  this->pinned_since_ms_ = 0;
+  ESP_LOGW(TAG, "Preferred BSSID %s %s; associating with any AP on the SSID", this->desired_.c_str(), reason);
+}
+
+void SnapclientBssidSelect::loop() {
+  if (this->desired_.empty() || this->pin_released_ || this->pinned_since_ms_ == 0) {
+    return;
+  }
+  auto *w = wifi::global_wifi_component;
+  if (w != nullptr && w->is_connected()) {
+    this->pinned_since_ms_ = 0;  // got there; nothing to fall back from
+    return;
+  }
+  if (millis() - this->pinned_since_ms_ >= PIN_FALLBACK_MS) {
+    this->release_pin_("unreachable");
+  }
 }
 
 void SnapclientBssidSelect::apply_lock_() {
@@ -213,12 +251,15 @@ void SnapclientBssidSelect::apply_lock_() {
     return;
   }
   wifi::bssid_t target;
-  if (!this->desired_.empty() && parse_bssid(this->desired_, target)) {
+  if (!this->desired_.empty() && parse_bssid(this->desired_, target) && !this->pin_released_) {
     sta.set_bssid(target);
     w->set_sta(sta);
     if (w->is_connected() && w->wifi_bssid() != target) {
-      ESP_LOGI(TAG, "On wrong AP; reconnecting to pinned %s", this->desired_.c_str());
+      ESP_LOGI(TAG, "On wrong AP; reconnecting to preferred %s", this->desired_.c_str());
       w->retry_connect();
+    }
+    if (!w->is_connected() && this->pinned_since_ms_ == 0) {
+      this->pinned_since_ms_ = millis();  // start the fallback timer
     }
   } else {
     sta.clear_bssid();
@@ -228,9 +269,19 @@ void SnapclientBssidSelect::apply_lock_() {
 
 void SnapclientBssidSelect::on_wifi_connect_state(StringRef ssid, std::span<const uint8_t, 6> bssid) {
   if (ssid.empty()) {
-    return;  // disconnect
+    // Disconnect: re-arm the preference. Retrying it here rather than while a fallback
+    // link is up means we never drop a working connection to chase the preferred AP --
+    // the retry rides a reconnect that was happening anyway.
+    if (this->pin_released_) {
+      this->pin_released_ = false;
+      this->pinned_since_ms_ = 0;
+      ESP_LOGI(TAG, "Link dropped; re-arming preferred BSSID %s", this->desired_.c_str());
+      this->apply_lock_();
+    }
+    return;
   }
   this->network_ssid_ = ssid.str();
+  this->pinned_since_ms_ = 0;
   this->apply_lock_();
   this->rebuild_options_();
 }
