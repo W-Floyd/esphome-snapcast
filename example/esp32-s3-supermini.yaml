@@ -293,6 +293,15 @@ sensor:
     device_class: ""
     entity_category: diagnostic
 
+button:
+  # A restart re-anchors the playout accounting from scratch, which is the reliable
+  # remedy for a device that has latched a timing offset and sits audibly behind its
+  # peers with clean-looking sync metrics. Also the fastest way out of a stuck
+  # ANNOUNCING state (an unmixable announcement retries forever upstream).
+  - platform: restart
+    name: Restart
+    entity_category: config
+
 # Runtime WiFi TX power tuning (pattern from speakeasy's wifi-9ramp.yaml). SuperMini
 # antennas distort at high power, so LOWER often connects better; find the sweet spot
 # from HA without reflashing. Persisted, and it is the ONLY place power should be set
