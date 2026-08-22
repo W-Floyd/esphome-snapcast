@@ -36,7 +36,16 @@ static const char *const TAG = "snapclient.rate_lock";
 // ~6.5x MCLK overspeed burst -- unusable on a running channel), and a +-500 ppm trim
 // never needs the integer part to move.
 
-static constexpr float TRIM_CLAMP_PPM = 500.0f;
+// Hardware-side backstop only. The caller's servo derives its own, tighter clamp
+// from KP * converge_fine (see trim_clamp_ppm() in snapcast_client.cpp) and must be
+// the binding limit -- if this one bit first it would silently truncate that
+// derivation, which is exactly what happened while both were a fixed 500 ppm: the
+// caller's clamp was raised and nothing changed. Sized instead by what the divider
+// can express without touching the integer part: the fraction has ~0.007 of headroom
+// before the integer would move, i.e. several thousand ppm, and set_trim_ppm() checks
+// that explicitly below. 5000 ppm is 0.5% pitch, at the audibility JND, so this also
+// caps a runaway caller at "noticeable" rather than "unlistenable".
+static constexpr float TRIM_CLAMP_PPM = 5000.0f;
 // x/y/z are 9-bit fields; denominators up to 511 give ~0.15 ppm rational spacing
 static constexpr uint32_t MAX_DENOMINATOR = 511;
 

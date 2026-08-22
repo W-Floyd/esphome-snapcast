@@ -93,7 +93,37 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // offset so P holds the error at zero.
 static constexpr float TRIM_KP_PPM_PER_US = 0.5f;
 static constexpr float TRIM_KI_PPM_PER_US_S = 0.0625f;
-static constexpr float TRIM_CLAMP_PPM = 500.0f;
+// The clamp is DERIVED, not chosen. The PI takes over at converge_fine, so for it to
+// act as a linear controller anywhere in that band the output must be able to express
+// the proportional term at the handoff:
+//
+//   clamp >= KP * converge_fine
+//
+// A fixed 500 ppm against the 2 ms default violated that by 2x (0.5 * 2000 = 1000),
+// so the whole upper half of the fine band was saturated BY CONSTRUCTION: every
+// recovery entered the PI stage already railed and stayed there until the error
+// halved. Measured mid-recovery at median 922 us: p_term = 461 ppm, trim +489.77,
+// span +442..+500, railed 25/48 -- P alone saturating, the integral contributing 29.
+//
+// This is also why both attempts to tune around it failed. Raising KP moved
+// saturation EARLIER (KP 1.25 rails at 400 us); raising the clamp alone to 3000 ppm
+// removed the saturation but let the integral wind 6x further and traded it for
+// overshoot. The three constants have to move together, so tie them.
+//
+// Audibility is not the binding constraint here: 1000 ppm is 0.1% pitch against a
+// ~0.5% JND, and it is only approached transiently while the error is ~converge_fine.
+// Bounded at both ends. The floor keeps the historical authority when converge_fine
+// is set tighter than the band the clamp already covered. The ceiling is audibility:
+// converge_fine is configurable up to 50 ms, which would derive 25000 ppm = 2.5%
+// pitch -- plainly audible, and above the rate lock's own backstop. 2000 ppm is 0.2%,
+// still comfortably under the ~0.5% JND. Between the two, the clamp tracks the band.
+static constexpr float TRIM_CLAMP_MIN_PPM = 500.0f;
+static constexpr float TRIM_CLAMP_MAX_PPM = 2000.0f;
+
+static float trim_clamp_ppm(int64_t converge_fine_us) {
+  return std::clamp(TRIM_KP_PPM_PER_US * static_cast<float>(converge_fine_us), TRIM_CLAMP_MIN_PPM,
+                    TRIM_CLAMP_MAX_PPM);
+}
 
 // REVERTED: raising these while muted made convergence worse, not better.
 //
@@ -1469,6 +1499,7 @@ void SnapcastClient::player_task_() {
       // settles inside the band instead of splice-limit-cycling around it.
       if (rate_lock_ok && (converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
+        const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
         const float p_term = TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us);
         // Conditional integration (anti-windup): winding the integral while the
         // output rails just schedules a rail-to-rail relaxation oscillation
@@ -1476,12 +1507,12 @@ void SnapcastClient::player_task_() {
         // ~90 s, with audible correction bursts). Freeze the integral whenever the
         // output is saturated in the error's own direction.
         const float unclamped = p_term + trim_integral_ppm;
-        if (std::abs(unclamped) < TRIM_CLAMP_PPM || (unclamped > 0.0f) != (median_err_us > 0)) {
+        if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (median_err_us > 0)) {
           trim_integral_ppm = std::clamp(
-              trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -TRIM_CLAMP_PPM,
-              TRIM_CLAMP_PPM);
+              trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -clamp_ppm,
+              clamp_ppm);
         }
-        const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -TRIM_CLAMP_PPM, TRIM_CLAMP_PPM);
+        const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -clamp_ppm, clamp_ppm);
         if (trim_samples == 0) {
           trim_min_ppm = trim_max_ppm = trim_ppm;
         } else {
@@ -1489,7 +1520,7 @@ void SnapcastClient::player_task_() {
           trim_max_ppm = std::max(trim_max_ppm, trim_ppm);
         }
         trim_samples++;
-        if (std::abs(trim_ppm) >= TRIM_CLAMP_PPM - 0.5f) {
+        if (std::abs(trim_ppm) >= clamp_ppm - 0.5f) {
           trim_railed++;
         }
         trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
