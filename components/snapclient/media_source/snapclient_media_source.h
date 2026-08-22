@@ -39,6 +39,11 @@ class SnapclientMediaSource final : public SnapclientChild,
   /// THREAD CONTEXT: the client's player task; may block up to timeout_ms.
   size_t on_audio_write(const uint8_t *data, size_t length, uint32_t timeout_ms, const StreamParams &params) override;
 
+  /// @brief Reports audio buffered downstream (mixer source queue), so the client can anchor its
+  /// playout accounting to the measured fill rather than assuming one.
+  /// THREAD CONTEXT: the client's player task, same as on_audio_write().
+  bool on_query_buffered(size_t &bytes) override;
+
  protected:
   /// @brief Updates the source state and keeps the client's output-active flag in step.
   void set_playback_state_(media_source::MediaSourceState state);

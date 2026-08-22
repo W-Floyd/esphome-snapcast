@@ -28,6 +28,23 @@ fallback. Verified degrading gracefully in QEMU with `[tcp] enabled = false`.
   matters on a congested link, since streamed logs compete with audio for the
   radio. Should fail the announcement (and clear the flag) when the mixer reports
   an incompatible format, rather than looping.
+- **Try dropping the starvation re-baseline entirely — it may make the fork
+  unnecessary.** The playout accounting is EXACT from a clean start: `pushed -
+  played` is the true queue as long as nothing discards. The offset only appears
+  when something does, and the re-baseline paths exist to recover from that. But
+  `timeout: never` was supposed to remove the teardown that discards, and
+  measurement supports it — zero mixer stops across the fleet while starvations
+  continued. If nothing tears down, nothing is discarded, no re-baseline is
+  needed, and the offset never arises, so `buffered_bytes()` and the six-component
+  fork below can both go.
+  This was attempted once and reverted, because the clamp's comments document
+  observed 100-250 ms offsets. The thing to notice is that **those observations
+  predate the `timeout: never` fix** — they are evidence from a world where
+  teardowns happened. Worth re-testing now, and cheap to test: keep the
+  accounting, skip the starvation re-baseline, and watch `depth +-N ms` in the
+  sync report plus `sync-delta.py`'s group-median check across a few starvations.
+  No divergence means the whole mechanism is redundant. Do this BEFORE investing
+  further in the fork.
 - **Upstream: expose the speaker's queued frame count.** `speaker::Speaker` offers
   only `virtual bool has_buffered_data() const` — a bool, not a count — so the
   fill level between our feedback point and the DAC is unobservable. That is the

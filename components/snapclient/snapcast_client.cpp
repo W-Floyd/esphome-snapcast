@@ -362,6 +362,13 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // permanently late by the discarded amount — every chunk hard-drops, which
       // starves the pipeline into another flush: an unrecoverable death spiral.
       // At resume the pipeline is empty, so played == pushed is ground truth.
+      //
+      // Deliberately NOT switched to the measured-fill anchor the starvation path now
+      // uses. Two reasons: this path's premise is observed rather than assumed (a
+      // >500 ms feedback gap IS a stop and restart, and a restart discards), and this
+      // runs on the speaker callback thread while on_query_buffered() is documented
+      // player-task-only. Querying from here would break that contract to replace a
+      // sound premise.
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
       this->fb_samples_ = 0;
 #ifdef USE_SNAPCLIENT_RATE_LOCK
@@ -1307,17 +1314,41 @@ void SnapcastClient::player_task_() {
     }
 
     if (this->pipeline_starved_.exchange(false, std::memory_order_relaxed)) {
-      // The pipeline fully drained (source starvation); the framework restarts its
-      // buffers at a fill level the feedback point cannot observe. Reset the playout
-      // accounting so playback re-baselines exactly like a fresh start (whose fill
-      // is deterministic), at the cost of one muted re-lock -- the automatic version
-      // of the manual speaker restart that used to be the fix.
+      // The pipeline fully drained (source starvation). Re-baseline the playout
+      // accounting -- but anchor it to the fill the pipeline REPORTS, not to an
+      // assumption that it is empty.
+      //
+      // Assuming empty was the long-standing behaviour and the cause of the
+      // silent-offset bug: whatever audio was still in flight went uncounted, so the
+      // prediction was wrong by that much and the servo dutifully steered the real
+      // audio to the wrong time while its own error read ~0 (it is measured against
+      // that same prediction). Measured offsets of 100-250 ms, audible against the
+      // other clients, invisible to every metric on the device.
+      //
+      // on_query_buffered() reports bytes still held downstream, so seed pushed as
+      // played + that, making the accounted queue equal the measured one. Falls back
+      // to the old assume-empty behaviour when the sink cannot report, which is why
+      // the query distinguishes "unknown" from "zero".
+      //
+      // Scope: the sink reports its own queue, not the mixer's output ring or the I2S
+      // DMA below it. Those are bounded by buffer_duration and identical across
+      // devices running one config, so what remains is common-mode -- and it is
+      // relative offset between devices that moves a stereo image, not a shared
+      // constant.
+      size_t buffered_bytes = 0;
+      const bool have_fill = this->audio_listener_ != nullptr && frame_bytes > 0 &&
+                             this->audio_listener_->on_query_buffered(buffered_bytes);
+      const int64_t in_flight_frames = have_fill ? static_cast<int64_t>(buffered_bytes / frame_bytes) : 0;
       this->playout_mutex_.lock();
       this->playout_valid_ = false;
       this->played_frames_total_ = 0;
-      this->pushed_frames_total_ = 0;
+      this->pushed_frames_total_ = in_flight_frames;
       this->fb_samples_ = 0;
       this->playout_mutex_.unlock();
+      if (have_fill) {
+        ESP_LOGD(TAG, "Re-baseline anchored to measured fill: %" PRId64 " frames (%" PRId64 " ms)", in_flight_frames,
+                 in_flight_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
+      }
       err_window_filled = 0;
       steer_dir = 0;
       converged = false;

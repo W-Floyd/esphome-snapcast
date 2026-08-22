@@ -122,6 +122,12 @@ class SnapcastAudioListener {
  public:
   virtual size_t on_audio_write(const uint8_t *data, size_t length, uint32_t timeout_ms,
                                 const StreamParams &params) = 0;
+
+  /// @brief Bytes of audio already handed over but not yet played, if the sink can report it.
+  /// Lets the playout accounting be anchored to the pipeline's MEASURED fill instead of an
+  /// assumption about it; see the re-baseline paths in the player loop.
+  /// @return false when unavailable -- distinct from a reported zero.
+  virtual bool on_query_buffered(size_t & /*bytes*/) { return false; }
 };
 
 /// @brief Native Snapcast client core.

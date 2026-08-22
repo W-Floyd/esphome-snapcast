@@ -92,7 +92,7 @@ external_components:
       type: git
       url: https://github.com/W-Floyd/esphome
       ref: speaker-buffered-bytes
-    components: [speaker, i2s_audio, mixer, audio]
+    components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
 
 snapclient:
   id: snap

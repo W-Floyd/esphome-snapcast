@@ -198,6 +198,8 @@ size_t SnapclientMediaSource::on_audio_write(const uint8_t *data, size_t length,
   return this->write_output(data, length, timeout_ms, stream_info);
 }
 
+bool SnapclientMediaSource::on_query_buffered(size_t &bytes) { return this->output_buffered_bytes(bytes); }
+
 }  // namespace esphome::snapclient
 
 #endif  // USE_ESP32 && USE_MEDIA_SOURCE
