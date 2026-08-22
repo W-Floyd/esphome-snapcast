@@ -1433,6 +1433,32 @@ void SnapcastClient::player_task_() {
       // report looks clean.
       const int32_t pipeline_ms =
           static_cast<int32_t>(pipeline_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
+      // MEASURED pipeline fill, against the accounted one above. The two should track:
+      // both claim to be the audio we have handed over but which has not yet played.
+      // A persistent gap is the phantom-frame bug -- notify_audio_played()'s clamp only
+      // fires when reported frames EXCEED the accounted queue, so while the queue looks
+      // healthy the DAC can play something we never pushed (auto_clear fill while the
+      // mixer task is behind, ducking, mixer output ahead of our source) and those
+      // frames are counted as our audio playing. Accounted then falls below true, the
+      // prediction lands early by the difference, and the servo pushes real audio LATE
+      // by that much -- permanently, since every metric agrees with itself. Reported as
+      // `fill <measured> ms (drift <accounted-measured>)`; a drift that holds for
+      // minutes IS the audible offset, and its sign says which way.
+      int32_t fill_ms = -1;
+      int32_t fill_drift_ms = 0;
+      {
+        size_t measured_bytes = 0;
+        if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
+            this->audio_listener_->on_query_buffered(measured_bytes)) {
+          const int64_t measured_frames = static_cast<int64_t>(measured_bytes / frame_bytes);
+          fill_ms = static_cast<int32_t>(measured_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
+          fill_drift_ms = pipeline_ms - fill_ms;
+        }
+      }
+      char fill_str[48] = "";
+      if (fill_ms >= 0) {
+        snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 ")", fill_ms, fill_drift_ms);
+      }
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
@@ -1472,11 +1498,11 @@ void SnapcastClient::player_task_() {
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, feedback %" PRId64
-               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s over %" PRIu32
+               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s%s over %" PRIu32
                " chunks",
                err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
-               hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, trim_str, tsf_str,
-               err_count);
+               hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, trim_str,
+               tsf_str, err_count);
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
