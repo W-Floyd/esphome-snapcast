@@ -62,8 +62,18 @@ static constexpr int64_t MAX_EXTRAPOLATION_US = 10000000;
 // Sandwich width above which a TSF sample was interrupted mid-read; retry.
 // After all retries, the narrowest attempt is still accepted up to the loose
 // bound (the servo median absorbs the noise; a drop to Kalman fallback is worse).
-static constexpr int64_t SANDWICH_MAX_US = 100;
+// Targeting ~10 us group sync, the sandwich is the dominant noise term: half the
+// bracket width is the uncertainty in pairing a TSF value to a local timestamp, and
+// that noise is PER DEVICE, so sharing the mapping does not cancel it. Accepting 100 us
+// meant admitting up to ~50 us of error into every deadline. Retry harder for a narrow
+// bracket; the loose bound stays generous because failing outright drops the caller to
+// its own Kalman estimate, which is far noisier than one wide TSF read -- but wide reads
+// are now excluded from the offset filter instead of being averaged in.
+static constexpr int64_t SANDWICH_MAX_US = 20;
 static constexpr int64_t SANDWICH_LOOSE_MAX_US = 400;
+static constexpr int SANDWICH_ATTEMPTS = 8;
+// A read wider than this is not allowed to update the offset filter
+static constexpr int64_t SANDWICH_TRUST_US = 40;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 
@@ -90,7 +100,10 @@ static constexpr int64_t TMS_SNAP_US = 20000;
 
 // Low-pass on the shared offset: 1/32 over per-chunk calls (~26 ms) is a ~0.8 s time constant,
 // cutting uncorrelated TSF read noise by ~sqrt(32). See shared_server_offset_us().
-static constexpr double OFFSET_EWMA_ALPHA = 1.0 / 32.0;
+// 1/64 over per-chunk calls (~26 ms) is a ~1.7 s time constant, cutting uncorrelated
+// read noise by ~8x. Nearly free in lag terms: the mapping is drift-compensated, so the
+// filtered quantity is near-constant rather than a moving signal.
+static constexpr double OFFSET_EWMA_ALPHA = 1.0 / 64.0;
 // Above this, the raw sample is a real re-anchor (leader change, reconnect), not slew or
 // noise: the published mapping moves at most TMS_SLEW_CATCHUP_US_PER_S, and read
 // noise is bounded by the sandwich. Snap instead of smearing it in over ~0.8 s.
@@ -118,14 +131,14 @@ TsfSync::~TsfSync() {
   }
 }
 
-bool TsfSync::sample_tsf_(int64_t &tsf_us, int64_t &local_us) {
+bool TsfSync::sample_tsf_(int64_t &tsf_us, int64_t &local_us, int64_t *width_out) {
   // Sandwich the TSF read between esp_timer reads; a wide sandwich means an
   // interrupt (or a slow driver path) landed mid-read and the pairing is noisy.
   // Prefer a tight sandwich, but accept the best attempt up to a looser bound --
   // the servo's median absorbs occasional noisy samples, while a hard failure
   // drops the whole mapping to the Kalman fallback.
   int64_t best_width = INT64_MAX;
-  for (int attempt = 0; attempt < 5; attempt++) {
+  for (int attempt = 0; attempt < SANDWICH_ATTEMPTS; attempt++) {
     const int64_t l1 = esp_timer_get_time();
     const int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
     const int64_t l2 = esp_timer_get_time();
@@ -139,17 +152,23 @@ bool TsfSync::sample_tsf_(int64_t &tsf_us, int64_t &local_us) {
       local_us = l1 + width / 2;
     }
     if (width <= SANDWICH_MAX_US) {
+      if (width_out != nullptr) {
+        *width_out = width;
+      }
       return true;
     }
+  }
+  if (width_out != nullptr) {
+    *width_out = best_width;
   }
   return best_width <= SANDWICH_LOOSE_MAX_US;
 }
 
 TsfSync::EvalResult TsfSync::evaluate_mapping_(int64_t tsf_base_us, int64_t tsf_minus_server_us, float drift_ppm,
-                                               int64_t &offset_us, int64_t &extrapolation_us) {
+                                               int64_t &offset_us, int64_t &extrapolation_us, int64_t *width_out) {
   int64_t tsf_now, local_now;
   extrapolation_us = 0;
-  if (!sample_tsf_(tsf_now, local_now)) {
+  if (!sample_tsf_(tsf_now, local_now, width_out)) {
     return EvalResult::NO_TSF;
   }
   extrapolation_us = tsf_now - tsf_base_us;
@@ -626,7 +645,8 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   }
   int64_t extrapolation_us;
   int64_t raw_us;
-  if (evaluate_mapping_(tsf_base, tms_base, drift_ppm, raw_us, extrapolation_us) != EvalResult::OK) {
+  int64_t sandwich_us = 0;
+  if (evaluate_mapping_(tsf_base, tms_base, drift_ppm, raw_us, extrapolation_us, &sandwich_us) != EvalResult::OK) {
     this->offset_filter_valid_ = false;
     return false;
   }
@@ -650,7 +670,9 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
       std::abs(static_cast<double>(raw_us) - this->offset_filter_us_) > OFFSET_SNAP_US) {
     this->offset_filter_us_ = static_cast<double>(raw_us);
     this->offset_filter_valid_ = true;
-  } else {
+  } else if (sandwich_us <= SANDWICH_TRUST_US) {
+    // Only narrow reads move the filter. A wide bracket is mostly interrupt latency, and
+    // averaging it in would spend filter authority tracking noise we already know is bad.
     this->offset_filter_us_ += OFFSET_EWMA_ALPHA * (static_cast<double>(raw_us) - this->offset_filter_us_);
   }
   offset_us = static_cast<int64_t>(this->offset_filter_us_);

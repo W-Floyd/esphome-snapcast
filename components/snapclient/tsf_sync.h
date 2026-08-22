@@ -113,14 +113,14 @@ class TsfSync {
   void check_pipeline_divergence_(int16_t leader_pipeline_ms, int64_t local_now_us);
   /// Sandwiched TSF read: local/tsf/local, midpoint local, retried when an
   /// interrupt widens the sandwich. @return false if TSF is unavailable.
-  static bool sample_tsf_(int64_t &tsf_us, int64_t &local_us);
+  static bool sample_tsf_(int64_t &tsf_us, int64_t &local_us, int64_t *width_out = nullptr);
 
   enum class EvalResult : uint8_t { OK, NO_TSF, AGE_CLAMP };
   /// Evaluates a mapping at a fresh TSF sample. NO_TSF: TSF unreadable (sampling
   /// failed). AGE_CLAMP: extrapolation negative or too old (AP reboot resets TSF;
   /// extrapolating across that would produce garbage deadlines).
   static EvalResult evaluate_mapping_(int64_t tsf_base_us, int64_t tsf_minus_server_us, float drift_ppm,
-                                      int64_t &offset_us, int64_t &extrapolation_us);
+                                      int64_t &offset_us, int64_t &extrapolation_us, int64_t *width_out = nullptr);
 
   const int64_t plausibility_us_;
 

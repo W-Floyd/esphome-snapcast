@@ -92,7 +92,15 @@ static uint32_t startup_steer_frames(uint32_t chunk_frames) {
 // default at 44.1 kHz), giving ~0.39 s here. That duration is a term in the loop lag
 // that bounds the trim gain, so it is not a free parameter: a codec or rate with a
 // different block size changes it.
-static constexpr size_t MEDIAN_WINDOW = 15;
+//
+// Lengthened from 15 for stereo-image stability. The per-chunk error is WHITE NOISE
+// (measured: consecutive-difference sigma / sigma = 1.32-1.43 against sqrt(2) = 1.41),
+// so averaging more of it reduces the residual as ~sqrt(n) and costs nothing in
+// tracking -- there is no ramp being trailed. Note this is the opposite of the earlier
+// attempt to SHORTEN the window to buy loop bandwidth: with a noise-dominated error,
+// bandwidth pumps noise into the output and length removes it. Added lag is ~0.2 s
+// (half-window), keeping phase margin comfortable at KP = 0.5.
+static constexpr size_t MEDIAN_WINDOW = 31;
 
 // Closes the playout accounting against a direct observation of the pipeline.
 //
