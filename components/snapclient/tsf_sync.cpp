@@ -62,18 +62,24 @@ static constexpr int64_t MAX_EXTRAPOLATION_US = 10000000;
 // Sandwich width above which a TSF sample was interrupted mid-read; retry.
 // After all retries, the narrowest attempt is still accepted up to the loose
 // bound (the servo median absorbs the noise; a drop to Kalman fallback is worse).
-// Targeting ~10 us group sync, the sandwich is the dominant noise term: half the
-// bracket width is the uncertainty in pairing a TSF value to a local timestamp, and
-// that noise is PER DEVICE, so sharing the mapping does not cancel it. Accepting 100 us
-// meant admitting up to ~50 us of error into every deadline. Retry harder for a narrow
-// bracket; the loose bound stays generous because failing outright drops the caller to
-// its own Kalman estimate, which is far noisier than one wide TSF read -- but wide reads
-// are now excluded from the offset filter instead of being averaged in.
-static constexpr int64_t SANDWICH_MAX_US = 20;
+// The bracket is dominated by the DETERMINISTIC cost of esp_wifi_get_tsf_time(), not by
+// jitter. Measured on four devices: median 42 us, full range 42-49 us. Two things follow.
+//
+// First, a threshold below ~42 us is unreachable, so demanding one just burns retries: an
+// earlier attempt at 20 us with 8 attempts spent ~340 us of blocking work per deadline and
+// returned the same best-of value it would have accepted immediately.
+//
+// Second, the error model behind that attempt was wrong. A CONSISTENT bracket means the TSF
+// is latched at a consistent point within the call, so the midpoint carries a consistent
+// BIAS -- and identical devices share that bias, so it cancels between them. The noise that
+// actually matters is the variation in bracket width, ~7 us peak-to-peak, i.e. a few us.
+// TSF read noise is therefore NOT the dominant timing term; it was assumed to be.
+static constexpr int64_t SANDWICH_MAX_US = 60;
 static constexpr int64_t SANDWICH_LOOSE_MAX_US = 400;
-static constexpr int SANDWICH_ATTEMPTS = 8;
-// A read wider than this is not allowed to update the offset filter
-static constexpr int64_t SANDWICH_TRUST_US = 40;
+static constexpr int SANDWICH_ATTEMPTS = 3;
+// A read wider than this is not allowed to update the offset filter: at a 42 us floor and
+// 7 us of spread, anything past here is genuine interference rather than call cost.
+static constexpr int64_t SANDWICH_TRUST_US = 80;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 

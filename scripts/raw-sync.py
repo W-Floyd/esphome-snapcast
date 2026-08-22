@@ -50,9 +50,12 @@ RAW_RE = re.compile(
     r"tsf=(-?\d+) tsf_local=(-?\d+) sw=(-?\d+) rate=(\d+)"
 )
 
-# Half the bracket is the local<->TSF pairing uncertainty; beyond this a sample is
-# reported but excluded from the fit.
-TRUST_SW_US = 40
+# The bracket floor is the deterministic cost of esp_wifi_get_tsf_time() -- measured at
+# 42 us median, 42-49 us range across four devices -- so a threshold near that excludes
+# everything. What matters is not the width but its CONSISTENCY: a fixed bracket puts a
+# fixed bias on the midpoint, which cancels between identical devices, while a widened
+# bracket means interference landed mid-read and that sample really is noisy.
+TRUST_SW_US = 80
 
 
 def parse(path):
@@ -75,14 +78,23 @@ def parse(path):
     return out
 
 
-def fit(samples):
-    """Least-squares tsf = a + b*server. b should be ~1 + crystal offset."""
+# Discontinuities, not noise, are the main contaminant: every starvation re-baselines
+# the frame accounting, which steps `pushed - played` and shifts that sample's computed
+# server time. A plain least-squares fit lets a handful of those steps tilt the whole
+# line -- observed as 440-1220 us residuals on a relation that should be near-perfectly
+# linear, worst on the device taking the most starvations. So reject them iteratively
+# rather than averaging them in.
+OUTLIER_SIGMA = 2.5
+OUTLIER_PASSES = 5
+MIN_FIT_SAMPLES = 6
+
+
+def _lsq(samples):
     n = len(samples)
     if n < 2:
         return None
-    sx = sum(s for s, _, _ in samples)
-    sy = sum(t for _, t, _ in samples)
-    mx, my = sx / n, sy / n
+    mx = sum(s for s, _, _ in samples) / n
+    my = sum(t for _, t, _ in samples) / n
     sxx = sum((s - mx) ** 2 for s, _, _ in samples)
     sxy = sum((s - mx) * (t - my) for s, t, _ in samples)
     if sxx == 0:
@@ -90,7 +102,35 @@ def fit(samples):
     b = sxy / sxx
     a = my - b * mx
     resid = [t - (a + b * s) for s, t, _ in samples]
-    return a, b, statistics.pstdev(resid) if len(resid) > 1 else 0.0
+    return a, b, (statistics.pstdev(resid) if len(resid) > 1 else 0.0), resid
+
+
+def fit(samples):
+    """Robust least-squares tsf = a + b*server.
+
+    -> (intercept, slope, residual sigma, n_used, n_dropped) or None.
+    b - 1 is the device's clock rate against the server. Sigma is reported AFTER
+    rejection, so it describes the steady-state relation rather than the disturbances.
+    """
+    kept = list(samples)
+    dropped = 0
+    for _ in range(OUTLIER_PASSES):
+        r = _lsq(kept)
+        if r is None:
+            return None
+        a, b, sd, resid = r
+        if sd == 0.0:
+            break
+        keep = [smp for smp, e in zip(kept, resid) if abs(e) <= OUTLIER_SIGMA * sd]
+        if len(keep) == len(kept) or len(keep) < MIN_FIT_SAMPLES:
+            break
+        dropped += len(kept) - len(keep)
+        kept = keep
+    r = _lsq(kept)
+    if r is None:
+        return None
+    a, b, sd, _ = r
+    return a, b, sd, len(kept), dropped
 
 
 def main():
@@ -122,10 +162,11 @@ def main():
         f = fit(s)
         if f is None:
             continue
-        a, b, sd = f
-        fits[name] = (a, b, sd)
+        a, b, sd, used, dropped = f
+        fits[name] = (a, b, sd, used)
         # b-1 is the device's clock rate versus the server's, in ppm
-        print(f"  {name:>10}  rate offset {(b - 1) * 1e6:+8.1f} ppm   fit residual {sd:7.1f} us   n={len(s)}")
+        print(f"  {name:>10}  rate offset {(b - 1) * 1e6:+8.1f} ppm   residual {sd:7.1f} us   "
+              f"n={used} (dropped {dropped} as steps)")
 
     if len(fits) < 2:
         return 1
@@ -141,12 +182,13 @@ def main():
     print(f"\ntrue relative offset at the midpoint of the shared window ({(hi - lo) / 1e6:.0f} s of overlap):")
     print("  positive = the first device renders that audio LATER\n")
     for x, y in itertools.combinations(fits, 2):
-        ax, bx, sdx = fits[x]
-        ay, by, sdy = fits[y]
+        ax, bx, sdx, nx = fits[x]
+        ay, by, sdy, ny = fits[y]
         delta = (ax + bx * mid) - (ay + by * mid)
-        # Fit residuals are independent, so combine in quadrature over n
-        conf = ((sdx ** 2 / len(usable[x])) + (sdy ** 2 / len(usable[y]))) ** 0.5
-        print(f"  {x:>10} - {y:<10} {delta:+9.1f} us   +-{conf:5.1f} us")
+        # Fit residuals are independent, so combine in quadrature over the used counts
+        conf = ((sdx ** 2 / nx) + (sdy ** 2 / ny)) ** 0.5
+        verdict = "" if abs(delta) > 2 * conf else "   (not significant)"
+        print(f"  {x:>10} - {y:<10} {delta:+9.1f} us   +-{conf:5.1f} us{verdict}")
     return 0
 
 
