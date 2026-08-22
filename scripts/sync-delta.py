@@ -43,7 +43,13 @@ def rows_that_fit(n_names):
 
 
 def parse(path):
+    """Timestamps are wall-clock time-of-day with no date, so an overnight log
+    wraps at midnight. nearest() binary-searches and the pair maths differences
+    these values, so the series MUST stay monotonic: unwrap each backwards jump
+    into the following day instead of letting it rewind ~86400 s."""
     out = []
+    day = 0
+    prev = None
     with open(path, errors="replace") as f:
         for line in f:
             m = LINE_RE.search(line)
@@ -51,7 +57,12 @@ def parse(path):
                 continue
             h, mi, s, ms, med = m.groups()
             t = int(h) * 3600 + int(mi) * 60 + int(s) + (int(ms.ljust(3, "0")) / 1000 if ms else 0)
-            out.append((t, int(med)))
+            # A large step backwards is midnight; a small one is just two log
+            # lines racing within the same second, which must not add a day.
+            if prev is not None and t + 43200 < prev - day * 86400:
+                day += 1
+            prev = t + day * 86400
+            out.append((prev, int(med)))
     return out
 
 

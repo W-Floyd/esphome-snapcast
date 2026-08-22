@@ -104,8 +104,16 @@ def stations(topology):
             out.append({
                 "radio": w.get("radio", "?"),
                 "rssi": w.get("rssi"),
-                "up": w.get("uplinkPhyRate"),
-                "down": w.get("downlinkPhyRate"),
+                # get_topology's uplink/downlink labels are INVERTED relative to
+                # the Wi-Fi Data Elements spec that the same router serves from
+                # data_repo.data_element: for one station sampled 5x in the same
+                # minute, get_topology said uplink=39/downlink=1 while
+                # data_element said Downlink=39/Uplink=1. Data Elements is a
+                # published spec (uplink = STA->AP) and get_topology is vendor UI
+                # glue, so trust the spec and swap here. cost/byte is
+                # direction-symmetric, so only the labels were ever affected.
+                "up": w.get("downlinkPhyRate"),
+                "down": w.get("uplinkPhyRate"),
                 "name": d.get("hostname") or d["macAddress"],
                 "mac": d["macAddress"],
                 "uptime": c.get("uptime"),
