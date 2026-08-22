@@ -128,6 +128,10 @@ static constexpr size_t MEDIAN_WINDOW = 31;
 // (~25 ms) and the query walks the whole listener chain. Smoothed because it differences
 // two independently-sampled quantities and a noisy servo target is worse than a slightly
 // stale one.
+// One RAW line per chunk (~38/s at 44.1 kHz FLAC). See the emit site for the airtime
+// trade-off; raise to sample less often on a congested link.
+static constexpr uint32_t RAW_SAMPLE_EVERY_CHUNKS = 1;
+
 static constexpr uint32_t FILL_SAMPLE_EVERY_CHUNKS = 8;
 static constexpr float FILL_EWMA_ALPHA = 0.25f;
 // Bound, symmetric: past this the reading is bad, not a real disagreement
@@ -1297,6 +1301,7 @@ void SnapcastClient::player_task_() {
   uint32_t trim_samples = 0;
   uint32_t trim_railed = 0;
 #endif
+  uint32_t raw_sample_countdown = 1;
   // Smoothed accounted-vs-observed disagreement (us); 0 when the accounting is honest
   float fill_corr_us = 0.0f;
   bool fill_corr_valid = false;
@@ -1483,6 +1488,46 @@ void SnapcastClient::player_task_() {
     // moved.
     const int64_t error_us = predicted - deadline;  // >0: this chunk would play late
 
+#ifdef SNAPCLIENT_TSF_ACTIVE
+    // RAW timing sample, for offline cross-device analysis. Deliberately built from
+    // DIRECT OBSERVATIONS only -- no servo state, no predicted playout -- because every
+    // wrong diagnosis in this area came from trusting a model of when audio renders.
+    //
+    // The feedback pair (played, played_ts) is ground truth: that many frames HAD rendered
+    // at that local time. (s_ts, pushed) anchors the frame count to server audio time,
+    // which is the same number on every device for the same audio. (tsf, tsf_local)
+    // converts local time to the one clock the devices provably share. So offline:
+    //
+    //   server_time_of_last_rendered_frame = s_ts - (pushed - played) * 1e6 / rate
+    //   tsf_time_of_that_frame             = played_ts + (tsf - tsf_local)
+    //
+    // Differencing tsf_time between devices at equal server_time is the true relative
+    // offset, with the servo and the prediction model entirely out of the measurement.
+    //
+    // Rate: confidence on the fitted offset improves as sqrt(n), so a per-chunk sample
+    // (~38/s at 44.1 kHz FLAC) resolves in seconds what a per-report sample needed
+    // minutes for. The cost is log traffic on a link that is often the bottleneck --
+    // streamed logs compete with audio for the radio, which is why hard-resync logging is
+    // throttled. Raise the divisor if the fleet is on a congested channel.
+    if (this->tsf_sync_ != nullptr && --raw_sample_countdown == 0) {
+      raw_sample_countdown = RAW_SAMPLE_EVERY_CHUNKS;
+      int64_t raw_tsf = 0, raw_local = 0, raw_width = 0;
+      if (TsfSync::raw_tsf_sample(raw_tsf, raw_local, raw_width)) {
+        this->playout_mutex_.lock();
+        const int64_t r_played = this->played_frames_total_;
+        const int64_t r_pushed = this->pushed_frames_total_;
+        const int64_t r_played_ts = this->played_last_ts_us_;
+        this->playout_mutex_.unlock();
+        ESP_LOGD(TAG,
+                 "RAW s_ts=%" PRId64 " pushed=%" PRId64 " played=%" PRId64 " played_ts=%" PRId64 " tsf=%" PRId64
+                 " tsf_local=%" PRId64 " sw=%" PRId64 " rate=%" PRIu32,
+                 rec.server_ts_us, r_pushed, r_played, r_played_ts, raw_tsf, raw_local, raw_width,
+                 rec.params.sample_rate);
+      }
+    }
+#endif
+
+
     err_accum_us += error_us;
     err_peak_us = std::max(err_peak_us, std::abs(error_us));
 
@@ -1589,38 +1634,6 @@ void SnapcastClient::player_task_() {
                err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
                hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, trim_str,
                tsf_str, err_count);
-#ifdef SNAPCLIENT_TSF_ACTIVE
-      // RAW timing sample, for offline cross-device analysis. Deliberately built from
-      // DIRECT OBSERVATIONS only -- no servo state, no predicted playout -- because every
-      // wrong diagnosis in this area came from trusting a model of when audio renders.
-      //
-      // The feedback pair (played_frames, played_ts) is ground truth: that many frames HAD
-      // rendered at that local time. server_ts/pushed_frames anchors the frame count to
-      // server audio time, which is the same number on every device for the same audio. The
-      // TSF pair converts local time to the one clock the devices provably share. So offline:
-      //
-      //   server_time_of_last_rendered_frame
-      //       = server_ts - (pushed_frames - played_frames) * 1e6 / rate
-      //   tsf_time_of_that_frame = played_ts + (tsf - tsf_local)
-      //
-      // Differencing tsf_time between two devices at equal server_time is the true relative
-      // offset, with the servo and the prediction model entirely out of the measurement.
-      if (this->tsf_sync_ != nullptr) {
-        int64_t raw_tsf = 0, raw_local = 0, raw_width = 0;
-        if (TsfSync::raw_tsf_sample(raw_tsf, raw_local, raw_width)) {
-          this->playout_mutex_.lock();
-          const int64_t r_played = this->played_frames_total_;
-          const int64_t r_pushed = this->pushed_frames_total_;
-          const int64_t r_played_ts = this->played_last_ts_us_;
-          this->playout_mutex_.unlock();
-          ESP_LOGD(TAG,
-                   "RAW s_ts=%" PRId64 " pushed=%" PRId64 " played=%" PRId64 " played_ts=%" PRId64 " tsf=%" PRId64
-                   " tsf_local=%" PRId64 " sw=%" PRId64 " rate=%" PRIu32,
-                   rec.server_ts_us, r_pushed, r_played, r_played_ts, raw_tsf, raw_local, raw_width,
-                   rec.params.sample_rate);
-        }
-      }
-#endif
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
