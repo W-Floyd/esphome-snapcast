@@ -46,9 +46,24 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  # SuperMini boards have a poorly matched antenna that distorts at full TX power,
-  # causing "Auth Expired" loops even at full RX bars. Reduced power is the known fix.
-  output_power: 8.5dB
+  # output_power is deliberately UNSET. It is not merely a boot default that the
+  # runtime "WiFi TX Power" number below overrides: on esp32 ESPHome also derives a
+  # COMPILE-TIME PHY ceiling from it --
+  #   phy_tx_power = max(10, min(20, ceil(output_power)))
+  #   -> CONFIG_ESP_PHY_MAX_WIFI_TX_POWER
+  # -- and esp_wifi_set_max_tx_power() then returns ESP_OK while the PHY silently
+  # clamps to that ceiling. With output_power: 8.5dB the whole fleet was pinned at
+  # 10 dBm: every runtime request, including 20.5, read back as 10.00 dBm, and the
+  # AP heard the clients ~7-8 points weaker than it should while they heard the AP
+  # fine (an asymmetry that looks exactly like a bad antenna). CONF_OUTPUT_POWER has
+  # no esp32 default, so omitting it skips both the runtime call and the sdkconfig
+  # override, leaving IDF's own 20 dBm ceiling and making the full 2-20.5 range of
+  # the number entity actually reachable.
+  #
+  # If high power really does distort this board's antenna (the SuperMini's match is
+  # poor, and "Auth Expired" loops at full RX bars are the classic symptom), turn it
+  # down with the RUNTIME number, which is persisted -- do not reintroduce
+  # output_power here, or the ceiling comes back with it.
 
 external_components:
   - source:
@@ -244,9 +259,11 @@ sensor:
 
 # Runtime WiFi TX power tuning (pattern from speakeasy's wifi-9ramp.yaml). SuperMini
 # antennas distort at high power, so LOWER often connects better; find the sweet spot
-# from HA without reflashing. Persisted; wifi.output_power above only covers boot
-# until this restores. (Speakeasy's step-up-on-disconnect ramp is deliberately not
-# copied: on this board raising power is usually what breaks the link.)
+# from HA without reflashing. Persisted, and it is the ONLY place power should be set
+# -- see the wifi: block on why output_power must stay unset (it imposes a
+# compile-time PHY ceiling this entity cannot exceed, silently). (Speakeasy's
+# step-up-on-disconnect ramp is deliberately not copied: on this board raising power
+# is usually what breaks the link.)
 number:
   # This client's latency setting on the snapserver (Client.SetLatency via the control
   # API). Server-persisted and pushed back in ServerSettings, so this entity stays in
