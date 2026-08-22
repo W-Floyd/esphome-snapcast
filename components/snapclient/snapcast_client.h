@@ -376,6 +376,12 @@ class SnapcastClient {
   // Longest interval between playback feedback callbacks in the current diagnostics
   // window; read-and-reset by the player task's periodic sync report
   int64_t max_feedback_gap_us_{0};
+  // Mean feedback interval over the report window. This is the term that sets the
+  // feedback-pivot EWMA time constant (ALPHA * interval) and therefore most of the
+  // loop lag that bounds the trim gain -- and it had only ever been INFERRED, from
+  // the max-gap line, when a gain increase was derived from it. Measure it.
+  int64_t fb_gap_sum_us_{0};
+  uint32_t fb_gap_count_{0};
   // Set by the feedback clamp when the pipeline fully drains (source starvation);
   // consumed by the player task, which re-baselines playout from scratch. The latch
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.

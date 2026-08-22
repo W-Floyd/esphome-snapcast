@@ -294,6 +294,11 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
     // (pipeline underrun); surfaced in the periodic sync report for diagnostics
     const int64_t gap = timestamp_us - this->played_last_ts_us_;
     this->max_feedback_gap_us_ = std::max(this->max_feedback_gap_us_, gap);
+    if (gap > 0 && gap < PIPELINE_FLUSH_GAP_US) {
+      // Flush-sized gaps are outages, not cadence; they would skew the mean
+      this->fb_gap_sum_us_ += gap;
+      this->fb_gap_count_++;
+    }
     if (gap > PIPELINE_FLUSH_GAP_US) {
       // The pipeline stopped and restarted; the orchestrator recreates its ring on
       // restart, silently DISCARDING pushed-but-unplayed frames. Without this
@@ -1178,6 +1183,17 @@ void SnapcastClient::player_task_() {
   float trim_integral_ppm = 0.0f;
   bool rate_lock_ok = this->rate_lock_ != nullptr;
   uint32_t rate_lock_rate = 0;
+  // Trim wander over the report window. The trim IS the loop's estimate of the
+  // disturbance it is cancelling, so its spread says whether the loop is tracking a
+  // slow crystal offset (narrow, as designed) or chasing something it cannot (wide,
+  // or pinned at the rail). Observed on all four devices: swings of hundreds of ppm
+  // and repeated +-500 ppm saturation while medians stayed inside a few hundred us
+  // -- i.e. running at its authority limit in normal operation. Quantify it before
+  // any further gain change.
+  float trim_min_ppm = 0.0f;
+  float trim_max_ppm = 0.0f;
+  uint32_t trim_samples = 0;
+  uint32_t trim_railed = 0;
 #endif
   // Mute-until-synced: real audio flows only after a full window of in-band medians
   bool converged = false;
@@ -1218,7 +1234,10 @@ void SnapcastClient::player_task_() {
 #ifdef USE_SNAPCLIENT_RATE_LOCK
     if (rate_lock_ok && rec.params.sample_rate != rate_lock_rate) {
       // The speaker reprograms the I2S clock for a new stream format; re-read the
-      // divider baseline once the new clock is running
+      // divider baseline once the new clock is running. The rate is what lets the
+      // lock compute the IDEAL divider rather than inherit the driver's rounding of
+      // it, which can otherwise eat the servo's whole trim authority.
+      this->rate_lock_->set_output_rate(rec.params.sample_rate);
       this->rate_lock_->invalidate_baseline();
       rate_lock_rate = rec.params.sample_rate;
     }
@@ -1304,9 +1323,13 @@ void SnapcastClient::player_task_() {
     if (++err_count >= 128) {
       int64_t max_gap_us;
       int64_t pipeline_frames;
+      int64_t fb_mean_gap_us;
       this->playout_mutex_.lock();
       max_gap_us = this->max_feedback_gap_us_;
       this->max_feedback_gap_us_ = 0;
+      fb_mean_gap_us = this->fb_gap_count_ > 0 ? this->fb_gap_sum_us_ / this->fb_gap_count_ : 0;
+      this->fb_gap_sum_us_ = 0;
+      this->fb_gap_count_ = 0;
       pipeline_frames = this->pushed_frames_total_ - this->played_frames_total_;
       this->playout_mutex_.unlock();
       // Accounted pipeline depth (pushed-but-unplayed). Sane: a stable few hundred
@@ -1319,10 +1342,16 @@ void SnapcastClient::player_task_() {
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
-      char trim_str[32] = "";
+      char trim_str[112] = "";
 #ifdef USE_SNAPCLIENT_RATE_LOCK
       if (rate_lock_ok) {
-        snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm", this->rate_lock_->applied_ppm());
+        if (trim_samples > 0) {
+          snprintf(trim_str, sizeof(trim_str),
+                   ", trim %+.2f ppm (span %+.0f..%+.0f, railed %" PRIu32 "/%" PRIu32 ")",
+                   this->rate_lock_->applied_ppm(), trim_min_ppm, trim_max_ppm, trim_railed, trim_samples);
+        } else {
+          snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (idle)", this->rate_lock_->applied_ppm());
+        }
       }
 #endif
       char tsf_str[64] = "";
@@ -1348,16 +1377,20 @@ void SnapcastClient::player_task_() {
 #endif
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
-               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, max feedback gap %" PRId64
-               " ms, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s over %" PRIu32 " chunks",
+               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, feedback %" PRId64
+               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s over %" PRIu32
+               " chunks",
                err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
-               hard_resyncs, max_gap_us / 1000, buffered_ms, pipeline_ms, trim_str, tsf_str, err_count);
+               hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, trim_str, tsf_str,
+               err_count);
       err_accum_us = 0;
       err_peak_us = 0;
       err_count = 0;
       soft_dropped_frames = 0;
       soft_inserted_frames = 0;
       hard_resyncs = 0;
+      trim_samples = 0;
+      trim_railed = 0;
     }
 
     // Hard-resync logging is throttled to one line per RESYNC_LOG_INTERVAL_US: during
@@ -1449,11 +1482,37 @@ void SnapcastClient::player_task_() {
               TRIM_CLAMP_PPM);
         }
         const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -TRIM_CLAMP_PPM, TRIM_CLAMP_PPM);
+        if (trim_samples == 0) {
+          trim_min_ppm = trim_max_ppm = trim_ppm;
+        } else {
+          trim_min_ppm = std::min(trim_min_ppm, trim_ppm);
+          trim_max_ppm = std::max(trim_max_ppm, trim_ppm);
+        }
+        trim_samples++;
+        if (std::abs(trim_ppm) >= TRIM_CLAMP_PPM - 0.5f) {
+          trim_railed++;
+        }
         trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
         if (!trim_holds) {
           rate_lock_ok = false;
           ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
         }
+      } else if (rate_lock_ok) {
+        // Outside the fine band the PI does not run, which previously left the LAST
+        // trim applied to the hardware for the whole excursion. That is an
+        // uncontrolled rate offset in an arbitrary direction: measured during a
+        // delivery stall, the clock sat frozen at -258.56 ppm across four
+        // consecutive reports (~10 s) -- playing SLOW while the device was already
+        // seconds late, i.e. actively widening the error the coarse mechanism was
+        // fighting. Hold nominal rate instead: we have no valid rate estimate out
+        // here, so zero is the only defensible value, and the chunk drops/splices
+        // below do the correcting.
+        //
+        // Only reachable while muted (the condition above is
+        // `converged || in-band`, so this branch means !converged && out-of-band),
+        // so the rate change cannot be audible. trim_holds stays false on purpose,
+        // to keep the coarse splice path engaged.
+        this->rate_lock_->set_trim_ppm(0.0f);
       }
 #endif
       // While muted (pre-convergence) audibility doesn't constrain splice size, so
