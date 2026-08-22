@@ -47,6 +47,18 @@ class RateLock {
   /// rational quantization (~0.15 ppm steps). Diagnostics only.
   float applied_ppm() const { return this->applied_ppm_; }
 
+  /// @brief Tells the lock which output rate the speaker is running, so the baseline
+  /// can be corrected to the exact ideal divider instead of inheriting the I2S
+  /// driver's rational approximation of it -- an error of up to ~500 ppm, which the
+  /// servo would otherwise have to cancel out of its own authority. Call before the
+  /// first trim and whenever the rate changes (alongside invalidate_baseline()).
+  /// 0 disables the correction.
+  void set_output_rate(uint32_t sample_rate) { this->output_rate_ = sample_rate; }
+
+  /// @brief How far the driver's baseline was off the ideal, ppm; 0 when no
+  /// correction was applied. Positive = driver was running slow. Diagnostics.
+  float baseline_corrected_ppm() const { return this->baseline_corrected_ppm_; }
+
  protected:
   bool read_baseline_();
 
@@ -59,6 +71,11 @@ class RateLock {
   uint32_t base_int_{0};
   uint32_t base_num_{0};
   uint32_t base_den_{1};
+  // Reference ratio trims are measured against: the exact ideal where it could be
+  // established, otherwise the driver's approximation above (legacy behaviour)
+  double base_ratio_{0.0};
+  uint32_t output_rate_{0};
+  float baseline_corrected_ppm_{0.0f};
   // Last written fractional-field register value, to skip redundant writes
   uint32_t last_frac_val_{0};
 };

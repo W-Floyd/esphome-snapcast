@@ -40,6 +40,30 @@ static constexpr float TRIM_CLAMP_PPM = 500.0f;
 // x/y/z are 9-bit fields; denominators up to 511 give ~0.15 ppm rational spacing
 static constexpr uint32_t MAX_DENOMINATOR = 511;
 
+// Baseline correction. Trims are relative to the baseline divider, so any error in
+// the divider the I2S DRIVER chose is a DC offset the servo must cancel out of its
+// own +-500 ppm authority before it can sync anything. Measured across one fleet,
+// the driver's rational approximation for 44.1 kHz varied per boot:
+//
+//   ideal 160 MHz / (44100 * 256) = 6250/441 = 14 + 76/441   exactly representable
+//   observed  14 + 76/441   ->    +0.0 ppm error
+//   observed  14 + 47/269   ->  -168.3 ppm error
+//   observed  14 + 68/379   ->  -499.6 ppm error
+//
+// The last one leaves the servo pinned at its rail with nothing left to sync with
+// (observed: one device at span +500..+500, railed 128/128, median stuck at 1-2 ms
+// while its peers held +-110 us). The hardware can express the exact ratio, so this
+// error is entirely self-inflicted: recompute the ideal divider and use THAT as the
+// baseline, and the DC term collapses to the rational quantization floor (~0.15 ppm).
+//
+// PLL_F160M is the S3's default I2S clock source.
+static constexpr double I2S_SRC_HZ = 160000000.0;
+// mclk_multiple is the speaker's choice and is not readable back, so it is inferred
+// from the divider the driver programmed. Adjacent multiples differ by >=33%, and the
+// driver's own error is <1000 ppm, so the match is unambiguous at this tolerance.
+static constexpr uint32_t MCLK_MULTIPLES[] = {64, 128, 192, 256, 384, 512, 576, 768, 1024};
+static constexpr double MULT_MATCH_TOL = 0.01;
+
 // tx_clkm_div_conf field layout: z[8:0] y[17:9] x[26:18] yn1[27]
 static constexpr uint32_t FRAC_FIELDS_MASK = 0x0FFFFFFF;
 
@@ -101,7 +125,43 @@ bool RateLock::read_baseline_() {
   this->base_num_ = b;
   this->base_den_ = a;
   this->last_frac_val_ = frac;
-  ESP_LOGD(TAG, "I2S%u baseline divider: %" PRIu32 " + %" PRIu32 "/%" PRIu32, this->port_, div_num, b, a);
+
+  const double programmed = div_num + static_cast<double>(b) / a;
+  this->base_ratio_ = programmed;
+  this->baseline_corrected_ppm_ = 0.0f;
+
+  // Replace the driver's approximation with the exact ideal ratio where we can
+  // establish it. Bails out (keeping the driver's baseline, i.e. the old behaviour)
+  // on anything unverified: no known output rate, no mclk_multiple that explains the
+  // programmed divider, or an ideal whose INTEGER part differs -- tx_clkm_div_num
+  // cannot be rewritten glitch-free on a running channel.
+  const uint32_t rate = this->output_rate_;
+  if (rate == 0) {
+    ESP_LOGD(TAG, "I2S%u baseline divider: %" PRIu32 " + %" PRIu32 "/%" PRIu32 " (rate unknown, uncorrected)",
+             this->port_, div_num, b, a);
+    return true;
+  }
+  for (const uint32_t mult : MCLK_MULTIPLES) {
+    const double ideal = I2S_SRC_HZ / (static_cast<double>(rate) * mult);
+    if (std::fabs(ideal - programmed) / programmed > MULT_MATCH_TOL) {
+      continue;
+    }
+    if (static_cast<uint32_t>(ideal) != div_num) {
+      ESP_LOGW(TAG, "I2S%u ideal divider %.6f needs integer part %u, driver programmed %" PRIu32 "; uncorrected",
+               this->port_, ideal, static_cast<unsigned>(ideal), div_num);
+      break;
+    }
+    this->base_ratio_ = ideal;
+    // Positive = the driver was running SLOW and the servo had to push this hard
+    this->baseline_corrected_ppm_ = static_cast<float>((programmed / ideal - 1.0) * 1e6);
+    ESP_LOGD(TAG,
+             "I2S%u baseline divider: %" PRIu32 " + %" PRIu32 "/%" PRIu32
+             " (driver) -> ideal %.6f for %" PRIu32 " Hz x%" PRIu32 ", reclaimed %+.1f ppm",
+             this->port_, div_num, b, a, ideal, rate, mult, this->baseline_corrected_ppm_);
+    return true;
+  }
+  ESP_LOGD(TAG, "I2S%u baseline divider: %" PRIu32 " + %" PRIu32 "/%" PRIu32 " (no mclk_multiple match, uncorrected)",
+           this->port_, div_num, b, a);
   return true;
 }
 
@@ -118,7 +178,9 @@ bool RateLock::set_trim_ppm(float ppm) {
   }
 
   ppm = std::clamp(ppm, -TRIM_CLAMP_PPM, TRIM_CLAMP_PPM);
-  const double base_ratio = this->base_int_ + static_cast<double>(this->base_num_) / this->base_den_;
+  // Ideal ratio where read_baseline_ could establish it, else the driver's own --
+  // so ppm is measured against the CORRECT rate, not against the driver's rounding
+  const double base_ratio = this->base_ratio_;
   // Positive ppm = play faster = higher MCLK = smaller divider
   const double target = base_ratio * (1.0 - static_cast<double>(ppm) * 1e-6);
   const double frac = target - this->base_int_;
