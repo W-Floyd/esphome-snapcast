@@ -67,7 +67,19 @@ static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
 // stage got WORSE, not better -- 12 s of a 26 s boot, with the median moving away
 // from zero (1010 -> 1376 -> 1804 us) before overshooting, then drifting steadily
 // past the deadband after unmute. Two of four devices never recovered at all.
-static constexpr uint32_t STARTUP_STEER_FRAMES = 8;
+// Expressed as a SLEW RATE, not a frame count. The old form was 8 frames per chunk,
+// which is only a rate once you fix the chunk size: 8 of ~1176 frames is ~6800 ppm at
+// 44.1 kHz, but snapcast chunks are a fixed DURATION, so frames scale with the sample
+// rate and the same 8 frames is a proportionally smaller slew at 48 kHz and above --
+// muted convergence silently slowed down on higher-rate streams. Deriving the count
+// from the chunk actually in hand keeps the slew constant across formats.
+static constexpr float STARTUP_STEER_PPM = 6800.0f;
+
+/// Frames to splice per chunk to slew at STARTUP_STEER_PPM, given this chunk's size.
+/// At least 1, so the coarse stage always makes progress on a very short chunk.
+static uint32_t startup_steer_frames(uint32_t chunk_frames) {
+  return std::max<uint32_t>(1, static_cast<uint32_t>(chunk_frames * (STARTUP_STEER_PPM * 1e-6f) + 0.5f));
+}
 
 // Median window for the steering servo's error signal (~0.4 s of chunks)
 static constexpr size_t MEDIAN_WINDOW = 15;
@@ -92,7 +104,11 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // window). KI = KP^2/4: critically damped; the integrator absorbs the crystal
 // offset so P holds the error at zero.
 static constexpr float TRIM_KP_PPM_PER_US = 0.5f;
-static constexpr float TRIM_KI_PPM_PER_US_S = 0.0625f;
+// Computed, not written out: KI = KP^2/4 is the critical-damping relationship above,
+// and a literal lets the two drift apart silently. That happened -- a KP change had
+// to have its KI recomputed by hand, and getting it wrong changes the damping with
+// no compile error and no obvious symptom.
+static constexpr float TRIM_KI_PPM_PER_US_S = TRIM_KP_PPM_PER_US * TRIM_KP_PPM_PER_US / 4.0f;
 // The clamp is DERIVED, not chosen. The PI takes over at converge_fine, so for it to
 // act as a linear controller anywhere in that band the output must be able to express
 // the proportional term at the handoff:
@@ -1549,8 +1565,9 @@ void SnapcastClient::player_task_() {
       // While muted (pre-convergence) audibility doesn't constrain splice size, so
       // steer hard to reach the band quickly, then single frames for the end-game
       if (!trim_holds) {
-        const uint32_t steer_frames =
-            (converged || std::abs(median_err_us) <= this->config_.converge_fine_us) ? 1 : STARTUP_STEER_FRAMES;
+        const uint32_t steer_frames = (converged || std::abs(median_err_us) <= this->config_.converge_fine_us)
+                                          ? 1
+                                          : startup_steer_frames(frames);
         if (steer_dir > 0) {
           drop_frames = steer_frames;
           soft_dropped_frames += steer_frames;
