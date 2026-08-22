@@ -33,6 +33,7 @@ void SnapclientHub::setup() {
   config.hard_resync_threshold_ms = this->hard_resync_threshold_ms_;
   config.stream_idle_timeout_ms = this->stream_idle_timeout_ms_;
   config.sync_deadband_us = this->sync_deadband_us_;
+  config.converge_fine_us = this->converge_fine_us_;
 #ifdef USE_SNAPCLIENT_RATE_LOCK
   config.rate_lock_i2s_port = this->rate_lock_port_;
 #endif

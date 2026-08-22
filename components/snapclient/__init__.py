@@ -44,6 +44,7 @@ PHASE_MODES = {
 }
 CONF_PHASE_INVERT = "phase_invert"
 CONF_SYNC_DEADBAND = "sync_deadband"
+CONF_CONVERGE_FINE = "converge_fine"
 CONF_RATE_LOCK = "rate_lock"
 CONF_I2S_PORT = "i2s_port"
 CONF_TSF_SYNC = "tsf_sync"
@@ -70,6 +71,37 @@ RATE_LOCK_SCHEMA = cv.All(
         msg_prefix="rate_lock (hardware I2S clock steering)",
     ),
 )
+
+
+def _validate_convergence_bands(config: ConfigType) -> ConfigType:
+    """The three sync thresholds must stay ordered, or convergence cannot finish.
+
+    Unmuting requires the median to hold inside 2x sync_deadband, and only the
+    fine mechanism can hold it there -- the coarse splices limit-cycle at roughly
+    +-800us. So if converge_fine drops to or below the unmute band, the handoff
+    happens inside the band the servo is trying to satisfy and a muted client can
+    oscillate forever (observed fleet-wide before the handoff existed). Likewise a
+    converge_fine at or above hard_resync_threshold would let the hard-resync path
+    fire before the fine mechanism ever engages.
+    """
+    unmute_band_us = 2 * config[CONF_SYNC_DEADBAND].total_microseconds
+    fine_us = config[CONF_CONVERGE_FINE].total_microseconds
+    hard_us = config[CONF_HARD_RESYNC_THRESHOLD].total_milliseconds * 1000
+    if fine_us <= unmute_band_us:
+        raise cv.Invalid(
+            f"{CONF_CONVERGE_FINE} ({fine_us}us) must exceed twice "
+            f"{CONF_SYNC_DEADBAND} ({unmute_band_us}us): the coarse splices cannot "
+            f"settle inside the unmute band, so the client would stay muted",
+            path=[CONF_CONVERGE_FINE],
+        )
+    if fine_us >= hard_us:
+        raise cv.Invalid(
+            f"{CONF_CONVERGE_FINE} ({fine_us}us) must be below "
+            f"{CONF_HARD_RESYNC_THRESHOLD} ({hard_us}us), or the hard-resync path "
+            f"fires before the fine mechanism engages",
+            path=[CONF_CONVERGE_FINE],
+        )
+    return config
 
 
 def _request_networking(config: ConfigType) -> ConfigType:
@@ -116,6 +148,22 @@ CONFIG_SCHEMA = cv.All(
                     max=cv.TimePeriod(milliseconds=20),
                 ),
             ),
+            # Coarse->fine handoff for muted convergence. Above this median error
+            # the servo uses hard multi-frame splices (fast, but they limit-cycle
+            # at ~+-800us with the measurement lag); below it the PI trim / single
+            # frames take over and actually settle inside the deadband. This is
+            # also the boundary that decides whether a hard resync re-mutes: an
+            # excursion that stays inside it is trim-only, so it is inaudible and
+            # does not force a re-lock. Lower it to spend longer on the fast
+            # mechanism (quicker lock, but risks the splice limit cycle never
+            # satisfying the unmute gate); raise it to hand off earlier.
+            cv.Optional(CONF_CONVERGE_FINE, default="2ms"): cv.All(
+                cv.positive_time_period_microseconds,
+                cv.Range(
+                    min=cv.TimePeriod(microseconds=250),
+                    max=cv.TimePeriod(milliseconds=50),
+                ),
+            ),
             cv.Optional(CONF_HARD_RESYNC_THRESHOLD, default="50ms"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(
@@ -145,6 +193,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
+    _validate_convergence_bands,
     _request_networking,
 )
 
@@ -167,6 +216,7 @@ async def to_code(config: ConfigType) -> None:
         )
     )
     cg.add(var.set_sync_deadband(config[CONF_SYNC_DEADBAND].total_microseconds))
+    cg.add(var.set_converge_fine(config[CONF_CONVERGE_FINE].total_microseconds))
     cg.add(
         var.set_hard_resync_threshold(
             config[CONF_HARD_RESYNC_THRESHOLD].total_milliseconds

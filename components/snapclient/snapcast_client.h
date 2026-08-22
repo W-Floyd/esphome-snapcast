@@ -43,6 +43,11 @@ struct SnapcastClientConfig {
   // Reference esp32 snapclient uses 128 us; single-frame steering splices are ~23 us
   // events, inaudible.
   int64_t sync_deadband_us{128};
+  // Coarse->fine handoff for muted convergence, and the boundary that decides
+  // whether a hard resync forces a re-lock (see the player loop). Must stay
+  // above 2*sync_deadband_us and below hard_resync_threshold_ms; the Python
+  // schema enforces both.
+  int64_t converge_fine_us{2000};
 #ifdef USE_SNAPCLIENT_RATE_LOCK
   // I2S port whose output clock the hardware rate lock steers (steady-state
   // corrections become clock trims instead of frame splices where supported)
@@ -375,6 +380,10 @@ class SnapcastClient {
   // consumed by the player task, which re-baselines playout from scratch. The latch
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
   std::atomic<bool> pipeline_starved_{false};
+  // Muted convergence: smooth the feedback pivot far less aggressively, trading
+  // estimate noise (inaudible through silence) for the loop lag that caps the
+  // trim gain. Set by the player task, read by notify_audio_played().
+  std::atomic<bool> fast_feedback_{true};
   bool starved_latched_{false};
 
   // --- Network task locals ---
