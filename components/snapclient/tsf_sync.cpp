@@ -84,15 +84,20 @@ static constexpr int64_t MAX_EXTRAPOLATION_US = 10000000;
 static constexpr int64_t SANDWICH_MAX_US = 50;
 static constexpr int64_t SANDWICH_LOOSE_MAX_US = 400;
 static constexpr int SANDWICH_ATTEMPTS = 5;
-// A read wider than this is not allowed to update the offset filter.
+// The trust threshold is DERIVED per device, not chosen. What distinguishes a good read
+// from a bad one is not an absolute width but whether the bracket is near the floor this
+// hardware can achieve -- and that floor varies: four otherwise identical boards measured
+// 45, 45, 79 and 81 us. Any fixed threshold is therefore wrong for some device, and
+// wrong in the worst way: at 70 us, two of the four had EVERY sample rejected and their
+// offset filter never updated, frozen at its first value while the true offset drifted
+// away from it. A derived threshold cannot do that, because it is defined by samples
+// that actually occurred.
 //
-// MUST stay above the widest NORMAL bracket any device achieves, not just the best. The
-// call cost is per-device: three devices read 46-50 us while a fourth read 83 us median
-// with excursions to 122. At a 70 us threshold that fourth device had every sample
-// rejected, so its offset filter never updated at all -- frozen at its first value while
-// the true offset drifted away from it, which is a slowly growing error of tens of ms.
-// Excluding noisy samples is only useful if the device still has samples left.
-static constexpr int64_t SANDWICH_TRUST_US = 200;
+// Floor = minimum bracket over a recent block of samples; trust anything within
+// SANDWICH_TRUST_FACTOR of it. The block bound lets the floor rise if the device gets
+// genuinely busier, rather than latching a lucky early read forever.
+static constexpr int64_t SANDWICH_TRUST_FACTOR = 2;
+static constexpr uint32_t SANDWICH_FLOOR_BLOCK = 256;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 
@@ -681,6 +686,19 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   // published mapping carries drift_ppm and evaluate_mapping_ extrapolates with it, so what
   // remains should be near-constant and any real movement is ppm-scale. Reset on a new mapping
   // so a leader change or re-anchor steps through immediately instead of being smeared.
+  // Track this device's bracket floor over a bounded block, so the trust threshold below
+  // is derived from reads that actually happened rather than assumed. The block bound lets
+  // the floor rise if the device becomes genuinely busier instead of latching a lucky
+  // early read forever.
+  this->sandwich_block_min_us_ =
+      this->sandwich_block_min_us_ == 0 ? sandwich_us : std::min(this->sandwich_block_min_us_, sandwich_us);
+  if (++this->sandwich_block_n_ >= SANDWICH_FLOOR_BLOCK || this->sandwich_floor_us_ == 0) {
+    this->sandwich_floor_us_ = this->sandwich_block_min_us_;
+    this->sandwich_block_min_us_ = 0;
+    this->sandwich_block_n_ = 0;
+  }
+  const int64_t trust_us = this->sandwich_floor_us_ * SANDWICH_TRUST_FACTOR;
+
   // Snap on a genuine step, filter otherwise. NOT keyed on adopt_: that runs once per
   // beacon, so re-anchoring there would reset the filter every second and filter nothing.
   // Consecutive mappings differ by at most the slew rate times the interval, so anything
@@ -689,9 +707,9 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
       std::abs(static_cast<double>(raw_us) - this->offset_filter_us_) > OFFSET_SNAP_US) {
     this->offset_filter_us_ = static_cast<double>(raw_us);
     this->offset_filter_valid_ = true;
-  } else if (sandwich_us <= SANDWICH_TRUST_US) {
-    // Only narrow reads move the filter. A wide bracket is mostly interrupt latency, and
-    // averaging it in would spend filter authority tracking noise we already know is bad.
+  } else if (sandwich_us <= trust_us) {
+    // Only reads near this device's own floor move the filter. A wider bracket is mostly
+    // interrupt latency, and averaging it in spends filter authority on known-bad data.
     this->offset_filter_us_ += OFFSET_EWMA_ALPHA * (static_cast<double>(raw_us) - this->offset_filter_us_);
   }
   offset_us = static_cast<int64_t>(this->offset_filter_us_);

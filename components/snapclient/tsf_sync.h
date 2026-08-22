@@ -199,6 +199,10 @@ class TsfSync {
   // Low-pass state for shared_server_offset_us(); player-task-only
   double offset_filter_us_{0.0};
   bool offset_filter_valid_{false};
+  // Per-device sandwich floor, so the trust threshold is derived rather than assumed
+  int64_t sandwich_floor_us_{0};
+  int64_t sandwich_block_min_us_{0};
+  uint32_t sandwich_block_n_{0};
 };
 
 }  // namespace esphome::snapclient
