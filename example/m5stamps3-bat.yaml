@@ -1,0 +1,34 @@
+# Snapclient on an M5Stamp S3 BAT (ESP32-S3-PICO-1-N8R8: 8 MB flash, 8 MB octal PSRAM).
+#
+# Same DAC pinout as the SuperMini build, so an existing board swaps in directly:
+#
+#   GPIO4  -> LCK  (word select / LR clock)
+#   GPIO5  -> BCK  (bit clock)
+#   GPIO6  -> DIN  (data)
+#
+# The onboard WS2812 is GPIO21 here, not GPIO48.
+#
+# Everything not board-specific is in snapclient-base.yaml.
+substitutions:
+  name: snapclient-stamps3
+  friendly_name: Snapclient StampS3
+
+  board: m5stack-stamps3
+  flash_size: 8MB
+  # N8R8's 8 MB PSRAM is OCTAL. Setting quad here boots but leaves PSRAM unusable,
+  # and the decoded-PCM ring buffer is sized expecting it.
+  psram_mode: octal
+  psram_speed: 80MHz
+
+  pin_lrclk: GPIO4
+  pin_bclk: GPIO5
+  pin_dout: GPIO6
+  pin_led: GPIO21
+
+packages:
+  base: !include snapclient-base.yaml
+
+# No wifi.output_power on purpose: this module has not shown the SuperMini's antenna
+# distortion, so it boots at the PHY maximum like any stock ESPHome board. The runtime
+# "WiFi TX Power" number can still trim it down, and the 20 dBm PHY ceiling is set in
+# the base regardless.
