@@ -1446,6 +1446,9 @@ void SnapcastClient::player_task_() {
 
     // Refresh the padding estimate: measured fill (rings + FULL DMA span, padding
     // included) minus what the accounting believes is outstanding (real frames only).
+    // Diagnostics-only since the correction is no longer applied: guard on the log level
+    // so the listener-chain walk and mutex are not paid for an unemitted number.
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
     if (fill_sample_countdown == 0) {
       fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
       size_t measured_bytes = 0;
@@ -1467,6 +1470,7 @@ void SnapcastClient::player_task_() {
     } else {
       fill_sample_countdown--;
     }
+#endif  // ESPHOME_LOG_LEVEL >= DEBUG
 
     // fill_corr_us is MEASURED AND REPORTED BUT NOT APPLIED. Applying it was wrong and
     // measurably harmful: it manufactured the very offset it was meant to remove.
@@ -1509,6 +1513,10 @@ void SnapcastClient::player_task_() {
     // minutes for. The cost is log traffic on a link that is often the bottleneck --
     // streamed logs compete with audio for the radio, which is why hard-resync logging is
     // throttled. Raise the divisor if the fleet is on a congested channel.
+    // Guarded on the log level, not merely wrapped around the ESP_LOGD: the macro compiles
+    // away below DEBUG but the work would not. raw_tsf_sample() costs up to 5 TSF reads of
+    // 45-81 us each plus a mutex acquisition, per chunk, none of it emitted at INFO.
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
     if (this->tsf_sync_ != nullptr && --raw_sample_countdown == 0) {
       raw_sample_countdown = RAW_SAMPLE_EVERY_CHUNKS;
       int64_t raw_tsf = 0, raw_local = 0, raw_width = 0;
@@ -1525,7 +1533,8 @@ void SnapcastClient::player_task_() {
                  rec.params.sample_rate);
       }
     }
-#endif
+#endif  // ESPHOME_LOG_LEVEL >= DEBUG
+#endif  // SNAPCLIENT_TSF_ACTIVE
 
 
     err_accum_us += error_us;
