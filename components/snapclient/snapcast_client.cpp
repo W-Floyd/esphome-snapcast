@@ -1672,6 +1672,14 @@ void SnapcastClient::player_task_() {
       hard_resyncs++;
       err_window_filled = 0;
       steer_dir = 0;
+      // INFO on the true->false edge: this is the moment audio goes silent, and it
+      // is the only user-audible event in the loop. Logging only the re-lock (which
+      // is INFO) made a dropout look like a spontaneous "Sync locked" with no cause,
+      // since the resync line above is DEBUG and throttled. One line per gap.
+      if (converged) {
+        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms late -- audible gap until re-lock",
+                 error_us / 1000);
+      }
       converged = false;
       this->discard_ring_bytes_(rec.bytes);
       continue;
@@ -1690,6 +1698,10 @@ void SnapcastClient::player_task_() {
       hard_resyncs++;
       err_window_filled = 0;
       steer_dir = 0;
+      if (converged) {
+        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms early -- audible gap until re-lock",
+                 -error_us / 1000);
+      }
       converged = false;
       this->push_silence_(fill, rec.params);
     } else if (std::abs(median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US) {

@@ -47,7 +47,7 @@ psram:
   speed: ${psram_speed}
 
 logger:
-  level: INFO
+  level: DEBUG
 
 api:
 
