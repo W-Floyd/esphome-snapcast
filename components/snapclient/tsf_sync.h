@@ -92,6 +92,16 @@ class TsfSync {
   /// THREAD CONTEXT: network task (same as service()).
   void set_peers(std::vector<uint32_t> peer_addrs);
 
+  /// @brief One raw sandwiched TSF sample: the AP's counter paired with our esp_timer,
+  /// plus the bracket width that pairing was measured to. Exposed for offline
+  /// cross-device analysis -- it is the only clock two devices provably share, so it is
+  /// the reference any real timing comparison has to be expressed in.
+  /// THREAD CONTEXT: any; performs its own reads.
+  static bool raw_tsf_sample(int64_t &tsf_us, int64_t &local_us, int64_t &width_us) {
+    width_us = 0;
+    return sample_tsf_(tsf_us, local_us, &width_us);
+  }
+
   Role role() const { return this->role_.load(std::memory_order_relaxed); }
   /// @brief Age of the active mapping in seconds, or -1 when none. Diagnostics.
   float mapping_age_s(int64_t local_now_us);
