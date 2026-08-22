@@ -29,6 +29,16 @@ esp32:
   flash_size: 4MB
   framework:
     type: esp-idf
+    sdkconfig_options:
+      # Raise the PHY TX-power ceiling INDEPENDENTLY of wifi.output_power. The two
+      # cannot be separated through output_power alone: on esp32 ESPHome derives the
+      # ceiling from it as max(10, min(20, ceil(output_power))), so one knob fixes
+      # both the boot power and the ceiling. We want a LOW boot power (this board's
+      # antenna is poorly matched and misassociates at high power) with a HIGH
+      # ceiling (so the runtime "WiFi TX Power" number can explore above 10 dBm).
+      # Setting the Kconfig value directly gives both; output_power below stays low
+      # and still governs what is actually applied at boot.
+      CONFIG_ESP_PHY_MAX_WIFI_TX_POWER: "20"
 
 # The SuperMini's ESP32-S3FH4R2 has 2 MB embedded QUAD PSRAM (not octal)
 psram:
@@ -46,24 +56,20 @@ ota:
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
-  # output_power is deliberately UNSET. It is not merely a boot default that the
-  # runtime "WiFi TX Power" number below overrides: on esp32 ESPHome also derives a
-  # COMPILE-TIME PHY ceiling from it --
-  #   phy_tx_power = max(10, min(20, ceil(output_power)))
-  #   -> CONFIG_ESP_PHY_MAX_WIFI_TX_POWER
-  # -- and esp_wifi_set_max_tx_power() then returns ESP_OK while the PHY silently
-  # clamps to that ceiling. With output_power: 8.5dB the whole fleet was pinned at
-  # 10 dBm: every runtime request, including 20.5, read back as 10.00 dBm, and the
-  # AP heard the clients ~7-8 points weaker than it should while they heard the AP
-  # fine (an asymmetry that looks exactly like a bad antenna). CONF_OUTPUT_POWER has
-  # no esp32 default, so omitting it skips both the runtime call and the sdkconfig
-  # override, leaving IDF's own 20 dBm ceiling and making the full 2-20.5 range of
-  # the number entity actually reachable.
+  # BOOT power only -- the PHY ceiling is raised separately in esp32.sdkconfig_options
+  # above, because output_power sets BOTH and we need them different.
   #
-  # If high power really does distort this board's antenna (the SuperMini's match is
-  # poor, and "Auth Expired" loops at full RX bars are the classic symptom), turn it
-  # down with the RUNTIME number, which is persisted -- do not reintroduce
-  # output_power here, or the ceiling comes back with it.
+  # Keep this LOW. The SuperMini's antenna is poorly matched and distorts at high
+  # power, causing "Auth Expired" loops even at full RX bars. This value is what the
+  # radio associates at, before the runtime number below restores.
+  #
+  # Do NOT simply delete this key to lift the ceiling: CONF_OUTPUT_POWER has no esp32
+  # default, so omitting it removes the boot-time call entirely and the radio comes up
+  # at the PHY maximum (20 dBm). Removing it was measured to leave two of four devices
+  # dropping every chunk with multi-second sync error and never recovering, because
+  # nothing lowered the power -- the restored number value is applied too late, and in
+  # practice its set_action did not run at all. The key is the floor, not just a cap.
+  output_power: 8.5dB
 
 external_components:
   - source:
