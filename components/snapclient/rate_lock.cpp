@@ -40,21 +40,22 @@ static constexpr float TRIM_CLAMP_PPM = 500.0f;
 // x/y/z are 9-bit fields; denominators up to 511 give ~0.15 ppm rational spacing
 static constexpr uint32_t MAX_DENOMINATOR = 511;
 
-// Baseline correction. Trims are relative to the baseline divider, so any error in
-// the divider the I2S DRIVER chose is a DC offset the servo must cancel out of its
-// own +-500 ppm authority before it can sync anything. Measured across one fleet,
-// the driver's rational approximation for 44.1 kHz varied per boot:
+// Baseline correction. Trims are relative to the baseline divider, so an error in
+// the divider the I2S DRIVER chose would be a DC offset the servo must cancel out of
+// its own +-500 ppm authority. The ideal ratio IS exactly representable here --
 //
-//   ideal 160 MHz / (44100 * 256) = 6250/441 = 14 + 76/441   exactly representable
-//   observed  14 + 76/441   ->    +0.0 ppm error
-//   observed  14 + 47/269   ->  -168.3 ppm error
-//   observed  14 + 68/379   ->  -499.6 ppm error
+//   ideal 160 MHz / (44100 * 256) = 6250/441 = 14 + 76/441
 //
-// The last one leaves the servo pinned at its rail with nothing left to sync with
-// (observed: one device at span +500..+500, railed 128/128, median stuck at 1-2 ms
-// while its peers held +-110 us). The hardware can express the exact ratio, so this
-// error is entirely self-inflicted: recompute the ideal divider and use THAT as the
-// baseline, and the DC term collapses to the rational quantization floor (~0.15 ppm).
+// -- so where the driver's approximation is off, recomputing the ideal and using
+// THAT as the reference collapses the DC term to the rational quantization floor
+// (~0.15 ppm).
+//
+// CAUTION on how rarely this actually applies. Every observed nonzero "driver error"
+// turned out to be OUR OWN last trim read back (see read_baseline_): the only
+// genuine driver value seen so far, on four devices at boot, was 76/441 -- already
+// exact, nothing to correct. So this path is a safety net for a driver that picks
+// badly, not a fix for an observed fault. Do not cite it as the explanation for a
+// railed servo: that hypothesis was tested and disproved.
 //
 // PLL_F160M is the S3's default I2S clock source.
 static constexpr double I2S_SRC_HZ = 160000000.0;
@@ -114,6 +115,22 @@ bool RateLock::read_baseline_() {
     return false;
   }
   const uint32_t frac = hw->tx_clkm_div_conf.val & FRAC_FIELDS_MASK;
+
+  // The register may hold OUR OWN last trim rather than anything the driver chose:
+  // invalidate_baseline() fires on events (starvation re-baseline, feedback flush
+  // gap) that do not necessarily restart the I2S channel. Re-reading then would
+  // reinterpret the servo's learned offset as driver error and zero it -- measured
+  // across five mid-stream reads on two devices, the "baseline error" came out at
+  // exactly minus the trim applied a moment earlier (-267.9 vs +267.87, -350.2 vs
+  // +350.17, +39.6 vs -39.63, +27.6 vs -27.64, -8.0 vs +8.00). Correcting that to
+  // "ideal" throws away the rate the servo had converged on and dumps the loop on
+  // its rail while the integral unwinds. If the register still holds what we wrote,
+  // nothing was reprogrammed: keep the reference and the trim exactly as they are.
+  if (this->ours_valid_ && frac == this->last_frac_val_ && this->base_ratio_ > 0.0) {
+    ESP_LOGD(TAG, "I2S%u divider unchanged since our last write; keeping baseline", this->port_);
+    return true;
+  }
+
   uint32_t b, a;
   // Round-trip sanity check: decode then re-encode must reproduce the register, or
   // our layout/encoding assumptions do not hold on this chip/IDF -- refuse to steer.
@@ -216,6 +233,9 @@ bool RateLock::set_trim_ppm(float ppm) {
     i2s_hw(this->port_)->tx_clkm_div_conf.val = val;
     this->last_frac_val_ = val;
   }
+  // Marks last_frac_val_ as OUR value, so a later re-baseline can tell "the driver
+  // reprogrammed the clock" from "nothing happened since we wrote this"
+  this->ours_valid_ = true;
   const double applied_ratio = this->base_int_ + static_cast<double>(best_b) / best_a;
   this->applied_ppm_ = static_cast<float>((1.0 - applied_ratio / base_ratio) * 1e6);
   return true;

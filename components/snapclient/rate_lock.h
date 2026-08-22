@@ -76,8 +76,11 @@ class RateLock {
   double base_ratio_{0.0};
   uint32_t output_rate_{0};
   float baseline_corrected_ppm_{0.0f};
-  // Last written fractional-field register value, to skip redundant writes
+  // Last written fractional-field register value, to skip redundant writes -- and to
+  // recognise our own trim on a re-baseline, so it is not mistaken for a divider the
+  // driver chose. ours_valid_ says last_frac_val_ actually came from us.
   uint32_t last_frac_val_{0};
+  bool ours_valid_{false};
 };
 
 }  // namespace esphome::snapclient
