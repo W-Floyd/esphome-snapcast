@@ -175,6 +175,12 @@ never touch ESPHome entities directly.
 A planned v2 ([PLAN-rate-lock.md](PLAN-rate-lock.md)) replaces steady-state frame
 splices with hardware rate steering via the S3's fractional I2S clock divider.
 
+**[TIMING.md](TIMING.md)** documents the whole timing architecture as built and
+measured on hardware: the four-clock chain, every buffer stage and its latency, the
+control loop and why its gains are what they are, the measured error budget, and —
+most usefully — which quantities the on-device metrics structurally *cannot* see, plus
+the raw-observation instrument (`scripts/raw-sync.py`) that can.
+
 ### Key sources
 
 - `esphome/components/sendspin` — architecture template: hub + children, the
