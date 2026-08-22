@@ -64,6 +64,14 @@ class TsfSync {
   /// the caller uses its own Kalman offset.
   bool shared_server_offset_us(int64_t local_now_us, int64_t &offset_us);
 
+  /// @brief Reports whether OUR OWN playout is currently tracking the timebase
+  /// (converged and the median error small). A leader publishes the timebase the
+  /// whole group follows, so a leader whose own playout has diverged -- mid-recovery,
+  /// or stuck in a degraded buffer state -- must hand off rather than keep
+  /// broadcasting. Only a healthy device may assume leadership.
+  /// THREAD CONTEXT: player task (atomic).
+  void set_playout_healthy(bool healthy) { this->playout_healthy_.store(healthy, std::memory_order_relaxed); }
+
   /// @brief Unicast peer roster (sockaddr s_addr values, network byte order), from
   /// the snapserver's Server.GetStatus client list. The leader unicasts its beacon
   /// to every peer in addition to the multicast group: client-to-client multicast
@@ -106,6 +114,8 @@ class TsfSync {
   bool have_bssid_{false};
 
   std::atomic<Role> role_{Role::IDLE};
+  std::atomic<bool> playout_healthy_{false};
+  int64_t unhealthy_since_us_{0};  // leader only; 0 = healthy
   uint8_t leader_mac_[6]{};
   int64_t last_rx_us_{0};       // last valid packet from another leader
   int64_t last_tx_us_{0};       // our last broadcast (leader)

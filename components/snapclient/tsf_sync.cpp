@@ -30,6 +30,8 @@ static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // leader broadcast cad
 static constexpr int64_t LEADER_TIMEOUT_US = 3500000;    // silence before takeover…
 static constexpr int64_t STAGGER_STEP_US = 100000;       // …plus per-MAC stagger
 static constexpr int64_t MAPPING_EXPIRY_US = 5000000;    // stale mapping → Kalman fallback
+// A leader tolerates this much continuous playout divergence before handing off
+static constexpr int64_t LEADER_UNHEALTHY_US = 5000000;
 static constexpr int64_t SERVICE_MIN_INTERVAL_US = 200000;
 // Age clamp on TSF extrapolation: an AP reboot resets TSF to ~zero with the BSSID
 // unchanged, leaving tsf_base "hours in the future" — evaluating that mapping would
@@ -164,6 +166,7 @@ void TsfSync::reset_(const char *reason) {
   }
   this->role_.store(Role::IDLE, std::memory_order_relaxed);
   this->last_rx_us_ = 0;
+  this->unhealthy_since_us_ = 0;
   this->tsf_rate_valid_ = false;
   this->rate_ref_local_us_ = 0;
   this->pub_valid_ = false;  // TSF timebase changed; the published line with it
@@ -421,6 +424,7 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
 
   this->receive_(local_now_us, est, server_id_hash);
 
+  const bool healthy = this->playout_healthy_.load(std::memory_order_relaxed);
   const Role role = this->role_.load(std::memory_order_relaxed);
   if (role == Role::LEADER) {
     if (!est.valid || !est.mature) {
@@ -429,6 +433,20 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
       // our estimate settles
       this->reset_("estimate not settled");
       return;
+    }
+    // Step down if our own playout has been off the timebase for a while: the
+    // group should not follow a mapping published by the device that is itself
+    // out of sync. Brief excursions are tolerated (a leader recovering from a
+    // hiccup would otherwise hand off constantly).
+    if (healthy) {
+      this->unhealthy_since_us_ = 0;
+    } else {
+      if (this->unhealthy_since_us_ == 0) {
+        this->unhealthy_since_us_ = local_now_us;
+      } else if (local_now_us - this->unhealthy_since_us_ >= LEADER_UNHEALTHY_US) {
+        this->reset_("own playout unsynced, stepping down");
+        return;
+      }
     }
     if (local_now_us - this->last_tx_us_ >= BEACON_INTERVAL_US) {
       this->broadcast_(local_now_us, est, server_id_hash);
@@ -443,7 +461,8 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
   const int64_t stagger = static_cast<int64_t>(this->my_mac_[5] & 0x0F) * STAGGER_STEP_US;
   const bool silence =
       this->last_rx_us_ == 0 || (local_now_us - this->last_rx_us_) > LEADER_TIMEOUT_US + stagger;
-  if (silence && est.valid && est.mature) {
+  // Only a device whose own playout is tracking may publish the group timebase
+  if (silence && est.valid && est.mature && healthy) {
     ESP_LOGI(TAG, "Assuming TSF leadership");
     this->role_.store(Role::LEADER, std::memory_order_relaxed);
     this->broadcast_(local_now_us, est, server_id_hash);

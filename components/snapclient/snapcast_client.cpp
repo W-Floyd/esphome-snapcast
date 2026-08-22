@@ -73,6 +73,11 @@ static constexpr int64_t CONVERGE_FINE_US = 2000;
 // Median window for the steering servo's error signal (~0.4 s of chunks)
 static constexpr size_t MEDIAN_WINDOW = 15;
 
+// Median error below which our playout counts as tracking the timebase, reported
+// to the TSF layer for leader eligibility. Generous: this gates "am I fit to
+// publish the group timebase", not servo precision.
+static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
+
 #ifdef USE_SNAPCLIENT_RATE_LOCK
 // Rate-lock PI gains. The plant is an integrator -- queue depth integrates any
 // rate mismatch, so the error's *slope* is the trim -- which is why a stepping
@@ -1437,6 +1442,17 @@ void SnapcastClient::player_task_() {
         }
       }
     }
+
+#ifdef SNAPCLIENT_TSF_ACTIVE
+    // Report our own tracking quality to the TSF layer: a leader publishes the
+    // timebase the whole group follows, so it must hand off while its own playout
+    // is diverged (observed: a device stuck in a degraded buffer state kept
+    // leading, with every peer following its mapping)
+    if (this->tsf_sync_ != nullptr) {
+      this->tsf_sync_->set_playout_healthy(converged && err_window_filled == MEDIAN_WINDOW &&
+                                           std::abs(median_err_us) < PLAYOUT_HEALTHY_US);
+    }
+#endif
 
     // Mute-until-synced (reference behavior): convergence corrections are chunky and
     // audible (drops of 14 frames/chunk in the proportional band), so the audio is
