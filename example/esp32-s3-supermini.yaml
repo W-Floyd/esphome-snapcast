@@ -107,6 +107,10 @@ snapclient:
   # their mutual sync to the AP's beacon timebase (~us). Falls back to the per-device
   # time-sync estimate when alone, roaming, or multicast-blocked.
   tsf_sync: true
+  # Per-chunk raw timing samples for scripts/raw-sync.py. Off by default: ~38 log
+  # lines/s/device, and chasing dropouts with DEBUG logs is exactly when that extra
+  # traffic on a congested channel hurts most. Turn on to measure, off to listen.
+  timing_diagnostics: true
 
 media_source:
   # Synchronized multiroom audio

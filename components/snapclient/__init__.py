@@ -48,6 +48,7 @@ CONF_CONVERGE_FINE = "converge_fine"
 CONF_RATE_LOCK = "rate_lock"
 CONF_I2S_PORT = "i2s_port"
 CONF_TSF_SYNC = "tsf_sync"
+CONF_TIMING_DIAGNOSTICS = "timing_diagnostics"
 
 
 def _none_to_empty_dict(value):
@@ -183,6 +184,12 @@ CONFIG_SCHEMA = cv.All(
             # server->TSF mapping so their mutual sync is us-class; wifi-only,
             # silently inactive elsewhere (Kalman fallback)
             cv.Optional(CONF_TSF_SYNC, default=False): cv.boolean,
+            # Per-chunk raw timing samples for scripts/raw-sync.py, which measures true
+            # inter-device rendering from direct observations. Deliberately separate from
+            # the log level: it emits ~38 lines/s/device, and the situation where DEBUG
+            # logs are most wanted -- chasing dropouts -- is the one where that extra
+            # traffic on a congested channel does the most harm. Off by default.
+            cv.Optional(CONF_TIMING_DIAGNOSTICS, default=False): cv.boolean,
             cv.Optional(CONF_STREAM_IDLE_TIMEOUT, default="3s"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(
@@ -237,6 +244,8 @@ async def to_code(config: ConfigType) -> None:
 
     if config[CONF_TSF_SYNC]:
         cg.add_define("USE_SNAPCLIENT_TSF_SYNC", True)
+    if config[CONF_TIMING_DIAGNOSTICS]:
+        cg.add_define("USE_SNAPCLIENT_TIMING_DIAG", True)
 
     if config[CONF_FLAC]:
         # snapserver's default stream codec; pulls micro_flac from esp-audio-libs

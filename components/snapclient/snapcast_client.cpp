@@ -392,12 +392,16 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
     // A gap well beyond the speaker's DMA cadence means the DAC was starved
     // (pipeline underrun); surfaced in the periodic sync report for diagnostics
     const int64_t gap = timestamp_us - this->played_last_ts_us_;
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
+    // Report-only. `gap` itself is functional below (the flush detector), but its max and
+    // mean exist purely for the sync report.
     this->max_feedback_gap_us_ = std::max(this->max_feedback_gap_us_, gap);
     if (gap > 0 && gap < PIPELINE_FLUSH_GAP_US) {
       // Flush-sized gaps are outages, not cadence; they would skew the mean
       this->fb_gap_sum_us_ += gap;
       this->fb_gap_count_++;
     }
+#endif  // USE_SNAPCLIENT_TIMING_DIAG
     if (gap > PIPELINE_FLUSH_GAP_US) {
       // The pipeline stopped and restarted; the orchestrator recreates its ring on
       // restart, silently DISCARDING pushed-but-unplayed frames. Without this
@@ -1446,9 +1450,9 @@ void SnapcastClient::player_task_() {
 
     // Refresh the padding estimate: measured fill (rings + FULL DMA span, padding
     // included) minus what the accounting believes is outstanding (real frames only).
-    // Diagnostics-only since the correction is no longer applied: guard on the log level
-    // so the listener-chain walk and mutex are not paid for an unemitted number.
-#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
+    // Diagnostics-only since the correction is no longer applied, so the listener-chain
+    // walk and mutex are not worth paying for unless timing diagnostics are wanted.
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
     if (fill_sample_countdown == 0) {
       fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
       size_t measured_bytes = 0;
@@ -1470,7 +1474,7 @@ void SnapcastClient::player_task_() {
     } else {
       fill_sample_countdown--;
     }
-#endif  // ESPHOME_LOG_LEVEL >= DEBUG
+#endif  // USE_SNAPCLIENT_TIMING_DIAG
 
     // fill_corr_us is MEASURED AND REPORTED BUT NOT APPLIED. Applying it was wrong and
     // measurably harmful: it manufactured the very offset it was meant to remove.
@@ -1513,10 +1517,11 @@ void SnapcastClient::player_task_() {
     // minutes for. The cost is log traffic on a link that is often the bottleneck --
     // streamed logs compete with audio for the radio, which is why hard-resync logging is
     // throttled. Raise the divisor if the fleet is on a congested channel.
-    // Guarded on the log level, not merely wrapped around the ESP_LOGD: the macro compiles
-    // away below DEBUG but the work would not. raw_tsf_sample() costs up to 5 TSF reads of
-    // 45-81 us each plus a mutex acquisition, per chunk, none of it emitted at INFO.
-#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
+    // Behind timing_diagnostics, not the log level. ESP_LOGD compiles away below DEBUG but
+    // the work would not -- raw_tsf_sample() costs up to 5 TSF reads of 45-81 us each plus
+    // a mutex, per chunk. More importantly the two concerns differ: this emits ~38 lines/s,
+    // and chasing dropouts with DEBUG logs is exactly when that traffic hurts most.
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
     if (this->tsf_sync_ != nullptr && --raw_sample_countdown == 0) {
       raw_sample_countdown = RAW_SAMPLE_EVERY_CHUNKS;
       int64_t raw_tsf = 0, raw_local = 0, raw_width = 0;
@@ -1533,7 +1538,7 @@ void SnapcastClient::player_task_() {
                  rec.params.sample_rate);
       }
     }
-#endif  // ESPHOME_LOG_LEVEL >= DEBUG
+#endif  // USE_SNAPCLIENT_TIMING_DIAG
 #endif  // SNAPCLIENT_TSF_ACTIVE
 
 
@@ -1743,6 +1748,9 @@ void SnapcastClient::player_task_() {
               clamp_ppm);
         }
         const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -clamp_ppm, clamp_ppm);
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
+        // Report-only: span shows whether the loop tracks a slow offset or chases
+        // something it cannot, and railed counts saturation.
         if (trim_samples == 0) {
           trim_min_ppm = trim_max_ppm = trim_ppm;
         } else {
@@ -1753,6 +1761,7 @@ void SnapcastClient::player_task_() {
         if (std::abs(trim_ppm) >= clamp_ppm - 0.5f) {
           trim_railed++;
         }
+#endif
         trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
         if (!trim_holds) {
           rate_lock_ok = false;
