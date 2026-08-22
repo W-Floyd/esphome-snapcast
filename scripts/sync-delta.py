@@ -28,6 +28,20 @@ import time
 
 # "[12:36:12.471]...median -204 us" (ms in the timestamp optional)
 LINE_RE = re.compile(r"\[(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,3}))?\].*median (-?\d+)\s*us")
+# "...pipeline 171 ms" on the same report line
+DEPTH_RE = re.compile(r"pipeline (-?\d+) ms")
+# Deviation from the group median that gets flagged. Compared per-device MEDIAN to
+# group median, healthy devices sit within a few ms of each other (measured: -2, +2,
+# +5 across three boards) while the audibly-late outlier sat at -79 with its entire
+# range, 156-200, clear of the fleet's 242-292. So the separation is ~15x the healthy
+# scatter and the threshold belongs well below the observed case, not just under it.
+# (Do not derive this from raw min-max ranges: depth sawtooths ~45 ms per device, so
+# the ranges overlap far more than the medians do -- an 80 ms threshold read off the
+# raw spread let the real -79 ms case slip through unflagged.)
+DEPTH_OUTLIER_MS = 40
+# Depth swings legitimately while a device refills after a starvation; only the tail
+# of the series is compared so a recovery minutes ago does not read as an offset now.
+DEPTH_TAIL = 12
 
 
 REFRESH_S = 10.0
@@ -48,6 +62,7 @@ def parse(path):
     these values, so the series MUST stay monotonic: unwrap each backwards jump
     into the following day instead of letting it rewind ~86400 s."""
     out = []
+    depth = []
     day = 0
     prev = None
     with open(path, errors="replace") as f:
@@ -63,7 +78,10 @@ def parse(path):
                 day += 1
             prev = t + day * 86400
             out.append((prev, int(med)))
-    return out
+            d = DEPTH_RE.search(line)
+            if d:
+                depth.append(int(d.group(1)))
+    return out, depth[-DEPTH_TAIL:]
 
 
 def nearest(series, t):
@@ -83,7 +101,9 @@ def nearest(series, t):
     return best
 
 
-def pair_and_report(names, all_series, window, quiet_rows, max_rows=None):
+def pair_and_report(names, parsed, window, quiet_rows, max_rows=None):
+    all_series = [ser for ser, _ in parsed]
+    depths = {n: d for n, (_, d) in zip(names, parsed)}
     # Time base: the series with the most reports (a rotated/idle log must not
     # veto the whole fleet). Devices missing a match at a row show as "--".
     base_idx = max(range(len(all_series)), key=lambda i: len(all_series[i]))
@@ -127,6 +147,42 @@ def pair_and_report(names, all_series, window, quiet_rows, max_rows=None):
               f"std={std:6.0f}  min={min(deltas):+7d}  max={max(deltas):+7d}")
     spreads = [max(p) - min(p) for _, meds in rows if (p := [m for m in meds if m is not None])]
     print(f"  group spread: mean={statistics.fmean(spreads):.0f} us  max={max(spreads)} us  rows={len(rows)}")
+    report_depth(names, depths)
+
+
+def report_depth(names, depths):
+    """Playout pipeline depth vs the group median.
+
+    The pair stats above CANNOT see an absolute playout offset. Each device's median
+    is measured against its own predicted playout, so if its frame accounting is off
+    by F the prediction is off by F too and the error reads ~0 while the audio is
+    physically F late. Depth (pushed-but-unplayed audio) is the one exposed number
+    that moves with F: measured twice on hardware, a device sitting shallower than the
+    fleet was audibly BEHIND by roughly the deficit (-150 ms deficit -> ~150 ms late,
+    -105 ms -> audibly late again), with textbook-clean medians throughout.
+
+    The group median is the reference because no single device has one -- notably the
+    TSF leader, which receives no beacons and so cannot self-check on-device.
+    """
+    have = {k: v for k, v in depths.items() if v}
+    if len(have) < 2:
+        return
+    # Per-device MEDIAN of the tail, not its latest sample: depth sawtooths by
+    # ~45 ms between reports, so one instant can sit at a peak and understate a real
+    # separation (observed: an outlier reading -52 vs median from its latest sample
+    # while its whole range, 157-201, lay clear of the fleet's 243-291).
+    typical = {k: statistics.median(v) for k, v in have.items()}
+    med = statistics.median(typical.values())
+    print(f"\nplayout depth vs group median ({med:.0f} ms) -- shallower reads LATE:")
+    width = max(len(x) for x in names) + 1
+    for k in names:
+        if k not in typical:
+            continue
+        series = have[k]
+        d = typical[k] - med
+        flag = "  <-- OFFSET?" if abs(d) >= DEPTH_OUTLIER_MS else ""
+        print(f"  {k:>{width}s}  {typical[k]:4.0f} ms  {d:+5.0f} vs median   "
+              f"(range {min(series)}-{max(series)} over {len(series)}){flag}")
 
 
 def main():
