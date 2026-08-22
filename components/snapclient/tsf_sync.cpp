@@ -76,10 +76,25 @@ static constexpr int64_t RATE_WINDOW_US = 4000000;
 // time-offset from its peers (observed: ~6 ms snap -> ~2 ms differential for ~10 s),
 // while a shared ramp keeps the pair identical throughout. Only implausibly large
 // deltas (broken mapping / reconnect re-baseline) snap through.
-static constexpr int64_t TMS_SLEW_MAX_US = 50;        // per beacon (~50 us/s), steady state
-static constexpr int64_t TMS_SLEW_CATCHUP_US = 300;   // per beacon, once |delta| > 1 ms
+// Expressed as RATES, scaled by the actual interval between broadcasts. They were
+// per-beacon allowances, which silently coupled the tracking speed to
+// BEACON_INTERVAL_US: raising the beacon rate to 10 Hz would have turned "50 us/s"
+// into 500 us/s with nobody intending it. Using the measured interval also fixes a
+// latent bug -- a delayed broadcast (service() rate limiting, task scheduling, a
+// missed tick) previously still allowed only one beacon's worth of correction, so the
+// published line fell further behind the longer the gap.
+static constexpr int64_t TMS_SLEW_MAX_US_PER_S = 50;       // steady state
+static constexpr int64_t TMS_SLEW_CATCHUP_US_PER_S = 300;  // once |delta| > 1 ms
 static constexpr int64_t TMS_CATCHUP_THRESHOLD_US = 1000;
 static constexpr int64_t TMS_SNAP_US = 20000;
+
+// Low-pass on the shared offset: 1/32 over per-chunk calls (~26 ms) is a ~0.8 s time constant,
+// cutting uncorrelated TSF read noise by ~sqrt(32). See shared_server_offset_us().
+static constexpr double OFFSET_EWMA_ALPHA = 1.0 / 32.0;
+// Above this, the raw sample is a real re-anchor (leader change, reconnect), not slew or
+// noise: the published mapping moves at most TMS_SLEW_CATCHUP_US_PER_S, and read
+// noise is bounded by the sandwich. Snap instead of smearing it in over ~0.8 s.
+static constexpr double OFFSET_SNAP_US = 2000.0;
 
 // All ESP32 variants are little-endian; fields are sent raw (no htonl)
 struct __attribute__((packed)) TsfPacket {
@@ -390,16 +405,20 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   // d(tsf−server)/dt = d(tsf−local)/dt + d(local−server)/dt = tsf_rate − kalman_drift
   const float drift_ppm = (this->tsf_rate_valid_ ? this->tsf_rate_ppm_ : 0.0f) - static_cast<float>(est.drift * 1e6);
 
-  // Slew-limit the published line toward the live estimate (see TMS_SLEW_MAX_US)
+  // Slew-limit the published line toward the live estimate (see TMS_SLEW_MAX_US_PER_S)
   const int64_t tms_target = tsf_now - server_now_us;
   int64_t tms_pub = tms_target;
   if (this->pub_valid_) {
+    const int64_t elapsed_us = tsf_now - this->pub_tsf_base_;
     const int64_t tms_expected =
-        this->pub_tms_base_ + static_cast<int64_t>(static_cast<double>(this->pub_drift_ppm_) * 1e-6 *
-                                                   static_cast<double>(tsf_now - this->pub_tsf_base_));
+        this->pub_tms_base_ +
+        static_cast<int64_t>(static_cast<double>(this->pub_drift_ppm_) * 1e-6 * static_cast<double>(elapsed_us));
     const int64_t delta = tms_target - tms_expected;
     if (std::abs(delta) <= TMS_SNAP_US) {
-      const int64_t slew = std::abs(delta) > TMS_CATCHUP_THRESHOLD_US ? TMS_SLEW_CATCHUP_US : TMS_SLEW_MAX_US;
+      const int64_t rate_us_per_s =
+          std::abs(delta) > TMS_CATCHUP_THRESHOLD_US ? TMS_SLEW_CATCHUP_US_PER_S : TMS_SLEW_MAX_US_PER_S;
+      // At least 1 us of authority, so a very short interval cannot stall tracking entirely
+      const int64_t slew = std::max<int64_t>(1, rate_us_per_s * std::max<int64_t>(0, elapsed_us) / 1000000);
       tms_pub = tms_expected + std::clamp<int64_t>(delta, -slew, slew);
     }
   }
@@ -602,10 +621,40 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   const float drift_ppm = this->map_drift_ppm_;
   this->mapping_mutex_.unlock();
   if (!valid) {
+    this->offset_filter_valid_ = false;
     return false;
   }
   int64_t extrapolation_us;
-  return evaluate_mapping_(tsf_base, tms_base, drift_ppm, offset_us, extrapolation_us) == EvalResult::OK;
+  int64_t raw_us;
+  if (evaluate_mapping_(tsf_base, tms_base, drift_ppm, raw_us, extrapolation_us) != EvalResult::OK) {
+    this->offset_filter_valid_ = false;
+    return false;
+  }
+
+  // Low-pass the offset. Every call takes a FRESH sandwiched TSF sample, so its read noise --
+  // up to SANDWICH_MAX_US, and uncorrelated between devices, therefore NOT cancelled by sharing
+  // the mapping -- lands directly in each chunk's deadline. Measured on four clients: the
+  // per-chunk sync error is white noise (consecutive-difference sigma / sigma = 1.32-1.43,
+  // versus sqrt(2) = 1.41 for pure white noise) at ~270 us, which is an order of magnitude
+  // coarser than stereo imaging tolerates while being perfectly adequate room-to-room.
+  //
+  // Filtering costs almost no lag because the quantity is already drift-compensated: the
+  // published mapping carries drift_ppm and evaluate_mapping_ extrapolates with it, so what
+  // remains should be near-constant and any real movement is ppm-scale. Reset on a new mapping
+  // so a leader change or re-anchor steps through immediately instead of being smeared.
+  // Snap on a genuine step, filter otherwise. NOT keyed on adopt_: that runs once per
+  // beacon, so re-anchoring there would reset the filter every second and filter nothing.
+  // Consecutive mappings differ by at most the slew rate times the interval, so anything
+  // this large is a leader change or a re-anchor, not slew and not read noise.
+  if (!this->offset_filter_valid_ ||
+      std::abs(static_cast<double>(raw_us) - this->offset_filter_us_) > OFFSET_SNAP_US) {
+    this->offset_filter_us_ = static_cast<double>(raw_us);
+    this->offset_filter_valid_ = true;
+  } else {
+    this->offset_filter_us_ += OFFSET_EWMA_ALPHA * (static_cast<double>(raw_us) - this->offset_filter_us_);
+  }
+  offset_us = static_cast<int64_t>(this->offset_filter_us_);
+  return true;
 }
 
 float TsfSync::mapping_age_s(int64_t local_now_us) {

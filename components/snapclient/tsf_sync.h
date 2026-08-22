@@ -186,6 +186,9 @@ class TsfSync {
   int64_t map_tsf_minus_server_us_{0};
   float map_drift_ppm_{0.0f};
   int64_t map_updated_local_us_{0};
+  // Low-pass state for shared_server_offset_us(); player-task-only
+  double offset_filter_us_{0.0};
+  bool offset_filter_valid_{false};
 };
 
 }  // namespace esphome::snapclient

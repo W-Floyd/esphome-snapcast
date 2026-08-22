@@ -94,24 +94,36 @@ static uint32_t startup_steer_frames(uint32_t chunk_frames) {
 // different block size changes it.
 static constexpr size_t MEDIAN_WINDOW = 15;
 
-// DMA-padding compensation. predict_next_play_us_() extrapolates from REAL frame
-// counts, but the I2S DMA also holds silence padding that costs render time and is
-// invisible to the played-frames callback (see the upstream i2s_audio change). The
-// unaccounted latency is therefore measured-fill minus accounted-fill, and it must be
-// added to the prediction or the device renders that much late.
+// Closes the playout accounting against a direct observation of the pipeline.
 //
-// Measured: healthy devices carried ~0 of it, while a device whose DMA had refilled
-// with padding after a starvation carried 50-80 ms -- persistent, audible against its
-// peers, and invisible to every frame-based metric including our own median.
+// `pushed - played` is an ACCUMULATOR: it integrates two independent counters and has
+// no self-correcting term, so any frame miscounted once stays miscounted. The reported
+// fill is an OBSERVATION of the same physical quantity -- and with every stage of the
+// chain now reported (source ring, mixer transfer buffer, output ring, DMA descriptors)
+// the two measure exactly the same audio by two routes. They must agree; where they do
+// not, the accumulator is wrong, because an observation cannot latch.
 //
-// Sampled every few chunks rather than per chunk: the padding changes on the DMA's own
-// timescale (~100 ms), and the query walks the whole listener chain. Smoothed because
-// it is differenced from two independently-sampled quantities, and a noisy servo target
-// is worse than a slightly stale one.
-static constexpr uint32_t PAD_SAMPLE_EVERY_CHUNKS = 8;
-static constexpr float PAD_EWMA_ALPHA = 0.25f;
-// Sanity bound: anything beyond this is a bad reading, not a real DMA depth
-static constexpr int64_t PAD_MAX_US = 400000;
+// Correction = fill - accounted, applied to the prediction. Zero when the accounting is
+// honest, so this is inert on a healthy device rather than a tuning knob. Signed:
+// phantom frames INFLATE accounted, making the prediction too late, so the device aims
+// early and renders early -- the correction is negative and cancels it. An earlier
+// version of this rejected negative samples on the assumption the error only ran one
+// way, which made it silently inert; the sign must not be assumed.
+//
+// Measured before the chain was complete: devices that had been running sat 76-83 ms
+// above their reported fill -- more than the 50 ms transfer buffer can physically hold,
+// so the excess was frames that existed nowhere -- while devices just restarted sat at
+// 52-55 ms, matching TRANSFER_BUFFER_DURATION_MS exactly. The pair carrying the excess
+// were the ones audibly behind, across five separate episodes.
+//
+// Sampled every few chunks, not per chunk: the fill moves on the mixer task's cadence
+// (~25 ms) and the query walks the whole listener chain. Smoothed because it differences
+// two independently-sampled quantities and a noisy servo target is worse than a slightly
+// stale one.
+static constexpr uint32_t FILL_SAMPLE_EVERY_CHUNKS = 8;
+static constexpr float FILL_EWMA_ALPHA = 0.25f;
+// Bound, symmetric: past this the reading is bad, not a real disagreement
+static constexpr int64_t FILL_CORR_MAX_US = 400000;
 
 // Median error below which our playout counts as tracking the timebase, reported
 // to the TSF layer for leader eligibility. Generous: this gates "am I fit to
@@ -1277,10 +1289,10 @@ void SnapcastClient::player_task_() {
   uint32_t trim_samples = 0;
   uint32_t trim_railed = 0;
 #endif
-  // Smoothed DMA-padding latency (us) that the frame accounting cannot see
-  float pad_us = 0.0f;
-  bool pad_valid = false;
-  uint32_t pad_sample_countdown = 0;
+  // Smoothed accounted-vs-observed disagreement (us); 0 when the accounting is honest
+  float fill_corr_us = 0.0f;
+  bool fill_corr_valid = false;
+  uint32_t fill_sample_countdown = 0;
   // Mute-until-synced: real audio flows only after a full window of in-band medians
   bool converged = false;
   uint32_t in_band_chunks = 0;
@@ -1421,8 +1433,8 @@ void SnapcastClient::player_task_() {
 
     // Refresh the padding estimate: measured fill (rings + FULL DMA span, padding
     // included) minus what the accounting believes is outstanding (real frames only).
-    if (pad_sample_countdown == 0) {
-      pad_sample_countdown = PAD_SAMPLE_EVERY_CHUNKS;
+    if (fill_sample_countdown == 0) {
+      fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
       size_t measured_bytes = 0;
       if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
           this->audio_listener_->on_query_buffered(measured_bytes)) {
@@ -1430,21 +1442,22 @@ void SnapcastClient::player_task_() {
         const int64_t accounted_frames = this->pushed_frames_total_ - this->played_frames_total_;
         this->playout_mutex_.unlock();
         const int64_t measured_frames = static_cast<int64_t>(measured_bytes / frame_bytes);
-        const int64_t pad_frames = measured_frames - accounted_frames;
-        const int64_t sample_us = pad_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
-        if (sample_us >= 0 && sample_us <= PAD_MAX_US) {
-          pad_us = pad_valid ? pad_us + PAD_EWMA_ALPHA * (static_cast<float>(sample_us) - pad_us)
+        const int64_t sample_us =
+            (measured_frames - accounted_frames) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+        if (std::abs(sample_us) <= FILL_CORR_MAX_US) {
+          fill_corr_us = fill_corr_valid
+                             ? fill_corr_us + FILL_EWMA_ALPHA * (static_cast<float>(sample_us) - fill_corr_us)
                              : static_cast<float>(sample_us);
-          pad_valid = true;
+          fill_corr_valid = true;
         }
       }
     } else {
-      pad_sample_countdown--;
+      fill_sample_countdown--;
     }
 
-    // Compensate: the real audio renders pad_us after the accounting says it will, so
-    // aim the servo that much earlier and it lands on the deadline.
-    const int64_t error_us = predicted + static_cast<int64_t>(pad_us) - deadline;  // >0: would play late
+    // Steer by the observation, not the accumulator: where they disagree the accumulator
+    // is wrong, so fold the difference into the prediction. Inert at 0.
+    const int64_t error_us = predicted + static_cast<int64_t>(fill_corr_us) - deadline;  // >0: would play late
 
     err_accum_us += error_us;
     err_peak_us = std::max(err_peak_us, std::abs(error_us));
@@ -1505,8 +1518,8 @@ void SnapcastClient::player_task_() {
       }
       char fill_str[80] = "";
       if (fill_ms >= 0) {
-        snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 ", pad %d ms)", fill_ms,
-                 fill_drift_ms, static_cast<int>(pad_us / 1000.0f));
+        snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 ", corr %+d ms)", fill_ms,
+                 fill_drift_ms, static_cast<int>(fill_corr_us / 1000.0f));
       }
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
