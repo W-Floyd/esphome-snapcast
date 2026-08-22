@@ -78,6 +78,21 @@ external_components:
   # When using this repo remotely instead:
   # - source: github://W-Floyd/snapclient-esphome
   #   components: [snapclient]
+  # Forked speaker stack, pending upstream: adds
+  # `Speaker::buffered_bytes(size_t &)` so the audio sitting between our push
+  # point and the DAC is READABLE. Everything downstream already computes that
+  # count and discards it (has_buffered_data() returns `available() > 0`), and
+  # its absence is why a pipeline restart at an unobserved fill leaves playback
+  # 100-250 ms offset with every sync metric still reading ~0: the error is
+  # measured against a prediction built from the same wrong accounting.
+  # An external component overrides the built-in of the same name, so only these
+  # four are replaced and the installed ESPHome is untouched. Drop this block
+  # once the change lands upstream.
+  - source:
+      type: git
+      url: https://github.com/W-Floyd/esphome
+      ref: speaker-buffered-bytes
+    components: [speaker, i2s_audio, mixer, audio]
 
 snapclient:
   id: snap
