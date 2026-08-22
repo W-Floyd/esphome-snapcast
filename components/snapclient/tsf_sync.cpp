@@ -24,7 +24,24 @@ static const char *const TSF_GROUP = "239.255.83.84";
 static constexpr uint16_t TSF_PORT = 47083;
 
 static constexpr uint32_t TSF_MAGIC = 0x534E5446;  // 'SNTF'
+// Bump on any wire change: mismatched packets are dropped, so a half-flashed fleet
+// falls back to per-device Kalman rather than misreading fields.
 static constexpr uint8_t TSF_VERSION = 1;
+
+// Pipeline-depth divergence alarm. Absolute playout depth is the one quantity the
+// sync median CANNOT see: the median is measured against this device's own
+// predicted playout, so if the frame accounting is offset by F, the prediction is
+// offset by F too and the error reads ~0 while the audio is physically F late.
+// Observed: one device sat at 72-118 ms of pipeline against a fleet norm of ~250 ms
+// and was audibly ~150 ms behind its pair, with textbook-clean sync reports on every
+// device. The group is the only available reference, so followers compare their own
+// depth against the leader's and shout when it diverges. Threshold sits above the
+// normal spread (224-282 ms measured across four identical boards = 58 ms) so
+// healthy variation stays quiet.
+static constexpr int32_t PIPELINE_DIVERGE_MS = 100;
+static constexpr int64_t PIPELINE_DIVERGE_MIN_US = 5000000;
+static constexpr int64_t PIPELINE_DIVERGE_LOG_US = 30000000;
+static constexpr int16_t PIPELINE_UNKNOWN = INT16_MIN;
 
 static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // leader broadcast cadence
 static constexpr int64_t LEADER_TIMEOUT_US = 3500000;    // silence before takeover…
@@ -75,6 +92,9 @@ struct __attribute__((packed)) TsfPacket {
   int64_t tsf_base_us;
   int64_t tsf_minus_server_us;
   float drift_ppm;  // d(tsf − server)/dt, in TSF units
+  // Sender's playout pipeline depth (pushed-but-unplayed), ms; PIPELINE_UNKNOWN
+  // before it has played anything. Diagnostics only -- never feeds the timebase.
+  int16_t pipeline_ms;
 };
 
 TsfSync::~TsfSync() {
@@ -301,7 +321,43 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     }
     this->warned_rejected_ = false;
     this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
+    this->check_pipeline_divergence_(pkt.pipeline_ms, local_now_us);
   }
+}
+
+void TsfSync::check_pipeline_divergence_(int16_t leader_pipeline_ms, int64_t local_now_us) {
+  const int32_t mine = this->pipeline_ms_.load(std::memory_order_relaxed);
+  if (leader_pipeline_ms == PIPELINE_UNKNOWN || mine == INT32_MIN) {
+    this->pipeline_delta_ms_.store(INT32_MIN, std::memory_order_relaxed);
+    this->pipeline_diverged_since_us_ = 0;
+    return;
+  }
+  const int32_t delta = mine - static_cast<int32_t>(leader_pipeline_ms);
+  this->pipeline_delta_ms_.store(delta, std::memory_order_relaxed);
+
+  if (std::abs(delta) < PIPELINE_DIVERGE_MS) {
+    this->pipeline_diverged_since_us_ = 0;
+    return;
+  }
+  if (this->pipeline_diverged_since_us_ == 0) {
+    this->pipeline_diverged_since_us_ = local_now_us;
+    return;
+  }
+  // Sustained: a transient counts for nothing, since depth legitimately swings while
+  // a device refills after a starvation. Only a depth that STAYS wrong is an offset.
+  if (local_now_us - this->pipeline_diverged_since_us_ < PIPELINE_DIVERGE_MIN_US) {
+    return;
+  }
+  if (this->last_diverge_log_us_ != 0 && local_now_us - this->last_diverge_log_us_ < PIPELINE_DIVERGE_LOG_US) {
+    return;
+  }
+  this->last_diverge_log_us_ = local_now_us;
+  // WARN, not DEBUG: this is inaudible to every other metric we have. The sync
+  // report will look perfect while this device plays |delta| ms out from the group.
+  ESP_LOGW(TAG, "Playout depth %+" PRId32 " ms vs leader (%" PRId32 " vs %d ms) for %.0f s: "
+                "audio is likely offset by about this much, sync reports notwithstanding",
+           delta, mine, static_cast<int>(leader_pipeline_ms),
+           (local_now_us - this->pipeline_diverged_since_us_) / 1e6);
 }
 
 void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash) {
@@ -361,6 +417,12 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   pkt.tsf_base_us = tsf_now;
   pkt.tsf_minus_server_us = tms_pub;
   pkt.drift_ppm = drift_ppm;
+  {
+    const int32_t depth = this->pipeline_ms_.load(std::memory_order_relaxed);
+    pkt.pipeline_ms = (depth == INT32_MIN || depth < INT16_MIN + 1 || depth > INT16_MAX)
+                          ? PIPELINE_UNKNOWN
+                          : static_cast<int16_t>(depth);
+  }
   struct sockaddr_in dest = {};
   dest.sin_family = AF_INET;
   dest.sin_port = htons(TSF_PORT);

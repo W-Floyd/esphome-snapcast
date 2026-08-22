@@ -1337,14 +1337,24 @@ void SnapcastClient::player_task_() {
         snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm", this->rate_lock_->applied_ppm());
       }
 #endif
-      char tsf_str[32] = "";
+      char tsf_str[64] = "";
 #ifdef SNAPCLIENT_TSF_ACTIVE
       if (this->tsf_sync_ != nullptr) {
+        // Publish our depth so the group can cross-check it (see TsfSync)
+        this->tsf_sync_->set_pipeline_ms(pipeline_ms);
         const TsfSync::Role role = this->tsf_sync_->role();
         if (role == TsfSync::Role::LEADER) {
           snprintf(tsf_str, sizeof(tsf_str), ", tsf=leader(peers %u)", this->tsf_sync_->peer_count());
         } else if (role == TsfSync::Role::FOLLOWER) {
-          snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs)", this->tsf_sync_->mapping_age_s(now_us()));
+          // depth delta vs the leader: the only visibility we have into an absolute
+          // playout offset, which the median above cannot show by construction
+          const int32_t depth_delta = this->tsf_sync_->pipeline_delta_ms();
+          if (depth_delta == INT32_MIN) {
+            snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs)", this->tsf_sync_->mapping_age_s(now_us()));
+          } else {
+            snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " ms)",
+                     this->tsf_sync_->mapping_age_s(now_us()), depth_delta);
+          }
         }
       }
 #endif

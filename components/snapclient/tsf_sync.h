@@ -72,6 +72,18 @@ class TsfSync {
   /// THREAD CONTEXT: player task (atomic).
   void set_playout_healthy(bool healthy) { this->playout_healthy_.store(healthy, std::memory_order_relaxed); }
 
+  /// @brief Reports our own playout pipeline depth (pushed-but-unplayed audio, ms).
+  /// Published in our beacons and compared against the leader's, because absolute
+  /// depth is invisible to the sync median: the median is measured against this
+  /// device's own predicted playout, so an accounting offset shifts prediction and
+  /// audio together and reads as zero error. The group is the only reference we have.
+  /// THREAD CONTEXT: player task (atomic).
+  void set_pipeline_ms(int32_t pipeline_ms) { this->pipeline_ms_.store(pipeline_ms, std::memory_order_relaxed); }
+
+  /// @brief Our pipeline depth minus the leader's, ms, or INT32_MIN when unknown (no
+  /// leader mapping, leader too old to report it, or we are the leader). Diagnostics.
+  int32_t pipeline_delta_ms() const { return this->pipeline_delta_ms_.load(std::memory_order_relaxed); }
+
   /// @brief Unicast peer roster (sockaddr s_addr values, network byte order), from
   /// the snapserver's Server.GetStatus client list. The leader unicasts its beacon
   /// to every peer in addition to the multicast group: client-to-client multicast
@@ -96,6 +108,9 @@ class TsfSync {
   /// On promotion, continue the line the group is already playing to instead of
   /// re-anchoring to our own estimate (which would step every follower).
   void seed_published_from_mapping_();
+  /// Compares our playout depth against the leader's and warns on sustained
+  /// divergence. Diagnostics only: never touches the mapping.
+  void check_pipeline_divergence_(int16_t leader_pipeline_ms, int64_t local_now_us);
   /// Sandwiched TSF read: local/tsf/local, midpoint local, retried when an
   /// interrupt widens the sandwich. @return false if TSF is unavailable.
   static bool sample_tsf_(int64_t &tsf_us, int64_t &local_us);
@@ -118,6 +133,10 @@ class TsfSync {
 
   std::atomic<Role> role_{Role::IDLE};
   std::atomic<bool> playout_healthy_{false};
+  std::atomic<int32_t> pipeline_ms_{INT32_MIN};
+  std::atomic<int32_t> pipeline_delta_ms_{INT32_MIN};
+  int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance
+  int64_t last_diverge_log_us_{0};
   int64_t unhealthy_since_us_{0};  // leader only; 0 = healthy
   int64_t healthy_since_us_{0};    // 0 = currently unhealthy
   int64_t no_lead_until_us_{0};    // cooldown after stepping down
