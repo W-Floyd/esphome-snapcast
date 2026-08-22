@@ -32,6 +32,11 @@ static constexpr int64_t STAGGER_STEP_US = 100000;       // …plus per-MAC stag
 static constexpr int64_t MAPPING_EXPIRY_US = 5000000;    // stale mapping → Kalman fallback
 // A leader tolerates this much continuous playout divergence before handing off
 static constexpr int64_t LEADER_UNHEALTHY_US = 5000000;
+// After stepping down, do not grab leadership again for this long: a device whose
+// health flickers would otherwise re-take it seconds later and oscillate
+static constexpr int64_t LEAD_COOLDOWN_US = 20000000;
+// Playout must be tracking this long before a device is eligible to lead
+static constexpr int64_t LEAD_HEALTHY_MIN_US = 2000000;
 static constexpr int64_t SERVICE_MIN_INTERVAL_US = 200000;
 // Age clamp on TSF extrapolation: an AP reboot resets TSF to ~zero with the BSSID
 // unchanged, leaving tsf_base "hours in the future" — evaluating that mapping would
@@ -445,6 +450,7 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
         this->unhealthy_since_us_ = local_now_us;
       } else if (local_now_us - this->unhealthy_since_us_ >= LEADER_UNHEALTHY_US) {
         this->reset_("own playout unsynced, stepping down");
+        this->no_lead_until_us_ = local_now_us + LEAD_COOLDOWN_US;
         return;
       }
     }
@@ -461,12 +467,40 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
   const int64_t stagger = static_cast<int64_t>(this->my_mac_[5] & 0x0F) * STAGGER_STEP_US;
   const bool silence =
       this->last_rx_us_ == 0 || (local_now_us - this->last_rx_us_) > LEADER_TIMEOUT_US + stagger;
-  // Only a device whose own playout is tracking may publish the group timebase
-  if (silence && est.valid && est.mature && healthy) {
+  // Only a device whose own playout has been tracking for a while may publish the
+  // group timebase, and not immediately after having stepped down
+  if (healthy) {
+    if (this->healthy_since_us_ == 0) {
+      this->healthy_since_us_ = local_now_us;
+    }
+  } else {
+    this->healthy_since_us_ = 0;
+  }
+  const bool eligible = est.valid && est.mature && this->healthy_since_us_ != 0 &&
+                        local_now_us - this->healthy_since_us_ >= LEAD_HEALTHY_MIN_US &&
+                        local_now_us >= this->no_lead_until_us_;
+  if (silence && eligible) {
     ESP_LOGI(TAG, "Assuming TSF leadership");
+    // Continuity: if we were following, keep publishing the line the group is
+    // ALREADY playing to and let the slew walk it toward our own estimate. A new
+    // leader that anchored to its own fresh estimate stepped every follower's
+    // deadline, which resynced them, which made them unhealthy -- observed as
+    // leadership bouncing d->c->b->b->c->a in 50 s with re-locks throughout.
+    this->seed_published_from_mapping_();
     this->role_.store(Role::LEADER, std::memory_order_relaxed);
     this->broadcast_(local_now_us, est, server_id_hash);
   }
+}
+
+void TsfSync::seed_published_from_mapping_() {
+  this->mapping_mutex_.lock();
+  if (this->mapping_valid_) {
+    this->pub_valid_ = true;
+    this->pub_tsf_base_ = this->map_tsf_base_us_;
+    this->pub_tms_base_ = this->map_tsf_minus_server_us_;
+    this->pub_drift_ppm_ = this->map_drift_ppm_;
+  }
+  this->mapping_mutex_.unlock();
 }
 
 void TsfSync::set_peers(std::vector<uint32_t> peer_addrs) {

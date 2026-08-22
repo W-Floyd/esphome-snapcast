@@ -93,6 +93,9 @@ class TsfSync {
   void broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash);
   /// Stores a mapping (from a packet, or our own broadcast) as the active one.
   void adopt_(int64_t tsf_base_us, int64_t tsf_minus_server_us, float drift_ppm, int64_t local_now_us);
+  /// On promotion, continue the line the group is already playing to instead of
+  /// re-anchoring to our own estimate (which would step every follower).
+  void seed_published_from_mapping_();
   /// Sandwiched TSF read: local/tsf/local, midpoint local, retried when an
   /// interrupt widens the sandwich. @return false if TSF is unavailable.
   static bool sample_tsf_(int64_t &tsf_us, int64_t &local_us);
@@ -116,6 +119,8 @@ class TsfSync {
   std::atomic<Role> role_{Role::IDLE};
   std::atomic<bool> playout_healthy_{false};
   int64_t unhealthy_since_us_{0};  // leader only; 0 = healthy
+  int64_t healthy_since_us_{0};    // 0 = currently unhealthy
+  int64_t no_lead_until_us_{0};    // cooldown after stepping down
   uint8_t leader_mac_[6]{};
   int64_t last_rx_us_{0};       // last valid packet from another leader
   int64_t last_tx_us_{0};       // our last broadcast (leader)
