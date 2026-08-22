@@ -68,11 +68,17 @@ static constexpr int64_t SOFT_CORRECTION_AGGRESSIVE_US = 10000;
 // from zero (1010 -> 1376 -> 1804 us) before overshooting, then drifting steadily
 // past the deadband after unmute. Two of four devices never recovered at all.
 // Expressed as a SLEW RATE, not a frame count. The old form was 8 frames per chunk,
-// which is only a rate once you fix the chunk size: 8 of ~1176 frames is ~6800 ppm at
-// 44.1 kHz, but snapcast chunks are a fixed DURATION, so frames scale with the sample
-// rate and the same 8 frames is a proportionally smaller slew at 48 kHz and above --
-// muted convergence silently slowed down on higher-rate streams. Deriving the count
-// from the chunk actually in hand keeps the slew constant across formats.
+// which is only a rate once the chunk size is fixed -- and it is not ours to fix. A
+// chunk is one CODEC BLOCK, so its size comes from the encoder, not from any client
+// setting and not from the server's buffer (that is the ~1 s of total buffering the
+// report calls "buffered"). Measured on four devices from the report cadence:
+// 26.2 ms, i.e. ~1152 frames at 44.1 kHz, which is FLAC's default block size.
+//
+// Because a block is a fixed FRAME COUNT per codec but a fixed DURATION only at a
+// given rate, 8 frames is ~6800 ppm at 44.1 kHz and proportionally less as the rate
+// rises -- muted convergence silently lost over half its slew at 96 kHz, with nothing
+// in the code or the logs to say so. Deriving the count from the chunk actually in
+// hand keeps the slew constant across formats and block sizes alike.
 static constexpr float STARTUP_STEER_PPM = 6800.0f;
 
 /// Frames to splice per chunk to slew at STARTUP_STEER_PPM, given this chunk's size.
@@ -81,7 +87,11 @@ static uint32_t startup_steer_frames(uint32_t chunk_frames) {
   return std::max<uint32_t>(1, static_cast<uint32_t>(chunk_frames * (STARTUP_STEER_PPM * 1e-6f) + 0.5f));
 }
 
-// Median window for the steering servo's error signal (~0.4 s of chunks)
+// Median window for the steering servo's error signal. One sample per chunk, so its
+// duration follows the codec block size -- measured 26.2 ms/chunk (FLAC's 1152-frame
+// default at 44.1 kHz), giving ~0.39 s here. That duration is a term in the loop lag
+// that bounds the trim gain, so it is not a free parameter: a codec or rate with a
+// different block size changes it.
 static constexpr size_t MEDIAN_WINDOW = 15;
 
 // Median error below which our playout counts as tracking the timebase, reported
