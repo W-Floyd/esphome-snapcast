@@ -55,7 +55,7 @@ RAW_RE = re.compile(
 # everything. What matters is not the width but its CONSISTENCY: a fixed bracket puts a
 # fixed bias on the midpoint, which cancels between identical devices, while a widened
 # bracket means interference landed mid-read and that sample really is noisy.
-TRUST_SW_US = 80
+TRUST_SW_US = 70
 
 
 def parse(path):

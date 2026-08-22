@@ -1463,9 +1463,25 @@ void SnapcastClient::player_task_() {
       fill_sample_countdown--;
     }
 
-    // Steer by the observation, not the accumulator: where they disagree the accumulator
-    // is wrong, so fold the difference into the prediction. Inert at 0.
-    const int64_t error_us = predicted + static_cast<int64_t>(fill_corr_us) - deadline;  // >0: would play late
+    // fill_corr_us is MEASURED AND REPORTED BUT NOT APPLIED. Applying it was wrong and
+    // measurably harmful: it manufactured the very offset it was meant to remove.
+    //
+    // The premise was that a disagreement between the accumulator (pushed - played) and
+    // the observed fill meant the accumulator had latched an error. Once every stage of
+    // the chain was reported, though, the residual stopped being unmeasured audio and
+    // became measurement offset -- non-atomic sampling of two quantities while audio
+    // flows, DMA quantisation, publish staleness. Correcting for that displaces real
+    // audio by the size of a measurement artefact, and because the artefact differs per
+    // device it produces a RELATIVE offset, which is the only kind that is audible.
+    //
+    // Caught by raw-sync.py, which measures inter-device rendering from direct
+    // observations and so is immune to this: devices carrying corr -10 ms rendered
+    // 9.3-10.0 ms later than one carrying corr 0, matching across all three pairings,
+    // and a device at corr -52 ms was ~52 ms late -- which is exactly the "distinctly
+    // 50 ms+" that was audible. Every on-device metric read clean throughout, medians
+    // inside 90 us, because the servo was faithfully hitting a target that had been
+    // moved.
+    const int64_t error_us = predicted - deadline;  // >0: this chunk would play late
 
     err_accum_us += error_us;
     err_peak_us = std::max(err_peak_us, std::abs(error_us));

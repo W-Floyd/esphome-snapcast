@@ -74,12 +74,20 @@ static constexpr int64_t MAX_EXTRAPOLATION_US = 10000000;
 // BIAS -- and identical devices share that bias, so it cancels between them. The noise that
 // actually matters is the variation in bracket width, ~7 us peak-to-peak, i.e. a few us.
 // TSF read noise is therefore NOT the dominant timing term; it was assumed to be.
-static constexpr int64_t SANDWICH_MAX_US = 60;
+// Threshold just above the clean-device floor with enough attempts to retry when a
+// device is not clean. Measured after loosening this too far: with a 60 us threshold and
+// 3 attempts, b/c/d returned on the first read at 46-50 us but a read 83 us median with
+// excursions to 122, and half of a's samples then failed the trust gate and stopped
+// updating its offset filter entirely. Best-of-N had been hiding that -- at 8 attempts
+// every device reported ~42 us. So keep enough retries for the best-of to matter on a
+// noisy device, while a clean one still returns on its first read.
+static constexpr int64_t SANDWICH_MAX_US = 50;
 static constexpr int64_t SANDWICH_LOOSE_MAX_US = 400;
-static constexpr int SANDWICH_ATTEMPTS = 3;
-// A read wider than this is not allowed to update the offset filter: at a 42 us floor and
-// 7 us of spread, anything past here is genuine interference rather than call cost.
-static constexpr int64_t SANDWICH_TRUST_US = 80;
+static constexpr int SANDWICH_ATTEMPTS = 5;
+// A read wider than this is not allowed to update the offset filter: with best-of-5
+// landing at 42-50 us on healthy hardware, anything past here is genuine interference
+// rather than the call's own cost.
+static constexpr int64_t SANDWICH_TRUST_US = 70;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 
