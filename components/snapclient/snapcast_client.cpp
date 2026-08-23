@@ -1689,6 +1689,17 @@ void SnapcastClient::player_task_() {
             snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " ms)",
                      this->tsf_sync_->mapping_age_s(now_us()), depth_delta);
           }
+        } else {
+          // Roleless does NOT imply no shared timebase: a leader that handed off keeps
+          // its mapping for the election, and deadlines still come from it. Printing
+          // nothing here read as "fell back to Kalman" and sent an earlier diagnosis
+          // down the wrong path, so say which it is.
+          const float age_s = this->tsf_sync_->mapping_age_s(now_us());
+          if (age_s >= 0.0f) {
+            snprintf(tsf_str, sizeof(tsf_str), ", tsf=roleless(mapping %.1fs)", age_s);
+          } else {
+            snprintf(tsf_str, sizeof(tsf_str), ", tsf=inactive(kalman)");
+          }
         }
       }
 #endif

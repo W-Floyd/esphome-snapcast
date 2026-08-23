@@ -243,6 +243,27 @@ bool TsfSync::ensure_socket_() {
   return this->joined_;
 }
 
+// Stepping down is NOT the network changing, and must not use reset_().
+//
+// A leader hands off because ITS OWN PLAYOUT has diverged. That says nothing about the
+// mapping it published: server<->TSF does not depend on whether this device's audio is
+// tracking. The TSF rate estimate is a property of the radio's clock and the peer list
+// a property of the network, neither of which the role affects either. So all of it
+// survives a demotion, and the client keeps computing deadlines from this mapping right
+// through the election -- shared_server_offset_us() gates on mapping validity and
+// MAPPING_EXPIRY_US (5 s), not on role, and that grace covers LEADER_TIMEOUT_US plus
+// the per-MAC stagger. The new leader's mapping is then adopted as an ordinary follower
+// step.
+//
+// Using reset_() here instead cost a measured ~6 s: the ex-leader dropped to the raw
+// Kalman fallback with medians at +-1 ms and trim swinging +543/-486 ppm, taking 16.0 s
+// to re-lock where a device that stayed a follower took 9.6 s.
+void TsfSync::demote_(const char *reason) {
+  ESP_LOGD(TAG, "Stepping down (%s); keeping mapping for the handoff", reason);
+  this->role_.store(Role::IDLE, std::memory_order_relaxed);
+  this->unhealthy_since_us_ = 0;
+}
+
 void TsfSync::reset_(const char *reason) {
   if (this->role_.load(std::memory_order_relaxed) != Role::IDLE || this->mapping_valid_) {
     ESP_LOGD(TAG, "Reset (%s)", reason);
@@ -582,7 +603,7 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
       if (this->unhealthy_since_us_ == 0) {
         this->unhealthy_since_us_ = local_now_us;
       } else if (local_now_us - this->unhealthy_since_us_ >= LEADER_UNHEALTHY_US) {
-        this->reset_("own playout unsynced, stepping down");
+        this->demote_("own playout unsynced");
         this->no_lead_until_us_ = local_now_us + LEAD_COOLDOWN_US;
         return;
       }

@@ -121,6 +121,10 @@ class TsfSync {
 
  protected:
   bool ensure_socket_();
+  /// @brief Hand off leadership while keeping the mapping, rate estimate and peers --
+  /// everything a demotion does not invalidate. See the definition for why this is not
+  /// reset_(), which is for the network genuinely changing underneath us.
+  void demote_(const char *reason);
   void reset_(const char *reason);
   void receive_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash);
   void broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash);
