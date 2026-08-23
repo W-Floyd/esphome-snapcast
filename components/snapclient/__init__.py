@@ -5,7 +5,7 @@ from esphome.components import audio, audio_timing, network, ota, socket, wifi
 from esphome.components.esp32 import only_on_variant
 from esphome.components.esp32.const import VARIANT_ESP32S3
 import esphome.config_validation as cv
-from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_NAME, CONF_PORT
+from esphome.const import CONF_BUFFER_SIZE, CONF_ID, CONF_NAME, CONF_NEVER, CONF_PORT
 from esphome.types import ConfigType
 
 CODEOWNERS = ["@W-Floyd"]
@@ -51,6 +51,7 @@ CONF_RATE_LOCK = "rate_lock"
 CONF_I2S_PORT = "i2s_port"
 CONF_TSF_SYNC = "tsf_sync"
 CONF_TIMING_DIAGNOSTICS = "timing_diagnostics"
+CONF_KEEPALIVE_HOLD = "keepalive_hold"
 
 
 def _none_to_empty_dict(value):
@@ -192,6 +193,20 @@ CONFIG_SCHEMA = cv.All(
             # logs are most wanted -- chasing dropouts -- is the one where that extra
             # traffic on a congested channel does the most harm. Off by default.
             cv.Optional(CONF_TIMING_DIAGNOSTICS, default=False): cv.boolean,
+            # How long a chunk gap is bridged with keepalive silence before the
+            # stream is allowed to end. Ending it tears the audio pipeline down, and
+            # rebuilding playout phase costs a mute plus 7-16 s of re-lock -- so an
+            # ordinary inter-track gap (17-18 s measured) is worth bridging. The
+            # default is ~6x that. `never` holds the pipeline for the whole session so
+            # the speaker stays ready to play in sync; it costs a continuously fed DAC,
+            # the radio pinned in high-performance mode and nonstop TSF beaconing, and
+            # it is NOT sufficient on its own for instant resumption -- a stream that
+            # resumed after 7.5 h idle still came back with a 6.9 h stale deadline and
+            # took 9.6-16 s to settle, with the pipeline held the whole time.
+            cv.Optional(CONF_KEEPALIVE_HOLD, default="2min"): cv.Any(
+                cv.positive_time_period_milliseconds,
+                cv.one_of(CONF_NEVER, lower=True),
+            ),
             cv.Optional(CONF_STREAM_IDLE_TIMEOUT, default="3s"): cv.All(
                 cv.positive_time_period_milliseconds,
                 cv.Range(
@@ -236,6 +251,9 @@ async def to_code(config: ConfigType) -> None:
             config[CONF_STREAM_IDLE_TIMEOUT].total_milliseconds
         )
     )
+    # 0 is the "never release while connected" sentinel on the C++ side
+    hold = config[CONF_KEEPALIVE_HOLD]
+    cg.add(var.set_keepalive_hold(0 if hold == CONF_NEVER else hold.total_milliseconds))
 
     cg.add(var.set_channel_mode(config[CONF_CHANNEL_MODE]))
     cg.add(var.set_phase_mode(config[CONF_PHASE_INVERT]))

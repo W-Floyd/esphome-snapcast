@@ -222,13 +222,6 @@ static constexpr int64_t PIPELINE_FLUSH_GAP_US = 500000;
 // speaker's no-data timeout (500 ms) cannot tear the pipeline down.
 static constexpr int64_t KEEPALIVE_SLICE_US = 50000;
 
-// How long a chunk gap may be bridged before the stream is allowed to end. Sized
-// between the two things a gap can mean: measured inter-track gaps on this fleet were
-// 17 s and 18 s, so this is ~6x the longest one and covers a short pause too, while
-// still releasing long before an idle stretch where holding on does damage. Promote to
-// a YAML option if a device ever needs its own value.
-static constexpr int64_t KEEPALIVE_HOLD_US = 120000000;
-
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
 // How long the stream may stay staler than the server's whole buffer before the
@@ -923,11 +916,22 @@ void SnapcastClient::service_tx_() {
   //   back with a 24888016 ms stale deadline on both devices within 61 ms of each
   //   other, taking 9.6 s and 16 s to re-lock -- worse than the teardown it avoided.
   //
-  // So bridge up to KEEPALIVE_HOLD_US and release beyond it. stream_idle_timeout still
+  // So bridge up to keepalive_hold and release beyond it. stream_idle_timeout still
   // governs the disconnected case, where there is nothing to wait for.
-  const int64_t idle_limit_us = this->connected_.load(std::memory_order_relaxed)
-                                    ? KEEPALIVE_HOLD_US
-                                    : static_cast<int64_t>(this->config_.stream_idle_timeout_ms) * 1000;
+  //
+  // keepalive_hold = 0 ("never") holds the pipeline for the whole session, so the
+  // speaker stays ready to play in sync. Be aware of what that does NOT buy: the
+  // overnight event above happened WITH the pipeline held, so holding it is not by
+  // itself sufficient for instant resumption -- the residual cost was the servo
+  // settling and a TSF re-election, not the teardown.
+  int64_t idle_limit_us;
+  if (!this->connected_.load(std::memory_order_relaxed)) {
+    idle_limit_us = static_cast<int64_t>(this->config_.stream_idle_timeout_ms) * 1000;
+  } else if (this->config_.keepalive_hold_ms == 0) {
+    idle_limit_us = INT64_MAX;  // never release
+  } else {
+    idle_limit_us = static_cast<int64_t>(this->config_.keepalive_hold_ms) * 1000;
+  }
   if (this->stream_active_ && now - this->last_chunk_us_ > idle_limit_us) {
     ESP_LOGD(TAG, "Stream idle for %" PRIu32 " ms, ending stream", this->config_.stream_idle_timeout_ms);
     this->set_stream_active_(false);

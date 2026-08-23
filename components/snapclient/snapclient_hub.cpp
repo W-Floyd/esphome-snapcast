@@ -32,6 +32,7 @@ void SnapclientHub::setup() {
   config.time_sync_interval_ms = this->time_sync_interval_ms_;
   config.hard_resync_threshold_ms = this->hard_resync_threshold_ms_;
   config.stream_idle_timeout_ms = this->stream_idle_timeout_ms_;
+  config.keepalive_hold_ms = this->keepalive_hold_ms_;
   config.sync_deadband_us = this->sync_deadband_us_;
   config.converge_fine_us = this->converge_fine_us_;
 #ifdef USE_AUDIO_TIMING_RATE_LOCK

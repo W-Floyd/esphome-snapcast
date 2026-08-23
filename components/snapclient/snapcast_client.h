@@ -49,6 +49,13 @@ struct SnapcastClientConfig {
   uint32_t time_sync_interval_ms{1000};
   uint32_t hard_resync_threshold_ms{50};
   uint32_t stream_idle_timeout_ms{3000};
+  /// @brief How long a chunk gap is bridged with keepalive silence before the stream is
+  /// allowed to end. 0 means NEVER release while the session is up: the pipeline, the
+  /// playout phase and the TSF mapping are held indefinitely so the speaker stays
+  /// ready to play in sync. Costs a fed DAC, a radio held in high-performance mode and
+  /// continuous TSF beaconing -- and note it does NOT make resumption free; see the
+  /// stream-idle block in loop().
+  uint32_t keepalive_hold_ms{120000};
   // Median sync error at which the steering servo engages (disengages at half).
   // Reference esp32 snapclient uses 128 us; single-frame steering splices are ~23 us
   // events, inaudible.
