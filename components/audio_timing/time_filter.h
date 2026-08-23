@@ -4,7 +4,7 @@
 #include <cmath>
 #include <limits>
 
-namespace esphome::snapclient {
+namespace esphome::audio_timing {
 
 /// @brief 2-state Kalman filter with Sage-Husa M-estimate adaptive measurement noise.
 ///
@@ -161,4 +161,4 @@ class KalmanTimeFilter {
   double r_hat_{25.0};
 };
 
-}  // namespace esphome::snapclient
+}  // namespace esphome::audio_timing

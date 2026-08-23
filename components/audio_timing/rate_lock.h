@@ -2,12 +2,12 @@
 
 #include "esphome/core/defines.h"
 
-#if defined(USE_ESP32) && defined(USE_SNAPCLIENT_RATE_LOCK)
+#if defined(USE_ESP32) && defined(USE_AUDIO_TIMING_RATE_LOCK)
 
 #include <atomic>
 #include <cstdint>
 
-namespace esphome::snapclient {
+namespace esphome::audio_timing {
 
 /// @brief Hardware sample-rate steering ("rate lock"): trims the I2S output clock by
 /// tens of ppm so the sync servo can hold lock with zero waveform splices.
@@ -83,6 +83,6 @@ class RateLock {
   bool ours_valid_{false};
 };
 
-}  // namespace esphome::snapclient
+}  // namespace esphome::audio_timing
 
-#endif  // USE_ESP32 && USE_SNAPCLIENT_RATE_LOCK
+#endif  // USE_ESP32 && USE_AUDIO_TIMING_RATE_LOCK

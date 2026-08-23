@@ -5,10 +5,10 @@
 #ifdef USE_ESP32
 
 #include "control_session.h"
-#include "rate_lock.h"
+#include "esphome/components/audio_timing/rate_lock.h"
 #include "snapcast_proto.h"
-#include "time_filter.h"
-#include "tsf_sync.h"
+#include "esphome/components/audio_timing/time_filter.h"
+#include "esphome/components/audio_timing/tsf_sync.h"
 
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/core/helpers.h"
@@ -29,6 +29,16 @@
 
 namespace esphome::snapclient {
 
+// The timing engine lives in its own component (see components/audio_timing): none of
+// it is Snapcast-specific. Imported by name so the call sites below read unchanged.
+using audio_timing::KalmanTimeFilter;
+#if defined(USE_ESP32) && defined(USE_AUDIO_TIMING_RATE_LOCK)
+using audio_timing::RateLock;
+#endif
+#ifdef AUDIO_TIMING_TSF_ACTIVE
+using audio_timing::TsfSync;
+#endif
+
 /// @brief Compile-time configuration for SnapcastClient, built by the hub's codegen setters.
 struct SnapcastClientConfig {
   std::string server_host;  // empty: discover the server via mDNS (_snapcast._tcp)
@@ -48,7 +58,7 @@ struct SnapcastClientConfig {
   // above 2*sync_deadband_us and below hard_resync_threshold_ms; the Python
   // schema enforces both.
   int64_t converge_fine_us{2000};
-#ifdef USE_SNAPCLIENT_RATE_LOCK
+#ifdef USE_AUDIO_TIMING_RATE_LOCK
   // I2S port whose output clock the hardware rate lock steers (steady-state
   // corrections become clock trims instead of frame splices where supported)
   uint8_t rate_lock_i2s_port{0};
@@ -213,7 +223,7 @@ class SnapcastClient {
   bool is_connected() const { return this->connected_.load(std::memory_order_relaxed); }
   /// @brief Current TSF group-sync role (atomic read; INACTIVE when unavailable).
   TsfRole get_tsf_role() const {
-#ifdef SNAPCLIENT_TSF_ACTIVE
+#ifdef AUDIO_TIMING_TSF_ACTIVE
     if (this->tsf_sync_ != nullptr) {
       switch (this->tsf_sync_->role()) {
         case TsfSync::Role::LEADER:
@@ -268,7 +278,7 @@ class SnapcastClient {
   void service_tx_();
   /// Sends one Client.SetLatency request on the server's control port (1705).
   void send_set_latency_rpc_(int32_t latency_ms);
-#ifdef SNAPCLIENT_TSF_ACTIVE
+#ifdef AUDIO_TIMING_TSF_ACTIVE
   /// Fetches the server's client roster (Server.GetStatus, control port) for TSF
   /// unicast beacons. Blocking; only called while no stream is active.
   void refresh_tsf_peers_();
@@ -401,7 +411,7 @@ class SnapcastClient {
   // FNV-1a of the active session's "host:port" — identifies which server clock a
   // shared TSF mapping refers to
   uint32_t server_id_hash_{0};
-#ifdef SNAPCLIENT_TSF_ACTIVE
+#ifdef AUDIO_TIMING_TSF_ACTIVE
   int64_t last_peer_refresh_us_{0};  // TSF unicast roster refresh (network task)
 #endif
   uint16_t next_message_id_{0};
@@ -421,13 +431,13 @@ class SnapcastClient {
   bool flac_header_done_{false};
 #endif
 
-#ifdef USE_SNAPCLIENT_RATE_LOCK
+#ifdef USE_AUDIO_TIMING_RATE_LOCK
   // Hardware clock steering; owned here, driven by the player task's servo. The
   // speaker callback thread only pokes invalidate_baseline() (atomic flag).
   std::unique_ptr<RateLock> rate_lock_;
 #endif
 
-#ifdef SNAPCLIENT_TSF_ACTIVE
+#ifdef AUDIO_TIMING_TSF_ACTIVE
   // TSF group sync: serviced by the network task, offset queried by the player task
   std::unique_ptr<TsfSync> tsf_sync_;
 #endif
@@ -437,7 +447,7 @@ class SnapcastClient {
   std::unique_ptr<ControlSession> control_session_;
 
   // --- Player task locals ---
-#ifdef SNAPCLIENT_TSF_ACTIVE
+#ifdef AUDIO_TIMING_TSF_ACTIVE
   // Whether the last chunk deadline came from the shared TSF mapping (vs the
   // per-device Kalman fallback); gates unmute so joins land on the final timebase
   bool deadline_on_shared_tsf_{false};

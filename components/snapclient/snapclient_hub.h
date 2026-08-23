@@ -68,7 +68,7 @@ class SnapclientHub final : public Component,
   void set_stream_idle_timeout(uint32_t timeout_ms) { this->stream_idle_timeout_ms_ = timeout_ms; }
   void set_sync_deadband(uint32_t deadband_us) { this->sync_deadband_us_ = deadband_us; }
   void set_converge_fine(uint32_t converge_fine_us) { this->converge_fine_us_ = converge_fine_us; }
-#ifdef USE_SNAPCLIENT_RATE_LOCK
+#ifdef USE_AUDIO_TIMING_RATE_LOCK
   void set_rate_lock_port(uint8_t port) { this->rate_lock_port_ = port; }
 #endif
 
@@ -182,7 +182,7 @@ class SnapclientHub final : public Component,
   uint32_t stream_idle_timeout_ms_{3000};
   uint32_t sync_deadband_us_{128};
   uint32_t converge_fine_us_{2000};
-#ifdef USE_SNAPCLIENT_RATE_LOCK
+#ifdef USE_AUDIO_TIMING_RATE_LOCK
   uint8_t rate_lock_port_{0};
 #endif
 

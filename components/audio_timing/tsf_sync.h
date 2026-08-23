@@ -2,11 +2,11 @@
 
 #include "esphome/core/defines.h"
 
-#if defined(USE_ESP32) && defined(USE_SNAPCLIENT_TSF_SYNC) && defined(USE_WIFI)
-#define SNAPCLIENT_TSF_ACTIVE
+#if defined(USE_ESP32) && defined(USE_AUDIO_TIMING_TSF_SYNC) && defined(USE_WIFI)
+#define AUDIO_TIMING_TSF_ACTIVE
 #endif
 
-#ifdef SNAPCLIENT_TSF_ACTIVE
+#ifdef AUDIO_TIMING_TSF_ACTIVE
 
 #include "esphome/core/helpers.h"
 
@@ -14,7 +14,7 @@
 #include <cstdint>
 #include <vector>
 
-namespace esphome::snapclient {
+namespace esphome::audio_timing {
 
 /// @brief TSF group sync (PLAN-tsf-sync.md): all clients on one wifi AP share the
 /// AP's TSF timer to ~µs, so if they also share ONE server→TSF mapping, their
@@ -205,6 +205,6 @@ class TsfSync {
   uint32_t sandwich_block_n_{0};
 };
 
-}  // namespace esphome::snapclient
+}  // namespace esphome::audio_timing
 
-#endif  // SNAPCLIENT_TSF_ACTIVE
+#endif  // AUDIO_TIMING_TSF_ACTIVE

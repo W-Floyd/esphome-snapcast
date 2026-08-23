@@ -1,6 +1,6 @@
 #include "rate_lock.h"
 
-#if defined(USE_ESP32) && defined(USE_SNAPCLIENT_RATE_LOCK)
+#if defined(USE_ESP32) && defined(USE_AUDIO_TIMING_RATE_LOCK)
 
 #include "esphome/core/log.h"
 
@@ -14,7 +14,7 @@
 #include <soc/i2s_struct.h>
 #endif
 
-namespace esphome::snapclient {
+namespace esphome::audio_timing {
 
 static const char *const TAG = "snapclient.rate_lock";
 
@@ -258,6 +258,6 @@ bool RateLock::set_trim_ppm(float) { return false; }
 
 #endif  // CONFIG_IDF_TARGET_ESP32S3
 
-}  // namespace esphome::snapclient
+}  // namespace esphome::audio_timing
 
-#endif  // USE_ESP32 && USE_SNAPCLIENT_RATE_LOCK
+#endif  // USE_ESP32 && USE_AUDIO_TIMING_RATE_LOCK
