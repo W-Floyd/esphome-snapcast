@@ -105,6 +105,13 @@ media_player:
 
 ```yaml
 select:
+  - platform: wifi_bssid_select
+    name: Access Point      # "Automatic" + one option per scan-discovered AP of the
+                            # connected SSID. A preference, not a hard pin: it falls
+                            # back to any AP after 20 s and re-arms on the next
+                            # disconnect, so a working link is never dropped to chase
+                            # the preferred AP. Its own component -- nothing about it
+                            # is Snapcast-specific.
   - platform: snapclient
     type: channel_mode
     name: Channel Mode      # Stereo / Left / Right / Mono, persisted; overrides channel_mode

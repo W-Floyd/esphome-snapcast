@@ -8,10 +8,6 @@
 #include "esphome/components/snapclient/snapclient_hub.h"
 #include "esphome/core/preferences.h"
 
-#if defined(USE_WIFI) && defined(USE_WIFI_SCAN_RESULTS_LISTENERS) && defined(USE_WIFI_CONNECT_STATE_LISTENERS)
-#include "esphome/components/wifi/wifi_component.h"
-#define SNAPCLIENT_BSSID_SELECT
-#endif
 
 namespace esphome::snapclient {
 
@@ -163,62 +159,6 @@ class SnapclientServerSelect final : public SnapclientChild, public SnapclientDy
   bool pin_released_{false};     // pin dropped after timing out; re-armed on next drop
   ESPPreferenceObject pref_;
 };
-
-#ifdef SNAPCLIENT_BSSID_SELECT
-/// @brief AP picker: "Automatic" + one BSSID option per scan-discovered AP of the
-/// connected SSID (from boot/roam scans, plus the current AP). Selecting one pins
-/// the STA config to that BSSID — removing mid-stream AP switching and guaranteeing
-/// a synchronized group shares one TSF timebase (PLAN-tsf-sync.md).
-///
-/// Lock application follows the rules proven by the wifi-lock lambda this replaces:
-/// never stamp a BSSID onto the pre-first-connect STA config (it is empty until the
-/// first connection — writing it would wipe the credentials); the lock is
-/// (re)applied from the connect-state listener, reconnecting once if the first
-/// connect landed on the wrong AP. While the pinned AP is absent, wifi retries
-/// against it exclusively; select "Automatic" to release.
-class SnapclientBssidSelect final : public Component,
-                                    public SnapclientDynamicSelect,
-                                    public wifi::WiFiScanResultsListener,
-                                    public wifi::WiFiConnectStateListener {
- public:
-  // After the wifi component (registers listeners on the wifi global)
-  float get_setup_priority() const override { return snapclient_priority::CHILD; }
-  void setup() override;
-  void dump_config() override;
-
-  void set_restore_value(bool restore) { this->restore_value_ = restore; }
-
-  // THREAD CONTEXT: main loop (wifi component's loop)
-  void on_wifi_scan_results(const wifi::wifi_scan_vector_t<wifi::WiFiScanResult> &results) override;
-  void on_wifi_connect_state(StringRef ssid, std::span<const uint8_t, 6> bssid) override;
-  void loop() override;
-
- protected:
-  void control(const std::string &value) override;
-  /// @brief Applies desired_ to the connected STA config (no-op before first connect).
-  void apply_lock_();
-  void rebuild_options_();
-
-  /// @brief Drops the pin so wifi can associate with any AP on the SSID.
-  /// The selection is remembered; only the constraint handed to wifi is released.
-  void release_pin_(const char *reason);
-
-  std::string desired_;        // preferred BSSID string; empty = automatic
-  std::string network_ssid_;   // SSID of the current connection (connect listener)
-  std::vector<std::pair<std::string, std::string>> scan_snapshot_;  // (ssid, bssid)
-  struct StoredOption {
-    char value[18];
-  };
-  bool restore_value_{true};
-  // A pin is a PREFERENCE, not a requirement: wifi's set_bssid() will refuse to
-  // associate with anything else, so an AP that is gone, overloaded, or simply out of
-  // range leaves the client unable to connect at all rather than degraded. Track how
-  // long we have been pinned-but-disconnected and drop the constraint past a timeout.
-  uint32_t pinned_since_ms_{0};  // 0 = not waiting on a pinned connect
-  bool pin_released_{false};     // pin dropped after timing out; re-armed on next drop
-  ESPPreferenceObject pref_;
-};
-#endif  // SNAPCLIENT_BSSID_SELECT
 
 }  // namespace esphome::snapclient
 

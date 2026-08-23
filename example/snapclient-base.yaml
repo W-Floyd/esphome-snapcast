@@ -235,8 +235,7 @@ select:
   # Mid-stream roam scans take the radio off-channel for hundreds of ms and starve
   # playback; roaming is already suppressed while streaming, and a pinned AP removes
   # switching entirely (and guarantees a stereo pair shares one TSF timebase).
-  - platform: snapclient
-    type: bssid
+  - platform: wifi_bssid_select
     name: Access Point
 
 text:
