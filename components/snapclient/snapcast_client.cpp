@@ -218,11 +218,11 @@ static float trim_clamp_ppm(int64_t converge_fine_us) {
 // notify_audio_played()
 static constexpr int64_t PIPELINE_FLUSH_GAP_US = 500000;
 
-// Keepalive silence while no chunk is available: pushed in these slices, up to
-// this total, so the speaker's no-data timeout (500 ms) cannot tear the pipeline
-// down mid-hiccup. The cap lets a genuinely ended stream idle out normally.
+// Keepalive silence while no chunk is available, pushed in these slices so the
+// speaker's no-data timeout (500 ms) cannot tear the pipeline down. There is
+// deliberately no total cap: the keepalive runs for as long as the SESSION is up.
+// See the stream-idle block in loop() for why, and for what that costs.
 static constexpr int64_t KEEPALIVE_SLICE_US = 50000;
-static constexpr int64_t KEEPALIVE_MAX_US = 10000000;
 
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
@@ -886,8 +886,26 @@ void SnapcastClient::service_tx_() {
 #endif
   }
 
-  // Stream idle detection: the server stops sending chunks when the group stream goes idle
-  if (this->stream_active_ &&
+  // Stream idle detection: the server stops sending chunks when the group stream
+  // goes idle.
+  //
+  // While the SESSION is up we deliberately do NOT end the stream on a chunk gap.
+  // Ending it tears the audio pipeline down (media source -> IDLE -> output
+  // inactive), and rebuilding playout phase from nothing costs a mute plus 7-20 s of
+  // re-lock. Measured on hardware: two ordinary inter-track gaps, 17 s and 18 s, each
+  // forced a teardown; the first restart came back 31 ms late and corrected silently,
+  // the second landed 61 ms late, tripped the 50 ms hard-resync threshold, and cost
+  // an audible 7.2 s gap. Identical events either side of a coin flip. The player
+  // task feeds keepalive silence across the whole gap instead, so playout phase, the
+  // frame accounting and the TSF mapping all stay live and a resuming stream needs no
+  // correction at all.
+  //
+  // Deliberate trade-off: the media player therefore reads PLAYING (silently) for as
+  // long as the session is connected, instead of dropping to IDLE after
+  // stream_idle_timeout. That option now only governs the disconnected case. TSF
+  // beaconing and the fast time-sync cadence also stay engaged across gaps -- which
+  // is the point, since a frozen mapping is what made a resuming group re-converge.
+  if (this->stream_active_ && !this->connected_.load(std::memory_order_relaxed) &&
       now - this->last_chunk_us_ > static_cast<int64_t>(this->config_.stream_idle_timeout_ms) * 1000) {
     ESP_LOGD(TAG, "Stream idle for %" PRIu32 " ms, ending stream", this->config_.stream_idle_timeout_ms);
     this->set_stream_active_(false);
@@ -1324,7 +1342,6 @@ void SnapcastClient::player_task_() {
   int64_t stale_since_us = 0;
   // Format of the last chunk played, for keepalive silence during a delivery gap
   StreamParams keepalive_params{};
-  int64_t keepalive_pushed_us = 0;
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -1335,18 +1352,16 @@ void SnapcastClient::player_task_() {
       // restart, unobservable refill, accounting re-baseline, mute, re-lock).
       // Silence occupies exactly the missing duration, so the playout timeline
       // stays continuous and a live stream resumes with no correction at all.
-      // Capped: a genuinely ended stream should be allowed to idle out.
+      // Runs for as long as the session is up -- an inter-track gap is measured in
+      // tens of seconds and any cap short of that reintroduces the teardown.
       if (keepalive_params.valid() && this->output_active_.load(std::memory_order_relaxed) &&
-          keepalive_pushed_us < KEEPALIVE_MAX_US) {
+          this->is_connected()) {
         const uint32_t frames = keepalive_params.sample_rate / (1000000 / KEEPALIVE_SLICE_US);
-        if (this->push_silence_(frames, keepalive_params) > 0) {
-          keepalive_pushed_us += KEEPALIVE_SLICE_US;
-        }
+        this->push_silence_(frames, keepalive_params);
       }
       continue;
     }
     keepalive_params = rec.params;
-    keepalive_pushed_us = 0;
 
     const uint32_t frame_bytes = rec.params.frame_bytes();
     if (frame_bytes == 0) {
