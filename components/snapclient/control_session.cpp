@@ -213,7 +213,10 @@ static void build_filter(JsonDocument &f) {
   }
   f["params"]["id"] = true;
   f["params"]["stream_id"] = true;
-  f["params"]["metadata"] = true;  // Stream.OnProperties carries it here
+  // Stream.OnProperties nests it: params = {id, properties:{canPlay..., metadata}}.
+  // Verified against the live server -- an earlier version whitelisted
+  // params.metadata, which does not exist, so the filter stripped every title.
+  f["params"]["properties"]["metadata"] = true;
   f["params"]["stream"]["id"] = true;
   f["params"]["stream"]["properties"]["metadata"] = true;
 }
@@ -228,13 +231,16 @@ void ControlSession::handle_line_(const std::string &line, int64_t now_us) {
   const char *method = doc["method"];
   if (method != nullptr) {
     if (strcmp(method, "Stream.OnProperties") == 0) {
-      // THE live metadata channel: params = {id, metadata:{...}} with metadata
-      // directly under params (NOT stream.properties.metadata). Handling only
-      // Stream.OnUpdate meant track changes were never seen and the sensors
-      // refreshed solely on control-session connect.
+      // A live metadata channel, alongside Stream.OnUpdate. Shape verified against
+      // the server: params = {id, properties:{canPlay, canGoNext, ..., metadata}}.
+      // It was read as params.metadata, which does not exist -- so every one of these
+      // notifications overwrote a good title with an empty string. Playlist tracks
+      // hid it because an OnUpdate usually followed and restored the title; off-
+      // playlist tracks change only the playback capabilities, so OnProperties
+      // arrived alone and the title stayed blank.
       const char *sid = doc["params"]["id"];
       if (sid != nullptr && this->stream_id_ == sid) {
-        JsonVariant meta = doc["params"]["metadata"];
+        JsonVariant meta = doc["params"]["properties"]["metadata"];
         this->set_metadata_(sid, &meta);
       } else if (this->stream_id_.empty()) {
         this->request_status_();  // don't know our stream yet
@@ -345,6 +351,15 @@ void ControlSession::handle_stream_(const void *stream_variant) {
 
 void ControlSession::set_metadata_(const char *stream_name, const void *metadata_variant) {
   const JsonVariant &meta = *static_cast<const JsonVariant *>(metadata_variant);
+  // Absent is not the same as empty. A null variant means this notification carried no
+  // metadata at all -- either the server does not put it here or the filter dropped it
+  // -- which says nothing about what is playing, so leave the sensors alone. An empty
+  // OBJECT is the server actively saying "nothing", and does clear them. Without this
+  // distinction a payload-shape mismatch silently blanks every title, which is exactly
+  // what happened, and it degrades to a stale title instead of a wrong one.
+  if (meta.isNull()) {
+    return;
+  }
   StreamMetadata md;
   md.stream_name = stream_name != nullptr ? stream_name : "";
   // "track" is the older key for the same field; accept either
