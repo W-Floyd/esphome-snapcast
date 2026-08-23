@@ -196,14 +196,20 @@ CONFIG_SCHEMA = cv.All(
             # How long a chunk gap is bridged with keepalive silence before the
             # stream is allowed to end. Ending it tears the audio pipeline down, and
             # rebuilding playout phase costs a mute plus 7-16 s of re-lock -- so an
-            # ordinary inter-track gap (17-18 s measured) is worth bridging. The
-            # default is ~6x that. `never` holds the pipeline for the whole session so
-            # the speaker stays ready to play in sync; it costs a continuously fed DAC,
-            # the radio pinned in high-performance mode and nonstop TSF beaconing, and
-            # it is NOT sufficient on its own for instant resumption -- a stream that
-            # resumed after 7.5 h idle still came back with a 6.9 h stale deadline and
-            # took 9.6-16 s to settle, with the pipeline held the whole time.
-            cv.Optional(CONF_KEEPALIVE_HOLD, default="2min"): cv.Any(
+            # ordinary inter-track gap (17-18 s measured) is worth bridging.
+            #
+            # Defaults to `never`: hold the pipeline for the whole session so the
+            # speaker stays ready to play in sync. The cost is a continuously fed DAC,
+            # the radio pinned in high-performance mode and nonstop TSF beaconing --
+            # irrelevant on a mains-powered speaker, which is what this component is
+            # for, but set a duration on anything battery-powered.
+            #
+            # Note what `never` does NOT buy: it is not sufficient on its own for
+            # instant resumption. A stream that resumed after 7.5 h idle still came
+            # back with a 6.9 h stale deadline and took 9.6-16 s to settle, with the
+            # pipeline held the entire time. The residual cost there was the servo
+            # settling plus a TSF re-election, not the teardown this prevents.
+            cv.Optional(CONF_KEEPALIVE_HOLD, default=CONF_NEVER): cv.Any(
                 cv.positive_time_period_milliseconds,
                 cv.one_of(CONF_NEVER, lower=True),
             ),

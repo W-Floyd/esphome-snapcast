@@ -55,7 +55,7 @@ struct SnapcastClientConfig {
   /// ready to play in sync. Costs a fed DAC, a radio held in high-performance mode and
   /// continuous TSF beaconing -- and note it does NOT make resumption free; see the
   /// stream-idle block in loop().
-  uint32_t keepalive_hold_ms{120000};
+  uint32_t keepalive_hold_ms{0};
   // Median sync error at which the steering servo engages (disengages at half).
   // Reference esp32 snapclient uses 128 us; single-frame steering splices are ~23 us
   // events, inaudible.

@@ -182,7 +182,7 @@ class SnapclientHub final : public Component,
   uint32_t time_sync_interval_ms_{1000};
   uint32_t hard_resync_threshold_ms_{50};
   uint32_t stream_idle_timeout_ms_{3000};
-  uint32_t keepalive_hold_ms_{120000};
+  uint32_t keepalive_hold_ms_{0};
   uint32_t sync_deadband_us_{128};
   uint32_t converge_fine_us_{2000};
 #ifdef USE_AUDIO_TIMING_RATE_LOCK

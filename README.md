@@ -95,7 +95,7 @@ media_player:
 | `time_sync_interval` | `250ms` | Time sync cadence while streaming; idle clients sync at max(this, 2s). Bursts run at connect and stream start |
 | `sync_deadband` | `128us` | Median error at which the steering servo engages (reference parity); holds stereo-pair imaging pinned — raise on very jittery links |
 | `hard_resync_threshold` | `50ms` | Sync error beyond which chunks are dropped / silence inserted |
-| `keepalive_hold` | `2min` | Chunk gap bridged with keepalive silence before the stream may end, so inter-track gaps cost no re-lock. `never` holds the pipeline for the whole session (speaker always ready to play in sync) at the cost of a continuously fed DAC and nonstop TSF beaconing |
+| `keepalive_hold` | `never` | Chunk gap bridged with keepalive silence before the stream may end, so inter-track gaps cost no re-lock. `never` holds the pipeline for the whole session (speaker always ready to play in sync) at the cost of a continuously fed DAC and nonstop TSF beaconing |
 | `stream_idle_timeout` | `3s` | No wire chunks for this long ⇒ stream ends. Governs the **disconnected** case; while connected `keepalive_hold` applies |
 | `channel_mode` | `stereo` | Boot default routing: `stereo`, `left`, `right`, `mono` |
 | `phase_invert` | `none` | Boot default polarity inversion: `none`, `left`, `right`, `both` |
