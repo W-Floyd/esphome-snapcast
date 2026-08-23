@@ -219,10 +219,15 @@ static float trim_clamp_ppm(int64_t converge_fine_us) {
 static constexpr int64_t PIPELINE_FLUSH_GAP_US = 500000;
 
 // Keepalive silence while no chunk is available, pushed in these slices so the
-// speaker's no-data timeout (500 ms) cannot tear the pipeline down. There is
-// deliberately no total cap: the keepalive runs for as long as the SESSION is up.
-// See the stream-idle block in loop() for why, and for what that costs.
+// speaker's no-data timeout (500 ms) cannot tear the pipeline down.
 static constexpr int64_t KEEPALIVE_SLICE_US = 50000;
+
+// How long a chunk gap may be bridged before the stream is allowed to end. Sized
+// between the two things a gap can mean: measured inter-track gaps on this fleet were
+// 17 s and 18 s, so this is ~6x the longest one and covers a short pause too, while
+// still releasing long before an idle stretch where holding on does damage. Promote to
+// a YAML option if a device ever needs its own value.
+static constexpr int64_t KEEPALIVE_HOLD_US = 120000000;
 
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
@@ -902,24 +907,28 @@ void SnapcastClient::service_tx_() {
   // Stream idle detection: the server stops sending chunks when the group stream
   // goes idle.
   //
-  // While the SESSION is up we deliberately do NOT end the stream on a chunk gap.
-  // Ending it tears the audio pipeline down (media source -> IDLE -> output
-  // inactive), and rebuilding playout phase from nothing costs a mute plus 7-20 s of
-  // re-lock. Measured on hardware: two ordinary inter-track gaps, 17 s and 18 s, each
-  // forced a teardown; the first restart came back 31 ms late and corrected silently,
-  // the second landed 61 ms late, tripped the 50 ms hard-resync threshold, and cost
-  // an audible 7.2 s gap. Identical events either side of a coin flip. The player
-  // task feeds keepalive silence across the whole gap instead, so playout phase, the
-  // frame accounting and the TSF mapping all stay live and a resuming stream needs no
-  // correction at all.
+  // Two very different things hide behind "no chunks":
   //
-  // Deliberate trade-off: the media player therefore reads PLAYING (silently) for as
-  // long as the session is connected, instead of dropping to IDLE after
-  // stream_idle_timeout. That option now only governs the disconnected case. TSF
-  // beaconing and the fast time-sync cadence also stay engaged across gaps -- which
-  // is the point, since a frozen mapping is what made a resuming group re-converge.
-  if (this->stream_active_ && !this->connected_.load(std::memory_order_relaxed) &&
-      now - this->last_chunk_us_ > static_cast<int64_t>(this->config_.stream_idle_timeout_ms) * 1000) {
+  //   An inter-track gap or short pause -- 17 s and 18 s measured here. Ending the
+  //   stream tears the pipeline down (media source -> IDLE -> output inactive) and
+  //   costs a mute plus 7-16 s of re-lock on resume, for nothing. Two such gaps 29 s
+  //   apart produced a 31 ms error that corrected silently and a 61 ms one that
+  //   tripped the hard-resync threshold: identical events either side of a coin flip.
+  //   Worth bridging with keepalive silence, which keeps playout phase, the frame
+  //   accounting and the TSF mapping live so a resuming stream needs no correction.
+  //
+  //   A finished listening session, where holding on is actively wrong: it keeps the
+  //   DAC fed, the radio in high-performance mode and TSF beaconing for hours, and the
+  //   accounting goes stale. Held across a 7.5 h overnight silence, resumption came
+  //   back with a 24888016 ms stale deadline on both devices within 61 ms of each
+  //   other, taking 9.6 s and 16 s to re-lock -- worse than the teardown it avoided.
+  //
+  // So bridge up to KEEPALIVE_HOLD_US and release beyond it. stream_idle_timeout still
+  // governs the disconnected case, where there is nothing to wait for.
+  const int64_t idle_limit_us = this->connected_.load(std::memory_order_relaxed)
+                                    ? KEEPALIVE_HOLD_US
+                                    : static_cast<int64_t>(this->config_.stream_idle_timeout_ms) * 1000;
+  if (this->stream_active_ && now - this->last_chunk_us_ > idle_limit_us) {
     ESP_LOGD(TAG, "Stream idle for %" PRIu32 " ms, ending stream", this->config_.stream_idle_timeout_ms);
     this->set_stream_active_(false);
   }

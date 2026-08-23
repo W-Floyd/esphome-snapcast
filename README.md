@@ -95,7 +95,7 @@ media_player:
 | `time_sync_interval` | `250ms` | Time sync cadence while streaming; idle clients sync at max(this, 2s). Bursts run at connect and stream start |
 | `sync_deadband` | `128us` | Median error at which the steering servo engages (reference parity); holds stereo-pair imaging pinned — raise on very jittery links |
 | `hard_resync_threshold` | `50ms` | Sync error beyond which chunks are dropped / silence inserted |
-| `stream_idle_timeout` | `3s` | No wire chunks for this long ⇒ stream ends. Applies only while **disconnected**: with the session up, a chunk gap is bridged with keepalive silence instead of ending the stream, so inter-track gaps cost no re-lock |
+| `stream_idle_timeout` | `3s` | No wire chunks for this long ⇒ stream ends. While **connected**, a chunk gap is instead bridged with keepalive silence for up to 2 min (`KEEPALIVE_HOLD_US`), so inter-track gaps cost no re-lock; past that the stream ends normally. This option governs the disconnected case |
 | `channel_mode` | `stereo` | Boot default routing: `stereo`, `left`, `right`, `mono` |
 | `phase_invert` | `none` | Boot default polarity inversion: `none`, `left`, `right`, `both` |
 | `static_delay` (media_source) | `0ms` | Per-device latency trim, like `snapclient --latency` |
@@ -174,11 +174,12 @@ never touch ESPHome entities directly.
 - **Pipeline-flush re-baseline**: a starved-then-restarted speaker pipeline discards
   pushed-but-unplayed frames; a >500 ms feedback gap re-baselines the frame
   accounting, preventing a permanent hard-resync spiral.
-- **Session-scoped keepalive**: a chunk gap is filled with silence for as long as the
-  server session is up, so the speaker/mixer never hit their no-data timeout. Ending
-  the stream tears the pipeline down, and rebuilding playout phase costs a mute plus
-  7–20 s of re-lock — measured on ordinary 17–18 s inter-track gaps. The cost is that
-  the media player reads PLAYING (silently) whenever the session is connected.
+- **Bridged chunk gaps**: a gap is filled with silence for up to 2 minutes, so the
+  speaker/mixer never hit their no-data timeout across an inter-track gap. Ending the
+  stream tears the pipeline down, and rebuilding playout phase costs a mute plus
+  7–16 s of re-lock — measured on ordinary 17–18 s gaps. Beyond the hold the stream
+  ends normally: holding it open across a 7.5 h overnight silence was *worse* than the
+  teardown, resuming with a 6.9 h stale deadline on every device at once.
 
 A planned v2 ([PLAN-rate-lock.md](PLAN-rate-lock.md)) replaces steady-state frame
 splices with hardware rate steering via the S3's fractional I2S clock divider.
