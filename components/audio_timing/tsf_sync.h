@@ -70,7 +70,18 @@ class TsfSync {
   /// or stuck in a degraded buffer state -- must hand off rather than keep
   /// broadcasting. Only a healthy device may assume leadership.
   /// THREAD CONTEXT: player task (atomic).
-  void set_playout_healthy(bool healthy) { this->playout_healthy_.store(healthy, std::memory_order_relaxed); }
+  /// @brief Report our own tracking quality to the TSF layer.
+  /// @param healthy playout is converged and tracking the timebase
+  /// @param deadline_implausible the error is so large that the DEADLINE, not our
+  ///        clock, must be wrong -- e.g. a resuming stream whose first chunk is
+  ///        already past its playout time. A leader must not read this as evidence of
+  ///        its own fault: the mapping it publishes is server<->TSF and stays valid
+  ///        regardless, and an implausible deadline arrives group-wide, so stepping
+  ///        down only destroys the timebase everyone is relying on.
+  void set_playout_healthy(bool healthy, bool deadline_implausible = false) {
+    this->playout_healthy_.store(healthy, std::memory_order_relaxed);
+    this->deadline_implausible_.store(deadline_implausible, std::memory_order_relaxed);
+  }
 
   /// @brief Reports our own playout pipeline depth (pushed-but-unplayed audio, ms).
   /// Published in our beacons and compared against the leader's, because absolute
@@ -143,6 +154,7 @@ class TsfSync {
 
   std::atomic<Role> role_{Role::IDLE};
   std::atomic<bool> playout_healthy_{false};
+  std::atomic<bool> deadline_implausible_{false};
   std::atomic<int32_t> pipeline_ms_{INT32_MIN};
   std::atomic<int32_t> pipeline_delta_ms_{INT32_MIN};
   int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance

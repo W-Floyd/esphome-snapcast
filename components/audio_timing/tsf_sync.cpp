@@ -569,6 +569,15 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
     // hiccup would otherwise hand off constantly).
     if (healthy) {
       this->unhealthy_since_us_ = 0;
+    } else if (this->deadline_implausible_.load(std::memory_order_relaxed)) {
+      // Not evidence of a leader-side fault, so hold the timer rather than clear or
+      // advance it: an implausible deadline hits the whole group at once (measured:
+      // every device saw the same 6.9 h stale deadline within 61 ms), and this leader
+      // stepping down took the group's only timebase with it. Stepping down also
+      // means reset_(), which is the same teardown used when the network changes --
+      // mapping invalidated, TSF rate estimate dropped, peers forgotten -- so the
+      // ex-leader spent ~6 s on the raw Kalman fallback with medians at +-1 ms and
+      // trim swinging +543/-486 ppm before it could settle as somebody's follower.
     } else {
       if (this->unhealthy_since_us_ == 0) {
         this->unhealthy_since_us_ = local_now_us;

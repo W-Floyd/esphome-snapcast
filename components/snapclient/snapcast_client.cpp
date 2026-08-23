@@ -1931,8 +1931,9 @@ void SnapcastClient::player_task_() {
     // is diverged (observed: a device stuck in a degraded buffer state kept
     // leading, with every peer following its mapping)
     if (this->tsf_sync_ != nullptr) {
-      this->tsf_sync_->set_playout_healthy(converged && err_window_filled == MEDIAN_WINDOW &&
-                                           std::abs(median_err_us) < PLAYOUT_HEALTHY_US);
+      this->tsf_sync_->set_playout_healthy(
+          converged && err_window_filled == MEDIAN_WINDOW && std::abs(median_err_us) < PLAYOUT_HEALTHY_US,
+          std::abs(median_err_us) > stale_us);
     }
 #endif
 
