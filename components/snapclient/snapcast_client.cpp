@@ -233,6 +233,19 @@ static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
 // in well under a second), short enough that the silent spiral is bounded.
 static constexpr int64_t STALE_BAILOUT_US = 3000000;
 
+// Re-mute policy for hard resyncs. Mute-until-synced exists because CONVERGENCE
+// splices repeatedly for seconds, which is audible as a correction storm -- not
+// because any single splice is. A one-shot catch-up is a |error| ms skip; muting for
+// it costs a full re-lock, measured at 7.2-13.3 s on this fleet. Dropping two chunks
+// beats seven seconds of silence, so a lone excursion now corrects audibly.
+//
+// The threshold is read off the logs, which separate cleanly by two orders of
+// magnitude: genuine one-shots produced 1, 2, 3 and 5 resyncs, while every real
+// storm produced 29, 37, 67, 101 or a window-saturating 128. Nothing landed in
+// between, so 8 sits in an empty gap rather than on a guess.
+static constexpr uint32_t RESYNC_STORM_COUNT = 8;
+static constexpr int64_t RESYNC_STORM_WINDOW_US = 2000000;
+
 #ifdef AUDIO_TIMING_TSF_ACTIVE
 // TSF unicast roster refresh cadence (only while no stream is active; blocking RPC)
 static constexpr int64_t TSF_PEER_REFRESH_US = 60000000;
@@ -1340,6 +1353,9 @@ void SnapcastClient::player_task_() {
   int64_t last_resync_log_us = 0;
   // When the stream first went staler than the server's buffer, 0 while it is not
   int64_t stale_since_us = 0;
+  // Rolling hard-resync count, for telling a one-shot catch-up from a storm
+  int64_t storm_window_us = 0;
+  uint32_t storm_resyncs = 0;
   // Format of the last chunk played, for keepalive silence during a delivery gap
   StreamParams keepalive_params{};
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
@@ -1714,6 +1730,27 @@ void SnapcastClient::player_task_() {
       stale_since_us = 0;
     }
 
+    // Decide ONCE, for both directions, whether this excursion should mute. Muting is
+    // for storms; a lone splice is cheaper than a re-lock. Magnitude still overrides
+    // the count: both devices once logged a simultaneous 24888016 ms error (a ~6.9 h
+    // timebase step) with only 5 resyncs, and playing audibly toward something that
+    // far outside the server's buffer is meaningless -- so anything past bufferMs
+    // mutes on the spot, and the bailout above reconnects if it persists.
+    bool mute_now = false;
+    if (std::abs(error_us) > hard_us) {
+      if (now_us() - storm_window_us > RESYNC_STORM_WINDOW_US) {
+        storm_window_us = now_us();
+        storm_resyncs = 0;
+      }
+      storm_resyncs++;
+      mute_now = storm_resyncs >= RESYNC_STORM_COUNT || std::abs(error_us) > stale_us;
+      if (converged && !mute_now && storm_resyncs == 1) {
+        // INFO because it IS audible -- a skip of roughly this length. Logged only for
+        // the first of a window so a storm cannot flood the link on its way to muting.
+        ESP_LOGI(TAG, "Hard resync %" PRId64 " ms: correcting audibly, staying unmuted", error_us / 1000);
+      }
+    }
+
     // Hard-resync logging is throttled to one line per RESYNC_LOG_INTERVAL_US: during
     // a recovery storm this fires per chunk, and when logs stream over the api the
     // log traffic competes with the audio stream on the already-congested link — a
@@ -1732,11 +1769,12 @@ void SnapcastClient::player_task_() {
       // is the only user-audible event in the loop. Logging only the re-lock (which
       // is INFO) made a dropout look like a spontaneous "Sync locked" with no cause,
       // since the resync line above is DEBUG and throttled. One line per gap.
-      if (converged) {
-        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms late -- audible gap until re-lock",
-                 error_us / 1000);
+      if (converged && mute_now) {
+        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms late (%" PRIu32
+                      " in %" PRId64 " s) -- audible gap until re-lock",
+                 error_us / 1000, storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
       }
-      converged = false;
+      converged = converged && !mute_now;
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
@@ -1754,11 +1792,12 @@ void SnapcastClient::player_task_() {
       hard_resyncs++;
       err_window_filled = 0;
       steer_dir = 0;
-      if (converged) {
-        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms early -- audible gap until re-lock",
-                 -error_us / 1000);
+      if (converged && mute_now) {
+        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms early (%" PRIu32
+                      " in %" PRId64 " s) -- audible gap until re-lock",
+                 -error_us / 1000, storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
       }
-      converged = false;
+      converged = converged && !mute_now;
       this->push_silence_(fill, rec.params);
     } else if (std::abs(median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US) {
       // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
