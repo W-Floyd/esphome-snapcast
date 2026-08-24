@@ -25,8 +25,17 @@ ESP32 (esp-idf), PSRAM strongly recommended. ESPHome new enough for
 
 ```yaml
 external_components:
+  # audio_timing is required: snapclient AUTO_LOADs it, and a `components:` filter hides
+  # anything it does not name. Omit the filter to also get wifi_bssid_select / wifi_tools.
   - source: github://W-Floyd/esphome-snapcast
-    components: [snapclient]
+    components: [snapclient, audio_timing]
+  # Forked speaker stack, pending upstream: makes the audio between our push point and the
+  # DAC readable, which the sync engine needs. Tracks a release tag; see TODO.md.
+  - source:
+      type: git
+      url: https://github.com/W-Floyd/esphome
+      ref: speaker-buffered-bytes
+    components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
 
 snapclient:
   id: snap

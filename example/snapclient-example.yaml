@@ -21,9 +21,35 @@ wifi:
   password: !secret wifi_password
 
 external_components:
+  # `audio_timing` is listed because snapclient AUTO_LOADs it, and a `components:` filter
+  # hides everything it does not name -- omitting the filter entirely also works and
+  # additionally exposes wifi_bssid_select and wifi_tools.
+  - source: github://W-Floyd/esphome-snapcast
+    components: [snapclient, audio_timing]
+  # Developing against a checkout instead? Swap the above for the working tree, so edits
+  # are picked up without pushing:
+  # - source:
+  #     type: local
+  #     path: ../components
+
+  # Forked speaker stack, pending upstream. Adds `Speaker::buffered_bytes(size_t &)`, so
+  # the audio sitting between our push point and the DAC is READABLE. Everything
+  # downstream already computes that count and throws it away
+  # (`has_buffered_data()` returns `available() > 0`), and its absence is why a pipeline
+  # restart at an unobserved fill leaves playback 100-250 ms offset with every sync metric
+  # still reading ~0: the error is measured against a prediction built from the same wrong
+  # accounting.
+  #
+  # An external component overrides the built-in of the same name, so only these six are
+  # replaced and the installed ESPHome is untouched. The branch tracks a RELEASE TAG
+  # (currently 2026.8.1), so it pairs with a stable CLI; `dev` is not usable as a base,
+  # because its components call codegen helpers absent from any released esphome. Drop
+  # this block once the change lands upstream (see TODO.md).
   - source:
-      type: local
-      path: ../components
+      type: git
+      url: https://github.com/W-Floyd/esphome
+      ref: speaker-buffered-bytes
+    components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
 
 # The Snapcast client hub: connection, time sync, decode, sync scheduling
 snapclient:

@@ -1,24 +1,5 @@
 # TODO
 
-## Blocking a usable public repo
-
-- **`example/snapclient-example.yaml` does not build against stock ESPHome.** It omits the
-  forked speaker stack that provides `output_buffered_bytes`, so the documented minimal
-  example fails to compile for anyone following the README. Add the fork to it:
-
-  ```yaml
-  external_components:
-    - source:
-        type: git
-        url: https://github.com/W-Floyd/esphome
-        ref: speaker-buffered-bytes
-      components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
-  ```
-
-  The fork is rebased on the `2026.8.1` release tag, so it pairs with a stable CLI, and
-  needs re-basing on each new release. `dev` is not usable as a base: its components call
-  codegen helpers absent from any released esphome.
-
 ## Upstream ESPHome
 
 - **Expose the speaker's queued frame count.** `speaker::Speaker` offers only
