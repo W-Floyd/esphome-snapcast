@@ -17,8 +17,41 @@ static constexpr char URI_CURRENT[] = "snapcast://current";
 
 // THREAD CONTEXT: Main loop. The callbacks registered here also fire on the main loop,
 // since SnapclientHub dispatches events from client_->loop().
+// How long the source may sit idle while the stream is live before playback is
+// re-requested, and how long a request may stay pending before it is retried.
+static constexpr uint32_t REARM_INTERVAL_MS = 5000;
+static constexpr uint32_t REARM_PENDING_TIMEOUT_MS = 15000;
+
 void SnapclientMediaSource::setup() {
   this->parent_->set_static_delay_ms(this->static_delay_ms_);
+
+  // Re-arm playback when the stream is live but nothing is routing our audio.
+  //
+  // The request above fires only on the stream's not-active -> active EDGE. With
+  // keepalive_hold: never that edge never recurs, because a chunk gap no longer ends
+  // the stream -- so a source that lands in IDLE for any reason stays there until a
+  // human presses play. Observed after a ~4 h idle: one device resumed on its own
+  // while its partner sat silent needing a manual play, with no error logged anywhere.
+  //
+  // Deliberately not undone: a user STOP. That sets IDLE too, and re-requesting would
+  // fight the person holding the remote. A PAUSE needs no special case -- it leaves
+  // the state PAUSED, which the IDLE test below already excludes.
+  this->set_interval("rearm_playback", REARM_INTERVAL_MS, [this]() {
+    // A request that never landed would otherwise latch pending_start_ forever, which
+    // is the same class of bug as the missing edge itself
+    if (this->pending_start_ && millis() - this->start_requested_ms_ > REARM_PENDING_TIMEOUT_MS) {
+      ESP_LOGW(TAG, "Play request went unanswered; retrying");
+      this->pending_start_ = false;
+    }
+    if (!this->stream_live_ || this->pending_start_ || this->user_stopped_ ||
+        this->get_state() != media_source::MediaSourceState::IDLE) {
+      return;
+    }
+    ESP_LOGW(TAG, "Stream is live but nothing is routing our audio; re-requesting playback");
+    this->pending_start_ = true;
+    this->start_requested_ms_ = millis();
+    this->request_play_uri_(URI_CURRENT);
+  });
 
   this->parent_->add_server_settings_callback([this](uint8_t volume, bool muted, int32_t latency_ms) {
     // Track the server's current belief so notify_volume_changed / notify_mute_changed
@@ -43,13 +76,16 @@ void SnapclientMediaSource::setup() {
     if (started) {
       ESP_LOGD(TAG, "Stream started: %" PRIu32 " Hz, %u bit, %u ch", params.sample_rate, params.bits_per_sample,
                params.channels);
+      this->stream_live_ = true;
       if (!this->pending_start_ && this->get_state() == media_source::MediaSourceState::IDLE) {
         // Ask the orchestrator to route audio from us
         this->pending_start_ = true;
+        this->start_requested_ms_ = millis();
         this->request_play_uri_(URI_CURRENT);
       }
     } else {
       ESP_LOGD(TAG, "Stream ended");
+      this->stream_live_ = false;
       this->set_playback_state_(media_source::MediaSourceState::IDLE);
     }
   });
@@ -66,6 +102,7 @@ bool SnapclientMediaSource::can_handle(const std::string &uri) const { return ur
 // THREAD CONTEXT: Main loop (media_source.h documents play_uri as main-loop only)
 bool SnapclientMediaSource::play_uri(const std::string &uri) {
   this->pending_start_ = false;
+  this->user_stopped_ = false;
   if (!this->is_ready() || this->is_failed() || !this->has_listener()) {
     return false;
   }
@@ -88,12 +125,15 @@ void SnapclientMediaSource::handle_command(media_source::MediaSourceCommand comm
   // their deadline while paused, so resuming snaps straight back into sync.
   switch (command) {
     case media_source::MediaSourceCommand::PLAY:
+      this->user_stopped_ = false;
       this->set_playback_state_(media_source::MediaSourceState::PLAYING);
       break;
     case media_source::MediaSourceCommand::PAUSE:
       this->set_playback_state_(media_source::MediaSourceState::PAUSED);
       break;
     case media_source::MediaSourceCommand::STOP:
+      // The user's decision; the re-arm must leave it alone until they play again
+      this->user_stopped_ = true;
       this->set_playback_state_(media_source::MediaSourceState::IDLE);
       break;
     default:

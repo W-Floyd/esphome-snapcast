@@ -76,6 +76,12 @@ class SnapclientMediaSource final : public SnapclientChild,
   bool local_muted_{false};
 
   bool pending_start_{false};
+  uint32_t start_requested_ms_{0};  // when pending_start_ was raised, for a retry timeout
+  bool stream_live_{false};         // the client is receiving chunks
+  // A STOP is the user's decision and must not be undone by the re-arm below. PAUSE
+  // does not need tracking: it leaves the state PAUSED, not IDLE, so the re-arm's
+  // IDLE test already excludes it.
+  bool user_stopped_{false};
 };
 
 }  // namespace esphome::snapclient
