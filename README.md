@@ -95,13 +95,14 @@ sensor.
 | `opus` | `false` | compile in Opus decoding (libopus; wants PSRAM) |
 | `time_sync_interval` | `250ms` | while streaming; idle uses `max(this, 2s)` |
 | `sync_deadband` | `128us` | median error that engages steering; raise on jittery links |
+| `converge_fine` | `2ms` | coarse→fine servo handoff, and whether a hard resync re-mutes; must sit above `2 × sync_deadband` and below `hard_resync_threshold` or convergence cannot finish |
 | `hard_resync_threshold` | `50ms` | beyond this, drop chunks / insert silence |
 | `pause_behavior` | `allow` | local PAUSE/STOP: `allow`, `resume` (undone once audio flows), `ignore` (refused) |
 | `keepalive_hold` | `never` | bridge a chunk gap with silence before letting the stream end; `never` keeps the speaker always ready |
 | `stream_idle_timeout` | `3s` | ends the stream when disconnected; while connected `keepalive_hold` applies |
 | `channel_mode` | `stereo` | `stereo`, `left`, `right`, `mono` |
 | `phase_invert` | `none` | `none`, `left`, `right`, `both` |
-| `rate_lock` | off | steer the S3's I2S divider instead of splicing frames |
+| `rate_lock` | off | steer the S3's I2S divider instead of splicing frames; takes `i2s_port` (default `0`) |
 | `tsf_sync` | `false` | share one server→TSF mapping between same-AP clients |
 | `timing_diagnostics` | `false` | per-chunk `RAW` lines for `scripts/raw-sync.py` |
 | `static_delay` (media_source) | `0ms` | per-device latency trim |
