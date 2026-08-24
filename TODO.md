@@ -65,8 +65,6 @@
 
 ## Features
 
-- **Opus codec** — Snapcast uses raw (non-Ogg) Opus framing; needs a bespoke decode path,
-  since esp-audio-libs' decoder expects Ogg.
 - **Runtime server retargeting** — `snapcast://host:port` URIs currently warn; needs
   thread-safe reconfiguration of the network task's target.
 - **Crossfade on servo frame splices** — the last near-inaudible discontinuity class; a

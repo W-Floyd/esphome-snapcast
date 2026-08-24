@@ -99,6 +99,7 @@ void VirtualSpeaker::consumer_task_() {
         break;
       }
       const uint32_t got_frames = got / frame_bytes;
+      this->measure_signal_(discard, got_frames, frame_bytes);
       consumed_now += got_frames;
       epoch_consumed_frames += got_frames;
       due -= got_frames;
@@ -111,10 +112,35 @@ void VirtualSpeaker::consumer_task_() {
 
     if (++ticks >= STATS_EVERY_TICKS) {
       ticks = 0;
-      ESP_LOGD(TAG, "Consumed %" PRId64 " frames, underruns %" PRId64 " frames, buffered %zu bytes",
-               this->consumed_frames_, this->underrun_frames_, this->ring_->available());
+      // Two zero crossings per cycle, over however much audio actually arrived
+      const uint32_t hz = this->signal_frames_ > 0 ? static_cast<uint32_t>(this->signal_crossings_ *
+                                                                           static_cast<int64_t>(this->sample_rate_) /
+                                                                           (2 * this->signal_frames_))
+                                                   : 0;
+      ESP_LOGD(TAG, "Consumed %" PRId64 " frames, underruns %" PRId64 " frames, buffered %zu bytes, signal ~%" PRIu32
+                    " Hz peak %d",
+               this->consumed_frames_, this->underrun_frames_, this->ring_->available(), hz, this->signal_peak_);
+      this->signal_crossings_ = 0;
+      this->signal_frames_ = 0;
+      this->signal_peak_ = 0;
     }
   }
+}
+
+void VirtualSpeaker::measure_signal_(const uint8_t *data, uint32_t frames, uint32_t frame_bytes) {
+  for (uint32_t i = 0; i < frames; i++) {
+    int16_t sample;
+    memcpy(&sample, data + i * frame_bytes, sizeof(sample));  // left channel
+    if ((sample >= 0) != (this->signal_prev_ >= 0)) {
+      this->signal_crossings_++;
+    }
+    this->signal_prev_ = sample;
+    const int magnitude = sample < 0 ? -static_cast<int>(sample) : sample;
+    if (magnitude > this->signal_peak_) {
+      this->signal_peak_ = static_cast<int16_t>(std::min(magnitude, 32767));
+    }
+  }
+  this->signal_frames_ += frames;
 }
 
 }  // namespace esphome::virtual_speaker

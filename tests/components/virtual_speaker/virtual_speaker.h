@@ -43,6 +43,8 @@ class VirtualSpeaker final : public Component, public speaker::Speaker {
  protected:
   static void consumer_task_trampoline(void *arg);
   void consumer_task_();
+  /// Accumulates zero crossings and peak amplitude for the left channel.
+  void measure_signal_(const uint8_t *data, uint32_t frames, uint32_t frame_bytes);
 
   uint32_t sample_rate_{48000};
   uint8_t channels_{2};
@@ -54,6 +56,14 @@ class VirtualSpeaker final : public Component, public speaker::Speaker {
   // Stats (consumer task only)
   int64_t consumed_frames_{0};
   int64_t underrun_frames_{0};
+  // Signal check over the current stats window. Frame counts alone cannot tell a
+  // correct decode from a plausible-looking wrong one, so the discarded audio is
+  // measured on the way past: zero crossings give the fundamental, and the peak
+  // separates silence from signal. The test source is a 440 Hz sine.
+  int16_t signal_prev_{0};
+  int16_t signal_peak_{0};
+  uint32_t signal_crossings_{0};
+  int64_t signal_frames_{0};
 };
 
 }  // namespace esphome::virtual_speaker

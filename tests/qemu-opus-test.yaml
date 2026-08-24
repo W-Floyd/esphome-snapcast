@@ -1,0 +1,27 @@
+# QEMU integration test, Opus variant: qemu-test.yaml plus the Opus decode path.
+# Drive it with `CODEC=opus ./run-qemu-test.sh`, which points snapserver's stream at
+# codec=opus.
+#
+# Opus does not fit in an ESP32's ~180 KB of DRAM next to the PCM ring -- libopus'
+# decoder state alone left 18 KB free -- so this variant turns on the external SPI RAM
+# that espressif QEMU emulates (`-m 4M`), and shrinks the pseudostack besides. That is
+# also the honest picture on real hardware: Opus wants a PSRAM board.
+packages:
+  base: !include qemu-test.yaml
+
+esphome:
+  name: snapclient-qemu-opus
+
+snapclient:
+  id: snap
+  opus: true
+
+psram:
+  mode: quad
+  speed: 40MHz
+
+audio:
+  codecs:
+    opus:
+      pseudostack:
+        size: 60000

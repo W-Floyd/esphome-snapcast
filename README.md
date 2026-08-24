@@ -65,8 +65,11 @@ Full example: [example/snapclient-example.yaml](example/snapclient-example.yaml)
 smart speaker with ducked HA announcements, put the shared config in one file and include
 it from thin per-board files via `packages:` + `substitutions:`.
 
-**PCM and FLAC only** — set your stream to `codec=flac` or `codec=pcm`. Opus and Vorbis
-use raw non-Ogg framing and need bespoke decoders.
+**PCM, FLAC and Opus** — set your stream to `codec=flac`, `codec=pcm` or `codec=opus`.
+Opus is opt-in (`opus: true` on the `snapclient:` block) because libopus costs ~200 KB of
+flash and, at runtime, a 120 KB pseudostack plus ~40 KB of decoder state: it needs PSRAM
+in practice. Note that snapserver resamples every Opus stream to 48 kHz stereo, so the
+speaker and `media_pipeline` have to be configured for that. Vorbis is still unsupported.
 
 ### Options
 

@@ -1,15 +1,35 @@
 #!/usr/bin/env bash
 # End-to-end integration test: real snapclient firmware on an emulated ESP32 (espressif
-# QEMU + OpenCores ethernet) against a local snapserver streaming a FLAC-encoded sine.
+# QEMU + OpenCores ethernet) against a local snapserver streaming an encoded sine.
 #
 # Requires: esphome, snapserver (brew install snapcast), ffmpeg, and espressif QEMU
 # (installed automatically below via ESPHome's cached esp-idf tools on first run).
 #
+#   ./run-qemu-test.sh             FLAC (snapserver's default codec)
+#   CODEC=pcm ./run-qemu-test.sh   uncompressed
+#   CODEC=opus ./run-qemu-test.sh  Opus; builds the separate opus config, which turns on
+#                                  QEMU's emulated PSRAM because libopus needs it
+#
 # Watch the serial log for:
 #   [snapclient.client] Sync error: avg X us, peak Y us   <- should converge to ~1 ms avg
-#   [virtual_speaker]   Consumed N frames, underruns 0
+#   [virtual_speaker]   Consumed N frames, underruns 0, signal ~440 Hz
+#
+# The signal line is the decode check: the source is a 440 Hz sine, so a codec that
+# decodes to plausible-looking garbage still fails it where a frame count would not.
+#
+# Give QEMU a quiet host. Under load (a parallel esphome compile will do it) the guest
+# takes an interrupt-watchdog panic with both cores parked in the idle task, and on the
+# PSRAM config it then boot-loops rather than recovering. That is the emulator missing
+# its deadline, not a firmware bug -- rerun it idle before believing a crash.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+CODEC=${CODEC:-flac}
+case "$CODEC" in
+  opus) CONFIG=qemu-opus-test.yaml; NAME=snapclient-qemu-opus ;;
+  flac|pcm) CONFIG=qemu-test.yaml; NAME=snapclient-qemu ;;
+  *) echo "unknown CODEC '$CODEC' (flac, pcm, opus)" >&2; exit 1 ;;
+esac
 
 WORK=$(mktemp -d)
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$WORK"' EXIT
@@ -18,7 +38,7 @@ echo "--- snapserver ---"
 mkfifo "$WORK/snapfifo"
 cat > "$WORK/snapserver.conf" <<EOF
 [stream]
-source = pipe://$WORK/snapfifo?name=test&sampleformat=48000:16:2&codec=flac
+source = pipe://$WORK/snapfifo?name=test&sampleformat=48000:16:2&codec=$CODEC
 buffer = 1000
 [http]
 enabled = false
@@ -30,10 +50,10 @@ ffmpeg -re -f lavfi -i "sine=frequency=440:sample_rate=48000" -ac 2 -f s16le -t 
   > "$WORK/snapfifo" 2>/dev/null &
 
 echo "--- firmware ---"
-esphome compile qemu-test.yaml
+esphome compile "$CONFIG"
 
 echo "--- flash image ---"
-cp .esphome/build/snapclient-qemu/build/firmware.factory.bin "$WORK/flash.bin"
+cp ".esphome/build/$NAME/build/firmware.factory.bin" "$WORK/flash.bin"
 python3 - "$WORK/flash.bin" <<'EOF'
 import sys
 with open(sys.argv[1], "r+b") as f:

@@ -9,6 +9,9 @@
 #endif
 
 #include <esp_timer.h>
+#ifdef USE_SNAPCLIENT_OPUS
+#include <esp_system.h>
+#endif
 #include <lwip/netdb.h>
 #include <lwip/sockets.h>
 
@@ -29,6 +32,17 @@ static const char *const TAG = "snapclient.client";
 // Sanity cap on a single message payload; the largest legitimate payloads are FLAC
 // wire chunks (a few KB) and codec headers.
 static constexpr uint32_t MAX_PAYLOAD_SIZE = 262144;
+
+#ifdef USE_SNAPCLIENT_OPUS
+// Snapcast's Opus codec header is a 12-byte "pseudo header": raw Opus packets carry no
+// sample format, so the server states the one it resampled to. Magic is the uint32
+// 0x4F505553 written little-endian, i.e. the bytes "SUPO" on the wire.
+static constexpr size_t OPUS_HEADER_SIZE = 12;
+static constexpr uint32_t OPUS_HEADER_MAGIC = 0x4F505553;
+// Opus decodes at most 120 ms per packet. snapserver emits 10/20/40/60 ms packets, but
+// sizing for the codec maximum costs 23 KB at 48 kHz stereo and removes a failure mode.
+static constexpr uint32_t OPUS_MAX_PACKET_MS = 120;
+#endif
 
 // Time-sync cadence: a burst on (re)connect for fast filter convergence, then steady
 // state. Mirrors the reference web client / embedded snapclient startup behavior.
@@ -1183,6 +1197,12 @@ void SnapcastClient::handle_codec_header_(const uint8_t *payload, size_t len) {
   this->set_stream_active_(false);
   this->codec_ = Codec::NONE;
   this->stream_params_ = StreamParams{};
+#ifdef USE_SNAPCLIENT_OPUS
+  // ~150 KB of decoder state and pseudostack; do not hold it across a codec change
+  this->opus_decoder_.reset();
+  this->opus_output_.reset();
+  this->opus_output_samples_ = 0;
+#endif
 
   if (header.codec_is("pcm")) {
     // Payload is a RIFF/WAVE header; the PCM format lives in the fmt chunk at fixed offsets
@@ -1219,8 +1239,61 @@ void SnapcastClient::handle_codec_header_(const uint8_t *payload, size_t len) {
 #else
     ESP_LOGE(TAG, "FLAC stream received but FLAC support is disabled (set `flac: true` on the snapclient component)");
 #endif
+  } else if (header.codec_is("opus")) {
+#ifdef USE_SNAPCLIENT_OPUS
+    if (header.payload_len < OPUS_HEADER_SIZE) {
+      ESP_LOGE(TAG, "Opus codec header too short (%zu bytes)", header.payload_len);
+      return;
+    }
+    uint32_t magic;
+    memcpy(&magic, header.payload, sizeof(magic));
+    if (magic != OPUS_HEADER_MAGIC) {
+      ESP_LOGE(TAG, "Not an Opus pseudo header (magic 0x%08" PRIX32 ")", magic);
+      return;
+    }
+    uint32_t rate;
+    uint16_t bits;
+    uint16_t channels;
+    memcpy(&rate, header.payload + 4, sizeof(rate));
+    memcpy(&bits, header.payload + 8, sizeof(bits));
+    memcpy(&channels, header.payload + 10, sizeof(channels));
+    // Validate before narrowing into StreamParams' uint8_t fields, or a nonsense
+    // header could truncate into a plausible one. opus_decoder_create accepts only
+    // these rates; snapserver always resamples to 48 kHz/16-bit stereo for Opus, so
+    // anything else here means a header we do not understand.
+    const bool rate_ok = rate == 8000 || rate == 12000 || rate == 16000 || rate == 24000 || rate == 48000;
+    if (!rate_ok || bits != 16 || channels < 1 || channels > 2) {
+      ESP_LOGE(TAG, "Unsupported Opus format: %" PRIu32 " Hz, %u bit, %u ch", rate, bits, channels);
+      return;
+    }
+    this->stream_params_.sample_rate = rate;
+    this->stream_params_.bits_per_sample = static_cast<uint8_t>(bits);
+    this->stream_params_.channels = static_cast<uint8_t>(channels);
+    int error = OPUS_OK;
+    this->opus_decoder_.reset(opus_decoder_create(static_cast<opus_int32>(rate), channels, &error));
+    if (this->opus_decoder_ == nullptr || error != OPUS_OK) {
+      ESP_LOGE(TAG, "Failed to create Opus decoder: %s", opus_strerror(error));
+      this->opus_decoder_.reset();
+      this->stream_params_ = StreamParams{};
+      return;
+    }
+    const size_t samples = static_cast<size_t>(rate) / 1000 * OPUS_MAX_PACKET_MS * channels;
+    RAMAllocator<int16_t> allocator;
+    this->opus_output_.reset(allocator.allocate(samples));
+    if (this->opus_output_ == nullptr) {
+      ESP_LOGE(TAG, "No memory for the %zu byte Opus packet buffer (%" PRIu32 " bytes free)",
+               samples * sizeof(int16_t), static_cast<uint32_t>(esp_get_free_heap_size()));
+      this->opus_decoder_.reset();
+      this->stream_params_ = StreamParams{};
+      return;
+    }
+    this->opus_output_samples_ = samples;
+    this->codec_ = Codec::OPUS;
+#else
+    ESP_LOGE(TAG, "Opus stream received but Opus support is disabled (set `opus: true` on the snapclient component)");
+#endif
   } else {
-    ESP_LOGE(TAG, "Unsupported codec '%.*s' — set the snapserver stream codec to flac or pcm",
+    ESP_LOGE(TAG, "Unsupported codec '%.*s' — set the snapserver stream codec to flac, pcm or opus",
              static_cast<int>(header.codec_len), header.codec);
   }
 
@@ -1253,6 +1326,11 @@ void SnapcastClient::handle_wire_chunk_(const uint8_t *payload, size_t len) {
     case Codec::FLAC:
       this->flac_input_.insert(this->flac_input_.end(), chunk.payload, chunk.payload + chunk.payload_len);
       this->decode_flac_input_(server_ts_us);
+      break;
+#endif
+#ifdef USE_SNAPCLIENT_OPUS
+    case Codec::OPUS:
+      this->decode_opus_packet_(chunk.payload, chunk.payload_len, server_ts_us);
       break;
 #endif
     default:
@@ -1301,6 +1379,26 @@ void SnapcastClient::decode_flac_input_(int64_t server_ts_us) {
     }
   }
   this->flac_input_.erase(this->flac_input_.begin(), this->flac_input_.begin() + offset);
+}
+#endif
+
+#ifdef USE_SNAPCLIENT_OPUS
+void SnapcastClient::decode_opus_packet_(const uint8_t *data, size_t len, int64_t server_ts_us) {
+  // One wire chunk is exactly one opus_encode() output (snapserver splits every PCM
+  // chunk into whole 60/40/20/10 ms packets and carries the remainder itself), so
+  // there is nothing to buffer across chunks and each packet keeps its own timestamp.
+  const int max_frames = static_cast<int>(this->opus_output_samples_ / this->stream_params_.channels);
+  const int frames = opus_decode(this->opus_decoder_.get(), data, static_cast<opus_int32>(len),
+                                 this->opus_output_.get(), max_frames, 0);
+  if (frames < 0) {
+    // The transport is TCP, so this is a malformed packet rather than a lost one:
+    // dropping it (instead of asking for packet-loss concealment) keeps the decoder
+    // state honest, and the servo absorbs the resulting gap.
+    ESP_LOGW(TAG, "Opus decode error %s, discarding %zu byte packet", opus_strerror(frames), len);
+    return;
+  }
+  const size_t bytes = static_cast<size_t>(frames) * this->stream_params_.channels * sizeof(int16_t);
+  this->emit_pcm_(reinterpret_cast<const uint8_t *>(this->opus_output_.get()), bytes, server_ts_us);
 }
 #endif
 

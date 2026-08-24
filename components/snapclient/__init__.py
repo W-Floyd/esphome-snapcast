@@ -10,7 +10,7 @@ from esphome.types import ConfigType
 
 CODEOWNERS = ["@W-Floyd"]
 DEPENDENCIES = ["network"]
-# audio: micro decoder libraries (FLAC); json: ArduinoJson for hello/settings payloads;
+# audio: micro decoder libraries (FLAC, Opus); json: ArduinoJson for hello/settings payloads;
 # ring_buffer: the decoded-PCM buffer between the network and player tasks;
 # mdns: server auto-discovery via _snapcast._tcp when no server is configured.
 # audio_timing: the protocol-agnostic clock filter / TSF sync / I2S rate lock,
@@ -21,6 +21,7 @@ DOMAIN = "snapclient"
 CONF_SERVER = "server"
 CONF_SNAPCLIENT_ID = "snapclient_id"
 CONF_FLAC = "flac"
+CONF_OPUS = "opus"
 CONF_TIME_SYNC_INTERVAL = "time_sync_interval"
 CONF_HARD_RESYNC_THRESHOLD = "hard_resync_threshold"
 CONF_STREAM_IDLE_TIMEOUT = "stream_idle_timeout"
@@ -141,6 +142,12 @@ CONFIG_SCHEMA = cv.All(
             # Sized for >1 s of 48 kHz/16-bit stereo by default.
             cv.Optional(CONF_BUFFER_SIZE, default=524288): cv.int_range(min=65536),
             cv.Optional(CONF_FLAC, default=True): cv.boolean,
+            # Opt-in: libopus costs ~200 KB flash and, at runtime, a 120 KB
+            # pseudostack plus ~40 KB of decoder state. snapserver's Opus streams
+            # are always 48 kHz stereo (it resamples), so a mono or 44.1 kHz
+            # pipeline has to be configured for that. Tune the memory placement
+            # under the top-level `audio:` component's `codecs: opus:` key.
+            cv.Optional(CONF_OPUS, default=False): cv.boolean,
             # Cadence while a stream is active; idle clients sync at max(this, 2s)
             cv.Optional(CONF_TIME_SYNC_INTERVAL, default="250ms"): cv.All(
                 cv.positive_time_period_milliseconds,
@@ -299,3 +306,10 @@ async def to_code(config: ConfigType) -> None:
         # snapserver's default stream codec; pulls micro_flac from esp-audio-libs
         audio.request_flac_support()
         cg.add_define("USE_SNAPCLIENT_FLAC", True)
+
+    if config[CONF_OPUS]:
+        # Pulls micro-opus (libopus). Snapcast frames Opus raw -- one packet per wire
+        # chunk, no Ogg -- so the decode path calls libopus directly rather than going
+        # through esp-audio-libs' Ogg-expecting decoder.
+        audio.request_opus_support()
+        cg.add_define("USE_SNAPCLIENT_OPUS", True)

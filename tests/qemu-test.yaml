@@ -35,6 +35,13 @@ external_components:
   - source:
       type: local
       path: components
+  # Same forked speaker stack the README tells consumers to pin: the component does not
+  # compile without `Speaker::buffered_bytes()`. See TODO.md.
+  - source:
+      type: git
+      url: https://github.com/W-Floyd/esphome
+      ref: speaker-buffered-bytes
+    components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
 
 snapclient:
   id: snap

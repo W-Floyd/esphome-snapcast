@@ -17,6 +17,10 @@
 #include <micro_flac/flac_decoder.h>
 #endif
 
+#ifdef USE_SNAPCLIENT_OPUS
+#include <opus.h>
+#endif
+
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <freertos/task.h>
@@ -332,6 +336,12 @@ class SnapcastClient {
   void decode_flac_input_(int64_t server_ts_us);
 #endif
 
+#ifdef USE_SNAPCLIENT_OPUS
+  /// Decodes one raw Opus packet -- a Snapcast wire chunk is exactly one, so unlike
+  /// FLAC there is no carry-over buffer -- and emits the PCM stamped @p server_ts_us.
+  void decode_opus_packet_(const uint8_t *data, size_t len, int64_t server_ts_us);
+#endif
+
   // --- Player task ---
   void player_task_();
   /// @return the predicted DAC time (µs) of the next frame pushed downstream, or -1 if
@@ -457,13 +467,29 @@ class SnapcastClient {
   std::vector<uint8_t> rx_buffer_;
   StreamParams stream_params_{};
 
-  enum class Codec : uint8_t { NONE, PCM, FLAC };
+  enum class Codec : uint8_t { NONE, PCM, FLAC, OPUS };
   Codec codec_{Codec::NONE};
 #ifdef USE_SNAPCLIENT_FLAC
   std::unique_ptr<micro_flac::FLACDecoder> flac_decoder_;
   std::vector<uint8_t> flac_input_;    // undecoded input carry-over across chunks
   std::vector<uint8_t> flac_output_;   // one decoded FLAC frame
   bool flac_header_done_{false};
+#endif
+
+#ifdef USE_SNAPCLIENT_OPUS
+  struct OpusDecoderDeleter {
+    void operator()(::OpusDecoder *decoder) const { opus_decoder_destroy(decoder); }
+  };
+  std::unique_ptr<::OpusDecoder, OpusDecoderDeleter> opus_decoder_;
+  // One decoded packet, sized for Opus' 120 ms maximum. Allocated through
+  // RAMAllocator rather than a vector so a short heap -- the realistic case on a
+  // PSRAM-less board, where libopus' own state has just taken ~40 KB -- reports a
+  // dead stream instead of aborting the device.
+  struct HeapFree {
+    void operator()(int16_t *buffer) const { free(buffer); }  // NOLINT(cppcoreguidelines-no-malloc)
+  };
+  std::unique_ptr<int16_t[], HeapFree> opus_output_;
+  size_t opus_output_samples_{0};
 #endif
 
 #ifdef USE_AUDIO_TIMING_RATE_LOCK
