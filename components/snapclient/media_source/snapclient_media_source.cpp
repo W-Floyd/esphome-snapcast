@@ -43,11 +43,20 @@ void SnapclientMediaSource::setup() {
       ESP_LOGW(TAG, "Play request went unanswered; retrying");
       this->pending_start_ = false;
     }
-    if (!this->stream_live_ || this->pending_start_ || this->user_halted_ ||
+    // "Audio flowing" rather than "stream live": keepalive_hold holds the stream open
+    // across a chunk gap, so stream_live_ alone stays true through hours of silence.
+    // Keying on real chunks is what makes follow_stream sane -- a halt taken while the
+    // music is stopped is honoured until the music actually comes back.
+    if (!this->stream_live_ || !this->parent_->audio_flowing() || this->pending_start_ ||
         this->get_state() != media_source::MediaSourceState::IDLE) {
       return;
     }
-    ESP_LOGW(TAG, "Stream is live but nothing is routing our audio; re-requesting playback");
+    if (this->user_halted_ && !this->parent_->follow_stream()) {
+      return;  // someone asked for silence and the stream is not authoritative
+    }
+    ESP_LOGW(TAG, "%s; re-requesting playback",
+             this->user_halted_ ? "Audio flowing again and follow_stream is set, overriding the local halt"
+                                : "Audio is flowing but nothing is routing it");
     this->pending_start_ = true;
     this->start_requested_ms_ = millis();
     this->request_play_uri_(URI_CURRENT);

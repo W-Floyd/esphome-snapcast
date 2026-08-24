@@ -498,6 +498,14 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
 }
 
 // THREAD CONTEXT: Main loop (diagnostics)
+bool SnapcastClient::audio_flowing() const {
+  const int64_t last = this->last_chunk_us_.load(std::memory_order_relaxed);
+  if (last == 0) {
+    return false;
+  }
+  return now_us() - last < static_cast<int64_t>(this->config_.stream_idle_timeout_ms) * 1000;
+}
+
 float SnapcastClient::get_clock_offset_ms() {
   this->filter_mutex_.lock();
   float offset = this->time_filter_.has_estimate()
@@ -590,7 +598,7 @@ void SnapcastClient::connection_session_() {
   this->stream_params_ = StreamParams{};
   this->time_sync_burst_remaining_ = TIME_SYNC_BURST_COUNT;
   this->next_time_sync_us_ = 0;
-  this->last_chunk_us_ = 0;
+  this->last_chunk_us_.store(0, std::memory_order_relaxed);
 
   std::string hello = build_hello_payload(this->config_.client_id.c_str(), this->config_.hostname);
   bool ok = this->send_message_(MessageType::HELLO, reinterpret_cast<const uint8_t *>(hello.data()), hello.size());
@@ -932,7 +940,7 @@ void SnapcastClient::service_tx_() {
   } else {
     idle_limit_us = static_cast<int64_t>(this->config_.keepalive_hold_ms) * 1000;
   }
-  if (this->stream_active_ && now - this->last_chunk_us_ > idle_limit_us) {
+  if (this->stream_active_ && now - this->last_chunk_us_.load(std::memory_order_relaxed) > idle_limit_us) {
     ESP_LOGD(TAG, "Stream idle for %" PRIu32 " ms, ending stream", this->config_.stream_idle_timeout_ms);
     this->set_stream_active_(false);
   }
@@ -1202,7 +1210,7 @@ void SnapcastClient::handle_wire_chunk_(const uint8_t *payload, size_t len) {
     return;
   }
 
-  this->last_chunk_us_ = now_us();
+  this->last_chunk_us_.store(now_us(), std::memory_order_relaxed);
   if (!this->stream_active_) {
     this->set_stream_active_(true);
   }

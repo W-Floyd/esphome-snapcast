@@ -52,6 +52,7 @@ CONF_I2S_PORT = "i2s_port"
 CONF_TSF_SYNC = "tsf_sync"
 CONF_TIMING_DIAGNOSTICS = "timing_diagnostics"
 CONF_KEEPALIVE_HOLD = "keepalive_hold"
+CONF_FOLLOW_STREAM = "follow_stream"
 
 
 def _none_to_empty_dict(value):
@@ -209,6 +210,17 @@ CONFIG_SCHEMA = cv.All(
             # back with a 6.9 h stale deadline and took 9.6-16 s to settle, with the
             # pipeline held the entire time. The residual cost there was the servo
             # settling plus a TSF re-election, not the teardown this prevents.
+            # Make the snapcast stream authoritative over local transport control: a
+            # PAUSE or STOP (from a person, or from a Home Assistant automation that
+            # stops every player in the house) is undone once audio is actually flowing
+            # again. For a fixed multiroom speaker that is usually what is wanted --
+            # otherwise one automation leaves the speaker silent until somebody notices
+            # and presses play.
+            #
+            # Note the consequence while music IS playing: a pause is reversed within a
+            # few seconds, which is the "disallow pausing" behaviour by another route.
+            # Off by default, since silently undoing a user's stop is surprising.
+            cv.Optional(CONF_FOLLOW_STREAM, default=False): cv.boolean,
             cv.Optional(CONF_KEEPALIVE_HOLD, default=CONF_NEVER): cv.Any(
                 cv.positive_time_period_milliseconds,
                 cv.one_of(CONF_NEVER, lower=True),
@@ -258,6 +270,7 @@ async def to_code(config: ConfigType) -> None:
         )
     )
     # 0 is the "never release while connected" sentinel on the C++ side
+    cg.add(var.set_follow_stream(config[CONF_FOLLOW_STREAM]))
     hold = config[CONF_KEEPALIVE_HOLD]
     cg.add(var.set_keepalive_hold(0 if hold == CONF_NEVER else hold.total_milliseconds))
 

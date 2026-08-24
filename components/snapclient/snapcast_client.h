@@ -247,6 +247,14 @@ class SnapcastClient {
   /// @brief Current server-minus-client clock offset estimate in ms.
   float get_clock_offset_ms();
   const ServerSettings &get_server_settings() const { return this->settings_main_; }
+  /// @brief True while wire chunks are actually arriving, as opposed to the stream
+  /// merely being nominally active.
+  ///
+  /// The distinction matters because keepalive_hold holds the stream open across a
+  /// chunk gap, so "stream active" no longer means "audio is playing". Uses
+  /// stream_idle_timeout as the threshold, which is exactly the question that option
+  /// was always asking.
+  bool audio_flowing() const;
 
  protected:
   // Fixed-size record describing one decoded chunk resident in the PCM ring buffer.
@@ -423,7 +431,8 @@ class SnapcastClient {
 #endif
   uint16_t next_message_id_{0};
   bool stream_active_{false};
-  int64_t last_chunk_us_{0};
+  // Written by the network task on every chunk, read from the main loop
+  std::atomic<int64_t> last_chunk_us_{0};
   int64_t next_time_sync_us_{0};
   uint32_t time_sync_burst_remaining_{0};
   std::vector<uint8_t> rx_buffer_;
