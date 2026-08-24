@@ -43,7 +43,7 @@ void SnapclientMediaSource::setup() {
       ESP_LOGW(TAG, "Play request went unanswered; retrying");
       this->pending_start_ = false;
     }
-    if (!this->stream_live_ || this->pending_start_ || this->user_stopped_ ||
+    if (!this->stream_live_ || this->pending_start_ || this->user_halted_ ||
         this->get_state() != media_source::MediaSourceState::IDLE) {
       return;
     }
@@ -102,7 +102,7 @@ bool SnapclientMediaSource::can_handle(const std::string &uri) const { return ur
 // THREAD CONTEXT: Main loop (media_source.h documents play_uri as main-loop only)
 bool SnapclientMediaSource::play_uri(const std::string &uri) {
   this->pending_start_ = false;
-  this->user_stopped_ = false;
+  this->user_halted_ = false;
   if (!this->is_ready() || this->is_failed() || !this->has_listener()) {
     return false;
   }
@@ -125,15 +125,17 @@ void SnapclientMediaSource::handle_command(media_source::MediaSourceCommand comm
   // their deadline while paused, so resuming snaps straight back into sync.
   switch (command) {
     case media_source::MediaSourceCommand::PLAY:
-      this->user_stopped_ = false;
+      this->user_halted_ = false;
       this->set_playback_state_(media_source::MediaSourceState::PLAYING);
       break;
     case media_source::MediaSourceCommand::PAUSE:
+      // Deliberate: survives a later drop to IDLE, so the re-arm cannot un-pause it
+      this->user_halted_ = true;
       this->set_playback_state_(media_source::MediaSourceState::PAUSED);
       break;
     case media_source::MediaSourceCommand::STOP:
       // The user's decision; the re-arm must leave it alone until they play again
-      this->user_stopped_ = true;
+      this->user_halted_ = true;
       this->set_playback_state_(media_source::MediaSourceState::IDLE);
       break;
     default:

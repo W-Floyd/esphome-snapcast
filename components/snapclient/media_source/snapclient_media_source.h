@@ -78,10 +78,15 @@ class SnapclientMediaSource final : public SnapclientChild,
   bool pending_start_{false};
   uint32_t start_requested_ms_{0};  // when pending_start_ was raised, for a retry timeout
   bool stream_live_{false};         // the client is receiving chunks
-  // A STOP is the user's decision and must not be undone by the re-arm below. PAUSE
-  // does not need tracking: it leaves the state PAUSED, not IDLE, so the re-arm's
-  // IDLE test already excludes it.
-  bool user_stopped_{false};
+  // Any deliberate halt -- PAUSE or STOP, from a person or a Home Assistant
+  // automation -- must never be undone by the re-arm below.
+  //
+  // STOP needs the flag because it sets IDLE, which is precisely what the re-arm
+  // looks for. PAUSE looks safe without it (PAUSED is not IDLE) but is not: if the
+  // pipeline later times out and the framework drops the source to IDLE, the pause
+  // would be forgotten and playback would resume against the automation that stopped
+  // it. Cleared only by an explicit PLAY or play_uri.
+  bool user_halted_{false};
 };
 
 }  // namespace esphome::snapclient
