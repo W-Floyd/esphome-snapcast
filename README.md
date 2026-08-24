@@ -1,4 +1,4 @@
-# snapclient-esphome
+# esphome-snapcast
 
 A native [Snapcast](https://github.com/badaix/snapcast) client for ESPHome,
 structured after ESPHome's upstream `sendspin` component: a hub that owns the
@@ -59,7 +59,7 @@ The short version:
 
 ```yaml
 external_components:
-  - source: github://W-Floyd/snapclient-esphome
+  - source: github://W-Floyd/esphome-snapcast
     components: [snapclient]
 
 snapclient:
