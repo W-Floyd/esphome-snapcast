@@ -4,9 +4,8 @@
 
 - **`example/snapclient-example.yaml` does not build against stock ESPHome.** It omits
   the forked speaker stack that provides `output_buffered_bytes`, so the documented
-  minimal example fails for anyone following the README. Either add the fork to the
-  example, or make the fork optional (see the starvation re-baseline item below, which
-  could retire it entirely).
+  minimal example fails for anyone following the README. Add the fork to the example —
+  the alternative of making it optional is no longer on the table, see below.
 
 ## Upstream ESPHome
 
@@ -45,8 +44,20 @@
   100–250 ms offsets — but **those observations predate the `timeout: never` fix**. They
   are evidence from a world where teardowns happened. Cheap to re-test: keep the
   accounting, skip the starvation re-baseline, and watch `drift` in the sync report plus
-  `sync-delta.py` across a few starvations. No divergence means the mechanism is
-  redundant. Do this BEFORE investing further in the fork.
+  `sync-delta.py` across a few starvations.
+
+  Field evidence since strengthened the case for deleting it. On 2026-08-23 a starvation
+  re-baseline anchored to a 50 ms measured fill mid-drain, which excludes whatever the
+  mixer ring and I2S DMA held at that instant; the clamp in `notify_audio_played()` then
+  absorbed the shortfall and `drift` sat at +51 ms for 18 minutes while that device played
+  ~43 ms early. The re-baseline caused the offset it exists to prevent.
+
+  **But this no longer retires the fork**, which an earlier version of this note claimed.
+  `on_query_buffered()` has three consumers now: the re-baseline anchor, the `fill`/`drift`
+  column, and the drift self-repair added in 4f14010. Only the first would go. The other
+  two are the measurement side — and the self-repair is what caught that 43 ms offset when
+  every other metric read ~40 µs, so the fork's justification has moved from the
+  re-baseline to being the one independent witness to the accounting.
 
 - **Stale deadline on stream resumption.** With `keepalive_hold: never` the pipeline is
   held across an idle, and the first chunk afterwards arrives with a deadline stale by
