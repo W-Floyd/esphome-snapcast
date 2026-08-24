@@ -1,25 +1,16 @@
-# Shared config for a real multiroom speaker. Board files include this as a package and
-# supply the substitutions; everything hardware-specific lives there.
+# Shared config for a real multiroom speaker: Snapcast mixed with ducked HA
+# announcements. A `mixer` blends two source speakers into the DAC — the media pipeline
+# plays Snapcast plus URLs, the announcement pipeline plays over the top, so Snapcast
+# stays connected and in sync throughout.
 #
-#   name / friendly_name              node identity
-#   board / flash_size                esp32 platform
-#   psram_mode / psram_speed
-#   pin_lrclk / pin_bclk / pin_dout   I2S to the DAC
-#   pin_led                           onboard WS2812, used as a play-state indicator
-#
-# Snapcast mixed with Home Assistant announcements: a `mixer` speaker blends two source
-# speakers into the DAC, the media pipeline plays Snapcast plus arbitrary URLs, and the
-# announcement pipeline plays over the top — ducking the music rather than stopping it,
-# so Snapcast stays connected and in sync throughout.
-#
-# For the complete option list see snapclient-example.yaml.
+# Board files include this as a package and supply: name, friendly_name, board,
+# flash_size, psram_mode, psram_speed, pin_lrclk, pin_bclk, pin_dout, pin_led.
+# Complete option list: snapclient-example.yaml.
 
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
-  # Appends the MAC's last 3 bytes, so a fleet can share this config and stay
-  # distinguishable in HA, mDNS and on the snapserver (Hello HostName derives from it)
-  name_add_mac_suffix: true
+  name_add_mac_suffix: true       # a fleet can share this config and stay distinct
 
 esp32:
   board: ${board}
@@ -27,11 +18,9 @@ esp32:
   framework:
     type: esp-idf
     sdkconfig_options:
-      # Raises the PHY TX-power ceiling independently of wifi.output_power, which cannot
-      # be done through output_power alone: esp32 derives the ceiling from it as
-      # max(10, min(20, ceil(output_power))). We want a LOW boot power (a poorly matched
-      # antenna misassociates at high power) with a HIGH ceiling, so the runtime "WiFi TX
-      # Power" number can explore above 10 dBm.
+      # Raises the PHY ceiling independently of wifi.output_power, which esp32 otherwise
+      # derives from it as max(10, min(20, ceil(output_power))). We want a low boot power
+      # with a high ceiling, so the runtime number below can explore past 10 dBm.
       CONFIG_ESP_PHY_MAX_WIFI_TX_POWER: "20"
 
 psram:
@@ -46,22 +35,19 @@ api:
 ota:
   - platform: esphome
 
-# output_power is per board, so board files add it via their own wifi: block, which
-# merges with this one. It is a FLOOR, not a cap: esp32 has no default, so omitting it
-# removes the boot-time call and the radio comes up at the PHY maximum. That left two of
-# four SuperMinis dropping every chunk with multi-second sync error and never
-# recovering — nothing lowered the power, and the runtime number's restore ran too late.
+# output_power is a FLOOR set per board, so board files add their own wifi: block, which
+# merges with this. esp32 has no default, so omitting it leaves the radio at the PHY
+# maximum: that left two of four SuperMinis dropping every chunk and never recovering.
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
 
 external_components:
-  # audio_timing is AUTO_LOADed by snapclient but a `components:` filter hides anything
-  # it does not name; wifi_tools and wifi_bssid_select are used below.
+  # A `components:` filter hides anything it does not name, including the AUTO_LOADed
+  # audio_timing.
   - source: github://W-Floyd/esphome-snapcast
     components: [snapclient, audio_timing, wifi_tools, wifi_bssid_select]
-  # Working tree instead:
-  # - source: {type: local, path: ../components}
+  # - source: {type: local, path: ../components}   # working tree instead
 
   # Forked speaker stack: adds `Speaker::buffered_bytes()`, letting the sync engine see
   # the audio between our push point and the DAC. Drop once upstream — see TODO.md.
@@ -74,16 +60,13 @@ external_components:
 snapclient:
   id: snap
   # server: 192.168.1.10        # omit to discover via mDNS
-  # These are fixed multiroom players, so the stream decides — not whatever last touched
-  # the media player entity. `ignore` refuses PAUSE and STOP outright, so there is no
-  # audible gap; `resume` would accept them and undo them seconds later, meaning silence
-  # then a restart. Trade-off: a deliberate stop is refused too, so a "turn everything
-  # off" automation cannot silence these — but nor can it strand one idle until somebody
-  # presses play, which is what happened before this existed.
+  # Fixed multiroom players: the stream decides, not whatever last touched the entity.
+  # `ignore` refuses PAUSE/STOP so there is no gap at all — including a deliberate stop,
+  # so a "turn everything off" automation cannot silence these. It also cannot strand one
+  # idle until somebody presses play, which is what happened before this existed.
   pause_behavior: ignore
   rate_lock:
-    i2s_audio_id: i2s_out       # by id: ESPHome does not number buses in
-                                # declaration order (a PDM mic takes port 0)
+    i2s_audio_id: i2s_out       # by id: a PDM mic would take port 0 and renumber this
   tsf_sync: true                # same-AP clients share one server→TSF mapping
   timing_diagnostics: false     # ~38 log lines/s/device; on to measure, off to listen
 
@@ -111,18 +94,15 @@ speaker:
     sample_rate: 44100
     channel: stereo
     buffer_duration: 100ms
-    # Never stop on a data gap: the 500 ms default tears down and rebuilds the
-    # speaker/mixer rings, escalating a brief hiccup into a multi-second dropout.
-    timeout: never
+    timeout: never              # the 500 ms default turns a hiccup into a rebuild
   - platform: mixer
     output_speaker: dac_speaker
     num_channels: 2
     source_speakers:
       - id: announcement_mixer_input
-      # The snapclient writes here, so this is the timeout that matters: at the default
-      # a hiccup stops the source, the mixer rebuilds, and the pipeline returns at a
-      # DIFFERENT fill (observed 250 ms -> 100 ms, permanent, sync error still ~0 —
-      # i.e. silently offset from its peers).
+      # The snapclient writes here, so this is the timeout that matters: on the default
+      # the mixer rebuilds and returns at a DIFFERENT fill (observed 250 -> 100 ms,
+      # permanent, sync error still ~0 — i.e. silently offset from its peers).
       - id: media_mixer_input
         timeout: never
 
@@ -134,18 +114,16 @@ media_player:
     media_pipeline:
       speaker: media_mixer_input
       sources: [snap_source, media_http_source]
-      # Match the snapserver stream exactly — nothing here resamples. This said 48000
-      # against a server streaming 44100; check yours with the Stream Format sensor.
+      # Must match the server — nothing here resamples. Check with Stream Format below;
+      # this said 48000 against a server streaming 44100.
       sample_rate: 44100
       num_channels: 2
     announcement_pipeline:
       speaker: announcement_mixer_input
       sources: [announcement_http_source]
-      # MUST match the media pipeline: the mixer neither resamples nor up-mixes. This
-      # was 48000/mono against 44100/stereo — wrong on both axes — and HA's ffmpeg_proxy
-      # faithfully delivered what was asked for, so the mixer rejected it with
-      # "Incompatible audio streams", the player stuck in ANNOUNCING, and it retried
-      # forever: 1742 ring buffers in under two minutes, needing a reboot.
+      # Must match the media pipeline exactly: the mixer neither resamples nor up-mixes.
+      # At 48000/mono against 44100/stereo it rejected every announcement, stuck the
+      # player in ANNOUNCING, and allocated 1742 ring buffers in two minutes.
       sample_rate: 44100
       num_channels: 2
     # Duck rather than pause, so Snapcast keeps playing and stays in sync
@@ -156,10 +134,9 @@ media_player:
     on_play:
       - mixer_speaker.apply_ducking: {id: media_mixer_input, decibel_reduction: 0, duration: 1.0s}
 
+# mono_dac: the MAX98357A analog-sums L+R, so "Stereo" would be an undefined mix and
+# one-sided inversion of duplicated content would cancel to silence.
 select:
-  # mono_dac: the MAX98357A analog-sums L+R, so "Stereo" would be an undefined mix and
-  # single-side inversion of duplicated content would cancel to silence. Both entities
-  # collapse their options accordingly.
   - platform: snapclient
     type: channel_mode
     snapclient_id: snap
@@ -171,15 +148,15 @@ select:
     name: Phase
     mono_dac: true
   - platform: snapclient
-    type: pause_behavior          # switch "the group decides" vs "the buttons work"
+    type: pause_behavior
     snapclient_id: snap
     name: Pause Behavior
   - platform: snapclient
-    type: server                  # "Automatic" + each mDNS result
+    type: server
     snapclient_id: snap
     name: Server
-  # Pin to one AP: mid-stream roam scans take the radio off-channel for hundreds of ms,
-  # and a pinned AP guarantees a stereo pair shares one TSF timebase.
+  # Roam scans take the radio off-channel for hundreds of ms; a pinned AP also guarantees
+  # a stereo pair shares one TSF timebase.
   - platform: wifi_bssid_select
     name: Access Point
 
@@ -189,17 +166,15 @@ text:
     name: Server Override
 
 text_sensor:
-  # What the server is actually sending — the check for the pipeline rates above
   - platform: snapclient
-    type: stream_format
+    type: stream_format           # the check for the pipeline rates above
     snapclient_id: snap
     name: Stream Format
   - platform: snapclient
-    type: tsf_role                # Leader / Follower / Inactive
+    type: tsf_role
     snapclient_id: snap
     name: TSF Role
-  # Now-playing metadata from the server's control API; empty when the control port is
-  # disabled or the stream carries none
+  # Now-playing from the server's control API; empty when it is disabled
   - platform: snapclient
     type: stream_title
     snapclient_id: snap
@@ -237,15 +212,12 @@ sensor:
     entity_category: diagnostic
 
 number:
-  # Server-persisted and pushed back in ServerSettings, so this stays in sync even when
-  # changed from snapweb — the canonical per-room delay trim.
   - platform: snapclient
-    type: server_latency
+    type: server_latency          # server-persisted; stays in sync with snapweb
     snapclient_id: snap
     name: Server Latency
-  # SuperMini antennas distort at high power, so LOWER often connects better. Persisted,
-  # and the only place power should be set at runtime; the driver quantizes and clamps
-  # the request, so the readback logged by set_max_tx_power is the meaningful value.
+  # SuperMini antennas distort at high power, so LOWER often connects better. The driver
+  # quantizes and clamps the request, so only the readback set_max_tx_power logs is real.
   - platform: template
     name: WiFi TX Power
     id: wifi_tx_power
@@ -262,9 +234,8 @@ number:
       - lambda: wifi_tools::set_max_tx_power(x);
 
 button:
-  # A restart re-anchors the playout accounting, which is the reliable remedy for a
-  # device that has latched a timing offset and sits audibly behind its peers with
-  # clean-looking metrics. Also the fastest way out of a stuck ANNOUNCING state.
+  # Re-anchors the playout accounting: the reliable remedy for a device that has latched
+  # a timing offset with clean-looking metrics, and the way out of a stuck ANNOUNCING.
   - platform: restart
     name: Restart
     entity_category: config
@@ -279,16 +250,15 @@ light:
     name: Status LED
     default_transition_length: 200ms
 
-# RSSI plus the negotiated PHY mode every 10 s at DEBUG; a fallback from HT20 down to
-# 11G/11B is the classic marginal-link tell, and it sits next to the sync report so a
-# stall's cause reads off one timeline.
+# RSSI plus the negotiated PHY mode every 10 s; a fallback from HT20 to 11G/11B is the
+# classic marginal-link tell, and it lands next to the sync report on one timeline.
 wifi_tools:
   diagnostics:
     update_interval: 10s
 
 interval:
-  # Play-state LED, guarded on transitions: an unconditional turn_on republishes the
-  # light state every tick, spamming the API and HA's recorder.
+  # Guarded on transitions: an unconditional turn_on republishes every tick, spamming
+  # the API and HA's recorder.
   - interval: 1s
     then:
       - if:

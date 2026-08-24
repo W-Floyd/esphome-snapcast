@@ -3,12 +3,9 @@
 # I2S DAC (PCM5102A / MAX98357A style):
 #   GPIO4 -> LCK   GPIO5 -> BCK   GPIO6 -> DIN
 #
-# The DAC's 5 V comes from VUSB on a bodge wire. The board can instead source it from
-# EXT_5V_OUT (J3 pin 7), but that rail is gated by the M5PM1 PMIC and needs a handful of
-# register writes at boot to enable the SY7088 boost; the bodge removes the firmware
-# dependency entirely. `git log` has the PMIC sequence if the rail is ever wanted back.
-#
-# Everything not board-specific is in snapclient-base.yaml.
+# The DAC's 5 V comes from VUSB on a bodge wire. EXT_5V_OUT (J3 pin 7) would work too,
+# but it is gated by the M5PM1 PMIC and needs register writes at boot; `git log` has that
+# sequence. Everything not board-specific is in snapclient-base.yaml.
 substitutions:
   name: snapclient-stamps3
   friendly_name: Snapclient StampS3
@@ -23,10 +20,8 @@ substitutions:
   pin_lrclk: GPIO4
   pin_bclk: GPIO5
   pin_dout: GPIO6
-  # The WS2812 hangs off the M5PM1 PMIC (PY_LED_PP / PY_LED_EN), not a plain GPIO, so
-  # the base's esp32_rmt_led_strip cannot drive it; it needs the m5pm1 neopixel platform,
-  # which is not wired up here. Pointed at an unused pad.
-  # GPIO48/47 are the PMIC's I2C bus on this board — do not reuse them.
+  # The WS2812 hangs off the PMIC, not a GPIO, so esp32_rmt_led_strip cannot drive it;
+  # pointed at an unused pad. GPIO48/47 are the PMIC's I2C bus — do not reuse them.
   pin_led: GPIO2
 
 packages:

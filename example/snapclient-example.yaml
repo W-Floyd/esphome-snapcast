@@ -1,5 +1,6 @@
-# Complete reference: every option this repo adds. Defaults are shown commented out,
-# so uncommenting a line never changes behaviour on its own.
+# Complete reference: every option this repo adds. Commented-out lines carry the real
+# default, so uncommenting one never changes behaviour; the few options that have no
+# default are marked `unset`, and uncommenting those does change behaviour.
 # Minimal config: README.md. Why the timing options are what they are: TIMING.md.
 
 esphome:
@@ -49,10 +50,10 @@ snapclient:
   id: snap
   server: 192.168.1.10            # omit to discover via mDNS
   # port: 1704
-  # name: Kitchen Speaker         # Hello HostName (default: node name)
+  # name: Kitchen Speaker         # unset: Hello HostName, defaults to the node name
   # buffer_size: 524288           # decoded PCM ring, bytes; min 65536
   # flac: true                    # snapserver's default codec
-  # opus: true                    # +87 KB flash, ~160 KB RAM: PSRAM only
+  # opus: false                   # +87 KB flash, ~160 KB RAM: PSRAM only
   # time_sync_interval: 250ms     # idle uses max(this, 2s)
   # sync_deadband: 128us          # splice servo engages here, disengages at half
   # converge_fine: 2ms            # coarse->fine handoff; 2*deadband < this < hard_resync
@@ -64,8 +65,9 @@ snapclient:
   # stream_idle_timeout: 3s       # ends the stream once disconnected
   # tsf_sync: false               # share one 802.11 timebase between same-AP clients
   # timing_diagnostics: false     # per-chunk RAW lines for scripts/raw-sync.py
-  # rate_lock:                    # S3 only: steer the I2S divider instead of splicing
-  #   i2s_audio_id: i2s_out         # the bus BY ID; port numbers are assigned, not ordered
+  # rate_lock:                    # unset. S3 only: steers the I2S divider rather than
+  #   i2s_audio_id: i2s_out         # splicing. The bus BY ID — ports are assigned, not
+                                    # ordered, so a PDM mic would renumber this one.
 
 # Bridges synchronized PCM into the speaker pipeline
 media_source:

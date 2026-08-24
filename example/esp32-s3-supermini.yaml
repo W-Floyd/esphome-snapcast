@@ -3,8 +3,7 @@
 # I2S DAC (PCM5102A / MAX98357A style):
 #   GPIO4 -> LCK   GPIO5 -> BCK   GPIO6 -> DIN
 #
-# The onboard WS2812 (GPIO48) doubles as a play-state indicator.
-# Everything not board-specific is in snapclient-base.yaml.
+# Onboard WS2812 on GPIO48. Everything not board-specific is in snapclient-base.yaml.
 substitutions:
   name: snapclient-supermini
   friendly_name: Snapclient SuperMini
@@ -22,8 +21,7 @@ substitutions:
 packages:
   base: !include snapclient-base.yaml
 
-# This board's antenna is poorly matched and distorts at high power, causing "Auth
-# Expired" loops even at full RX bars, so pin the BOOT power low and trim upward from
-# the runtime number if a given unit tolerates it. Merges into the base's wifi: block.
+# This antenna is poorly matched and distorts at high power, giving "Auth Expired" loops
+# even at full RX bars: pin the boot power low and trim up from the runtime number.
 wifi:
   output_power: 8.5dB
