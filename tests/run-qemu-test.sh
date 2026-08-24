@@ -11,8 +11,12 @@
 #                                  QEMU's emulated PSRAM because libopus needs it
 #
 # Watch the serial log for:
-#   [snapclient.client] Sync error: avg X us, peak Y us   <- should converge to ~1 ms avg
 #   [virtual_speaker]   Consumed N frames, underruns 0, signal ~440 Hz
+#
+# Sync accuracy is NOT what this validates -- the median error wanders several ms under
+# QEMU and does not converge, identically for every codec, because the emulated timebase
+# and virtual DAC feedback are not the thing being modelled. Use real hardware and
+# scripts/raw-sync.py for that.
 #
 # The signal line is the decode check: the source is a 440 Hz sine, so a codec that
 # decodes to plausible-looking garbage still fails it where a frame count would not.

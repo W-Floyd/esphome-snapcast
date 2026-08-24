@@ -25,6 +25,28 @@ class SnapclientTsfRoleTextSensor final : public SnapclientChild, public text_se
   bool published_{false};
 };
 
+/// @brief Publishes the format snapserver is actually sending, as "48000 Hz, 16 bit,
+/// 2 ch" — the same wording the codec-header log line uses. Empty while no stream is
+/// active.
+///
+/// The rate is negotiated at runtime rather than fixed by the YAML: the codec header
+/// decides it, the speaker is reconfigured to match, and `rate_lock` re-baselines. This
+/// makes the value visible, which matters because a rate that disagrees with the
+/// `media_pipeline` costs a speaker reconfigure and a dropped buffer at every stream
+/// start. It is deliberately NOT wired into the media player's advertised formats:
+/// those describe what Home Assistant should ENCODE FOR US, which is unrelated traffic.
+class SnapclientStreamFormatTextSensor final : public SnapclientChild, public text_sensor::TextSensor {
+ public:
+  void setup() override;
+  void dump_config() override;
+
+ protected:
+  void publish_(bool active, const StreamParams &params);
+
+  std::string last_;
+  bool published_{false};
+};
+
 /// @brief Publishes one field of the current stream's metadata (title / artist /
 /// album / stream name), live from the persistent control session. Empty when the
 /// control port is unavailable or the stream carries no metadata.

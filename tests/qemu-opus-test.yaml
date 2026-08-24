@@ -25,3 +25,18 @@ audio:
     opus:
       pseudostack:
         size: 60000
+
+# Exercises the stream-format text sensor: it should read "48000 Hz, 16 bit, 2 ch"
+# once the codec header lands, and empty before that.
+text_sensor:
+  - platform: snapclient
+    type: stream_format
+    snapclient_id: snap
+    name: Stream Format
+    # text_sensor publishes at VERBOSE, which this component cannot afford to run at,
+    # so echo the value at INFO to make it visible in the serial capture.
+    on_value:
+      - logger.log:
+          format: "STREAM FORMAT SENSOR: '%s'"
+          args: [x.c_str()]
+          level: INFO

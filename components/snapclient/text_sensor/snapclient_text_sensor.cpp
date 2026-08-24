@@ -4,6 +4,9 @@
 
 #include "esphome/core/log.h"
 
+#include <cinttypes>
+#include <cstdio>
+
 namespace esphome::snapclient {
 
 static const char *const TAG = "snapclient.text_sensor";
@@ -29,6 +32,33 @@ void SnapclientTsfRoleTextSensor::publish_() {
 }
 
 void SnapclientTsfRoleTextSensor::dump_config() { LOG_TEXT_SENSOR("", "Snapclient TSF Role Text Sensor", this); }
+
+void SnapclientStreamFormatTextSensor::setup() {
+  this->parent_->add_stream_state_callback(
+      [this](bool active, const StreamParams &params) { this->publish_(active, params); });
+  this->publish_(false, StreamParams{});  // known-empty until a codec header arrives
+}
+
+// THREAD CONTEXT: Main loop (hub callback)
+void SnapclientStreamFormatTextSensor::publish_(bool active, const StreamParams &params) {
+  std::string value;
+  if (active && params.valid()) {
+    char buffer[40];
+    snprintf(buffer, sizeof(buffer), "%" PRIu32 " Hz, %u bit, %u ch", params.sample_rate, params.bits_per_sample,
+             params.channels);
+    value = buffer;
+  }
+  if (this->published_ && value == this->last_) {
+    return;
+  }
+  this->published_ = true;
+  this->last_ = std::move(value);
+  this->publish_state(this->last_);
+}
+
+void SnapclientStreamFormatTextSensor::dump_config() {
+  LOG_TEXT_SENSOR("", "Snapclient Stream Format Text Sensor", this);
+}
 
 void SnapclientMetadataTextSensor::setup() {
   this->parent_->add_metadata_callback([this](const StreamMetadata &metadata) { this->publish_(metadata); });

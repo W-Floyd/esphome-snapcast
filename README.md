@@ -48,7 +48,7 @@ media_source:
 speaker:
   - platform: i2s_audio
     id: my_speaker
-    sample_rate: 48000        # match the stream; a resampler degrades sync
+    sample_rate: 48000        # match the stream: nothing resamples, see below
     ...
 
 media_player:
@@ -66,10 +66,22 @@ smart speaker with ducked HA announcements, put the shared config in one file an
 it from thin per-board files via `packages:` + `substitutions:`.
 
 **PCM, FLAC and Opus** — set your stream to `codec=flac`, `codec=pcm` or `codec=opus`.
-Opus is opt-in (`opus: true` on the `snapclient:` block) because libopus costs ~200 KB of
-flash and, at runtime, a 120 KB pseudostack plus ~40 KB of decoder state: it needs PSRAM
-in practice. Note that snapserver resamples every Opus stream to 48 kHz stereo, so the
-speaker and `media_pipeline` have to be configured for that. Vorbis is still unsupported.
+All three are 16-bit only. Vorbis is unsupported.
+
+Opus is opt-in (`opus: true`), because libopus is the one codec with a real cost: ~87 KB
+of flash, and at runtime ~40 KB of decoder state plus a 120 KB pseudostack (tunable down
+to 60 KB under the `audio:` component's `codecs: opus:` key). On a board without PSRAM it
+does not fit — `opus_decoder_create` left 18 KB free on a bare ESP32 — so treat PSRAM as
+a requirement rather than a recommendation there. snapserver also resamples every Opus
+stream to 48 kHz stereo.
+
+**Match the sample rate.** Nothing in this path resamples. The rate is negotiated at
+runtime from the codec header, so a mismatch is survivable — the speaker is reconfigured
+to whatever the server sends — but `speaker_source` discards the write that triggers the
+reconfigure, so every stream start pays a pipeline restart, which is the failure mode
+[TIMING.md](TIMING.md) traces to silent playback offsets. Set the speaker and
+`media_pipeline` to the stream's real format and check it with the `stream_format` text
+sensor.
 
 ### Options
 
@@ -80,6 +92,7 @@ speaker and `media_pipeline` have to be configured for that. Vorbis is still uns
 | `name` | node name | `HostName` in Hello |
 | `buffer_size` | `524288` | decoded PCM buffer, bytes (PSRAM-preferred) |
 | `flac` | `true` | compile in FLAC decoding |
+| `opus` | `false` | compile in Opus decoding (libopus; wants PSRAM) |
 | `time_sync_interval` | `250ms` | while streaming; idle uses `max(this, 2s)` |
 | `sync_deadband` | `128us` | median error that engages steering; raise on jittery links |
 | `hard_resync_threshold` | `50ms` | beyond this, drop chunks / insert silence |
@@ -115,7 +128,10 @@ number:
 
 text_sensor:
   - platform: snapclient
-    type: stream_title               # also stream_artist, stream_album, stream_name, tsf_role
+    type: stream_title               # also stream_artist, stream_album, stream_name
+  - platform: snapclient
+    type: stream_format              # what the server is really sending, e.g.
+                                     # "48000 Hz, 16 bit, 2 ch"; also tsf_role
 
 text:
   - platform: snapclient             # manual "host" or "host:port" server override,
@@ -125,7 +141,7 @@ text:
 ## Design
 
 Two FreeRTOS tasks. The **network** task does TCP/mDNS, the Hello handshake, time sync
-and FLAC/PCM decode into a timestamped PCM ring; a full ring backpressures TCP. The
+and PCM/FLAC/Opus decode into a timestamped PCM ring; a full ring backpressures TCP. The
 **player** task pops chunks, computes each one's deadline
 (`server_ts + bufferMs − serverLatency − clock_offset − static_delay`) and steers
 playback against the speaker's DAC-write feedback. Events reach the main loop through a
@@ -163,8 +179,20 @@ macOS cannot pass USB through, so build there and flash from the host.
 
 [tests/run-qemu-test.sh](tests/run-qemu-test.sh) runs the real firmware under QEMU
 against a local snapserver, with [virtual_speaker](tests/components/virtual_speaker)
-standing in for the absent I2S device. Sync converges to ~1 ms average under QEMU's
-imperfect timing; real hardware is far tighter.
+standing in for the absent I2S device. `CODEC=flac|pcm|opus` picks the stream codec; the
+opus case builds a separate config, because libopus needs the PSRAM that QEMU emulates
+but the default config deliberately does without.
+
+virtual_speaker measures the audio it consumes — zero crossings for the fundamental, peak
+for silence — so the harness can tell a correct decode from a plausible-looking wrong one.
+Against its 440 Hz source, expect `signal ~440 Hz` and `underruns 0`.
+
+What it does **not** validate is sync accuracy: the median error wanders several ms under
+QEMU and does not converge, identically for every codec, because the emulated timebase and
+virtual DAC feedback are not the thing being modelled. Use real hardware and
+`scripts/raw-sync.py` for that. Give QEMU an idle host, too — under load the guest takes
+an interrupt-watchdog panic with both cores parked in the idle task, which is the emulator
+missing its deadlines rather than a firmware fault.
 
 ## License
 

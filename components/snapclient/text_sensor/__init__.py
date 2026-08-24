@@ -1,4 +1,4 @@
-"""Text sensors for snapclient: TSF group-sync role and stream metadata."""
+"""Text sensors for snapclient: TSF group-sync role, stream format, and metadata."""
 
 import esphome.codegen as cg
 from esphome.components import text_sensor
@@ -10,9 +10,13 @@ from .. import CONF_SNAPCLIENT_ID, SnapclientHub, snapclient_ns
 CODEOWNERS = ["@W-Floyd"]
 
 CONF_TSF_ROLE = "tsf_role"
+CONF_STREAM_FORMAT = "stream_format"
 
 SnapclientTsfRoleTextSensor = snapclient_ns.class_(
     "SnapclientTsfRoleTextSensor", cg.Component, text_sensor.TextSensor
+)
+SnapclientStreamFormatTextSensor = snapclient_ns.class_(
+    "SnapclientStreamFormatTextSensor", cg.Component, text_sensor.TextSensor
 )
 SnapclientMetadataTextSensor = snapclient_ns.class_(
     "SnapclientMetadataTextSensor", cg.Component, text_sensor.TextSensor
@@ -48,6 +52,17 @@ CONFIG_SCHEMA = cv.All(
                     SnapclientTsfRoleTextSensor,
                     entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
                     icon="mdi:account-star",
+                )
+            ),
+            # The format snapserver is actually sending, e.g. "48000 Hz, 16 bit, 2 ch".
+            # Negotiated from the codec header at runtime, not fixed by the YAML, so
+            # this is how you check that a `media_pipeline` matches the server -- a
+            # mismatch is survivable but reconfigures the speaker on every stream.
+            CONF_STREAM_FORMAT: _hub_schema(
+                text_sensor.text_sensor_schema(
+                    SnapclientStreamFormatTextSensor,
+                    entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
+                    icon="mdi:waveform",
                 )
             ),
             **{
