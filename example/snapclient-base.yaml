@@ -97,14 +97,15 @@ snapclient:
   # buffer_size: 524288  # fits comfortably in the 2 MB PSRAM
   # static_delay is set on the media_source below
   # These speakers are fixed multiroom players, so the stream decides -- not whatever
-  # last touched the media player entity. A PAUSE or STOP is undone once audio is
-  # actually flowing again, which stops a "turn everything off when we leave"
-  # automation from leaving one speaker silent until somebody notices and presses play
-  # (exactly what happened: one device sat idle for ~4 h while its partner, not in the
-  # automation's action list, resumed on its own).
+  # last touched the media player entity. `ignore` refuses PAUSE and STOP outright, so
+  # there is no audible gap at all; `resume` would accept them and undo them a few
+  # seconds later, which means silence and then a restart.
   #
-  # Accepted consequence: pausing while music plays is reversed within a few seconds.
-  follow_stream: true
+  # Accepted trade-off: a deliberate stop is refused too. A "turn everything off when
+  # we leave" automation will not silence these speakers -- but it also cannot leave one
+  # stranded idle until somebody presses play, which is what happened before this
+  # existed. Use `resume` instead if the automation needs to win.
+  pause_behavior: ignore
   # Hardware rate lock (opt-in): steady-state sync corrections steer the I2S clock
   # divider instead of splicing frames; splices remain the fallback
   rate_lock:

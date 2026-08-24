@@ -68,10 +68,8 @@ class SnapclientHub final : public Component,
   void set_stream_idle_timeout(uint32_t timeout_ms) { this->stream_idle_timeout_ms_ = timeout_ms; }
   /// @brief 0 = never release the pipeline while connected
   void set_keepalive_hold(uint32_t hold_ms) { this->keepalive_hold_ms_ = hold_ms; }
-  /// @brief When true the snapcast stream is authoritative: a local pause or stop is
-  /// undone once audio is flowing again. See the media_source's re-arm.
-  void set_follow_stream(bool follow) { this->follow_stream_ = follow; }
-  bool follow_stream() const { return this->follow_stream_; }
+  void set_pause_behavior(PauseBehavior behavior) { this->pause_behavior_ = behavior; }
+  PauseBehavior pause_behavior() const { return this->pause_behavior_; }
   /// @brief True while wire chunks are actually arriving (not merely stream_active)
   bool audio_flowing() const { return this->client_ != nullptr && this->client_->audio_flowing(); }
   void set_sync_deadband(uint32_t deadband_us) { this->sync_deadband_us_ = deadband_us; }
@@ -189,7 +187,7 @@ class SnapclientHub final : public Component,
   uint32_t hard_resync_threshold_ms_{50};
   uint32_t stream_idle_timeout_ms_{3000};
   uint32_t keepalive_hold_ms_{0};
-  bool follow_stream_{false};
+  PauseBehavior pause_behavior_{PauseBehavior::ALLOW};
   uint32_t sync_deadband_us_{128};
   uint32_t converge_fine_us_{2000};
 #ifdef USE_AUDIO_TIMING_RATE_LOCK

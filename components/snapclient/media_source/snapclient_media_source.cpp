@@ -45,17 +45,17 @@ void SnapclientMediaSource::setup() {
     }
     // "Audio flowing" rather than "stream live": keepalive_hold holds the stream open
     // across a chunk gap, so stream_live_ alone stays true through hours of silence.
-    // Keying on real chunks is what makes follow_stream sane -- a halt taken while the
-    // music is stopped is honoured until the music actually comes back.
+    // Keying on real chunks is what makes RESUME sane -- a halt taken while the music
+    // is stopped is honoured until the music actually comes back.
     if (!this->stream_live_ || !this->parent_->audio_flowing() || this->pending_start_ ||
         this->get_state() != media_source::MediaSourceState::IDLE) {
       return;
     }
-    if (this->user_halted_ && !this->parent_->follow_stream()) {
+    if (this->user_halted_ && this->parent_->pause_behavior() != PauseBehavior::RESUME) {
       return;  // someone asked for silence and the stream is not authoritative
     }
     ESP_LOGW(TAG, "%s; re-requesting playback",
-             this->user_halted_ ? "Audio flowing again and follow_stream is set, overriding the local halt"
+             this->user_halted_ ? "Audio flowing again, overriding the local halt (pause_behavior: resume)"
                                 : "Audio is flowing but nothing is routing it");
     this->pending_start_ = true;
     this->start_requested_ms_ = millis();
@@ -129,6 +129,17 @@ bool SnapclientMediaSource::play_uri(const std::string &uri) {
 
 // THREAD CONTEXT: Main loop (media_source.h documents handle_command as main-loop only)
 void SnapclientMediaSource::handle_command(media_source::MediaSourceCommand command) {
+  // pause_behavior: ignore refuses the transport outright. Refusing beats accepting and
+  // then undoing it: RESUME leaves a real audible gap (silence, then playback returns a
+  // few seconds later) whereas this leaves the audio untouched. The state is not
+  // changed, so the media player keeps reporting PLAYING -- which is the truth, and the
+  // transport button simply does nothing.
+  if (this->parent_->pause_behavior() == PauseBehavior::IGNORE &&
+      (command == media_source::MediaSourceCommand::PAUSE || command == media_source::MediaSourceCommand::STOP)) {
+    ESP_LOGI(TAG, "Ignoring %s (pause_behavior: ignore)",
+             command == media_source::MediaSourceCommand::PAUSE ? "PAUSE" : "STOP");
+    return;
+  }
   // The Snapcast binary protocol carries no transport control (that lives in the
   // server's JSON-RPC API), so pause/stop act locally. Chunks are still discarded at
   // their deadline while paused, so resuming snaps straight back into sync.

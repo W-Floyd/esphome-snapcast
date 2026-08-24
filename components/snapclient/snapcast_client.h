@@ -89,6 +89,25 @@ enum class PhaseMode : uint8_t {
   BOTH = 3,   // Invert both channels
 };
 
+/// @brief What a local PAUSE or STOP does on this client.
+///
+/// A fixed multiroom speaker and a desk speaker want opposite answers, which is why
+/// this is configurable rather than chosen.
+enum class PauseBehavior : uint8_t {
+  // Honoured. The client stays silent until something plays it again; the media
+  // source's re-arm only intervenes when nothing asked for the halt.
+  ALLOW = 0,
+  // Honoured, then undone once audio is flowing again. Survives a "stop everything"
+  // automation without leaving the speaker silent for hours -- but note it means a
+  // real audible gap: silence, then playback resumes a few seconds later.
+  RESUME = 1,
+  // Refused outright, so there is no gap at all. The media player keeps reporting
+  // PLAYING, which is the honest state, and the transport button simply does nothing.
+  // The trade-off is that a deliberate stop is also refused, so anything relying on
+  // stopping this player (an automation, a voice command) will not work.
+  IGNORE = 2,
+};
+
 /// @brief Decoded stream format of the current Snapcast stream.
 struct StreamParams {
   uint32_t sample_rate{0};

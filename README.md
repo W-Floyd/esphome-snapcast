@@ -95,7 +95,7 @@ media_player:
 | `time_sync_interval` | `250ms` | Time sync cadence while streaming; idle clients sync at max(this, 2s). Bursts run at connect and stream start |
 | `sync_deadband` | `128us` | Median error at which the steering servo engages (reference parity); holds stereo-pair imaging pinned — raise on very jittery links |
 | `hard_resync_threshold` | `50ms` | Sync error beyond which chunks are dropped / silence inserted |
-| `follow_stream` | `false` | Make the Snapcast stream authoritative over local transport control: a PAUSE or STOP is undone once audio is actually flowing again. For a fixed multiroom speaker this stops one "turn everything off" automation leaving it silent until someone presses play. Note that while music is playing a pause is reversed within seconds |
+| `pause_behavior` | `allow` | What a local PAUSE/STOP does. `allow`: honoured. `resume`: honoured, then undone once audio flows again — survives a "stop everything" automation, at the cost of an audible gap. `ignore`: refused outright, no gap, but a deliberate stop is refused too |
 | `keepalive_hold` | `never` | Chunk gap bridged with keepalive silence before the stream may end, so inter-track gaps cost no re-lock. `never` holds the pipeline for the whole session (speaker always ready to play in sync) at the cost of a continuously fed DAC and nonstop TSF beaconing |
 | `stream_idle_timeout` | `3s` | No wire chunks for this long ⇒ stream ends. Governs the **disconnected** case; while connected `keepalive_hold` applies |
 | `channel_mode` | `stereo` | Boot default routing: `stereo`, `left`, `right`, `mono` |
