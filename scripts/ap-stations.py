@@ -151,6 +151,159 @@ def report(rows, brief=False):
                   f"-- confirm it actually transmits before acting")
 
 
+# --- congestion -------------------------------------------------------------
+# Airtime is what congests a cell, and this router cannot report it: the Data
+# Elements UtilizationTransmit/Receive fields are a stub (six stations reported
+# an identical 120000 delta over 61 s while the only station actually sending
+# reported 0), BytesSent/BytesReceived are mutually inconsistent with the packet
+# counts, and the per-radio Channel/Utilization survey is a cached off-channel
+# scan that can be byte-identical across a 40-minute gap.
+#
+# What does survive cross-checking is PacketsSent/PacketsReceived, RetransCount
+# and the PHY rates. So estimate airtime the honest way: measure the packet rate
+# over a real interval and price each packet at that station's own PHY rate.
+# That is a MODEL, not a measurement -- it assumes a mean frame size and a fixed
+# per-frame overhead -- but it is directional, and it is the only thing here that
+# separates a slow station that transmits from one that merely idles.
+FRAME_BYTES = 800         # assumed mean frame; shifts absolute ms/s, not ranking
+FRAME_OVERHEAD_US = 120   # preamble + DIFS + SIFS + ACK, roughly, per frame
+
+
+def data_elements(payload):
+    """Flatten get_DataElements into (radio_rows, sta_rows)."""
+    radios, stas = [], []
+    for dev in payload.get("Network", {}).get("Device", []):
+        for radio in dev.get("Radio", []):
+            chan = None
+            for prof in radio.get("CurrentOperatingClassProfile", []):
+                chan = prof.get("Channel", chan)
+            scan_util, neighbors = None, 0
+            for sr in radio.get("ScanResult", []):
+                for oc in sr.get("OpClassScan", []):
+                    for cs in oc.get("ChannelScan", []):
+                        if cs.get("Channel") == chan:
+                            scan_util = cs.get("Utilization")
+                        neighbors += cs.get("NeighborBSSNumberOfEntries", 0)
+            radios.append({"id": radio.get("ID"), "channel": chan,
+                           # Radio.Utilization is a LIVE busy measurement: it
+                           # moved 38/44/37/37 over four 20 s samples while the
+                           # ScanResult table below stayed frozen at 58. Scale is
+                           # ambiguous (0-255 per BSS-Load, or already percent),
+                           # so it is reported raw -- trend and ranking are sound,
+                           # the absolute figure is not.
+                           "util": radio.get("Utilization"),
+                           "scan_util": scan_util, "neighbors": neighbors,
+                           "device": dev.get("ID"), "noise_raw": radio.get("Noise")})
+            for bss in radio.get("BSS", []):
+                for sta in bss.get("STA", []):
+                    sig = sta.get("SignalStrength")
+                    stas.append({
+                        "radio": radio.get("ID"),
+                        "channel": chan,
+                        "mac": (sta.get("MACAddress") or "").lower(),
+                        # SignalStrength is RCPI: dBm = value/2 - 110, verified
+                        # against get_topology's rssi for the same station.
+                        "rssi": (sig / 2 - 110) if sig is not None else None,
+                        "up_rate": sta.get("LastDataUplinkRate"),
+                        "down_rate": sta.get("LastDataDownlinkRate"),
+                        "pkts_sent": sta.get("PacketsSent"),      # AP -> STA
+                        "pkts_recv": sta.get("PacketsReceived"),  # STA -> AP
+                        "retrans": sta.get("RetransCount"),
+                    })
+    return radios, stas
+
+
+def airtime_ms(packets, rate_mbps):
+    """Modelled airtime for `packets` frames at `rate_mbps`, in milliseconds."""
+    if not packets or not rate_mbps:
+        return 0.0
+    return packets * ((FRAME_BYTES * 8) / rate_mbps + FRAME_OVERHEAD_US) / 1000.0
+
+
+def congestion(host, session_box, login_args, seconds, names):
+    def fetch():
+        try:
+            return ubus(host, session_box[0], "network.wireless", "get_DataElements")
+        except RuntimeError:
+            session_box[0] = login(host, *login_args)
+            return ubus(host, session_box[0], "network.wireless", "get_DataElements")
+
+    r0, s0 = data_elements(fetch())
+    t0 = time.time()
+    print("sampling %.0fs of traffic ..." % seconds, file=sys.stderr)
+    time.sleep(seconds)
+    r1, s1 = data_elements(fetch())
+    elapsed = time.time() - t0
+
+    before = {s["mac"]: s for s in s0}
+    rows = []
+    for s in s1:
+        b = before.get(s["mac"])
+        if not b:
+            continue   # associated mid-window: no baseline, so no rate
+        d_sent = (s["pkts_sent"] or 0) - (b["pkts_sent"] or 0)
+        d_recv = (s["pkts_recv"] or 0) - (b["pkts_recv"] or 0)
+        d_retr = (s["retrans"] or 0) - (b["retrans"] or 0)
+        if d_sent < 0 or d_recv < 0 or d_retr < 0:
+            continue   # counter reset (reassociation): the delta is garbage
+        ms = airtime_ms(d_sent, s["down_rate"]) + airtime_ms(d_recv, s["up_rate"])
+        rows.append({**s, "d_sent": d_sent, "d_recv": d_recv, "d_retr": d_retr,
+                     "pps": (d_sent + d_recv) / elapsed,
+                     "air": 100 * ms / (elapsed * 1000),
+                     "name": names.get(s["mac"], s["mac"])})
+
+    was = {r["id"]: r for r in r0}
+    surveys = {r["id"]: r for r in r1}
+    by_radio = {r["id"]: r for r in r1}
+    groups = {}
+    for r in rows:
+        groups.setdefault(r["radio"], []).append(r)
+    for rid in by_radio:          # radios with no transmitting station still count
+        groups.setdefault(rid, [])
+
+    print("\n===== congestion over %.0fs (%s) =====" % (elapsed, time.strftime("%H:%M:%S")))
+    for rid in sorted(groups, key=lambda k: (by_radio.get(k, {}).get("channel") or 0, k)):
+        group = sorted(groups[rid], key=lambda r: -r["air"])
+        # A zero-packet row means "not counted", not "idle": rank only real rows.
+        active = [r for r in group if r["d_sent"] or r["d_recv"]]
+        total = sum(r["air"] for r in active)
+        srv, prev = surveys.get(rid, {}), was.get(rid, {})
+        stale = srv.get("scan_util") is not None and srv.get("scan_util") == prev.get("scan_util")
+        print("\n--- radio %s  channel %s: %d associated, %d transmitting, "
+              "~%.1f%% modelled airtime ---"
+              % (rid, srv.get("channel"), len(group), len(active), total))
+        print("    live Radio.Utilization: %s -> %s (raw; moves, so it is real)"
+              % (prev.get("util"), srv.get("util")))
+        if srv.get("scan_util") is not None:
+            print("    cached scan survey: utilization=%s, neighbor BSS=%s%s"
+                  % (srv.get("scan_util"), srv.get("neighbors"),
+                     "  [identical in both samples: frozen, ignore]" if stale else ""))
+        if not active:
+            print("    no station reported a packet delta")
+            continue
+        print("%6s %7s %6s %5s %5s %5s  station" % ("air%", "pkt/s", "retx%", "rssi", "up", "down"))
+        for r in active:
+            denom = r["d_sent"] + r["d_retr"]
+            retx = 100 * r["d_retr"] / denom if denom else 0.0
+            flag = ""
+            if r["air"] >= 5 and min(r["up_rate"] or 999, r["down_rate"] or 999) <= 24:
+                flag = "  <-- slow AND busy: this is what costs the cell"
+            elif retx >= 20:
+                flag = "  <-- heavy retransmission"
+            print("%6.2f %7.1f %6.1f %5s %5s %5s  %-32s%s"
+                  % (r["air"], r["pps"], retx,
+                     "?" if r["rssi"] is None else round(r["rssi"]),
+                     r["up_rate"] or "?", r["down_rate"] or "?", r["name"][:32], flag))
+        idle = len(group) - len(active)
+        if idle:
+            print("    (%d associated station(s) reported no packets: absent from this "
+                  "ranking, not proven idle)" % idle)
+    print("\nairtime is MODELLED -- packet delta priced at each station's PHY rate, "
+          "assuming\n%dB frames + %dus overhead. It excludes other BSSes, non-Wi-Fi "
+          "interference\nand management traffic, so read the total as a floor for this "
+          "cell, not the\nchannel's true busy fraction." % (FRAME_BYTES, FRAME_OVERHEAD_US))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -162,13 +315,26 @@ def main():
     ap.add_argument("--watch", type=float, metavar="SECONDS",
                     help="poll forever at this interval, timestamped for log correlation")
     ap.add_argument("--brief", action="store_true", help="counts only (useful with --watch)")
+    ap.add_argument("--congestion", type=float, nargs="?", const=60, metavar="SECONDS",
+                    help="sample a packet-rate window and rank stations by modelled airtime")
     args = ap.parse_args()
 
     if args.from_json:
         report(stations(json.load(open(args.from_json))), args.brief)
         return
 
-    session = args.session or login(args.host, *(args.login or ("", "")))
+    login_args = tuple(args.login or ("", ""))
+    session = args.session or login(args.host, *login_args)
+
+    if args.congestion:
+        box = [session]
+        try:   # hostnames live in get_topology, not in Data Elements
+            topo = ubus(args.host, box[0], "data_repo.webinfo", "get_topology")
+            names = {s["mac"].lower(): s["name"] for s in stations(topo)}
+        except Exception:
+            names = {}
+        congestion(args.host, box, login_args, args.congestion, names)
+        return
 
     while True:
         try:
@@ -176,7 +342,7 @@ def main():
                 topo = ubus(args.host, session, "data_repo.webinfo", "get_topology")
             except RuntimeError:
                 # Sessions expire after 300 s; re-login once and retry
-                session = login(args.host, *(args.login or ("", "")))
+                session = login(args.host, *login_args)
                 topo = ubus(args.host, session, "data_repo.webinfo", "get_topology")
             print(f"\n===== {time.strftime('%H:%M:%S')} =====")
             report(stations(topo), args.brief)
