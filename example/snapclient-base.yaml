@@ -96,6 +96,15 @@ snapclient:
   # server: 192.168.1.10 # omit to auto-discover via mDNS (_snapcast._tcp)
   # buffer_size: 524288  # fits comfortably in the 2 MB PSRAM
   # static_delay is set on the media_source below
+  # These speakers are fixed multiroom players, so the stream decides -- not whatever
+  # last touched the media player entity. A PAUSE or STOP is undone once audio is
+  # actually flowing again, which stops a "turn everything off when we leave"
+  # automation from leaving one speaker silent until somebody notices and presses play
+  # (exactly what happened: one device sat idle for ~4 h while its partner, not in the
+  # automation's action list, resumed on its own).
+  #
+  # Accepted consequence: pausing while music plays is reversed within a few seconds.
+  follow_stream: true
   # Hardware rate lock (opt-in): steady-state sync corrections steer the I2S clock
   # divider instead of splicing frames; splices remain the fallback
   rate_lock:
