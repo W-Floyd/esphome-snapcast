@@ -146,11 +146,6 @@ void SnapclientHub::set_phase_mode(PhaseMode mode) {
   }
 }
 
-void SnapclientHub::set_volume_curve_db_range(float db_range) {
-  this->volume_curve_.set_db_range(db_range);
-  this->volume_curve_callbacks_.call();
-}
-
 void SnapclientHub::send_client_volume(uint8_t volume_percent, bool muted) {
   if (this->client_ != nullptr) {
     this->client_->send_client_info(volume_percent, muted);

@@ -9,30 +9,6 @@ namespace esphome::snapclient {
 
 static const char *const TAG = "snapclient.number";
 
-void SnapclientVolumeCurveNumber::setup() {
-  float value = this->initial_value_;
-  if (this->restore_value_) {
-    this->pref_ = global_preferences->make_preference<float>(this->get_object_id_hash());
-    float restored;
-    if (this->pref_.load(&restored)) {
-      value = restored;
-    }
-  }
-  this->parent_->set_volume_curve_db_range(value);
-  this->publish_state(value);
-}
-
-void SnapclientVolumeCurveNumber::dump_config() { LOG_NUMBER("", "Snapclient Volume Curve Number", this); }
-
-// THREAD CONTEXT: Main loop (invoked by the number framework)
-void SnapclientVolumeCurveNumber::control(float value) {
-  this->parent_->set_volume_curve_db_range(value);
-  this->publish_state(value);
-  if (this->restore_value_) {
-    this->pref_.save(&value);
-  }
-}
-
 void SnapclientServerLatencyNumber::setup() {
   // Mirror the server's belief; every ServerSettings push carries latency
   this->parent_->add_server_settings_callback([this](uint8_t volume, bool muted, int32_t latency_ms) {

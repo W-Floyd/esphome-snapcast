@@ -74,12 +74,6 @@ void SnapclientMediaSource::setup() {
     this->set_timeout("apply_server_settings", 0, [this]() { this->apply_server_state_(); });
   });
 
-  // A changed volume curve remaps the current slider position to a new gain
-  this->parent_->add_volume_curve_callback([this]() {
-    if (this->last_server_volume_ >= 0) {
-      this->apply_server_volume_(static_cast<uint8_t>(this->last_server_volume_));
-    }
-  });
 
   this->parent_->add_stream_state_callback([this](bool started, const StreamParams &params) {
     if (started) {
@@ -200,11 +194,13 @@ void SnapclientMediaSource::apply_server_state_() {
   this->request_mute_(this->local_muted_);
 }
 
-// THREAD CONTEXT: Main loop (server settings / volume curve callbacks)
+// THREAD CONTEXT: Main loop (server settings)
 void SnapclientMediaSource::apply_server_volume_(uint8_t volume_percent) {
-  // The Snapcast slider is a position; the orchestrator volume is an amplitude gain.
-  // The curve (0 dB range = linear passthrough) maps between them.
-  const float gain = this->parent_->get_volume_curve().apply(volume_percent / 100.0f);
+  // Straight through. No taper is applied here: every ESPHome output path already maps
+  // the slider linearly in DECIBELS -- i2s_audio spans SOFTWARE_VOLUME_MIN_DB (-49 dB)
+  // to 0, and audio_dac drivers write dB-scaled registers -- so a second curve on top
+  // would double-apply the log law and make the slider bottom-heavy.
+  const float gain = volume_percent / 100.0f;
   this->last_requested_gain_ = gain;
   this->request_volume_(gain);
 }
@@ -217,8 +213,7 @@ void SnapclientMediaSource::notify_volume_changed(float volume) {
   }
   // A local (HA slider) change: report the equivalent slider position to the server
   this->last_local_volume_ms_ = millis();
-  const float slider = this->parent_->get_volume_curve().inverse(volume);
-  const int volume_percent = static_cast<int>(std::roundf(slider * 100.0f));
+  const int volume_percent = static_cast<int>(std::roundf(volume * 100.0f));
   this->local_volume_ = static_cast<uint8_t>(std::clamp(volume_percent, 0, 100));
   if (volume_percent != this->last_server_volume_) {
     this->parent_->send_client_volume(this->local_volume_, this->local_muted_);

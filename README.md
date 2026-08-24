@@ -99,8 +99,6 @@ select:
 
 number:
   - platform: snapclient
-    type: volume_curve               # leave at 0 — ESPHome speakers already taper 49 dB
-  - platform: snapclient
     type: server_latency             # this client's latency ON the server
 
 text_sensor:
