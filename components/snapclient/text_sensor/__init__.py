@@ -41,7 +41,7 @@ CONFIG_SCHEMA = cv.All(
     cv.typed_schema(
         {
             # "Leader" / "Follower" / "Inactive" — which role this device holds in
-            # the TSF group sync (PLAN-tsf-sync.md); Inactive when tsf_sync is off,
+            # the TSF group sync; Inactive when tsf_sync is off,
             # no wifi, no session, or no election result yet
             CONF_TSF_ROLE: _hub_schema(
                 text_sensor.text_sensor_schema(

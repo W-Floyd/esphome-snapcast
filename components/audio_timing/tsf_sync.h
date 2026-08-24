@@ -16,7 +16,7 @@
 
 namespace esphome::audio_timing {
 
-/// @brief TSF group sync (PLAN-tsf-sync.md): all clients on one wifi AP share the
+/// @brief TSF group sync: all clients on one wifi AP share the
 /// AP's TSF timer to ~µs, so if they also share ONE server→TSF mapping, their
 /// mutual sync is TSF-grade while the group tracks the server through a single
 /// member's Kalman estimate (its wander becomes common-mode, which is inaudible;

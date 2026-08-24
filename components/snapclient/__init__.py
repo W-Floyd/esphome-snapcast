@@ -191,7 +191,7 @@ CONFIG_SCHEMA = cv.All(
                 PHASE_MODES, lower=True
             ),
             cv.Optional(CONF_RATE_LOCK): RATE_LOCK_SCHEMA,
-            # TSF group sync (PLAN-tsf-sync.md): same-AP clients share one
+            # TSF group sync: same-AP clients share one
             # server->TSF mapping so their mutual sync is us-class; wifi-only,
             # silently inactive elsewhere (Kalman fallback)
             cv.Optional(CONF_TSF_SYNC, default=False): cv.boolean,

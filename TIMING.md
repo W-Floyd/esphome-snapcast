@@ -40,8 +40,8 @@ time; every member — leader included — computes deadlines from that *publish
 The mapping's own error becomes common-mode and cancels between devices. What remains
 per-device is only the noise in reading TSF locally, which is much smaller.
 
-See [PLAN-tsf-sync.md](PLAN-tsf-sync.md) for the election, failover and fallback
-behaviour. Measured: the four devices agree on the server-versus-TSF rate to within
+Election, failover and the Kalman fallback are documented at the top of
+`components/audio_timing/tsf_sync.h`. Measured: the four devices agree on the server-versus-TSF rate to within
 2 ppm (all reading −16.7 to −18.5 ppm), which is a good independent check that they
 are genuinely sharing one timebase.
 

@@ -128,8 +128,7 @@ corrections steer the I2S clock rather than splicing frames.
 **[TIMING.md](TIMING.md)** is the real documentation: the clock chain, every buffer stage
 and its latency, why the gains are what they are, the measured error budget, and which
 quantities the on-device metrics structurally *cannot* see — plus the raw-observation
-instrument (`scripts/raw-sync.py`) that can. Also
-[PLAN-rate-lock.md](PLAN-rate-lock.md), [PLAN-tsf-sync.md](PLAN-tsf-sync.md).
+instrument (`scripts/raw-sync.py`) that can.
 
 Derived from: upstream `sendspin` (architecture), `badaix/snapcast` (protocol ground
 truth), esp32 `snapclient`/`lightsnapcast` (the control law, channel modes, volume
