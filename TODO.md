@@ -2,10 +2,6 @@
 
 ## Blocking a usable public repo
 
-- **No LICENSE.** The repo is publicly visible but not legally reusable, which for a
-  component whose whole purpose is consumption via `github://` is the opposite of the
-  intent. ESPHome core is GPLv3 and this links against it; MIT or Apache-2.0 are the
-  usual choices for external components.
 - **`example/snapclient-example.yaml` does not build against stock ESPHome.** It omits
   the forked speaker stack that provides `output_buffered_bytes`, so the documented
   minimal example fails for anyone following the README. Either add the fork to the

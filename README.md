@@ -130,9 +130,9 @@ and its latency, why the gains are what they are, the measured error budget, and
 quantities the on-device metrics structurally *cannot* see — plus the raw-observation
 instrument (`scripts/raw-sync.py`) that can.
 
-Derived from: upstream `sendspin` (architecture), `badaix/snapcast` (protocol ground
-truth), esp32 `snapclient`/`lightsnapcast` (the control law, channel modes, volume
-curve), and ImmichFrame-snapweb's `snapstream.ts` (the Kalman time filter).
+Derived from upstream `sendspin` (architecture), `badaix/snapcast` (protocol ground
+truth), `CarlosDerSeher/snapclient` (the control law and channel modes) and
+`badaix/snapweb` (the Kalman time filter) — see [NOTICE.md](NOTICE.md).
 
 ## Flashing
 
@@ -153,3 +153,9 @@ macOS cannot pass USB through, so build there and flash from the host.
 against a local snapserver, with [virtual_speaker](tests/components/virtual_speaker)
 standing in for the absent I2S device. Sync converges to ~1 ms average under QEMU's
 imperfect timing; real hardware is far tighter.
+
+## License
+
+[GPLv3](LICENSE). Inherited rather than chosen: ESPHome's C++ runtime is GPLv3, and parts
+of the timing engine are ports of GPLv3 code. [NOTICE.md](NOTICE.md) has the details and
+the attributions.
