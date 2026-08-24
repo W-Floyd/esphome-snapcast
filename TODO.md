@@ -2,89 +2,90 @@
 
 ## Blocking a usable public repo
 
-- **`example/snapclient-example.yaml` does not build against stock ESPHome.** It omits
-  the forked speaker stack that provides `output_buffered_bytes`, so the documented
-  minimal example fails for anyone following the README. Add the fork to the example —
-  the alternative of making it optional is no longer on the table, see below.
+- **`example/snapclient-example.yaml` does not build against stock ESPHome.** It omits the
+  forked speaker stack that provides `output_buffered_bytes`, so the documented minimal
+  example fails to compile for anyone following the README. Add the fork to it:
+
+  ```yaml
+  external_components:
+    - source:
+        type: git
+        url: https://github.com/W-Floyd/esphome
+        ref: speaker-buffered-bytes
+      components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
+  ```
+
+  The fork is rebased on the `2026.8.1` release tag, so it pairs with a stable CLI, and
+  needs re-basing on each new release. `dev` is not usable as a base: its components call
+  codegen helpers absent from any released esphome.
 
 ## Upstream ESPHome
 
 - **Expose the speaker's queued frame count.** `speaker::Speaker` offers only
-  `virtual bool has_buffered_data() const` — a bool, not a count — so the fill between
-  our feedback point and the DAC is unobservable. That is the root of the silent-offset
-  class: after a starvation the accounting can re-baseline against a wrong fill and
-  settle playing 100–250 ms out while every sync metric reads ~0, because the error is
-  measured against the same corrupted prediction. A `size_t buffered_frames()` would let
-  both re-baseline paths use ground truth instead of inferring it, and would retire the
-  six-component fork this repo currently carries.
+  `virtual bool has_buffered_data() const` — a bool, not a count — so the fill between our
+  feedback point and the DAC is unobservable. That is the root of the silent-offset class:
+  the accounting can re-baseline against a wrong fill and settle playing 100–250 ms out
+  while every sync metric reads ~0, because the error is measured against the same
+  corrupted prediction. A `size_t buffered_frames()` would let the re-baseline paths use
+  ground truth, and would retire the six-component fork this repo carries.
 - **`speaker::set_rate_adjustment(float ppm)`**, default no-op, implemented in the i2s
-  speaker per-SoC. This is phase 4 of the shipped rate lock: the component currently
-  pokes the S3's MCLK divider directly, and would prefer a speaker API with the
-  register-poking helper as the fallback for older ESPHome. Satellite1's forked
-  `I2SAudioSpeaker::sync_play()` is independent evidence of demand.
+  speaker per-SoC. `rate_lock` pokes the S3's MCLK divider directly and would prefer a
+  speaker API, keeping the register-poking helper as the fallback for older ESPHome.
+  Satellite1's forked `I2SAudioSpeaker::sync_play()` is independent evidence of demand.
 - **`speaker_source` spins forever on an unmixable announcement.** A format mismatch
-  cannot be resolved by retrying, but that is what it does. Observed with an announcement
-  pipeline at 48000/mono against a 44100/stereo stream: the mixer set
-  `Error flag: Incompatible audio streams` once, then the player stayed in `ANNOUNCING`
+  cannot be resolved by retrying, but that is what it does: with an announcement pipeline
+  at 48000/mono against a 44100/stereo stream, the mixer sets
+  `Error flag: Incompatible audio streams` once, then the player stays in `ANNOUNCING`
   allocating a fresh 9600-byte ring ~16×/second — 1742 of them in under two minutes, flag
   never cleared, until reboot. Two defects: unbounded allocation on an unsatisfiable
   retry, and no terminal failure for the announcement.
 
 ## Investigate
 
-- **Try dropping the starvation re-baseline entirely.** The accounting is exact from a
-  clean start — `pushed − played` is the true queue as long as nothing discards — so the
-  offset only appears when something does, and the re-baseline paths exist to recover
-  from that. `timeout: never` was supposed to remove the teardown that discards, and
-  measurement supports it: zero mixer stops across the fleet while starvations continued.
-  If nothing tears down, nothing is discarded, no re-baseline is needed, and both
-  `buffered_bytes()` and the fork can go.
+- **Drop the starvation re-baseline.** It is a net harm as it stands. Anchoring `pushed` to
+  the sink's reported fill uses a number that excludes whatever the mixer ring and I2S DMA
+  hold at that instant, which mid-drain is substantial; the clamp in
+  `notify_audio_played()` then permanently absorbs the shortfall. Measured consequence:
+  `drift` steps to +51 ms and stays there while the device plays ~43 ms early, with both
+  sync medians reading ~40 µs. The mechanism causes the offset it exists to prevent.
 
-  Attempted once and reverted, because the clamp's comments document observed
-  100–250 ms offsets — but **those observations predate the `timeout: never` fix**. They
-  are evidence from a world where teardowns happened. Cheap to re-test: keep the
-  accounting, skip the starvation re-baseline, and watch `drift` in the sync report plus
-  `sync-delta.py` across a few starvations.
+  The accounting is exact from a clean start — `pushed − played` is the true queue as long
+  as nothing discards — so the question is whether anything still discards. `timeout:
+  never` was meant to remove the teardown that does, and there are zero mixer stops across
+  the fleet, yet `Pipeline drained (source starvation)` still fires. Whether that drain
+  discards frames is the crux, and it is unmeasured. Test: skip the re-baseline, watch
+  `drift` and `sync-delta.py` across several starvations; no divergence means it is
+  redundant.
 
-  Field evidence since strengthened the case for deleting it. On 2026-08-23 a starvation
-  re-baseline anchored to a 50 ms measured fill mid-drain, which excludes whatever the
-  mixer ring and I2S DMA held at that instant; the clamp in `notify_audio_played()` then
-  absorbed the shortfall and `drift` sat at +51 ms for 18 minutes while that device played
-  ~43 ms early. The re-baseline caused the offset it exists to prevent.
-
-  **But this no longer retires the fork**, which an earlier version of this note claimed.
-  `on_query_buffered()` has three consumers now: the re-baseline anchor, the `fill`/`drift`
-  column, and the drift self-repair added in 4f14010. Only the first would go. The other
-  two are the measurement side — and the self-repair is what caught that 43 ms offset when
-  every other metric read ~40 µs, so the fork's justification has moved from the
-  re-baseline to being the one independent witness to the accounting.
+  This does not retire the fork. `on_query_buffered()` has three consumers — the
+  re-baseline anchor, the `fill`/`drift` column, and the drift self-repair — and only the
+  first would go. The self-repair is the one independent witness to the accounting, and it
+  is what makes a split visible at all.
 
 - **Stale deadline on stream resumption.** With `keepalive_hold: never` the pipeline is
-  held across an idle, and the first chunk afterwards arrives with a deadline stale by
-  roughly the idle duration (measured: 14044648 ms after 3.90 h, 24888016 ms after
-  ~6.9 h — both matching the gap). It self-heals in ~2.5 s of chunk-dropping and the
-  magnitude rule mutes correctly, but the mechanism is unexplained and needs the
-  snapserver side to close. Two clients derived slightly different magnitudes from the
-  same event, which suggests each computed it locally against a common bad input rather
-  than being told the same number.
+  held across an idle, and the first chunk afterwards carries a deadline stale by roughly
+  the idle duration (14044648 ms after 3.90 h; 24888016 ms after ~6.9 h). It self-heals in
+  ~2.5 s of chunk-dropping and the magnitude rule mutes correctly, so it is bounded, but
+  the mechanism is unexplained and closing it needs the snapserver side. Two clients
+  derived slightly different magnitudes from one event, which suggests each computed it
+  locally against a common bad input rather than being handed the same number.
 
-- **Extract the servo from `player_task_` into `audio_timing`.** That function is ~630
-  lines and the largest single thing in the component; the timing primitives already
-  moved out, so this is the remaining half. Blocked on nothing technical, but it is the
-  most safety-critical code here — every constant in it is load-bearing and documented
-  against a specific hardware failure — so it wants a quiet period and a soak, not a
-  refactor alongside live debugging.
+- **Extract the servo from `player_task_` into `audio_timing`.** ~630 lines, the largest
+  single thing in the component; the timing primitives already live in `audio_timing`, so
+  this is the remaining half. Nothing blocks it technically, but every constant in it is
+  load-bearing and documented against a specific hardware failure, so it wants a quiet
+  period and a soak rather than a refactor alongside live debugging.
 
-- **Residual serial-log gaps.** After fixing host-side buffering, a ~200 s gap still
-  appeared in an otherwise clean 10 s cadence. `esp_wifi_statis_dump()` is the suspect —
-  it emits a large multi-line block every tick and its output has never appeared in any
-  capture — and it is now opt-in (`wifi_tools: diagnostics: dump_statistics`), so the
-  next long capture with it off is the experiment.
+- **Residual serial-log gaps.** A ~200 s gap appears in an otherwise clean 10 s cadence
+  with host-side buffering ruled out. `esp_wifi_statis_dump()` is the suspect: it emits a
+  large multi-line block every tick and its output has never appeared in any capture. It is
+  opt-in (`wifi_tools: diagnostics: dump_statistics`, default off), so a long capture with
+  it disabled is the experiment.
 
 ## Features
 
-- **Opus codec** — Snapcast uses raw (non-Ogg) Opus framing; needs a bespoke decode path
-  (esp-audio-libs' decoder expects Ogg).
+- **Opus codec** — Snapcast uses raw (non-Ogg) Opus framing; needs a bespoke decode path,
+  since esp-audio-libs' decoder expects Ogg.
 - **Runtime server retargeting** — `snapcast://host:port` URIs currently warn; needs
   thread-safe reconfiguration of the network task's target.
 - **Crossfade on servo frame splices** — the last near-inaudible discontinuity class; a
