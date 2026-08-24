@@ -46,13 +46,16 @@ through ESPHome's own audio stack — so announcements, volume, mixing, and any
 ## Usage
 
 See [example/snapclient-example.yaml](example/snapclient-example.yaml) for a minimal
-config. The full smart-speaker pattern on real hardware (Speakeasy OTS pinout) lives in
-[example/snapclient-base.yaml](example/snapclient-base.yaml), included as a package by
-thin per-board files that supply only the hardware substitutions —
-[esp32-s3-supermini.yaml](example/esp32-s3-supermini.yaml) and
-[m5stamps3-bat.yaml](example/m5stamps3-bat.yaml). Snapcast mixed with Home Assistant
-announcements via a `mixer` speaker and dual pipelines, with the music ducking under
-announcements while staying in sync. The short version:
+config.
+
+For a full smart-speaker setup — Snapcast mixed with Home Assistant announcements via a
+`mixer` speaker and dual pipelines, so the music ducks under announcements instead of
+stopping and stays in sync throughout — put the shared parts in one file and include it
+from thin per-board files that supply only the hardware substitutions (pins, flash and
+PSRAM size, TX power). ESPHome's `packages:` plus `substitutions:` is all that takes, and
+it keeps board differences from multiplying through the audio config.
+
+The short version:
 
 ```yaml
 external_components:
@@ -219,22 +222,25 @@ the raw-observation instrument (`scripts/raw-sync.py`) that can.
 
 ## Flashing
 
-[scripts/flash.sh](scripts/flash.sh) (ergonomics adapted from speakeasy's flasher)
-builds and flashes in one step:
-
 ```bash
-scripts/flash.sh --usb                      # serial: auto-detects the ESP32 port
-scripts/flash.sh 192.168.1.42 kitchen.local # ESPHome OTA, multiple devices, -p for parallel
-scripts/flash.sh --docker --usb             # build in ghcr.io/esphome/esphome, flash from host
-scripts/flash.sh -c example/snapclient-example.yaml --usb
+esphome run example/snapclient-example.yaml --device /dev/ttyACM0   # serial
+esphome run example/snapclient-example.yaml --device kitchen.local  # OTA
 ```
 
-Docker note: mount the **repo root** (so `external_components: path: ../components`
-resolves) — `docker run --rm -v "$PWD":/config ghcr.io/esphome/esphome run
-example/esp32-s3-supermini.yaml`. On Linux add `--device=/dev/ttyACM0` for serial;
-Docker Desktop on macOS cannot pass USB through, so build in Docker and flash from
-the host (what `--docker` does), use https://web.esphome.io with
-`firmware.factory.bin`, or flash once via USB and use OTA thereafter.
+**Serial flashing needs the factory image**, not the app image. Serial writes at offset
+`0x0`, so it needs `firmware.factory.bin` (bootloader + partition table + app); handing
+it the app-only image puts an app where the bootloader belongs, and the ROM then loads
+it, fails the image SHA-256 check, prints "Attempting to boot anyway" and watchdog-loops
+at roughly 1.3 s per cycle until a correct flash recovers it. Plain `esphome run` picks
+the right artifact on its own — the trap is passing `--file` with an app image, which
+esphome honours on the serial path from 2026.8.0 onward.
+
+Docker note: mount the **repo root**, so `external_components: path: ../components`
+resolves — `docker run --rm -v "$PWD":/config ghcr.io/esphome/esphome run
+example/snapclient-example.yaml`. On Linux add `--device=/dev/ttyACM0` for serial.
+Docker Desktop on macOS cannot pass USB through, so build in Docker and flash from the
+host, use https://web.esphome.io with `firmware.factory.bin`, or flash once over USB and
+use OTA after that.
 
 ## Testing without hardware
 

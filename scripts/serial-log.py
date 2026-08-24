@@ -8,7 +8,7 @@ Two reasons to prefer this over `esphome logs --device /dev/tty...`:
    container paths (/config/...), so the very first crash line aborts the whole
    log session with FileNotFoundError -- exactly when the log matters most.
 2. USB logging consumes no wifi airtime. When the thing under investigation IS
-   airtime (see scripts/ap-stations.py), streaming logs over the API is part of
+   airtime, streaming logs over the API is part of
    the problem.
 
 Timestamps are emitted as [HH:MM:SS.mmm] so the output is parseable by
