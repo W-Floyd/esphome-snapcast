@@ -241,6 +241,35 @@ static constexpr int64_t STALE_BAILOUT_US = 3000000;
 // magnitude: genuine one-shots produced 1, 2, 3 and 5 resyncs, while every real
 // storm produced 29, 37, 67, 101 or a window-saturating 128. Nothing landed in
 // between, so 8 sits in an empty gap rather than on a guess.
+// Self-repair for a split between the ACCOUNTED queue (pushed-played) and the
+// MEASURED fill the sink reports. A split is a silent, permanent timing offset: the
+// prediction is wrong by the difference, the servo steers real audio to the wrong time,
+// and every on-device metric agrees with itself because the error is measured against
+// that same prediction. Observed on hardware: a starvation re-baseline anchored to the
+// sink's reported fill, which excludes whatever the mixer's output ring and the I2S DMA
+// held at that instant, so the clamp in notify_audio_played() then permanently absorbed
+// the shortfall -- drift stepped +8 -> +51 ms and stayed there, playing ~43 ms early.
+//
+// A small POSITIVE drift is normal and device-specific (4.7 ms and 8.0 ms on two
+// clients here), so the baseline is learned rather than assumed, and only the excess
+// over it is repaired.
+static constexpr float DRIFT_LEARN_ALPHA = 1.0f / 64.0f;
+// The baseline only tracks values CLOSE to it, never merely "below the repair
+// threshold". Learning anything under the threshold would ratchet: a split of
+// REPAIR-1 ms is too small to repair, so it would be absorbed into the baseline and
+// the next split of the same size would be measured from there, hiding the error a
+// slice at a time. Outside this band the drift is reported and left alone.
+static constexpr float DRIFT_LEARN_BAND_MS = 5.0f;
+// Excess over the learned baseline that counts as a split. Well above the observed
+// baselines, well below the ~43 ms that needs catching. Also stays under
+// hard_resync_threshold so the correction is absorbed by the proportional path
+// instead of triggering a mute.
+static constexpr int32_t DRIFT_REPAIR_MS = 20;
+// Held this long before acting: a real split is rock-steady (18 minutes at +50.7),
+// while a refill transient is not, and repairing a transient would inject the error
+// it is meant to remove.
+static constexpr int64_t DRIFT_REPAIR_HOLD_US = 10000000;
+
 static constexpr uint32_t RESYNC_STORM_COUNT = 8;
 static constexpr int64_t RESYNC_STORM_WINDOW_US = 2000000;
 
@@ -1377,6 +1406,10 @@ void SnapcastClient::player_task_() {
   // Rolling hard-resync count, for telling a one-shot catch-up from a storm
   int64_t storm_window_us = 0;
   uint32_t storm_resyncs = 0;
+  // Learned accounted-vs-measured baseline, and when the excess over it began
+  float drift_baseline_ms = 0.0f;
+  bool drift_baseline_valid = false;
+  int64_t drift_excess_since_us = 0;
   // Format of the last chunk played, for keepalive silence during a delivery gap
   StreamParams keepalive_params{};
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
@@ -1659,6 +1692,45 @@ void SnapcastClient::player_task_() {
           fill_drift_ms = pipeline_ms - fill_ms;
         }
       }
+      // Repair a sustained split. Acts only on evidence: the measured fill is an
+      // independent witness to the accounted queue, so a gap that holds for
+      // DRIFT_REPAIR_HOLD_US is the accounting being wrong, not the pipeline moving.
+      if (fill_ms >= 0 && converged) {
+        if (!drift_baseline_valid) {
+          drift_baseline_ms = static_cast<float>(fill_drift_ms);
+          drift_baseline_valid = true;
+        }
+        const int32_t excess_ms = fill_drift_ms - static_cast<int32_t>(drift_baseline_ms);
+        if (excess_ms >= DRIFT_REPAIR_MS) {
+          if (drift_excess_since_us == 0) {
+            drift_excess_since_us = now_us();
+          } else if (now_us() - drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
+            // Trust the measurement: drop the accounted queue by the excess. Playback
+            // was running that far early, so the prediction moves later and the servo
+            // walks the phase back through the proportional band.
+            const int64_t excess_frames =
+                static_cast<int64_t>(excess_ms) * static_cast<int64_t>(rec.params.sample_rate) / 1000;
+            this->playout_mutex_.lock();
+            this->pushed_frames_total_ -= excess_frames;
+            this->playout_mutex_.unlock();
+            ESP_LOGW(TAG,
+                     "Accounting split repaired: accounted queue ran %" PRId32 " ms over measured fill "
+                     "(baseline %+.1f) for %" PRId64 " s; playback was that far early",
+                     excess_ms, drift_baseline_ms, DRIFT_REPAIR_HOLD_US / 1000000);
+            drift_excess_since_us = 0;
+          }
+        } else {
+          drift_excess_since_us = 0;
+        }
+        // Learn only from values near the baseline, so a split can never be absorbed
+        // into it -- see DRIFT_LEARN_BAND_MS
+        if (std::abs(static_cast<float>(fill_drift_ms) - drift_baseline_ms) < DRIFT_LEARN_BAND_MS) {
+          drift_baseline_ms += DRIFT_LEARN_ALPHA * (static_cast<float>(fill_drift_ms) - drift_baseline_ms);
+        }
+      } else {
+        drift_excess_since_us = 0;
+      }
+
       char fill_str[80] = "";
       if (fill_ms >= 0) {
         snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 ", corr %+d ms)", fill_ms,
