@@ -59,6 +59,13 @@ snapclient:
   # name: Kitchen Speaker      # display name basis on the server (default: node name)
   # buffer_size: 524288        # decoded PCM buffer (bytes), PSRAM-preferred
   # flac: true                 # snapserver's default codec; pcm always works
+  # Opus is off by default, and it is the one codec with a real cost: +87 KB of flash,
+  # and at runtime ~40 KB of decoder state plus a 60-120 KB pseudostack, so it wants the
+  # PSRAM this board has (it does not fit in a bare ESP32's DRAM next to the PCM ring).
+  # snapserver resamples every Opus stream to 48 kHz stereo, which is what the speaker
+  # and media_pipeline below are already set to. Tune where the buffers land with the
+  # top-level `audio:` component's `codecs: opus:` key.
+  # opus: true
   # time_sync_interval: 1s
   # hard_resync_threshold: 50ms
   # stream_idle_timeout: 3s
