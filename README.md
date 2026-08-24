@@ -85,7 +85,7 @@ playback offsets. Check with the `stream_format` sensor.
 | `stream_idle_timeout` | `3s` | ends the stream when disconnected; while connected `keepalive_hold` applies |
 | `channel_mode` | `stereo` | `stereo`, `left`, `right`, `mono` |
 | `phase_invert` | `none` | `none`, `left`, `right`, `both` |
-| `rate_lock` | off | steer the S3's I2S divider instead of splicing frames; takes `i2s_port` (default `0`) |
+| `rate_lock` | off | steer the S3's I2S divider instead of splicing frames; requires `i2s_audio_id` naming the bus |
 | `tsf_sync` | `false` | share one server→TSF mapping between same-AP clients |
 | `timing_diagnostics` | `false` | per-chunk `RAW` lines for `scripts/raw-sync.py` |
 | `static_delay` (media_source) | `0ms` | per-device latency trim |

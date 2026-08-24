@@ -1,7 +1,7 @@
 """Snapcast client hub component, modeled on ESPHome's sendspin component."""
 
 import esphome.codegen as cg
-from esphome.components import audio, audio_timing, network, ota, socket, wifi
+from esphome.components import audio, audio_timing, i2s_audio, network, ota, socket, wifi
 from esphome.components.esp32 import only_on_variant
 from esphome.components.esp32.const import VARIANT_ESP32S3
 import esphome.config_validation as cv
@@ -56,7 +56,7 @@ CONF_PHASE_INVERT = "phase_invert"
 CONF_SYNC_DEADBAND = "sync_deadband"
 CONF_CONVERGE_FINE = "converge_fine"
 CONF_RATE_LOCK = "rate_lock"
-CONF_I2S_PORT = "i2s_port"
+CONF_I2S_AUDIO_ID = "i2s_audio_id"
 CONF_TSF_SYNC = "tsf_sync"
 CONF_TIMING_DIAGNOSTICS = "timing_diagnostics"
 CONF_KEEPALIVE_HOLD = "keepalive_hold"
@@ -75,8 +75,13 @@ RATE_LOCK_SCHEMA = cv.All(
     _none_to_empty_dict,
     cv.Schema(
         {
-            # The i2s_audio bus port driving the speaker (first bus is port 0)
-            cv.Optional(CONF_I2S_PORT, default=0): cv.int_range(min=0, max=1),
+            # The i2s_audio bus driving the speaker, BY ID. Not a port number: ESPHome
+            # does not number buses in declaration order -- a PDM or internal-ADC
+            # microphone forces its own bus to port 0 and pushes the others up -- so a
+            # hand-written number silently steers the wrong clock in exactly the
+            # smart-speaker layout this is most wanted in. The port is resolved from
+            # i2s_audio's own assignment in to_code().
+            cv.Required(CONF_I2S_AUDIO_ID): cv.use_id(i2s_audio.I2SAudioComponent),
         }
     ),
     only_on_variant(
@@ -256,6 +261,28 @@ CONFIG_SCHEMA = cv.All(
 )
 
 
+def _resolve_i2s_port(rate_lock_config: ConfigType) -> int:
+    """Maps the configured i2s_audio id to the port number ESPHome assigned it.
+
+    i2s_audio computes this in its own final validation (`_assign_ports`), which has
+    run by the time any to_code does, and stores it keyed by id. Reading that map is
+    the only way to be right: it reorders buses so a PDM/internal-ADC microphone owns
+    port 0. There is no public accessor, so this reaches into the module -- a rename
+    upstream breaks the build loudly, which is the failure mode we want, rather than
+    the silent wrong-clock a hand-written port number gives.
+    """
+    bus_id = rate_lock_config[CONF_I2S_AUDIO_ID]
+    port_map = i2s_audio._get_data().port_map  # noqa: SLF001
+    port = port_map.get(str(bus_id))
+    if port is None:
+        raise cv.Invalid(
+            f"rate_lock: could not determine the I2S port for '{bus_id}'. "
+            f"Known buses: {', '.join(sorted(port_map)) or '(none)'}",
+            path=[CONF_RATE_LOCK, CONF_I2S_AUDIO_ID],
+        )
+    return port
+
+
 async def to_code(config: ConfigType) -> None:
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
@@ -295,7 +322,7 @@ async def to_code(config: ConfigType) -> None:
 
     if CONF_RATE_LOCK in config:
         audio_timing.request_rate_lock()
-        cg.add(var.set_rate_lock_port(config[CONF_RATE_LOCK][CONF_I2S_PORT]))
+        cg.add(var.set_rate_lock_port(_resolve_i2s_port(config[CONF_RATE_LOCK])))
 
     if config[CONF_TSF_SYNC]:
         audio_timing.request_tsf_sync()

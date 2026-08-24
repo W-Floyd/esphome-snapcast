@@ -82,7 +82,8 @@ snapclient:
   # presses play, which is what happened before this existed.
   pause_behavior: ignore
   rate_lock:
-    i2s_port: 0                 # the i2s_out bus below
+    i2s_audio_id: i2s_out       # by id: ESPHome does not number buses in
+                                # declaration order (a PDM mic takes port 0)
   tsf_sync: true                # same-AP clients share one server→TSF mapping
   timing_diagnostics: false     # ~38 log lines/s/device; on to measure, off to listen
 

@@ -65,7 +65,7 @@ snapclient:
   # tsf_sync: false               # share one 802.11 timebase between same-AP clients
   # timing_diagnostics: false     # per-chunk RAW lines for scripts/raw-sync.py
   # rate_lock:                    # S3 only: steer the I2S divider instead of splicing
-  #   i2s_port: 0
+  #   i2s_audio_id: i2s_out         # the bus BY ID; port numbers are assigned, not ordered
 
 # Bridges synchronized PCM into the speaker pipeline
 media_source:
