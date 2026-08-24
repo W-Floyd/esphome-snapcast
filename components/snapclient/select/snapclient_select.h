@@ -42,12 +42,6 @@ class SnapclientIndexedSelect : public SnapclientChild, public select::Select {
   virtual uint8_t initial_index_() const = 0;
 
   bool restore_value_{true};
-  // A pin is a PREFERENCE, not a requirement: wifi's set_bssid() will refuse to
-  // associate with anything else, so an AP that is gone, overloaded, or simply out of
-  // range leaves the client unable to connect at all rather than degraded. Track how
-  // long we have been pinned-but-disconnected and drop the constraint past a timeout.
-  uint32_t pinned_since_ms_{0};  // 0 = not waiting on a pinned connect
-  bool pin_released_{false};     // pin dropped after timing out; re-armed on next drop
   ESPPreferenceObject pref_;
 };
 
@@ -125,6 +119,23 @@ class SnapclientPhaseSelect final : public SnapclientIndexedSelect {
   bool mono_dac_{false};
 };
 
+/// @brief What a local PAUSE or STOP does (Allow / Resume / Ignore).
+///
+/// Runtime-selectable because the right answer is a property of the room, not of the
+/// build: a fixed multiroom speaker wants the stream to win, a desk speaker wants the
+/// transport buttons to work. Overrides the hub's pause_behavior default and persists.
+class SnapclientPauseBehaviorSelect final : public SnapclientIndexedSelect {
+ public:
+  void dump_config() override;
+
+ protected:
+  // Options are declared in the same order as the enum, so the index maps straight on
+  void apply_index_(uint8_t index) override {
+    this->parent_->set_pause_behavior(static_cast<PauseBehavior>(index));
+  }
+  uint8_t initial_index_() const override { return static_cast<uint8_t>(this->parent_->pause_behavior()); }
+};
+
 /// @brief Picker over mDNS-discovered snapservers ("Automatic" + one option per
 /// server, labeled "name (host:port)").
 ///
@@ -151,12 +162,6 @@ class SnapclientServerSelect final : public SnapclientChild, public SnapclientDy
     char value[65];
   };
   bool restore_value_{true};
-  // A pin is a PREFERENCE, not a requirement: wifi's set_bssid() will refuse to
-  // associate with anything else, so an AP that is gone, overloaded, or simply out of
-  // range leaves the client unable to connect at all rather than degraded. Track how
-  // long we have been pinned-but-disconnected and drop the constraint past a timeout.
-  uint32_t pinned_since_ms_{0};  // 0 = not waiting on a pinned connect
-  bool pin_released_{false};     // pin dropped after timing out; re-armed on next drop
   ESPPreferenceObject pref_;
 };
 

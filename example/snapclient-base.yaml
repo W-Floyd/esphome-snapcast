@@ -228,6 +228,12 @@ select:
   # speaker in a synchronized pair cancels bass. mono_dac collapses the options to
   # None / Inverted: the MAX98357A analog-sums L+R, so single-side inversion of
   # duplicated content would cancel to silence.
+  # Runtime override of pause_behavior, so a speaker can be switched between "the
+  # group decides" and "the buttons work" without a reflash.
+  - platform: snapclient
+    type: pause_behavior
+    snapclient_id: snap
+    name: Pause Behavior
   - platform: snapclient
     type: phase
     snapclient_id: snap

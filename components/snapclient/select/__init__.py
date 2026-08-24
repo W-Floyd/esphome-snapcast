@@ -12,10 +12,12 @@ CODEOWNERS = ["@W-Floyd"]
 CONF_CHANNEL_MODE = "channel_mode"
 CONF_PHASE = "phase"
 CONF_SERVER = "server"
+CONF_PAUSE_BEHAVIOR = "pause_behavior"
 
-# Option orders must match the ChannelMode / PhaseMode enums
+# Option orders must match the ChannelMode / PhaseMode / PauseBehavior enums
 CHANNEL_MODE_OPTIONS = ["Stereo", "Left", "Right", "Mono"]
 PHASE_OPTIONS = ["None", "Left", "Right", "Both"]
+PAUSE_BEHAVIOR_OPTIONS = ["Allow", "Resume", "Ignore"]
 # Mono-summing amps (MAX98357A style) analog-mix L+R: inverting one side of
 # duplicated content cancels to silence, so only whole-program inversion is offered;
 # "Stereo" is just an undefined analog (L+R)/2, so the digital Mix stands in for it
@@ -37,6 +39,9 @@ SnapclientPhaseSelect = snapclient_ns.class_(
 )
 SnapclientServerSelect = snapclient_ns.class_(
     "SnapclientServerSelect", cg.Component, select.Select
+)
+SnapclientPauseBehaviorSelect = snapclient_ns.class_(
+    "SnapclientPauseBehaviorSelect", cg.Component, select.Select
 )
 
 
@@ -68,6 +73,13 @@ CONFIG_SCHEMA = cv.All(
             CONF_SERVER: _select_schema(
                 SnapclientServerSelect, "mdi:server-network"
             ),
+            # What a local PAUSE/STOP does. Runtime-selectable because the right answer
+            # belongs to the room rather than the build: Ignore for a fixed multiroom
+            # speaker whose group is the source of truth, Allow for one whose transport
+            # buttons should work. Overrides the hub's pause_behavior default.
+            CONF_PAUSE_BEHAVIOR: _select_schema(
+                SnapclientPauseBehaviorSelect, "mdi:pause-octagon-outline"
+            ),
         },
     ),
     cv.only_on_esp32,
@@ -77,6 +89,7 @@ _OPTIONS = {
     CONF_CHANNEL_MODE: CHANNEL_MODE_OPTIONS,
     CONF_PHASE: PHASE_OPTIONS,
     CONF_SERVER: ["Automatic"],
+    CONF_PAUSE_BEHAVIOR: PAUSE_BEHAVIOR_OPTIONS,
 }
 
 

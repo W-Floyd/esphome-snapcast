@@ -117,6 +117,10 @@ select:
     type: channel_mode
     name: Channel Mode      # Stereo / Left / Right / Mono, persisted; overrides channel_mode
   - platform: snapclient
+    type: pause_behavior
+    name: Pause Behavior   # Allow / Resume / Ignore at runtime, persisted; overrides
+                           # the hub's pause_behavior default
+  - platform: snapclient
     type: phase
     name: Phase             # polarity inversion: None / Left / Right / Both, persisted;
                             # overrides phase_invert (fixes an out-of-phase driver in software)
