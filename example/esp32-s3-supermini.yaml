@@ -1,0 +1,29 @@
+# ESP32-S3 SuperMini (ESP32-S3FH4R2: 4 MB flash, 2 MB quad PSRAM).
+#
+# I2S DAC (PCM5102A / MAX98357A style):
+#   GPIO4 -> LCK   GPIO5 -> BCK   GPIO6 -> DIN
+#
+# The onboard WS2812 (GPIO48) doubles as a play-state indicator.
+# Everything not board-specific is in snapclient-base.yaml.
+substitutions:
+  name: snapclient-supermini
+  friendly_name: Snapclient SuperMini
+
+  board: esp32-s3-devkitc-1
+  flash_size: 4MB
+  psram_mode: quad              # the S3FH4R2's 2 MB PSRAM is quad, not octal
+  psram_speed: 80MHz
+
+  pin_lrclk: GPIO4
+  pin_bclk: GPIO5
+  pin_dout: GPIO6
+  pin_led: GPIO48
+
+packages:
+  base: !include snapclient-base.yaml
+
+# This board's antenna is poorly matched and distorts at high power, causing "Auth
+# Expired" loops even at full RX bars, so pin the BOOT power low and trim upward from
+# the runtime number if a given unit tolerates it. Merges into the base's wifi: block.
+wifi:
+  output_power: 8.5dB

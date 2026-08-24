@@ -46,6 +46,11 @@ Then a normal `i2s_audio` speaker and a `speaker_source` media player whose
 **[example/snapclient-example.yaml](example/snapclient-example.yaml) is the complete
 reference** — every option below, defaults shown commented out.
 
+For a real speaker, [snapclient-base.yaml](example/snapclient-base.yaml) is a working
+build with ducked HA announcements, entities and diagnostics, included as a package by
+thin per-board files: [esp32-s3-supermini.yaml](example/esp32-s3-supermini.yaml) and
+[m5stamps3-bat.yaml](example/m5stamps3-bat.yaml).
+
 ## Codecs
 
 `pcm`, `flac` and `opus`, 16-bit only. Vorbis is unsupported.
