@@ -58,6 +58,40 @@ while [[ $# -gt 0 ]]; do
 done
 set -- ${ARGS[@]+"${ARGS[@]}"}
 
+# A serial port handed in as a positional device is unambiguous intent, but it would
+# otherwise take the OTA path — which resolves the APP-ONLY image and then lets
+# `esphome upload` serial-flash it at offset 0x0. That is exactly the failure described
+# above resolve_bin(): SHA-256 mismatch, "Attempting to boot anyway", and a ~1.3 s
+# watchdog boot loop that needs a USB recovery flash. Observed in the field, twice.
+# Route it to USB mode (which uses the factory image) rather than writing a broken one.
+if [[ "${USB}" -eq 0 && $# -gt 0 ]]; then
+    SERIAL_ARGS=()
+    NET_ARGS=()
+    for dev_arg in "$@"; do
+        case "${dev_arg}" in
+            /dev/*|COM[0-9]*) SERIAL_ARGS+=("${dev_arg}") ;;
+            *) NET_ARGS+=("${dev_arg}") ;;
+        esac
+    done
+    if [[ ${#SERIAL_ARGS[@]} -gt 0 ]]; then
+        if [[ ${#NET_ARGS[@]} -gt 0 ]]; then
+            echo "ERROR: cannot mix serial ports with network devices in one run" >&2
+            echo "       serial:  ${SERIAL_ARGS[*]}" >&2
+            echo "       network: ${NET_ARGS[*]}" >&2
+            echo "       They need different images (factory vs app-only); run them separately." >&2
+            exit 1
+        fi
+        if [[ ${#SERIAL_ARGS[@]} -gt 1 ]]; then
+            echo "ERROR: only one serial port per run (got: ${SERIAL_ARGS[*]})" >&2
+            exit 1
+        fi
+        echo "==> ${SERIAL_ARGS[0]} is a serial port; switching to USB mode (factory image)"
+        USB=1
+        PORT="${SERIAL_ARGS[0]}"
+        set --
+    fi
+fi
+
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "${REPO_ROOT}"
 [[ -f "${CONFIG}" ]] || { echo "ERROR: config not found: ${CONFIG}" >&2; exit 1; }
@@ -162,8 +196,14 @@ if [[ -n "${OTA_BIN:-}" ]]; then
     FACTORY_BIN="$(dirname "${OTA_BIN}")/firmware.factory.bin"
     if [[ -f "${FACTORY_BIN}" ]]; then
         USB_FILE_ARG=(--file "${FACTORY_BIN}")
-    else
-        echo "WARNING: ${FACTORY_BIN} not found; letting esphome pick the serial image" >&2
+    elif [[ "${USB}" -eq 1 ]]; then
+        # Hard failure, not a warning: letting esphome choose here is how the app-only
+        # image ends up at 0x0, and the result is a boot loop needing USB recovery.
+        # Refusing to flash is strictly better than flashing something that will not boot.
+        echo "ERROR: factory image not found: ${FACTORY_BIN}" >&2
+        echo "       Serial flashing writes at 0x0 and needs bootloader + partitions + app." >&2
+        echo "       Run 'esphome compile ${CONFIG}' and retry." >&2
+        exit 1
     fi
 fi
 
