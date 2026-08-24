@@ -101,21 +101,6 @@ static uint32_t startup_steer_frames(uint32_t chunk_frames) {
   return std::max<uint32_t>(1, static_cast<uint32_t>(chunk_frames * (STARTUP_STEER_PPM * 1e-6f) + 0.5f));
 }
 
-// Median window for the steering servo's error signal. One sample per chunk, so its
-// duration follows the codec block size -- measured 26.2 ms/chunk (FLAC's 1152-frame
-// default at 44.1 kHz), giving ~0.39 s here. That duration is a term in the loop lag
-// that bounds the trim gain, so it is not a free parameter: a codec or rate with a
-// different block size changes it.
-//
-// Lengthened from 15 for stereo-image stability. The per-chunk error is WHITE NOISE
-// (measured: consecutive-difference sigma / sigma = 1.32-1.43 against sqrt(2) = 1.41),
-// so averaging more of it reduces the residual as ~sqrt(n) and costs nothing in
-// tracking -- there is no ramp being trailed. Note this is the opposite of the earlier
-// attempt to SHORTEN the window to buy loop bandwidth: with a noise-dominated error,
-// bandwidth pumps noise into the output and length removes it. Added lag is ~0.2 s
-// (half-window), keeping phase margin comfortable at KP = 0.5.
-static constexpr size_t MEDIAN_WINDOW = 31;
-
 // Closes the playout accounting against a direct observation of the pipeline.
 //
 // `pushed - played` is an ACCUMULATOR: it integrates two independent counters and has
@@ -1449,67 +1434,13 @@ void SnapcastClient::set_stream_active_(bool active) {
 // ============================== Player task ==============================
 
 void SnapcastClient::player_task_() {
-  bool warned_no_sync = false;
-  // Rolling sync-error diagnostics, logged once per ~128 chunks (~3 s)
-  int64_t err_accum_us = 0;
-  int64_t err_peak_us = 0;
-  uint32_t err_count = 0;
-  // Per-window stutter forensics: how often each correction mechanism fired
-  uint32_t soft_dropped_frames = 0;
-  uint32_t soft_inserted_frames = 0;
-  uint32_t hard_resyncs = 0;
-  // Median of recent sync errors (rejects residual feedback spikes better than a
-  // mean); the steering servo acts on this, not the raw per-chunk error. Same design
-  // as the esp32 snapclient reference (99/19-sample medians on a sample-accurate age).
-  int64_t err_window[MEDIAN_WINDOW];
-  size_t err_window_idx = 0;
-  size_t err_window_filled = 0;
-  // Bang-bang steering with hysteresis, ported from the reference: while engaged,
-  // trim exactly one frame per chunk (~950 ppm) until the median crosses back inside
-  // the disengage threshold. Holds the error near zero continuously instead of
-  // letting it random-walk inside a deadband — a free-walking deadband is exactly
-  // what wanders the stereo image between two paired devices.
-  int8_t steer_dir = 0;
+  // All servo state lives in one struct so the loop below can be split into named
+  // steps; see ServoState for what each field is and why. rate_lock_ok starts from
+  // whether the hardware lock exists at all.
+  ServoState st;
 #ifdef USE_AUDIO_TIMING_RATE_LOCK
-  // Rate lock: once converged, steady-state corrections become hardware clock trims
-  // instead of frame splices. The PI integrator (positive = play faster) persists
-  // across resyncs, flushes, and rate changes because it converges to the crystal
-  // offset, a property of the hardware, not the stream.
-  float trim_integral_ppm = 0.0f;
-  bool rate_lock_ok = this->rate_lock_ != nullptr;
-  uint32_t rate_lock_rate = 0;
-  // Trim wander over the report window. The trim IS the loop's estimate of the
-  // disturbance it is cancelling, so its spread says whether the loop is tracking a
-  // slow crystal offset (narrow, as designed) or chasing something it cannot (wide,
-  // or pinned at the rail). Observed on all four devices: swings of hundreds of ppm
-  // and repeated +-500 ppm saturation while medians stayed inside a few hundred us
-  // -- i.e. running at its authority limit in normal operation. Quantify it before
-  // any further gain change.
-  float trim_min_ppm = 0.0f;
-  float trim_max_ppm = 0.0f;
-  uint32_t trim_samples = 0;
-  uint32_t trim_railed = 0;
+  st.rate_lock_ok = this->rate_lock_ != nullptr;
 #endif
-  uint32_t raw_sample_countdown = 1;
-  // Smoothed accounted-vs-observed disagreement (us); 0 when the accounting is honest
-  float fill_corr_us = 0.0f;
-  bool fill_corr_valid = false;
-  uint32_t fill_sample_countdown = 0;
-  // Mute-until-synced: real audio flows only after a full window of in-band medians
-  bool converged = false;
-  uint32_t in_band_chunks = 0;
-  int64_t last_resync_log_us = 0;
-  // When the stream first went staler than the server's buffer, 0 while it is not
-  int64_t stale_since_us = 0;
-  // Rolling hard-resync count, for telling a one-shot catch-up from a storm
-  int64_t storm_window_us = 0;
-  uint32_t storm_resyncs = 0;
-  // Learned accounted-vs-measured baseline, and when the excess over it began
-  float drift_baseline_ms = 0.0f;
-  bool drift_baseline_valid = false;
-  int64_t drift_excess_since_us = 0;
-  // Format of the last chunk played, for keepalive silence during a delivery gap
-  StreamParams keepalive_params{};
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -1522,14 +1453,14 @@ void SnapcastClient::player_task_() {
       // stays continuous and a live stream resumes with no correction at all.
       // Runs for as long as the session is up -- an inter-track gap is measured in
       // tens of seconds and any cap short of that reintroduces the teardown.
-      if (keepalive_params.valid() && this->output_active_.load(std::memory_order_relaxed) &&
+      if (st.keepalive_params.valid() && this->output_active_.load(std::memory_order_relaxed) &&
           this->is_connected()) {
-        const uint32_t frames = keepalive_params.sample_rate / (1000000 / KEEPALIVE_SLICE_US);
-        this->push_silence_(frames, keepalive_params);
+        const uint32_t frames = st.keepalive_params.sample_rate / (1000000 / KEEPALIVE_SLICE_US);
+        this->push_silence_(frames, st.keepalive_params);
       }
       continue;
     }
-    keepalive_params = rec.params;
+    st.keepalive_params = rec.params;
 
     const uint32_t frame_bytes = rec.params.frame_bytes();
     if (frame_bytes == 0) {
@@ -1538,14 +1469,14 @@ void SnapcastClient::player_task_() {
     }
 
 #ifdef USE_AUDIO_TIMING_RATE_LOCK
-    if (rate_lock_ok && rec.params.sample_rate != rate_lock_rate) {
+    if (st.rate_lock_ok && rec.params.sample_rate != st.rate_lock_rate) {
       // The speaker reprograms the I2S clock for a new stream format; re-read the
       // divider baseline once the new clock is running. The rate is what lets the
       // lock compute the IDEAL divider rather than inherit the driver's rounding of
       // it, which can otherwise eat the servo's whole trim authority.
       this->rate_lock_->set_output_rate(rec.params.sample_rate);
       this->rate_lock_->invalidate_baseline();
-      rate_lock_rate = rec.params.sample_rate;
+      st.rate_lock_rate = rec.params.sample_rate;
     }
 #endif
 
@@ -1556,59 +1487,7 @@ void SnapcastClient::player_task_() {
       continue;
     }
 
-    if (this->pipeline_starved_.exchange(false, std::memory_order_relaxed)) {
-      // The pipeline fully drained (source starvation). Re-baseline the playout
-      // accounting -- but anchor it to the fill the pipeline REPORTS, not to an
-      // assumption that it is empty.
-      //
-      // Assuming empty was the long-standing behaviour and the cause of the
-      // silent-offset bug: whatever audio was still in flight went uncounted, so the
-      // prediction was wrong by that much and the servo dutifully steered the real
-      // audio to the wrong time while its own error read ~0 (it is measured against
-      // that same prediction). Measured offsets of 100-250 ms, audible against the
-      // other clients, invisible to every metric on the device.
-      //
-      // on_query_buffered() reports bytes still held downstream, so seed pushed as
-      // played + that, making the accounted queue equal the measured one. Falls back
-      // to the old assume-empty behaviour when the sink cannot report, which is why
-      // the query distinguishes "unknown" from "zero".
-      //
-      // Scope: the sink reports its own queue, not the mixer's output ring or the I2S
-      // DMA below it. Those are bounded by buffer_duration and identical across
-      // devices running one config, so what remains is common-mode -- and it is
-      // relative offset between devices that moves a stereo image, not a shared
-      // constant.
-      size_t buffered_bytes = 0;
-      const bool have_fill = this->audio_listener_ != nullptr && frame_bytes > 0 &&
-                             this->audio_listener_->on_query_buffered(buffered_bytes);
-      const int64_t in_flight_frames = have_fill ? static_cast<int64_t>(buffered_bytes / frame_bytes) : 0;
-      this->playout_mutex_.lock();
-      this->playout_valid_ = false;
-      this->played_frames_total_ = 0;
-      this->pushed_frames_total_ = in_flight_frames;
-      this->fb_samples_ = 0;
-      this->playout_mutex_.unlock();
-      if (have_fill) {
-        ESP_LOGD(TAG, "Re-baseline anchored to measured fill: %" PRId64 " frames (%" PRId64 " ms)", in_flight_frames,
-                 in_flight_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
-      } else {
-        // Log the FALLBACK too. Without this the two cases are indistinguishable in a
-        // log -- a silent fallback looks exactly like the feature working, which is
-        // how the first flash of this code read as "no starvations to anchor" when in
-        // fact every one of ~120 starvations had taken this branch.
-        ESP_LOGW(TAG, "Re-baseline could not read the pipeline fill; assuming empty (listener=%d)",
-                 this->audio_listener_ != nullptr ? 1 : 0);
-      }
-      err_window_filled = 0;
-      steer_dir = 0;
-      converged = false;
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
-      if (this->rate_lock_ != nullptr) {
-        this->rate_lock_->invalidate_baseline();
-      }
-#endif
-      ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
-    }
+    this->rebaseline_after_starvation_(st, rec, frame_bytes);
 
     const int64_t deadline = this->chunk_deadline_us_(rec);
     const int64_t hard_us = static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000;
@@ -1627,11 +1506,11 @@ void SnapcastClient::player_task_() {
              !this->shutdown_.load(std::memory_order_relaxed)) {
         vTaskDelay(pdMS_TO_TICKS(10));
       }
-      if (!warned_no_sync) {
+      if (!st.warned_no_sync) {
         this->filter_mutex_.lock();
-        warned_no_sync = !this->time_filter_.has_estimate();
+        st.warned_no_sync = !this->time_filter_.has_estimate();
         this->filter_mutex_.unlock();
-        if (warned_no_sync) {
+        if (st.warned_no_sync) {
           ESP_LOGW(TAG, "Starting playback before first time sync; expect a hard resync");
         }
       }
@@ -1644,8 +1523,8 @@ void SnapcastClient::player_task_() {
     // Diagnostics-only since the correction is no longer applied, so the listener-chain
     // walk and mutex are not worth paying for unless timing diagnostics are wanted.
 #ifdef USE_SNAPCLIENT_TIMING_DIAG
-    if (fill_sample_countdown == 0) {
-      fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
+    if (st.fill_sample_countdown == 0) {
+      st.fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
       size_t measured_bytes = 0;
       if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
           this->audio_listener_->on_query_buffered(measured_bytes)) {
@@ -1656,18 +1535,18 @@ void SnapcastClient::player_task_() {
         const int64_t sample_us =
             (measured_frames - accounted_frames) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
         if (std::abs(sample_us) <= FILL_CORR_MAX_US) {
-          fill_corr_us = fill_corr_valid
-                             ? fill_corr_us + FILL_EWMA_ALPHA * (static_cast<float>(sample_us) - fill_corr_us)
+          st.fill_corr_us = st.fill_corr_valid
+                             ? st.fill_corr_us + FILL_EWMA_ALPHA * (static_cast<float>(sample_us) - st.fill_corr_us)
                              : static_cast<float>(sample_us);
-          fill_corr_valid = true;
+          st.fill_corr_valid = true;
         }
       }
     } else {
-      fill_sample_countdown--;
+      st.fill_sample_countdown--;
     }
 #endif  // USE_SNAPCLIENT_TIMING_DIAG
 
-    // fill_corr_us is MEASURED AND REPORTED BUT NOT APPLIED. Applying it was wrong and
+    // st.fill_corr_us is MEASURED AND REPORTED BUT NOT APPLIED. Applying it was wrong and
     // measurably harmful: it manufactured the very offset it was meant to remove.
     //
     // The premise was that a disagreement between the accumulator (pushed - played) and
@@ -1713,8 +1592,8 @@ void SnapcastClient::player_task_() {
     // a mutex, per chunk. More importantly the two concerns differ: this emits ~38 lines/s,
     // and chasing dropouts with DEBUG logs is exactly when that traffic hurts most.
 #ifdef USE_SNAPCLIENT_TIMING_DIAG
-    if (this->tsf_sync_ != nullptr && --raw_sample_countdown == 0) {
-      raw_sample_countdown = RAW_SAMPLE_EVERY_CHUNKS;
+    if (this->tsf_sync_ != nullptr && --st.raw_sample_countdown == 0) {
+      st.raw_sample_countdown = RAW_SAMPLE_EVERY_CHUNKS;
       int64_t raw_tsf = 0, raw_local = 0, raw_width = 0;
       if (TsfSync::raw_tsf_sample(raw_tsf, raw_local, raw_width)) {
         this->playout_mutex_.lock();
@@ -1733,23 +1612,323 @@ void SnapcastClient::player_task_() {
 #endif  // AUDIO_TIMING_TSF_ACTIVE
 
 
-    err_accum_us += error_us;
-    err_peak_us = std::max(err_peak_us, std::abs(error_us));
+    st.err_accum_us += error_us;
+    st.err_peak_us = std::max(st.err_peak_us, std::abs(error_us));
 
-    err_window[err_window_idx] = error_us;
-    err_window_idx = (err_window_idx + 1) % MEDIAN_WINDOW;
-    if (err_window_filled < MEDIAN_WINDOW) {
-      err_window_filled++;
+    st.err_window[st.err_window_idx] = error_us;
+    st.err_window_idx = (st.err_window_idx + 1) % MEDIAN_WINDOW;
+    if (st.err_window_filled < MEDIAN_WINDOW) {
+      st.err_window_filled++;
     }
     int64_t median_err_us = error_us;
-    if (err_window_filled == MEDIAN_WINDOW) {
+    if (st.err_window_filled == MEDIAN_WINDOW) {
       int64_t sorted[MEDIAN_WINDOW];
-      memcpy(sorted, err_window, sizeof(sorted));
+      memcpy(sorted, st.err_window, sizeof(sorted));
       std::nth_element(sorted, sorted + MEDIAN_WINDOW / 2, sorted + MEDIAN_WINDOW);
       median_err_us = sorted[MEDIAN_WINDOW / 2];
     }
 
-    if (++err_count >= 128) {
+    this->log_sync_report_(st, rec, frame_bytes, median_err_us);
+
+    // Past the server's own bufferMs every chunk in flight is stale by definition.
+    const int64_t stale_us =
+        std::max<int64_t>(static_cast<int64_t>(this->buffer_ms_.load(std::memory_order_relaxed)),
+                          static_cast<int64_t>(this->config_.hard_resync_threshold_ms)) *
+        1000;
+    this->check_stale_bailout_(st, error_us, stale_us);
+
+    // Decide ONCE, for both directions, whether this excursion should mute. Muting is
+    // for storms; a lone splice is cheaper than a re-lock. Magnitude still overrides
+    // the count: both devices once logged a simultaneous 24888016 ms error (a ~6.9 h
+    // timebase step) with only 5 resyncs, and playing audibly toward something that
+    // far outside the server's buffer is meaningless -- so anything past bufferMs
+    // mutes on the spot, and the bailout above reconnects if it persists.
+    bool mute_now = false;
+    if (std::abs(error_us) > hard_us) {
+      if (now_us() - st.storm_window_us > RESYNC_STORM_WINDOW_US) {
+        st.storm_window_us = now_us();
+        st.storm_resyncs = 0;
+      }
+      st.storm_resyncs++;
+      mute_now = st.storm_resyncs >= RESYNC_STORM_COUNT || std::abs(error_us) > stale_us;
+      if (st.converged && !mute_now && st.storm_resyncs == 1) {
+        // INFO because it IS audible -- a skip of roughly this length. Logged only for
+        // the first of a window so a storm cannot flood the link on its way to muting.
+        ESP_LOGI(TAG, "Hard resync %" PRId64 " ms: correcting audibly, staying unmuted", error_us / 1000);
+      }
+    }
+
+    // Hard-resync logging is throttled to one line per RESYNC_LOG_INTERVAL_US: during
+    // a recovery storm this fires per chunk, and when logs stream over the api the
+    // log traffic competes with the audio stream on the already-congested link — a
+    // feedback loop that prolongs the outage. The periodic sync report carries the
+    // full per-window count either way.
+    if (error_us > hard_us) {
+      // Hard resync, late: drop whole chunks until we catch back up
+      if (now_us() - st.last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
+        st.last_resync_log_us = now_us();
+        ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunks (throttled log)", error_us / 1000);
+      }
+      st.hard_resyncs++;
+      st.err_window_filled = 0;
+      st.steer_dir = 0;
+      // INFO on the true->false edge: this is the moment audio goes silent, and it
+      // is the only user-audible event in the loop. Logging only the re-lock (which
+      // is INFO) made a dropout look like a spontaneous "Sync locked" with no cause,
+      // since the resync line above is DEBUG and throttled. One line per gap.
+      if (st.converged && mute_now) {
+        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms late (%" PRIu32
+                      " in %" PRId64 " s) -- audible gap until re-lock",
+                 error_us / 1000, st.storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
+      }
+      st.converged = st.converged && !mute_now;
+      this->discard_ring_bytes_(rec.bytes);
+      continue;
+    }
+
+    uint32_t drop_frames = 0;
+    if (error_us < -hard_us) {
+      // Hard resync, early: fill the gap with silence (bounded per chunk so the
+      // loop stays responsive), keeping the DAC fed and continuous
+      const int64_t gap_frames = (-error_us) * rec.params.sample_rate / 1000000;
+      const uint32_t fill = std::min<int64_t>(gap_frames, rec.params.sample_rate / 2);
+      if (now_us() - st.last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
+        st.last_resync_log_us = now_us();
+        ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms early, inserting silence (throttled log)", -error_us / 1000);
+      }
+      st.hard_resyncs++;
+      st.err_window_filled = 0;
+      st.steer_dir = 0;
+      if (st.converged && mute_now) {
+        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms early (%" PRIu32
+                      " in %" PRId64 " s) -- audible gap until re-lock",
+                 -error_us / 1000, st.storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
+      }
+      st.converged = st.converged && !mute_now;
+      this->push_silence_(fill, rec.params);
+    } else if (std::abs(median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US) {
+      // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
+      // doesn't leave playback audibly behind for long
+      const int32_t adjust_frames =
+          static_cast<int32_t>(median_err_us * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
+      const int32_t max_adjust = std::max<int32_t>(1, frames / (SOFT_CORRECTION_DIVISOR / 4));
+      const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
+      if (adjust > 0) {
+        drop_frames = adjust;
+        st.soft_dropped_frames += adjust;
+      } else if (adjust < 0) {
+        st.soft_inserted_frames += -adjust;
+        this->push_silence_(-adjust, rec.params);
+      }
+      st.steer_dir = 0;
+    } else if (st.err_window_filled == MEDIAN_WINDOW) {
+      // Steering servo (reference design): engage when the median error exceeds
+      // sync_deadband, then trim exactly one frame (~23 us splice, inaudible) per
+      // chunk until it crosses back inside half the threshold. Continuous hold near
+      // zero is what keeps a stereo pair's image pinned.
+      const int64_t engage_us = this->config_.sync_deadband_us;
+      if (st.steer_dir == 0) {
+        if (median_err_us > engage_us) {
+          st.steer_dir = 1;
+        } else if (median_err_us < -engage_us) {
+          st.steer_dir = -1;
+        }
+      } else if ((st.steer_dir > 0 && median_err_us < engage_us / 2) ||
+                 (st.steer_dir < 0 && median_err_us > -engage_us / 2)) {
+        st.steer_dir = 0;
+      }
+      bool trim_holds = false;
+#ifdef USE_AUDIO_TIMING_RATE_LOCK
+      // Steady-state rate lock: steer the I2S clock instead of splicing frames.
+      // Continuous PI on the median error, no deadband -- trims are inaudible, and
+      // gating them through the hysteresis band re-creates the limit cycle. The
+      // hysteresis/st.steer_dir path above still drives the splice fallback. Muted
+      // convergence uses hard splices while far out (much faster than the trim
+      // slew), handing off to the PI for the end-game so the error actually
+      // settles inside the band instead of splice-limit-cycling around it.
+      if (st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
+        const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
+        const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
+        const float p_term = TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us);
+        // Conditional integration (anti-windup): winding the integral while the
+        // output rails just schedules a rail-to-rail relaxation oscillation
+        // (observed post-boot: trim flipping +-500 ppm with +-5 ms medians for
+        // ~90 s, with audible correction bursts). Freeze the integral whenever the
+        // output is saturated in the error's own direction.
+        const float unclamped = p_term + st.trim_integral_ppm;
+        if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (median_err_us > 0)) {
+          st.trim_integral_ppm = std::clamp(
+              st.trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -clamp_ppm,
+              clamp_ppm);
+        }
+        const float trim_ppm = std::clamp(p_term + st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
+        // Report-only: span shows whether the loop tracks a slow offset or chases
+        // something it cannot, and railed counts saturation.
+        if (st.trim_samples == 0) {
+          st.trim_min_ppm = st.trim_max_ppm = trim_ppm;
+        } else {
+          st.trim_min_ppm = std::min(st.trim_min_ppm, trim_ppm);
+          st.trim_max_ppm = std::max(st.trim_max_ppm, trim_ppm);
+        }
+        st.trim_samples++;
+        if (std::abs(trim_ppm) >= clamp_ppm - 0.5f) {
+          st.trim_railed++;
+        }
+#endif
+        trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
+        if (!trim_holds) {
+          st.rate_lock_ok = false;
+          ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
+        }
+      } else if (st.rate_lock_ok) {
+        // Outside the fine band the PI does not run, which previously left the LAST
+        // trim applied to the hardware for the whole excursion. That is an
+        // uncontrolled rate offset in an arbitrary direction: measured during a
+        // delivery stall, the clock sat frozen at -258.56 ppm across four
+        // consecutive reports (~10 s) -- playing SLOW while the device was already
+        // seconds late, i.e. actively widening the error the coarse mechanism was
+        // fighting. Hold nominal rate instead: we have no valid rate estimate out
+        // here, so zero is the only defensible value, and the chunk drops/splices
+        // below do the correcting.
+        //
+        // Only reachable while muted (the condition above is
+        // `st.converged || in-band`, so this branch means !st.converged && out-of-band),
+        // so the rate change cannot be audible. trim_holds stays false on purpose,
+        // to keep the coarse splice path engaged.
+        this->rate_lock_->set_trim_ppm(0.0f);
+      }
+#endif
+      // While muted (pre-convergence) audibility doesn't constrain splice size, so
+      // steer hard to reach the band quickly, then single frames for the end-game
+      if (!trim_holds) {
+        const uint32_t steer_frames = (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)
+                                          ? 1
+                                          : startup_steer_frames(frames);
+        if (st.steer_dir > 0) {
+          drop_frames = steer_frames;
+          st.soft_dropped_frames += steer_frames;
+        } else if (st.steer_dir < 0) {
+          st.soft_inserted_frames += steer_frames;
+          if (st.converged) {
+            this->push_repeat_frame_(rec.params);
+          } else {
+            this->push_silence_(steer_frames, rec.params);
+          }
+        }
+      }
+    }
+
+#ifdef AUDIO_TIMING_TSF_ACTIVE
+    // Report our own tracking quality to the TSF layer: a leader publishes the
+    // timebase the whole group follows, so it must hand off while its own playout
+    // is diverged (observed: a device stuck in a degraded buffer state kept
+    // leading, with every peer following its mapping)
+    if (this->tsf_sync_ != nullptr) {
+      this->tsf_sync_->set_playout_healthy(
+          st.converged && st.err_window_filled == MEDIAN_WINDOW && std::abs(median_err_us) < PLAYOUT_HEALTHY_US,
+          std::abs(median_err_us) > stale_us);
+    }
+#endif
+
+    // Mute-until-synced (reference behavior): convergence corrections are chunky and
+    // audible (drops of 14 frames/chunk in the proportional band), so the audio is
+    // replaced with silence until the median error holds inside the servo band for a
+    // full median window -- a single in-band median mid-convergence is a transient
+    // (observed: unmuting on one produced ~90 s of audible post-unmute corrections).
+    // Hard resyncs re-mute, turning recovery storms into silent gaps.
+    // Unmute needs "no audible corrections pending", not servo-engagement
+    // precision: fine-stage medians routinely wobble past the deadband while the
+    // PI settles, and requiring consecutive sub-deadband medians stretched
+    // post-boot mutes to ~20 s of counter resets. Corrections inside 2x deadband
+    // are trim-only and inaudible.
+    if (std::abs(median_err_us) <= 2 * this->config_.sync_deadband_us) {
+#ifdef AUDIO_TIMING_TSF_ACTIVE
+      // Don't unmute onto a provisional timebase: a follower still on its Kalman
+      // fallback (leader's mapping rejected while our own estimate is raw) will
+      // step by up to the plausibility bound when it finally adopts the shared
+      // mapping -- audible corrections right after unmute on every speaker join.
+      const bool timebase_settled = this->tsf_sync_ == nullptr ||
+                                    this->tsf_sync_->role() != TsfSync::Role::FOLLOWER ||
+                                    this->deadline_on_shared_tsf_;
+#else
+      const bool timebase_settled = true;
+#endif
+      if (!st.converged && st.err_window_filled == MEDIAN_WINDOW && timebase_settled && ++st.in_band_chunks >= MEDIAN_WINDOW) {
+        st.converged = true;
+        ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us), unmuting", median_err_us);
+      }
+    } else {
+      st.in_band_chunks = 0;
+    }
+
+    this->push_chunk_(rec, drop_frames, !st.converged);
+  }
+  vTaskDelete(nullptr);
+}
+
+// THREAD CONTEXT: player task. Consumes the pipeline_starved_ latch.
+void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRecord &rec, uint32_t frame_bytes) {
+    if (this->pipeline_starved_.exchange(false, std::memory_order_relaxed)) {
+      // The pipeline fully drained (source starvation). Re-baseline the playout
+      // accounting -- but anchor it to the fill the pipeline REPORTS, not to an
+      // assumption that it is empty.
+      //
+      // Assuming empty was the long-standing behaviour and the cause of the
+      // silent-offset bug: whatever audio was still in flight went uncounted, so the
+      // prediction was wrong by that much and the servo dutifully steered the real
+      // audio to the wrong time while its own error read ~0 (it is measured against
+      // that same prediction). Measured offsets of 100-250 ms, audible against the
+      // other clients, invisible to every metric on the device.
+      //
+      // on_query_buffered() reports bytes still held downstream, so seed pushed as
+      // played + that, making the accounted queue equal the measured one. Falls back
+      // to the old assume-empty behaviour when the sink cannot report, which is why
+      // the query distinguishes "unknown" from "zero".
+      //
+      // Scope: the sink reports its own queue, not the mixer's output ring or the I2S
+      // DMA below it. Those are bounded by buffer_duration and identical across
+      // devices running one config, so what remains is common-mode -- and it is
+      // relative offset between devices that moves a stereo image, not a shared
+      // constant.
+      size_t buffered_bytes = 0;
+      const bool have_fill = this->audio_listener_ != nullptr && frame_bytes > 0 &&
+                             this->audio_listener_->on_query_buffered(buffered_bytes);
+      const int64_t in_flight_frames = have_fill ? static_cast<int64_t>(buffered_bytes / frame_bytes) : 0;
+      this->playout_mutex_.lock();
+      this->playout_valid_ = false;
+      this->played_frames_total_ = 0;
+      this->pushed_frames_total_ = in_flight_frames;
+      this->fb_samples_ = 0;
+      this->playout_mutex_.unlock();
+      if (have_fill) {
+        ESP_LOGD(TAG, "Re-baseline anchored to measured fill: %" PRId64 " frames (%" PRId64 " ms)", in_flight_frames,
+                 in_flight_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
+      } else {
+        // Log the FALLBACK too. Without this the two cases are indistinguishable in a
+        // log -- a silent fallback looks exactly like the feature working, which is
+        // how the first flash of this code read as "no starvations to anchor" when in
+        // fact every one of ~120 starvations had taken this branch.
+        ESP_LOGW(TAG, "Re-baseline could not read the pipeline fill; assuming empty (listener=%d)",
+                 this->audio_listener_ != nullptr ? 1 : 0);
+      }
+      st.err_window_filled = 0;
+      st.steer_dir = 0;
+      st.converged = false;
+  #ifdef USE_AUDIO_TIMING_RATE_LOCK
+      if (this->rate_lock_ != nullptr) {
+        this->rate_lock_->invalidate_baseline();
+      }
+  #endif
+      ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
+    }
+}
+
+// THREAD CONTEXT: player task. Emits the periodic report and, on the same cadence,
+// repairs a sustained accounted-vs-measured split. Resets the window counters.
+void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, uint32_t frame_bytes,
+                                      int64_t median_err_us) {
+    if (++st.err_count >= 128) {
       int64_t max_gap_us;
       int64_t pipeline_frames;
       int64_t fb_mean_gap_us;
@@ -1793,16 +1972,16 @@ void SnapcastClient::player_task_() {
       // Repair a sustained split. Acts only on evidence: the measured fill is an
       // independent witness to the accounted queue, so a gap that holds for
       // DRIFT_REPAIR_HOLD_US is the accounting being wrong, not the pipeline moving.
-      if (fill_ms >= 0 && converged) {
-        if (!drift_baseline_valid) {
-          drift_baseline_ms = static_cast<float>(fill_drift_ms);
-          drift_baseline_valid = true;
+      if (fill_ms >= 0 && st.converged) {
+        if (!st.drift_baseline_valid) {
+          st.drift_baseline_ms = static_cast<float>(fill_drift_ms);
+          st.drift_baseline_valid = true;
         }
-        const int32_t excess_ms = fill_drift_ms - static_cast<int32_t>(drift_baseline_ms);
+        const int32_t excess_ms = fill_drift_ms - static_cast<int32_t>(st.drift_baseline_ms);
         if (excess_ms >= DRIFT_REPAIR_MS) {
-          if (drift_excess_since_us == 0) {
-            drift_excess_since_us = now_us();
-          } else if (now_us() - drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
+          if (st.drift_excess_since_us == 0) {
+            st.drift_excess_since_us = now_us();
+          } else if (now_us() - st.drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
             // Trust the measurement: drop the accounted queue by the excess. Playback
             // was running that far early, so the prediction moves later and the servo
             // walks the phase back through the proportional band.
@@ -1814,43 +1993,43 @@ void SnapcastClient::player_task_() {
             ESP_LOGW(TAG,
                      "Accounting split repaired: accounted queue ran %" PRId32 " ms over measured fill "
                      "(baseline %+.1f) for %" PRId64 " s; playback was that far early",
-                     excess_ms, drift_baseline_ms, DRIFT_REPAIR_HOLD_US / 1000000);
-            drift_excess_since_us = 0;
+                     excess_ms, st.drift_baseline_ms, DRIFT_REPAIR_HOLD_US / 1000000);
+            st.drift_excess_since_us = 0;
           }
         } else {
-          drift_excess_since_us = 0;
+          st.drift_excess_since_us = 0;
         }
         // Learn only from values near the baseline, so a split can never be absorbed
         // into it -- see DRIFT_LEARN_BAND_MS
-        if (std::abs(static_cast<float>(fill_drift_ms) - drift_baseline_ms) < DRIFT_LEARN_BAND_MS) {
-          drift_baseline_ms += DRIFT_LEARN_ALPHA * (static_cast<float>(fill_drift_ms) - drift_baseline_ms);
+        if (std::abs(static_cast<float>(fill_drift_ms) - st.drift_baseline_ms) < DRIFT_LEARN_BAND_MS) {
+          st.drift_baseline_ms += DRIFT_LEARN_ALPHA * (static_cast<float>(fill_drift_ms) - st.drift_baseline_ms);
         }
       } else {
-        drift_excess_since_us = 0;
+        st.drift_excess_since_us = 0;
       }
 
       char fill_str[80] = "";
       if (fill_ms >= 0) {
         snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 ", corr %+d ms)", fill_ms,
-                 fill_drift_ms, static_cast<int>(fill_corr_us / 1000.0f));
+                 fill_drift_ms, static_cast<int>(st.fill_corr_us / 1000.0f));
       }
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
       char trim_str[112] = "";
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
-      if (rate_lock_ok) {
-        if (trim_samples > 0) {
+  #ifdef USE_AUDIO_TIMING_RATE_LOCK
+      if (st.rate_lock_ok) {
+        if (st.trim_samples > 0) {
           snprintf(trim_str, sizeof(trim_str),
                    ", trim %+.2f ppm (span %+.0f..%+.0f, railed %" PRIu32 "/%" PRIu32 ")",
-                   this->rate_lock_->applied_ppm(), trim_min_ppm, trim_max_ppm, trim_railed, trim_samples);
+                   this->rate_lock_->applied_ppm(), st.trim_min_ppm, st.trim_max_ppm, st.trim_railed, st.trim_samples);
         } else {
           snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (idle)", this->rate_lock_->applied_ppm());
         }
       }
-#endif
+  #endif
       char tsf_str[64] = "";
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+  #ifdef AUDIO_TIMING_TSF_ACTIVE
       if (this->tsf_sync_ != nullptr) {
         // Publish our depth so the group can cross-check it (see TsfSync)
         this->tsf_sync_->set_pipeline_ms(pipeline_ms);
@@ -1880,27 +2059,30 @@ void SnapcastClient::player_task_() {
           }
         }
       }
-#endif
+  #endif
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, feedback %" PRId64
                " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s%s over %" PRIu32
                " chunks",
-               err_accum_us / err_count, err_peak_us, median_err_us, soft_dropped_frames, soft_inserted_frames,
-               hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, trim_str,
-               tsf_str, err_count);
-      err_accum_us = 0;
-      err_peak_us = 0;
-      err_count = 0;
-      soft_dropped_frames = 0;
-      soft_inserted_frames = 0;
-      hard_resyncs = 0;
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
-      trim_samples = 0;
-      trim_railed = 0;
-#endif
+               st.err_accum_us / st.err_count, st.err_peak_us, median_err_us, st.soft_dropped_frames, st.soft_inserted_frames,
+               st.hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, trim_str,
+               tsf_str, st.err_count);
+      st.err_accum_us = 0;
+      st.err_peak_us = 0;
+      st.err_count = 0;
+      st.soft_dropped_frames = 0;
+      st.soft_inserted_frames = 0;
+      st.hard_resyncs = 0;
+  #ifdef USE_AUDIO_TIMING_RATE_LOCK
+      st.trim_samples = 0;
+      st.trim_railed = 0;
+  #endif
     }
+}
 
+// THREAD CONTEXT: player task.
+void SnapcastClient::check_stale_bailout_(ServoState &st, int64_t error_us, int64_t stale_us) {
     // Bail out of a backlog that cannot be caught up. Dropping chunks only closes a
     // gap when chunks arrive FASTER than real time; when the radio is the bottleneck
     // the client receives a trickle, discards all of it, and stays exactly as far
@@ -1913,253 +2095,20 @@ void SnapcastClient::player_task_() {
     // the stream to now: ~1-2 s of silence against an unbounded silent spiral. The
     // ring's remaining stale chunks are not purged -- the player discards them on the
     // next passes, which costs no pushes and drains in well under the reconnect.
-    const int64_t stale_us =
-        std::max<int64_t>(static_cast<int64_t>(this->buffer_ms_.load(std::memory_order_relaxed)),
-                          static_cast<int64_t>(this->config_.hard_resync_threshold_ms)) *
-        1000;
     if (error_us > stale_us) {
-      if (stale_since_us == 0) {
-        stale_since_us = now_us();
-      } else if (now_us() - stale_since_us >= STALE_BAILOUT_US) {
+      if (st.stale_since_us == 0) {
+        st.stale_since_us = now_us();
+      } else if (now_us() - st.stale_since_us >= STALE_BAILOUT_US) {
         ESP_LOGW(TAG, "Stream %" PRId64 " ms late for %" PRId64 " s and not catching up: reconnecting",
                  error_us / 1000, STALE_BAILOUT_US / 1000000);
-        stale_since_us = 0;
+        st.stale_since_us = 0;
         // Breaks recv_exact_ out of the session; the network task reconnects with no
         // backoff, and connection_session_() clears the flag and resets the time filter
         this->reconnect_requested_.store(true, std::memory_order_relaxed);
       }
     } else {
-      stale_since_us = 0;
+      st.stale_since_us = 0;
     }
-
-    // Decide ONCE, for both directions, whether this excursion should mute. Muting is
-    // for storms; a lone splice is cheaper than a re-lock. Magnitude still overrides
-    // the count: both devices once logged a simultaneous 24888016 ms error (a ~6.9 h
-    // timebase step) with only 5 resyncs, and playing audibly toward something that
-    // far outside the server's buffer is meaningless -- so anything past bufferMs
-    // mutes on the spot, and the bailout above reconnects if it persists.
-    bool mute_now = false;
-    if (std::abs(error_us) > hard_us) {
-      if (now_us() - storm_window_us > RESYNC_STORM_WINDOW_US) {
-        storm_window_us = now_us();
-        storm_resyncs = 0;
-      }
-      storm_resyncs++;
-      mute_now = storm_resyncs >= RESYNC_STORM_COUNT || std::abs(error_us) > stale_us;
-      if (converged && !mute_now && storm_resyncs == 1) {
-        // INFO because it IS audible -- a skip of roughly this length. Logged only for
-        // the first of a window so a storm cannot flood the link on its way to muting.
-        ESP_LOGI(TAG, "Hard resync %" PRId64 " ms: correcting audibly, staying unmuted", error_us / 1000);
-      }
-    }
-
-    // Hard-resync logging is throttled to one line per RESYNC_LOG_INTERVAL_US: during
-    // a recovery storm this fires per chunk, and when logs stream over the api the
-    // log traffic competes with the audio stream on the already-congested link — a
-    // feedback loop that prolongs the outage. The periodic sync report carries the
-    // full per-window count either way.
-    if (error_us > hard_us) {
-      // Hard resync, late: drop whole chunks until we catch back up
-      if (now_us() - last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
-        last_resync_log_us = now_us();
-        ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunks (throttled log)", error_us / 1000);
-      }
-      hard_resyncs++;
-      err_window_filled = 0;
-      steer_dir = 0;
-      // INFO on the true->false edge: this is the moment audio goes silent, and it
-      // is the only user-audible event in the loop. Logging only the re-lock (which
-      // is INFO) made a dropout look like a spontaneous "Sync locked" with no cause,
-      // since the resync line above is DEBUG and throttled. One line per gap.
-      if (converged && mute_now) {
-        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms late (%" PRIu32
-                      " in %" PRId64 " s) -- audible gap until re-lock",
-                 error_us / 1000, storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
-      }
-      converged = converged && !mute_now;
-      this->discard_ring_bytes_(rec.bytes);
-      continue;
-    }
-
-    uint32_t drop_frames = 0;
-    if (error_us < -hard_us) {
-      // Hard resync, early: fill the gap with silence (bounded per chunk so the
-      // loop stays responsive), keeping the DAC fed and continuous
-      const int64_t gap_frames = (-error_us) * rec.params.sample_rate / 1000000;
-      const uint32_t fill = std::min<int64_t>(gap_frames, rec.params.sample_rate / 2);
-      if (now_us() - last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
-        last_resync_log_us = now_us();
-        ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms early, inserting silence (throttled log)", -error_us / 1000);
-      }
-      hard_resyncs++;
-      err_window_filled = 0;
-      steer_dir = 0;
-      if (converged && mute_now) {
-        ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms early (%" PRIu32
-                      " in %" PRId64 " s) -- audible gap until re-lock",
-                 -error_us / 1000, storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
-      }
-      converged = converged && !mute_now;
-      this->push_silence_(fill, rec.params);
-    } else if (std::abs(median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US) {
-      // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
-      // doesn't leave playback audibly behind for long
-      const int32_t adjust_frames =
-          static_cast<int32_t>(median_err_us * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
-      const int32_t max_adjust = std::max<int32_t>(1, frames / (SOFT_CORRECTION_DIVISOR / 4));
-      const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
-      if (adjust > 0) {
-        drop_frames = adjust;
-        soft_dropped_frames += adjust;
-      } else if (adjust < 0) {
-        soft_inserted_frames += -adjust;
-        this->push_silence_(-adjust, rec.params);
-      }
-      steer_dir = 0;
-    } else if (err_window_filled == MEDIAN_WINDOW) {
-      // Steering servo (reference design): engage when the median error exceeds
-      // sync_deadband, then trim exactly one frame (~23 us splice, inaudible) per
-      // chunk until it crosses back inside half the threshold. Continuous hold near
-      // zero is what keeps a stereo pair's image pinned.
-      const int64_t engage_us = this->config_.sync_deadband_us;
-      if (steer_dir == 0) {
-        if (median_err_us > engage_us) {
-          steer_dir = 1;
-        } else if (median_err_us < -engage_us) {
-          steer_dir = -1;
-        }
-      } else if ((steer_dir > 0 && median_err_us < engage_us / 2) ||
-                 (steer_dir < 0 && median_err_us > -engage_us / 2)) {
-        steer_dir = 0;
-      }
-      bool trim_holds = false;
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
-      // Steady-state rate lock: steer the I2S clock instead of splicing frames.
-      // Continuous PI on the median error, no deadband -- trims are inaudible, and
-      // gating them through the hysteresis band re-creates the limit cycle. The
-      // hysteresis/steer_dir path above still drives the splice fallback. Muted
-      // convergence uses hard splices while far out (much faster than the trim
-      // slew), handing off to the PI for the end-game so the error actually
-      // settles inside the band instead of splice-limit-cycling around it.
-      if (rate_lock_ok && (converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
-        const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
-        const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
-        const float p_term = TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us);
-        // Conditional integration (anti-windup): winding the integral while the
-        // output rails just schedules a rail-to-rail relaxation oscillation
-        // (observed post-boot: trim flipping +-500 ppm with +-5 ms medians for
-        // ~90 s, with audible correction bursts). Freeze the integral whenever the
-        // output is saturated in the error's own direction.
-        const float unclamped = p_term + trim_integral_ppm;
-        if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (median_err_us > 0)) {
-          trim_integral_ppm = std::clamp(
-              trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -clamp_ppm,
-              clamp_ppm);
-        }
-        const float trim_ppm = std::clamp(p_term + trim_integral_ppm, -clamp_ppm, clamp_ppm);
-#ifdef USE_SNAPCLIENT_TIMING_DIAG
-        // Report-only: span shows whether the loop tracks a slow offset or chases
-        // something it cannot, and railed counts saturation.
-        if (trim_samples == 0) {
-          trim_min_ppm = trim_max_ppm = trim_ppm;
-        } else {
-          trim_min_ppm = std::min(trim_min_ppm, trim_ppm);
-          trim_max_ppm = std::max(trim_max_ppm, trim_ppm);
-        }
-        trim_samples++;
-        if (std::abs(trim_ppm) >= clamp_ppm - 0.5f) {
-          trim_railed++;
-        }
-#endif
-        trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
-        if (!trim_holds) {
-          rate_lock_ok = false;
-          ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
-        }
-      } else if (rate_lock_ok) {
-        // Outside the fine band the PI does not run, which previously left the LAST
-        // trim applied to the hardware for the whole excursion. That is an
-        // uncontrolled rate offset in an arbitrary direction: measured during a
-        // delivery stall, the clock sat frozen at -258.56 ppm across four
-        // consecutive reports (~10 s) -- playing SLOW while the device was already
-        // seconds late, i.e. actively widening the error the coarse mechanism was
-        // fighting. Hold nominal rate instead: we have no valid rate estimate out
-        // here, so zero is the only defensible value, and the chunk drops/splices
-        // below do the correcting.
-        //
-        // Only reachable while muted (the condition above is
-        // `converged || in-band`, so this branch means !converged && out-of-band),
-        // so the rate change cannot be audible. trim_holds stays false on purpose,
-        // to keep the coarse splice path engaged.
-        this->rate_lock_->set_trim_ppm(0.0f);
-      }
-#endif
-      // While muted (pre-convergence) audibility doesn't constrain splice size, so
-      // steer hard to reach the band quickly, then single frames for the end-game
-      if (!trim_holds) {
-        const uint32_t steer_frames = (converged || std::abs(median_err_us) <= this->config_.converge_fine_us)
-                                          ? 1
-                                          : startup_steer_frames(frames);
-        if (steer_dir > 0) {
-          drop_frames = steer_frames;
-          soft_dropped_frames += steer_frames;
-        } else if (steer_dir < 0) {
-          soft_inserted_frames += steer_frames;
-          if (converged) {
-            this->push_repeat_frame_(rec.params);
-          } else {
-            this->push_silence_(steer_frames, rec.params);
-          }
-        }
-      }
-    }
-
-#ifdef AUDIO_TIMING_TSF_ACTIVE
-    // Report our own tracking quality to the TSF layer: a leader publishes the
-    // timebase the whole group follows, so it must hand off while its own playout
-    // is diverged (observed: a device stuck in a degraded buffer state kept
-    // leading, with every peer following its mapping)
-    if (this->tsf_sync_ != nullptr) {
-      this->tsf_sync_->set_playout_healthy(
-          converged && err_window_filled == MEDIAN_WINDOW && std::abs(median_err_us) < PLAYOUT_HEALTHY_US,
-          std::abs(median_err_us) > stale_us);
-    }
-#endif
-
-    // Mute-until-synced (reference behavior): convergence corrections are chunky and
-    // audible (drops of 14 frames/chunk in the proportional band), so the audio is
-    // replaced with silence until the median error holds inside the servo band for a
-    // full median window -- a single in-band median mid-convergence is a transient
-    // (observed: unmuting on one produced ~90 s of audible post-unmute corrections).
-    // Hard resyncs re-mute, turning recovery storms into silent gaps.
-    // Unmute needs "no audible corrections pending", not servo-engagement
-    // precision: fine-stage medians routinely wobble past the deadband while the
-    // PI settles, and requiring consecutive sub-deadband medians stretched
-    // post-boot mutes to ~20 s of counter resets. Corrections inside 2x deadband
-    // are trim-only and inaudible.
-    if (std::abs(median_err_us) <= 2 * this->config_.sync_deadband_us) {
-#ifdef AUDIO_TIMING_TSF_ACTIVE
-      // Don't unmute onto a provisional timebase: a follower still on its Kalman
-      // fallback (leader's mapping rejected while our own estimate is raw) will
-      // step by up to the plausibility bound when it finally adopts the shared
-      // mapping -- audible corrections right after unmute on every speaker join.
-      const bool timebase_settled = this->tsf_sync_ == nullptr ||
-                                    this->tsf_sync_->role() != TsfSync::Role::FOLLOWER ||
-                                    this->deadline_on_shared_tsf_;
-#else
-      const bool timebase_settled = true;
-#endif
-      if (!converged && err_window_filled == MEDIAN_WINDOW && timebase_settled && ++in_band_chunks >= MEDIAN_WINDOW) {
-        converged = true;
-        ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us), unmuting", median_err_us);
-      }
-    } else {
-      in_band_chunks = 0;
-    }
-
-    this->push_chunk_(rec, drop_frames, !converged);
-  }
-  vTaskDelete(nullptr);
 }
 
 int64_t SnapcastClient::predict_next_play_us_(uint32_t sample_rate) {

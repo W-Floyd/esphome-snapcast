@@ -280,6 +280,92 @@ class SnapcastClient {
   bool audio_flowing() const;
 
  protected:
+  // Median window for the steering servo's error signal. One sample per chunk, so its
+  // duration follows the codec block size -- measured 26.2 ms/chunk (FLAC's 1152-frame
+  // default at 44.1 kHz), giving ~0.39 s here. That duration is a term in the loop lag
+  // that bounds the trim gain, so it is not a free parameter: a codec or rate with a
+  // different block size changes it.
+  //
+  // Lengthened from 15 for stereo-image stability. The per-chunk error is WHITE NOISE
+  // (measured: consecutive-difference sigma / sigma = 1.32-1.43 against sqrt(2) = 1.41),
+  // so averaging more of it reduces the residual as ~sqrt(n) and costs nothing in
+  // tracking -- there is no ramp being trailed. Note this is the opposite of the earlier
+  // attempt to SHORTEN the window to buy loop bandwidth: with a noise-dominated error,
+  // bandwidth pumps noise into the output and length removes it. Added lag is ~0.2 s
+  // (half-window), keeping phase margin comfortable at KP = 0.5.
+  static constexpr size_t MEDIAN_WINDOW = 31;
+
+  /// @brief Everything the playout servo carries between chunks.
+  ///
+  /// These were locals of player_task_(), which is why the loop was ~700 lines: the
+  /// declarations and their rationale sat 600 lines from the code that used them.
+  /// Grouping them changes nothing at runtime -- the servo is still single-threaded in
+  /// the player task, and this is still its stack -- but it lets the loop body be split
+  /// into named steps that take the state explicitly.
+  struct ServoState {
+    bool warned_no_sync{false};
+    // Rolling sync-error diagnostics, logged once per ~128 chunks (~3 s)
+    int64_t err_accum_us{0};
+    int64_t err_peak_us{0};
+    uint32_t err_count{0};
+    // Per-window stutter forensics: how often each correction mechanism fired
+    uint32_t soft_dropped_frames{0};
+    uint32_t soft_inserted_frames{0};
+    uint32_t hard_resyncs{0};
+    // Median of recent sync errors (rejects residual feedback spikes better than a
+    // mean); the steering servo acts on this, not the raw per-chunk error. Same design
+    // as the esp32 snapclient reference (99/19-sample medians on a sample-accurate age).
+    int64_t err_window[MEDIAN_WINDOW]{};
+    size_t err_window_idx{0};
+    size_t err_window_filled{0};
+    // Bang-bang steering with hysteresis, ported from the reference: while engaged,
+    // trim exactly one frame per chunk (~950 ppm) until the median crosses back inside
+    // the disengage threshold. Holds the error near zero continuously instead of
+    // letting it random-walk inside a deadband -- a free-walking deadband is exactly
+    // what wanders the stereo image between two paired devices.
+    int8_t steer_dir{0};
+#ifdef USE_AUDIO_TIMING_RATE_LOCK
+    // Rate lock: once converged, steady-state corrections become hardware clock trims
+    // instead of frame splices. The PI integrator (positive = play faster) persists
+    // across resyncs, flushes, and rate changes because it converges to the crystal
+    // offset, a property of the hardware, not the stream.
+    float trim_integral_ppm{0.0f};
+    bool rate_lock_ok{false};
+    uint32_t rate_lock_rate{0};
+    // Trim wander over the report window. The trim IS the loop's estimate of the
+    // disturbance it is cancelling, so its spread says whether the loop is tracking a
+    // slow crystal offset (narrow, as designed) or chasing something it cannot (wide,
+    // or pinned at the rail). Observed on all four devices: swings of hundreds of ppm
+    // and repeated +-500 ppm saturation while medians stayed inside a few hundred us
+    // -- i.e. running at its authority limit in normal operation. Quantify it before
+    // any further gain change.
+    float trim_min_ppm{0.0f};
+    float trim_max_ppm{0.0f};
+    uint32_t trim_samples{0};
+    uint32_t trim_railed{0};
+#endif
+    uint32_t raw_sample_countdown{1};
+    // Smoothed accounted-vs-observed disagreement (us); 0 when the accounting is honest
+    float fill_corr_us{0.0f};
+    bool fill_corr_valid{false};
+    uint32_t fill_sample_countdown{0};
+    // Mute-until-synced: real audio flows only after a full window of in-band medians
+    bool converged{false};
+    uint32_t in_band_chunks{0};
+    int64_t last_resync_log_us{0};
+    // When the stream first went staler than the server's buffer, 0 while it is not
+    int64_t stale_since_us{0};
+    // Rolling hard-resync count, for telling a one-shot catch-up from a storm
+    int64_t storm_window_us{0};
+    uint32_t storm_resyncs{0};
+    // Learned accounted-vs-measured baseline, and when the excess over it began
+    float drift_baseline_ms{0.0f};
+    bool drift_baseline_valid{false};
+    int64_t drift_excess_since_us{0};
+    // Format of the last chunk played, for keepalive silence during a delivery gap
+    StreamParams keepalive_params{};
+  };
+
   // Fixed-size record describing one decoded chunk resident in the PCM ring buffer.
   // Records are posted to the player task strictly after their PCM bytes are written,
   // so a popped record's bytes are always fully readable.
@@ -344,6 +430,17 @@ class SnapcastClient {
 
   // --- Player task ---
   void player_task_();
+  /// Re-anchors the playout accounting after the pipeline fully drained, to the fill
+  /// the sink REPORTS rather than an assumption that it is empty. Consumes the
+  /// pipeline_starved_ latch, so it is called unconditionally once per chunk.
+  void rebaseline_after_starvation_(ServoState &st, const ChunkRecord &rec, uint32_t frame_bytes);
+  /// Emits the periodic sync report every 128 chunks and, on that same cadence,
+  /// repairs a sustained split between the accounted queue and the measured fill.
+  /// Resets the per-window counters.
+  void log_sync_report_(ServoState &st, const ChunkRecord &rec, uint32_t frame_bytes, int64_t median_err_us);
+  /// Requests a reconnect once the stream has been unrecoverably late for
+  /// STALE_BAILOUT_US -- dropping chunks cannot close a gap the radio is causing.
+  void check_stale_bailout_(ServoState &st, int64_t error_us, int64_t stale_us);
   /// @return the predicted DAC time (µs) of the next frame pushed downstream, or -1 if
   /// no playback feedback has arrived yet.
   int64_t predict_next_play_us_(uint32_t sample_rate);
