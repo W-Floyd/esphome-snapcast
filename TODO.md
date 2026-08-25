@@ -11,7 +11,7 @@
   ground truth, and would retire the six-component fork this repo carries.
 - **`speaker::set_rate_adjustment(float ppm)`**, default no-op, implemented in the i2s
   speaker per-SoC. `rate_lock` pokes the S3's MCLK divider directly and would prefer a
-  speaker API, keeping the register-poking helper as the fallback for older ESPHome.
+  speaker API, keeping `i2s_rate_lock` as the fallback for older ESPHome.
   Satellite1's forked `I2SAudioSpeaker::sync_play()` is independent evidence of demand.
 - **`speaker_source` spins forever on an unmixable announcement.** A format mismatch
   cannot be resolved by retrying, but that is what it does: with an announcement pipeline
@@ -51,7 +51,7 @@
   derived slightly different magnitudes from one event, which suggests each computed it
   locally against a common bad input rather than being handed the same number.
 
-- **Extract the servo into `clock_sync` — waiting on a consumer, not on tidiness.** The
+- **Extract the servo — waiting on a consumer, not on tidiness.** The
   length complaint is closed: `player_task_` is 433 lines, its 31 locals are a `ServoState`
   struct, and the re-baseline, sync report and stale bailout are named methods. What is
   left is a real extraction, and two things argue against doing it speculatively.
@@ -70,7 +70,12 @@
   correction split — with no rate steering, no median filter, no PI and no shared timebase.
   The MIT relicense means it *could* now take this code, which the GPL forbade. It has its
   own working implementation, though, so the trigger is somebody asking rather than the
-  licence allowing. If it happens it belongs in `clock_sync`, not a new component.
+  licence allowing.
+
+  It would need somewhere to live. `clock_sync` is now deliberately audio-free — a clock
+  filter and TSF distribution, neither of which knows what is being played — and the
+  servo is the opposite: chunks, sample rates, frame splices, silence insertion. So it
+  would be a third component alongside `i2s_rate_lock`, not a member of either.
 
   The portable half of this is `set_rate_adjustment` above: an API, so no licence or
   extraction question, and the only way rate steering reaches a non-S3 target at all.
@@ -80,6 +85,21 @@
   large multi-line block every tick and its output has never appeared in any capture. It is
   opt-in (`wifi_tools: diagnostics: dump_statistics`, default off), so a long capture with
   it disabled is the experiment.
+
+- **Schema-to-README drift check.** The options table and the example's commented
+  defaults are both hand-maintained against `CONFIG_SCHEMA`, and both have silently
+  drifted: `opus` was missing from the table when it landed, `converge_fine` had never
+  been there at all, and three of nineteen commented "defaults" in the example were not
+  the defaults. An AST walk over every `cv.Optional` catches all of it in ~40 lines —
+  key set and default values, plus the `unset` marker for options that have none.
+  Generating the DESCRIPTIONS is not worth it: seven options carry no source comment, so
+  the README's prose is the better text.
+
+## Housekeeping
+
+- **Cut a tagged release.** The README tells people to pin `github://…@<tag>` and there
+  are no tags, so the only thing to pin is a SHA. A tag would also anchor the MIT cutover,
+  which NOTICE.md currently dates but does not tie to a release.
 
 ## Features
 
