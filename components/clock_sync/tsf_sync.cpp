@@ -504,10 +504,19 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   pkt.tsf_minus_server_us = tms_pub;
   pkt.drift_ppm = drift_ppm;
   {
+    // Only the sentinel is out of range. The bound used to be INT16's, and the cast used to be to
+    // int16_t, because v1 carried this field as int16 MILLISECONDS -- +-32 s, which no real depth
+    // reaches. v2 widened it to int32 microseconds (see the version history above) but left this
+    // publish site behind, so the same numbers now meant +-32767 MICROSECONDS: +-32 ms.
+    //
+    // Every real depth is far outside that. Measured on this fleet, they sit at 230-290 ms, so every
+    // beacon has been publishing PIPELINE_UNKNOWN and the receiver's divergence check has never once
+    // run. That check is the ONLY instrument that can see an absolute inter-device offset -- the sync
+    // median is measured against each device's own prediction, so an offset shifts prediction and
+    // audio together and reads as zero. Losing it is why a pair could sit milliseconds apart on a
+    // logic analyser with both reporting themselves perfect.
     const int32_t depth = this->pipeline_us_.load(std::memory_order_relaxed);
-    pkt.pipeline_us = (depth == INT32_MIN || depth < INT16_MIN + 1 || depth > INT16_MAX)
-                          ? PIPELINE_UNKNOWN
-                          : static_cast<int16_t>(depth);
+    pkt.pipeline_us = depth;  // PIPELINE_UNKNOWN is INT32_MIN, which passes through unchanged
   }
   struct sockaddr_in dest = {};
   dest.sin_family = AF_INET;
