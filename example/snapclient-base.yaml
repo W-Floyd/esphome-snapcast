@@ -45,16 +45,16 @@ wifi:
 external_components:
   # A `components:` filter hides anything it does not name, including the AUTO_LOADed
   # clock_sync.
-  - source: github://W-Floyd/esphome-snapcast
-    components: [snapclient, clock_sync, wifi_tools, wifi_bssid_select]
-  # - source: {type: local, path: ../components}   # working tree instead
+  # - source: github://W-Floyd/esphome-snapcast
+    # components: [snapclient, clock_sync, wifi_tools, wifi_bssid_select]
+  - source: {type: local, path: ../components}   # working tree instead
 
   # Forked speaker stack: adds `Speaker::buffered_bytes()`, letting the sync engine see
   # the audio between our push point and the DAC. Drop once upstream — see TODO.md.
   - source:
       type: git
       url: https://github.com/W-Floyd/esphome
-      ref: speaker-buffered-bytes
+      ref: speaker-render-latency
     components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
 
 snapclient:

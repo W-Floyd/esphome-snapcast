@@ -42,7 +42,7 @@ class SnapclientMediaSource final : public SnapclientChild,
   /// @brief Reports audio buffered downstream (mixer source queue), so the client can anchor its
   /// playout accounting to the measured fill rather than assuming one.
   /// THREAD CONTEXT: the client's player task, same as on_audio_write().
-  bool on_query_buffered(size_t &bytes) override;
+  bool on_query_latency(uint32_t &microseconds) override;
 
  protected:
   /// @brief Updates the source state and keeps the client's output-active flag in step.

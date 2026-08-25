@@ -163,11 +163,18 @@ class SnapcastAudioListener {
   virtual size_t on_audio_write(const uint8_t *data, size_t length, uint32_t timeout_ms,
                                 const StreamParams &params) = 0;
 
-  /// @brief Bytes of audio already handed over but not yet played, if the sink can report it.
-  /// Lets the playout accounting be anchored to the pipeline's MEASURED fill instead of an
+  /// @brief How long from now until audio handed over now would be rendered, if the sink can report
+  /// it. Lets the playout accounting be anchored to the pipeline's MEASURED depth instead of an
   /// assumption about it; see the re-baseline paths in the player loop.
+  ///
+  /// A DURATION, because the chain crosses format boundaries -- a mixer may widen mono to stereo, a
+  /// resampler changes the frame rate, the i2s slot width may be narrower than the stream -- so byte
+  /// counts from different stages cannot be added. It is also LATENCY, not audio remaining: it
+  /// includes the i2s DMA's silence padding, which holds none of our audio but still takes time to
+  /// clock out, so it does not fall to zero as the queue empties.
+  ///
   /// @return false when unavailable -- distinct from a reported zero.
-  virtual bool on_query_buffered(size_t & /*bytes*/) { return false; }
+  virtual bool on_query_latency(uint32_t & /*microseconds*/) { return false; }
 };
 
 /// @brief Native Snapcast client core.

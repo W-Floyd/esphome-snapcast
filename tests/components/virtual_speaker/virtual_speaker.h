@@ -40,6 +40,20 @@ class VirtualSpeaker final : public Component, public speaker::Speaker {
   void stop() override;
   bool has_buffered_data() const override { return this->ring_ != nullptr && this->ring_->available() > 0; }
 
+  /// @brief Latency to the virtual DAC: everything in the ring, since the consumer task drains it at
+  /// exactly the sample rate and nothing sits downstream of it. Implemented so the harness exercises
+  /// the sync engine's measured-depth path rather than its "sink cannot report" fallback -- without
+  /// it the fill/drift column never appears and the starvation re-baseline anchor is never taken.
+  bool render_latency(uint32_t &microseconds) const override {
+    if (this->ring_ == nullptr) {
+      return false;
+    }
+    const uint32_t frame_bytes = this->channels_ * 2;
+    microseconds = static_cast<uint32_t>(static_cast<uint64_t>(this->ring_->available() / frame_bytes) * 1000000 /
+                                         this->sample_rate_);
+    return true;
+  }
+
  protected:
   static void consumer_task_trampoline(void *arg);
   void consumer_task_();

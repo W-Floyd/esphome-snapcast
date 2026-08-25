@@ -458,7 +458,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // Deliberately NOT switched to the measured-fill anchor the starvation path now
       // uses. Two reasons: this path's premise is observed rather than assumed (a
       // >500 ms feedback gap IS a stop and restart, and a restart discards), and this
-      // runs on the speaker callback thread while on_query_buffered() is documented
+      // runs on the speaker callback thread while on_query_latency() is documented
       // player-task-only. Querying from here would break that contract to replace a
       // sound premise.
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
@@ -1525,15 +1525,15 @@ void SnapcastClient::player_task_() {
 #ifdef USE_SNAPCLIENT_TIMING_DIAG
     if (st.fill_sample_countdown == 0) {
       st.fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
-      size_t measured_bytes = 0;
+      uint32_t measured_us = 0;
       if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
-          this->audio_listener_->on_query_buffered(measured_bytes)) {
+          this->audio_listener_->on_query_latency(measured_us)) {
         this->playout_mutex_.lock();
         const int64_t accounted_frames = this->pushed_frames_total_ - this->played_frames_total_;
         this->playout_mutex_.unlock();
-        const int64_t measured_frames = static_cast<int64_t>(measured_bytes / frame_bytes);
-        const int64_t sample_us =
-            (measured_frames - accounted_frames) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+        const int64_t accounted_us =
+            accounted_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+        const int64_t sample_us = static_cast<int64_t>(measured_us) - accounted_us;
         if (std::abs(sample_us) <= FILL_CORR_MAX_US) {
           st.fill_corr_us = st.fill_corr_valid
                              ? st.fill_corr_us + FILL_EWMA_ALPHA * (static_cast<float>(sample_us) - st.fill_corr_us)
@@ -1881,20 +1881,24 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       // that same prediction). Measured offsets of 100-250 ms, audible against the
       // other clients, invisible to every metric on the device.
       //
-      // on_query_buffered() reports bytes still held downstream, so seed pushed as
-      // played + that, making the accounted queue equal the measured one. Falls back
-      // to the old assume-empty behaviour when the sink cannot report, which is why
-      // the query distinguishes "unknown" from "zero".
+      // on_query_latency() reports how long until audio handed over now would render, so seed
+      // pushed as played + that, making the accounted queue equal the measured one. Falls back
+      // to the old assume-empty behaviour when the sink cannot report, which is why the query
+      // distinguishes "unknown" from "zero".
       //
-      // Scope: the sink reports its own queue, not the mixer's output ring or the I2S
-      // DMA below it. Those are bounded by buffer_duration and identical across
-      // devices running one config, so what remains is common-mode -- and it is
-      // relative offset between devices that moves a stereo image, not a shared
-      // constant.
-      size_t buffered_bytes = 0;
+      // The reported latency includes buffering that holds none of OUR audio -- notably the I2S
+      // DMA's silence padding -- and that is deliberate. The prediction this anchors asks when the
+      // NEXT pushed frame will render, and padding sits ahead of it in the queue, so it delays our
+      // audio just as real frames would. Anchoring to our own audio alone was the earlier behaviour
+      // and it under-predicted by exactly the padding.
+      //
+      // Now whole-chain: source ring, mixer transfer buffer, output ring and DMA span are all
+      // included, so the previous caveat about unreported downstream stages no longer applies.
+      uint32_t buffered_us = 0;
       const bool have_fill = this->audio_listener_ != nullptr && frame_bytes > 0 &&
-                             this->audio_listener_->on_query_buffered(buffered_bytes);
-      const int64_t in_flight_frames = have_fill ? static_cast<int64_t>(buffered_bytes / frame_bytes) : 0;
+                             this->audio_listener_->on_query_latency(buffered_us);
+      const int64_t in_flight_frames =
+          have_fill ? static_cast<int64_t>(buffered_us) * rec.params.sample_rate / 1000000 : 0;
       this->playout_mutex_.lock();
       this->playout_valid_ = false;
       this->played_frames_total_ = 0;
@@ -1902,8 +1906,8 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       this->fb_samples_ = 0;
       this->playout_mutex_.unlock();
       if (have_fill) {
-        ESP_LOGD(TAG, "Re-baseline anchored to measured fill: %" PRId64 " frames (%" PRId64 " ms)", in_flight_frames,
-                 in_flight_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
+        ESP_LOGD(TAG, "Re-baseline anchored to measured latency: %" PRIu32 " ms (%" PRId64 " frames)",
+                 buffered_us / 1000, in_flight_frames);
       } else {
         // Log the FALLBACK too. Without this the two cases are indistinguishable in a
         // log -- a silent fallback looks exactly like the feature working, which is
@@ -1961,11 +1965,10 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       int32_t fill_ms = -1;
       int32_t fill_drift_ms = 0;
       {
-        size_t measured_bytes = 0;
+        uint32_t measured_us = 0;
         if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
-            this->audio_listener_->on_query_buffered(measured_bytes)) {
-          const int64_t measured_frames = static_cast<int64_t>(measured_bytes / frame_bytes);
-          fill_ms = static_cast<int32_t>(measured_frames * 1000 / static_cast<int64_t>(rec.params.sample_rate));
+            this->audio_listener_->on_query_latency(measured_us)) {
+          fill_ms = static_cast<int32_t>(measured_us / 1000);
           fill_drift_ms = pipeline_ms - fill_ms;
         }
       }
