@@ -44,6 +44,10 @@ class VirtualSpeaker final : public Component, public speaker::Speaker {
   /// exactly the sample rate and nothing sits downstream of it. Implemented so the harness exercises
   /// the sync engine's measured-depth path rather than its "sink cannot report" fallback -- without
   /// it the fill/drift column never appears and the starvation re-baseline anchor is never taken.
+  /// Nothing downstream pads, so every buffered byte is the caller's own audio and the two
+  /// questions have the same answer here.
+  bool buffered_audio(uint32_t &microseconds) const override { return this->render_latency(microseconds); }
+
   bool render_latency(uint32_t &microseconds) const override {
     if (this->ring_ == nullptr) {
       return false;

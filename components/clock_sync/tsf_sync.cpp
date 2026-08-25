@@ -26,7 +26,10 @@ static constexpr uint16_t TSF_PORT = 47083;
 static constexpr uint32_t TSF_MAGIC = 0x534E5446;  // 'SNTF'
 // Bump on any wire change: mismatched packets are dropped, so a half-flashed fleet
 // falls back to per-device Kalman rather than misreading fields.
-static constexpr uint8_t TSF_VERSION = 1;
+// 2: pipeline depth widened from int16 ms to int32 us. A mixed-fleet receiver rejects on
+// version, so the group simply stops sharing a timebase and every device falls back to its
+// own Kalman estimate -- degraded but never wrong. Flash the fleet together.
+static constexpr uint8_t TSF_VERSION = 2;
 
 // Pipeline-depth divergence alarm. Absolute playout depth is the one quantity the
 // sync median CANNOT see: the median is measured against this device's own
@@ -38,10 +41,10 @@ static constexpr uint8_t TSF_VERSION = 1;
 // depth against the leader's and shout when it diverges. Threshold sits above the
 // normal spread (224-282 ms measured across four identical boards = 58 ms) so
 // healthy variation stays quiet.
-static constexpr int32_t PIPELINE_DIVERGE_MS = 100;
+static constexpr int32_t PIPELINE_DIVERGE_US = 100000;
 static constexpr int64_t PIPELINE_DIVERGE_MIN_US = 5000000;
 static constexpr int64_t PIPELINE_DIVERGE_LOG_US = 30000000;
-static constexpr int16_t PIPELINE_UNKNOWN = INT16_MIN;
+static constexpr int32_t PIPELINE_UNKNOWN = INT32_MIN;
 
 static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // leader broadcast cadence
 static constexpr int64_t LEADER_TIMEOUT_US = 3500000;    // silence before takeover…
@@ -144,9 +147,9 @@ struct __attribute__((packed)) TsfPacket {
   int64_t tsf_base_us;
   int64_t tsf_minus_server_us;
   float drift_ppm;  // d(tsf − server)/dt, in TSF units
-  // Sender's playout pipeline depth (pushed-but-unplayed), ms; PIPELINE_UNKNOWN
+  // Sender's playout pipeline depth (pushed-but-unplayed), us; PIPELINE_UNKNOWN
   // before it has played anything. Diagnostics only -- never feeds the timebase.
-  int16_t pipeline_ms;
+  int32_t pipeline_us;
 };
 
 TsfSync::~TsfSync() {
@@ -400,21 +403,21 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     }
     this->warned_rejected_ = false;
     this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
-    this->check_pipeline_divergence_(pkt.pipeline_ms, local_now_us);
+    this->check_pipeline_divergence_(pkt.pipeline_us, local_now_us);
   }
 }
 
-void TsfSync::check_pipeline_divergence_(int16_t leader_pipeline_ms, int64_t local_now_us) {
-  const int32_t mine = this->pipeline_ms_.load(std::memory_order_relaxed);
-  if (leader_pipeline_ms == PIPELINE_UNKNOWN || mine == INT32_MIN) {
-    this->pipeline_delta_ms_.store(INT32_MIN, std::memory_order_relaxed);
+void TsfSync::check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t local_now_us) {
+  const int32_t mine = this->pipeline_us_.load(std::memory_order_relaxed);
+  if (leader_pipeline_us == PIPELINE_UNKNOWN || mine == INT32_MIN) {
+    this->pipeline_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
     this->pipeline_diverged_since_us_ = 0;
     return;
   }
-  const int32_t delta = mine - static_cast<int32_t>(leader_pipeline_ms);
-  this->pipeline_delta_ms_.store(delta, std::memory_order_relaxed);
+  const int32_t delta = mine - leader_pipeline_us;
+  this->pipeline_delta_us_.store(delta, std::memory_order_relaxed);
 
-  if (std::abs(delta) < PIPELINE_DIVERGE_MS) {
+  if (std::abs(delta) < PIPELINE_DIVERGE_US) {
     this->pipeline_diverged_since_us_ = 0;
     return;
   }
@@ -433,9 +436,9 @@ void TsfSync::check_pipeline_divergence_(int16_t leader_pipeline_ms, int64_t loc
   this->last_diverge_log_us_ = local_now_us;
   // WARN, not DEBUG: this is inaudible to every other metric we have. The sync
   // report will look perfect while this device plays |delta| ms out from the group.
-  ESP_LOGW(TAG, "Playout depth %+" PRId32 " ms vs leader (%" PRId32 " vs %d ms) for %.0f s: "
+  ESP_LOGW(TAG, "Playout depth %+" PRId32 " us vs leader (%" PRId32 " vs %" PRId32 " us) for %.0f s: "
                 "audio is likely offset by about this much, sync reports notwithstanding",
-           delta, mine, static_cast<int>(leader_pipeline_ms),
+           delta, mine, leader_pipeline_us,
            (local_now_us - this->pipeline_diverged_since_us_) / 1e6);
 }
 
@@ -501,8 +504,8 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   pkt.tsf_minus_server_us = tms_pub;
   pkt.drift_ppm = drift_ppm;
   {
-    const int32_t depth = this->pipeline_ms_.load(std::memory_order_relaxed);
-    pkt.pipeline_ms = (depth == INT32_MIN || depth < INT16_MIN + 1 || depth > INT16_MAX)
+    const int32_t depth = this->pipeline_us_.load(std::memory_order_relaxed);
+    pkt.pipeline_us = (depth == INT32_MIN || depth < INT16_MIN + 1 || depth > INT16_MAX)
                           ? PIPELINE_UNKNOWN
                           : static_cast<int16_t>(depth);
   }

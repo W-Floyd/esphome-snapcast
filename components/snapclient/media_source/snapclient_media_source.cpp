@@ -259,6 +259,10 @@ bool SnapclientMediaSource::on_query_latency(uint32_t &microseconds) {
   return this->output_render_latency(microseconds);
 }
 
+bool SnapclientMediaSource::on_query_audio(uint32_t &microseconds) {
+  return this->output_buffered_audio(microseconds);
+}
+
 }  // namespace esphome::snapclient
 
 #endif  // USE_ESP32 && USE_MEDIA_SOURCE

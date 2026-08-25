@@ -175,6 +175,13 @@ class SnapcastAudioListener {
   ///
   /// @return false when unavailable -- distinct from a reported zero.
   virtual bool on_query_latency(uint32_t & /*microseconds*/) { return false; }
+
+  /// @brief How much of OUR OWN audio the sink still holds, as a duration. Excludes padding and
+  /// anything we did not write, so this -- not on_query_latency() -- is what the accounting
+  /// cross-check compares against `pushed - played`. Differencing against the latency instead
+  /// yields the DMA's silence padding as a phantom split.
+  /// @return false when unavailable -- distinct from a reported zero.
+  virtual bool on_query_audio(uint32_t & /*microseconds*/) { return false; }
 };
 
 /// @brief Native Snapcast client core.
@@ -365,9 +372,7 @@ class SnapcastClient {
     // Rolling hard-resync count, for telling a one-shot catch-up from a storm
     int64_t storm_window_us{0};
     uint32_t storm_resyncs{0};
-    // Learned accounted-vs-measured baseline, and when the excess over it began
-    float drift_baseline_us{0.0f};
-    bool drift_baseline_valid{false};
+    // When the drift first exceeded the repair threshold, 0 while it has not
     int64_t drift_excess_since_us{0};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};

@@ -249,21 +249,13 @@ static constexpr int64_t STALE_BAILOUT_US = 3000000;
 // held at that instant, so the clamp in notify_audio_played() then permanently absorbed
 // the shortfall -- drift stepped +8 -> +51 ms and stayed there, playing ~43 ms early.
 //
-// A small POSITIVE drift is normal and device-specific (4.7 ms and 8.0 ms on two
-// clients here), so the baseline is learned rather than assumed, and only the excess
-// over it is repaired.
-static constexpr float DRIFT_LEARN_ALPHA = 1.0f / 64.0f;
-// The baseline only tracks values CLOSE to it, never merely "below the repair
-// threshold". Learning anything under the threshold would ratchet: a split of
-// REPAIR-1 ms is too small to repair, so it would be absorbed into the baseline and
-// the next split of the same size would be measured from there, hiding the error a
-// slice at a time. Outside this band the drift is reported and left alone.
-static constexpr float DRIFT_LEARN_BAND_US = 5000.0f;
-// Excess over the learned baseline that counts as a split. Well above the observed
-// baselines, well below the ~43 ms that needs catching. Also stays under
-// hard_resync_threshold so the correction is absorbed by the proportional path
-// instead of triggering a mute.
-static constexpr int32_t DRIFT_REPAIR_US = 20000;
+// Drift that counts as a split. With the chain fully reported there is no legitimate
+// standing drift, so the floor is only the skew between sampling the accounted queue and
+// the measured latency -- sub-millisecond. 5 ms leaves a wide margin over that while
+// catching splits far earlier than the 20 ms this needed when a per-device baseline had
+// to be cleared first. Still well under hard_resync_threshold, so the correction is
+// absorbed by the proportional path instead of triggering a mute.
+static constexpr int32_t DRIFT_REPAIR_US = 5000;
 // Held this long before acting: a real split is rock-steady (18 minutes at +50.7),
 // while a refill transient is not, and repairing a transient would inject the error
 // it is meant to remove.
@@ -1525,9 +1517,11 @@ void SnapcastClient::player_task_() {
 #ifdef USE_SNAPCLIENT_TIMING_DIAG
     if (st.fill_sample_countdown == 0) {
       st.fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
+      // Own-audio, for the same reason as the drift column: this compares against the accounted
+      // queue, which counts only frames we wrote.
       uint32_t measured_us = 0;
       if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
-          this->audio_listener_->on_query_latency(measured_us)) {
+          this->audio_listener_->on_query_audio(measured_us)) {
         this->playout_mutex_.lock();
         const int64_t accounted_frames = this->pushed_frames_total_ - this->played_frames_total_;
         this->playout_mutex_.unlock();
@@ -1970,48 +1964,54 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       int32_t fill_ms = -1;
       int32_t fill_drift_us = 0;
       {
+        // OWN-AUDIO, not latency. `pushed - played` counts only frames we wrote, so differencing it
+        // against the latency counts the DMA's silence padding as a split that is not one --
+        // measured on hardware as a standing -71 ms and -10 ms on two clients, in the direction the
+        // repair cannot even act on.
         uint32_t measured_us = 0;
         if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
-            this->audio_listener_->on_query_latency(measured_us)) {
+            this->audio_listener_->on_query_audio(measured_us)) {
           const int64_t accounted_us = pipeline_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
           fill_ms = static_cast<int32_t>(measured_us / 1000);
           fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured_us));
         }
       }
-      // Repair a sustained split. Acts only on evidence: the measured fill is an
-      // independent witness to the accounted queue, so a gap that holds for
-      // DRIFT_REPAIR_HOLD_US is the accounting being wrong, not the pipeline moving.
+      // Repair a sustained split. Acts only on evidence: the measured latency is an independent
+      // witness to the accounted queue, so a gap that holds for DRIFT_REPAIR_HOLD_US is the
+      // accounting being wrong, not the pipeline moving.
+      //
+      // Repairs toward ZERO, with no learned baseline. A baseline was right while the chain was
+      // only partly reported -- the sink published its own queue and nothing else, so the mixer
+      // transfer buffer and the DMA span showed up as a standing positive drift that differed per
+      // board (4.7 ms and 8.0 ms on two clients). Those stages are reported now, so there is no
+      // legitimate residue left to learn: measured on hardware, a fully-accounted device sits at a
+      // drift median of 7 us.
+      //
+      // Learning it was also actively harmful. The baseline was an EWMA that absorbed anything
+      // within a few ms of itself, so a split growing slower than that per report was ratcheted
+      // into "normal for this device" and never repaired -- observed on a client sitting at 72 ms
+      // of drift having fired zero repairs across its entire log.
       if (fill_ms >= 0 && st.converged) {
-        if (!st.drift_baseline_valid) {
-          st.drift_baseline_us = static_cast<float>(fill_drift_us);
-          st.drift_baseline_valid = true;
-        }
-        const int32_t excess_us = fill_drift_us - static_cast<int32_t>(st.drift_baseline_us);
-        if (excess_us >= DRIFT_REPAIR_US) {
+        if (fill_drift_us >= DRIFT_REPAIR_US) {
           if (st.drift_excess_since_us == 0) {
             st.drift_excess_since_us = now_us();
           } else if (now_us() - st.drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
-            // Trust the measurement: drop the accounted queue by the excess. Playback
-            // was running that far early, so the prediction moves later and the servo
-            // walks the phase back through the proportional band.
+            // Trust the measurement: drop the accounted queue by the whole drift. Playback was
+            // running that far early, so the prediction moves later and the servo walks the phase
+            // back through the proportional band.
             const int64_t excess_frames =
-                static_cast<int64_t>(excess_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000;
+                static_cast<int64_t>(fill_drift_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000;
             this->playout_mutex_.lock();
             this->pushed_frames_total_ -= excess_frames;
             this->playout_mutex_.unlock();
             ESP_LOGW(TAG,
-                     "Accounting split repaired: accounted queue ran %" PRId32 " us over measured fill "
-                     "(baseline %+.0f us) for %" PRId64 " s; playback was that far early",
-                     excess_us, st.drift_baseline_us, DRIFT_REPAIR_HOLD_US / 1000000);
+                     "Accounting split repaired: accounted queue ran %" PRId32 " us over measured latency "
+                     "for %" PRId64 " s; playback was that far early",
+                     fill_drift_us, DRIFT_REPAIR_HOLD_US / 1000000);
             st.drift_excess_since_us = 0;
           }
         } else {
           st.drift_excess_since_us = 0;
-        }
-        // Learn only from values near the baseline, so a split can never be absorbed
-        // into it -- see DRIFT_LEARN_BAND_US
-        if (std::abs(static_cast<float>(fill_drift_us) - st.drift_baseline_us) < DRIFT_LEARN_BAND_US) {
-          st.drift_baseline_us += DRIFT_LEARN_ALPHA * (static_cast<float>(fill_drift_us) - st.drift_baseline_us);
         }
       } else {
         st.drift_excess_since_us = 0;
@@ -2041,18 +2041,22 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
   #ifdef CLOCK_SYNC_TSF_ACTIVE
       if (this->tsf_sync_ != nullptr) {
         // Publish our depth so the group can cross-check it (see TsfSync)
-        this->tsf_sync_->set_pipeline_ms(pipeline_ms);
+        // Microseconds: this delta is the only instrument that can see an absolute playout
+        // offset, and the alignment it has to resolve is ~100 us, so a millisecond grid read
+        // +0 across the entire range that matters.
+        this->tsf_sync_->set_pipeline_us(static_cast<int32_t>(
+            pipeline_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate)));
         const TsfSync::Role role = this->tsf_sync_->role();
         if (role == TsfSync::Role::LEADER) {
           snprintf(tsf_str, sizeof(tsf_str), ", tsf=leader(peers %u)", this->tsf_sync_->peer_count());
         } else if (role == TsfSync::Role::FOLLOWER) {
           // depth delta vs the leader: the only visibility we have into an absolute
           // playout offset, which the median above cannot show by construction
-          const int32_t depth_delta = this->tsf_sync_->pipeline_delta_ms();
+          const int32_t depth_delta = this->tsf_sync_->pipeline_delta_us();
           if (depth_delta == INT32_MIN) {
             snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs)", this->tsf_sync_->mapping_age_s(now_us()));
           } else {
-            snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " ms)",
+            snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " us)",
                      this->tsf_sync_->mapping_age_s(now_us()), depth_delta);
           }
         } else {

@@ -12,7 +12,7 @@ consuming component's job.
 - ``TsfSync`` -- 802.11 TSF as a shared timebase for co-located clients: leader
   election, a slew-limited published mapping, sandwiched TSF reads. Generic distributed
   clock sync; the only audio in it is the naming of two hooks
-  (``set_playout_healthy``, ``set_pipeline_ms``), both of which mean "is this node's
+  (``set_playout_healthy``, ``set_pipeline_us``), both of which mean "is this node's
   output on time" and "how deep is its output queue".
 
 Neither includes a protocol header or references a protocol type. There is no YAML
