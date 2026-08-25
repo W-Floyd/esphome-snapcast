@@ -366,6 +366,15 @@ class SnapcastClient {
     // across resyncs, flushes, and rate changes because it converges to the crystal
     // offset, a property of the hardware, not the stream.
     float trim_integral_ppm{0.0f};
+    // Last trim handed to the hardware, and the point the slew limiter ramps from. Part
+    // of the control path, not diagnostics -- it must exist in every build, and it must
+    // track what is actually programmed (including the nominal-rate fallback) or the
+    // limiter ramps away from a value the clock is not running at.
+    float trim_applied_ppm{0.0f};
+    // Which KP the integrator was last conditioned for, so the gain switch can be made
+    // bumpless exactly once per transition rather than every chunk. Starts false to match
+    // st.converged: a fresh servo acquires before it runs.
+    bool trim_run_gain{false};
     bool rate_lock_ok{false};
     uint32_t rate_lock_rate{0};
     // Trim wander over the report window. The trim IS the loop's estimate of the
@@ -534,6 +543,8 @@ class SnapcastClient {
   /// @brief Clears both histories. Call under playout_mutex_ whenever the counters are reset or
   /// re-baselined: a level recorded before a re-baseline says nothing about the one after it.
   void clear_playout_history_();
+  /// TEMPORARY DIAGNOSTIC: see the definition.
+  void dbg_early_recon_(const ChunkRecord &rec, const char *phase);
   /// @brief The accounted queue (`pushed - played`) as it stood at `as_of_us`, in frames.
   ///
   /// This is the whole point of the histories: it makes the accounting comparable to a sink reading
@@ -645,6 +656,13 @@ class SnapcastClient {
   // (available_frames > 0 but under the credit) logs nothing and flags nothing, yet it shorts
   // `played` permanently -- which is the shape of the startup offset: DMA-buffer quantised,
   // varying per start. Remove once explained.
+  // TEMPORARY DIAGNOSTIC: the startup offset is fully formed before the first sync report, so
+  // per-report logging cannot watch it appear. This counts chunks from the first push so the same
+  // one-instant reconciliation can run from the very beginning, at chunk resolution.
+  uint32_t dbg_early_chunks_{0};
+  int64_t dbg_clamped_frames_{0};
+  uint32_t dbg_clamp_events_{0};
+  int64_t dbg_clamp_last_log_us_{0};
 
   // Recent history of the two playout counters, so the accounted queue can be evaluated at the
   // instant a sink reading describes rather than at the instant we read it.

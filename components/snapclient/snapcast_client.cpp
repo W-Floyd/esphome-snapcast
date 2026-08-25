@@ -136,6 +136,29 @@ static constexpr float FILL_EWMA_ALPHA = 0.25f;
 // Bound, symmetric: past this the reading is bad, not a real disagreement
 static constexpr int64_t FILL_CORR_MAX_US = 400000;
 
+// Unmute gate width, in multiples of sync_deadband (128 us default -> ~1 ms).
+//
+// Was 2x. That was calibrated against a loop running KP = 0.5 everywhere, which held the
+// common-mode error to sd ~74 us so 256 us was a comfortable fit. The run gain is now 0.1
+// (see TRIM_KP_RUN_PPM_PER_US), deliberately chosen to STOP tracking the common-mode
+// error, which then wanders to sd 649 us and peaks near 2.8 ms. A gate an order of
+// magnitude tighter than the error the loop is designed to permit cannot be met: measured
+// with only 54-57% of medians in band, and unmute needs MEDIAN_WINDOW *consecutive* in
+// band, so the counter kept resetting and audio took 31-35 s to start.
+//
+// Widening is sound on the gate's own stated justification -- "corrections inside the
+// band are trim-only and inaudible". That holds all the way to converge_fine (2 ms), not
+// just to 2x deadband: while muted and inside converge_fine the PI is engaged, trim_holds
+// is true, and the splice path is suppressed entirely. So nothing audible happens anywhere
+// inside 1 ms; the old value was simply tighter than it needed to be.
+//
+// The obvious worry -- two boards unmuting at opposite edges of a wider band, i.e. 2 ms of
+// differential at start -- does not apply. The gate tests each board's own median, and
+// those are 0.84-0.98 correlated between boards with a differential sd of ~30 us. They
+// unmute at nearly the same error, which is the same reason the common-mode wander is
+// inaudible in the first place.
+static constexpr int64_t UNMUTE_BAND_DEADBANDS = 8;
+
 // Median error below which our playout counts as tracking the timebase, reported
 // to the TSF layer for leader eligibility. Generous: this gates "am I fit to
 // publish the group timebase", not servo precision.
@@ -155,12 +178,99 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // phase margin against the ~0.85 s measurement lag (feedback-pivot EWMA + median
 // window). KI = KP^2/4: critically damped; the integrator absorbs the crystal
 // offset so P holds the error at zero.
-static constexpr float TRIM_KP_PPM_PER_US = 0.5f;
-// Computed, not written out: KI = KP^2/4 is the critical-damping relationship above,
-// and a literal lets the two drift apart silently. That happened -- a KP change had
-// to have its KI recomputed by hand, and getting it wrong changes the damping with
-// no compile error and no obvious symptom.
-static constexpr float TRIM_KI_PPM_PER_US_S = TRIM_KP_PPM_PER_US * TRIM_KP_PPM_PER_US / 4.0f;
+//
+// 0.5 -> 0.1 DELIBERATELY TRADES absolute tracking for inter-device tracking, because
+// the two are not the same quantity and only the second is audible in a stereo pair.
+// The +-1-2 ms above is the cost, and it was previously read as the reason NOT to lower
+// KP. That judgement used the median -- i.e. the COMMON-MODE error, which paired boards
+// share (corr(median_a, median_b) = 0.84-0.98 across sessions) and which therefore
+// cancels on the wire. What lands between two speakers is the DIFFERENTIAL, and the
+// whole chain from it to the audible skew has now been measured link by link, with a
+// logic analyser on the I2S lines cross-referenced against both boards' logs:
+//
+//   differential median   sd 43.0 us
+//     x KP = 0.5           -> 21.5 ppm predicted
+//   differential trim     sd 20.9 ppm measured
+//     -> wire rate         sd 15.2 ppm measured, corr -0.889 (slope -0.65)
+//     -> offset excursions 40-90 us, ~2.4/min, every one of them one-sided
+//
+// (Negative correlation is the correct sign: positive trim plays faster, so the leading
+// board renders EARLIER and B-A falls. The 0.65 gain rather than 1.0 is the report-time
+// trim snapshot being compared against a wire rate averaged over +-1.6 s.)
+//
+// Differential trim is KP * differential median to within a few percent in every session
+// measured, so this scales the excursions linearly: ~4.2 ppm and ~10-20 us at KP = 0.1.
+// Judge this on the analyser and on the differential, NOT on the median -- the median is
+// expected to get worse, and that is the trade being made, not a regression.
+//
+// Do not "fix" the resulting median by rate-limiting or quantising the trim. Both have
+// been tried and both limit-cycle structurally, for the reason in the paragraph above
+// this one: see the REVERTED note below the KI definition.
+// ACQUIRE runs while muted, where the job is to null the error fast enough that the
+// unmute gate (MEDIAN_WINDOW consecutive chunks inside 2x sync_deadband) can be met, and
+// nothing is audible yet so amplified noise costs nothing. RUN takes over once unmuted,
+// where the differential is the only thing that matters. See the switch in the PI block.
+static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
+static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.1f;
+// Authority is derived from the ACQUIRE gain deliberately: the clamp exists so the PI can
+// express its proportional term at the converge_fine handoff, which is an acquisition
+// question. Deriving it from the run gain would shrink the headroom available for a
+// large excursion for no benefit.
+static constexpr float TRIM_KP_PPM_PER_US = TRIM_KP_ACQUIRE_PPM_PER_US;
+// KI = KP^2/4 (critical damping) is COMPUTED AT THE POINT OF USE from whichever gain is
+// active, not held in a constant here. A literal lets the two drift apart silently --
+// that already happened once, a KP change whose KI had to be recomputed by hand, and
+// getting it wrong changes the damping with no compile error and no obvious symptom.
+// With a switched KP a single constant would be wrong for one of the two phases by
+// construction, which is the same failure wearing a different hat.
+// Slew limit on the applied trim, once unmuted. The loop's job here is to cancel THIS
+// board's crystal offset -- a hardware property that moves with temperature, i.e. over
+// minutes. Anything that demands a fast rate change is by construction not a crystal
+// error, and the measured disturbance is COMMON MODE: paired boards see the same error
+// at the same instant (corr(median_a, median_b) = 0.981, corr(trim_a, trim_b) = 0.986
+// over 42 matched reports), so the phase error it is chasing would cancel between them
+// on its own if the loop simply left it alone.
+//
+// What does NOT cancel is the small mismatch in how two boards answer that shared
+// disturbance. Measured: common-mode median sd 75.6 us (range -163..+179) against a
+// differential of sd 14.9 us, and a differential TRIM of sd 7.3 ppm, peak 22 ppm.
+// Sustained across one ~3.3 s report window that integrates to 24 us sd / 73 us peak
+// of real inter-device skew -- which is exactly the 50-100 us excursions seen on the
+// logic analyser, appearing there as an instantaneous RATE step (0 -> +42, +40, -73
+// ppm) that then decays. No frame corrections fired during any of them; only the clock
+// moved. So the audible defect is the loop's own answer to a disturbance that was
+// harmless until it was corrected.
+//
+// REVERTED: rate-limiting the trim was tried and made every measured quantity worse.
+//
+// The reasoning was sound as far as it went. The disturbance driving the trim is COMMON
+// MODE -- paired boards see the same error at the same instant (corr(median_a, median_b)
+// = 0.981, corr(trim_a, trim_b) = 0.986 over 42 matched reports) -- so the phase error
+// would cancel between them if the loop left it alone, and what lands on the wire is only
+// the mismatch in how the two boards answer it: differential trim sd 7.3 ppm, peak 22,
+// integrating over a ~3.3 s report to 24 us sd / 73 us peak of real skew. That matched
+// the 50-100 us excursions on the analyser, which appear there as an instantaneous RATE
+// step (0 -> +42, +40, -73 ppm) that then decays, with no frame corrections anywhere near
+// them. The diagnosis stands; the remedy did not.
+//
+// A flat 2 ppm/s bound, measured on hardware against those same numbers:
+//
+//   common-mode median   sd  75.6 ->  409.1 us
+//   differential median  sd  14.9 ->  329.1 us
+//   differential trim    sd   7.3 ->   24.9 ppm  (i.e. 24 -> 82 us per report)
+//
+// and both boards entered a ~40 s limit cycle swinging +-1.5 ms. That is the textbook
+// consequence of rate-limiting inside a feedback loop: while the limiter binds it is a
+// phase lag, and here it binds essentially always. The error wanders ~100 us/s, so the P
+// term alone legitimately needs ~50 ppm/s (KP * 100) to track it; any bound far below
+// that is active almost continuously. Scaling the bound with |error| does not rescue it
+// -- at the 180 us common-mode range it still only allows ~2 ppm/s, ~25x too tight.
+//
+// The general lesson: this loop's output cannot be rate-limited. Differential trim noise
+// has to be attacked at the input (filter the error) or through the gain, not at the
+// output. Note that differential trim sd 7.3 ppm is almost exactly KP * differential
+// median sd (0.5 * 14.9 = 7.45), so it scales linearly with KP -- which makes KP, not a
+// limiter, the lever with a predictable effect.
 // The clamp is DERIVED, not chosen. The PI takes over at converge_fine, so for it to
 // act as a linear controller anywhere in that band the output must be able to express
 // the proportional term at the handoff:
@@ -556,6 +666,19 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // would re-baseline in a tight loop (observed: 9 resets in 261 ms).
       this->starved_latched_ = true;
       this->pipeline_starved_.store(true, std::memory_order_relaxed);
+    }
+    // TEMPORARY DIAGNOSTIC: attribute the silent half of this clamp. Time-throttled because this
+    // runs on the speaker callback thread at the DMA cadence, and a pathological case would
+    // otherwise flood the link.
+    const int64_t dbg_excess = static_cast<int64_t>(frames) - std::max<int64_t>(available_frames, 0);
+    this->dbg_clamped_frames_ += dbg_excess;
+    this->dbg_clamp_events_++;
+    if (timestamp_us - this->dbg_clamp_last_log_us_ >= 1000000) {
+      this->dbg_clamp_last_log_us_ = timestamp_us;
+      ESP_LOGW(TAG,
+               "CLAMPDBG discarded %" PRId64 " frames (credit %" PRIu32 ", available %" PRId64 "); total %" PRId64
+               " frames in %" PRIu32 " events",
+               dbg_excess, frames, available_frames, this->dbg_clamped_frames_, this->dbg_clamp_events_);
     }
     frames = static_cast<uint32_t>(std::max<int64_t>(available_frames, 0));
   } else if (frames > 0) {
@@ -1574,9 +1697,18 @@ void SnapcastClient::player_task_() {
             lat_now.microseconds > own_now.microseconds ? lat_now.microseconds - own_now.microseconds : 0;
         if (pad_now_us <= PADDING_DRAINED_US) {
           const int64_t pad_now_frames = pad_now_us * rec.params.sample_rate / 1000000;
-          const int64_t repay = st.padding_debt_frames - pad_now_frames;
+          this->playout_mutex_.lock();
+          // NEVER below `played`. The debt is a frame count recorded at seed time, but by the time
+          // it is repaid the DAC may already have consumed everything the seed covered -- and then
+          // subtracting it whole drives pushed under played, which is not merely untidy: it makes
+          // available_frames NEGATIVE, so the clamp in notify_audio_played() discards EVERY
+          // subsequent credit, `played` stops advancing, and the starvation latch re-fires forever.
+          // Observed on hardware as acct_after=-10000 us, then "available -441" on the very next
+          // credit, then a reconnect and seven minutes of silence with the sink idle
+          // (written == completed, nothing in flight) until the device was power-cycled.
+          const int64_t repay =
+              std::min(st.padding_debt_frames - pad_now_frames, this->pushed_frames_total_ - this->played_frames_total_);
           if (repay > 0) {
-            this->playout_mutex_.lock();
             this->pushed_frames_total_ -= repay;
             // The counter stepped; levels recorded against the old value would read as a split.
             this->clear_playout_history_();
@@ -1584,7 +1716,21 @@ void SnapcastClient::player_task_() {
                                 this->pushed_frames_total_);
             this->mark_playout_(this->played_history_, this->played_history_next_, now_us(),
                                 this->played_frames_total_);
-            this->playout_mutex_.unlock();
+          }
+          const int64_t dbg_pushed_after = this->pushed_frames_total_;
+          const int64_t dbg_played_after = this->played_frames_total_;
+          this->playout_mutex_.unlock();
+          if (repay > 0) {
+            // Everything needed to see whether the residual exists BEFORE this repayment or is
+            // created BY it: the accounting either side, and the chain reading it is compared to.
+            const int64_t acct_after =
+                (dbg_pushed_after - dbg_played_after) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+            ESP_LOGD(TAG,
+                     "PAYDBG debt=%" PRId64 " pad_now=%" PRId64 " repay=%" PRId64 " pushed=%" PRId64 " played=%" PRId64
+                     " acct_after=%" PRId64 " lat=%" PRIu32 " own=%" PRIu32 " resid=%" PRId64,
+                     st.padding_debt_frames, pad_now_us, repay, dbg_pushed_after, dbg_played_after, acct_after,
+                     lat_now.microseconds, own_now.microseconds,
+                     acct_after - static_cast<int64_t>(own_now.microseconds));
             ESP_LOGD(TAG, "Repaid re-baseline padding debt: %" PRId64 " frames (%" PRId64 " us), %s",
                      repay, repay * 1000000 / static_cast<int64_t>(rec.params.sample_rate),
                      st.converged ? "AUDIBLE (already unmuted)" : "silent (still muted)");
@@ -1632,6 +1778,10 @@ void SnapcastClient::player_task_() {
         }
       }
       this->push_chunk_(rec, 0, true);
+      // TEMPORARY DIAGNOSTIC: the startup pushes go through HERE, not the main path below, so
+      // without this the instrument only starts watching after ~12 chunks are already pushed --
+      // which is exactly the window the offset forms in.
+      this->dbg_early_recon_(rec, "boot");
       continue;
     }
 
@@ -1734,6 +1884,7 @@ void SnapcastClient::player_task_() {
     }
 #endif  // USE_SNAPCLIENT_TIMING_DIAG
 #endif  // CLOCK_SYNC_TSF_ACTIVE
+
 
     st.err_accum_us += error_us;
     st.err_peak_us = std::max(st.err_peak_us, std::abs(error_us));
@@ -1881,7 +2032,29 @@ void SnapcastClient::player_task_() {
       if (st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
         const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
-        const float p_term = TRIM_KP_PPM_PER_US * static_cast<float>(median_err_us);
+        // Acquisition and steady state want OPPOSITE gains, so the loop switches.
+        //
+        // Running on the low gain everywhere delayed audio start badly: the unmute gate
+        // needs MEDIAN_WINDOW *consecutive* chunks inside 2x sync_deadband, and the low
+        // gain no longer holds the common-mode error in that band -- measured 54%/57% of
+        // medians in band, so the counter kept resetting and lock took 31-33 s from boot.
+        // The low gain is chosen precisely BECAUSE it stops chasing the common-mode error
+        // (see TRIM_KP_RUN_PPM_PER_US), so it is structurally in tension with a gate that
+        // is defined on that error. Acquisition needs the error nulled fast; steady state
+        // needs the differential noise not amplified. One gain cannot do both.
+        const float kp = st.converged ? TRIM_KP_RUN_PPM_PER_US : TRIM_KP_ACQUIRE_PPM_PER_US;
+        // Bumpless transfer. The gains differ 5x, so switching would step the output by
+        // (kp_hi - kp_lo) * error -- up to ~100 ppm at the unmute threshold, i.e. a real
+        // rate step on one board at the exact moment it becomes audible, which is the
+        // defect this whole change exists to remove. Move the difference into the
+        // integrator instead so the commanded trim is continuous across the switch.
+        if (st.converged != st.trim_run_gain) {
+          const float from = st.trim_run_gain ? TRIM_KP_RUN_PPM_PER_US : TRIM_KP_ACQUIRE_PPM_PER_US;
+          st.trim_integral_ppm =
+              std::clamp(st.trim_integral_ppm + (from - kp) * static_cast<float>(median_err_us), -clamp_ppm, clamp_ppm);
+          st.trim_run_gain = st.converged;
+        }
+        const float p_term = kp * static_cast<float>(median_err_us);
         // Conditional integration (anti-windup): winding the integral while the
         // output rails just schedules a rail-to-rail relaxation oscillation
         // (observed post-boot: trim flipping +-500 ppm with +-5 ms medians for
@@ -1889,11 +2062,18 @@ void SnapcastClient::player_task_() {
         // output is saturated in the error's own direction.
         const float unclamped = p_term + st.trim_integral_ppm;
         if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (median_err_us > 0)) {
+          // KI tracks the ACTIVE gain: the critical-damping relationship is KI = KP^2/4,
+          // so a switched KP with a fixed KI would change the damping at the switch --
+          // the exact silent-failure mode the KI note near the gain definitions warns about.
           st.trim_integral_ppm = std::clamp(
-              st.trim_integral_ppm + TRIM_KI_PPM_PER_US_S * static_cast<float>(median_err_us) * dt_s, -clamp_ppm,
+              st.trim_integral_ppm + (kp * kp / 4.0f) * static_cast<float>(median_err_us) * dt_s, -clamp_ppm,
               clamp_ppm);
         }
         const float trim_ppm = std::clamp(p_term + st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
+        // What the PI asked for, kept so the report can show it next to what the divider
+        // actually realised. Measured on hardware they agree to ~0.2 ppm, which is how
+        // divider quantisation was ruled out as a source of the inter-device excursions.
+        st.trim_applied_ppm = trim_ppm;
 #ifdef USE_SNAPCLIENT_TIMING_DIAG
         // Report-only: span shows whether the loop tracks a slow offset or chases
         // something it cannot, and railed counts saturation.
@@ -1929,6 +2109,10 @@ void SnapcastClient::player_task_() {
         // so the rate change cannot be audible. trim_holds stays false on purpose,
         // to keep the coarse splice path engaged.
         this->rate_lock_->set_trim_ppm(0.0f);
+        // The hardware is back at nominal, so the slew limiter must start from nominal
+        // too -- otherwise the next re-entry ramps away from a value that is no longer
+        // programmed, at 2 ppm/s, and the trim silently lags the demand for minutes.
+        st.trim_applied_ppm = 0.0f;
       }
 #endif
       // While muted (pre-convergence) audibility doesn't constrain splice size, so
@@ -1978,9 +2162,9 @@ void SnapcastClient::player_task_() {
     // Unmute needs "no audible corrections pending", not servo-engagement
     // precision: fine-stage medians routinely wobble past the deadband while the
     // PI settles, and requiring consecutive sub-deadband medians stretched
-    // post-boot mutes to ~20 s of counter resets. Corrections inside 2x deadband
+    // post-boot mutes to ~20 s of counter resets. Corrections inside the gate (UNMUTE_BAND_DEADBANDS)
     // are trim-only and inaudible.
-    if (std::abs(median_err_us) <= 2 * this->config_.sync_deadband_us) {
+    if (std::abs(median_err_us) <= UNMUTE_BAND_DEADBANDS * this->config_.sync_deadband_us) {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
       // Don't unmute onto a provisional timebase: a follower still on its Kalman
       // fallback (leader's mapping rejected while our own estimate is raw) will
@@ -2004,6 +2188,12 @@ void SnapcastClient::player_task_() {
 
     this->push_chunk_(rec, drop_frames, !st.converged);
 
+    // TEMPORARY DIAGNOSTIC: see dbg_early_recon_ -- this is the post-startup half.
+    // Every term comes from ONE snapshot and the accounting is evaluated at that same instant, so
+    // this is the RECON line at chunk resolution rather than once per 128 chunks. Bounded to the
+    // first few seconds and sampled every 4th chunk, which is ~10 lines/s for ~4 s.
+    this->dbg_early_recon_(rec, "run");
+
     // Accumulate the accounted queue per chunk so the group cross-check can be handed a MEAN rather
     // than a single sample of a sawtooth. One extra lock per chunk (~38/s) buys an order of
     // magnitude on that comparison's noise floor.
@@ -2013,6 +2203,56 @@ void SnapcastClient::player_task_() {
     st.depth_samples++;
   }
   vTaskDelete(nullptr);
+}
+
+// TEMPORARY DIAGNOSTIC: one-instant reconciliation of the accounting against the chain, from the
+// very first chunk. Every term is from ONE snapshot and the accounting is evaluated at that
+// snapshot's instant, so nothing here is aligned by guesswork. Bounded and sampled so it cannot
+// flood. Remove once the startup offset is explained.
+void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase) {
+  if (this->dbg_early_chunks_ >= 240) {
+    return;
+  }
+  const uint32_t n = this->dbg_early_chunks_++;
+  if ((n % 2) != 0) {
+    return;
+  }
+  audio::AudioDepth m;
+  if (this->audio_listener_ == nullptr || !this->audio_listener_->on_query_audio(m)) {
+    ESP_LOGD(TAG, "EARLY[%" PRIu32 "] %s: sink cannot report yet", n, phase);
+    return;
+  }
+  int64_t acct_frames = 0;
+  this->playout_mutex_.lock();
+  const bool ok = this->accounted_at_(m.as_of_us, acct_frames);
+  const int64_t p_now = this->pushed_frames_total_;
+  const int64_t pl_now = this->played_frames_total_;
+  this->playout_mutex_.unlock();
+  const int64_t rate = static_cast<int64_t>(rec.params.sample_rate);
+  // CONSERVATION RESIDUALS, in frames. Every boundary must satisfy received == passed-on + held, so a
+  // non-zero residual names the stage that is losing audio. All terms come from one snapshot, so
+  // these are exact rather than differences of separately-sampled counters.
+  //   r_push : what we think we handed over, against what the source ring says it took
+  //   r_src  : the source ring -- taken in, minus given to the mixer, minus what it still holds
+  //   r_sink : the sink ring -- taken in, minus written to DMA, minus what it still holds
+  const int64_t own_frames = static_cast<int64_t>(m.dbg_own_us) * rate / 1000000;
+  const int64_t queued_frames = static_cast<int64_t>(m.dbg_queued_us) * rate / 1000000;
+  const int64_t xfer_frames = static_cast<int64_t>(m.dbg_xfer_us) * rate / 1000000;
+  const int64_t r_push = p_now - static_cast<int64_t>(m.dbg_src_received);
+  const int64_t r_src = static_cast<int64_t>(m.dbg_src_received) - static_cast<int64_t>(m.dbg_src_consumed) -
+                        own_frames;
+  const int64_t r_mix = static_cast<int64_t>(m.dbg_src_consumed) - static_cast<int64_t>(m.dbg_sink_received) -
+                        xfer_frames;
+  const int64_t r_sink = static_cast<int64_t>(m.dbg_sink_received) - queued_frames;
+  ESP_LOGD(TAG,
+           "EARLY[%" PRIu32 "] %s ok=%d acct=%" PRId64 " live=%" PRId64 " meas=%" PRIu32 " own=%" PRIu32
+           " xfer=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " pushed=%" PRId64 " played=%" PRId64
+           " | srcrx=%" PRIu32 " srctx=%" PRIu32 " sinkrx=%" PRIu32 " r_push=%" PRId64 " r_src=%" PRId64
+           " r_mix=%" PRId64 " r_sink=%" PRId64 " age=%" PRId64,
+           n, phase, ok ? 1 : 0, ok ? acct_frames * 1000000 / rate : -1, (p_now - pl_now) * 1000000 / rate,
+           m.microseconds, m.dbg_own_us, m.dbg_xfer_us, m.dbg_queued_us, m.dbg_dma_us, p_now, pl_now,
+           m.dbg_src_received, m.dbg_src_consumed, m.dbg_sink_received, r_push, r_src, r_mix, r_sink,
+           now_us() - m.as_of_us);
 }
 
 // THREAD CONTEXT: player task. Consumes the pipeline_starved_ latch.
@@ -2090,6 +2330,10 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       if (have_fill) {
         // The snapshot's age is logged but NOT applied -- see above. It is here because it is the
         // number that would have to be wrong for this anchor to be wrong.
+        ESP_LOGD(TAG, "SEEDDBG latency=%" PRIu32 " own=%" PRIu32 " debt=%" PRId64 " seed=%" PRId64
+                      " played_was=%" PRId64,
+                 latency.microseconds, have_own ? own_audio.microseconds : 0, st.padding_debt_frames,
+                 in_flight_frames, this->played_frames_total_);
         ESP_LOGD(TAG, "Re-baseline anchored to measured latency: %" PRIu32 " ms (%" PRId64
                       " frames), snapshot %" PRId64 " ms old",
                  latency.microseconds / 1000, in_flight_frames, (now_us() - latency.as_of_us) / 1000);
@@ -2182,6 +2426,42 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                 accounted_then_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
             fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured.microseconds));
 
+            // TEMPORARY DIAGNOSTIC: every term of the comparison at ONE instant. The reading carries
+            // the chain's split with it under the same seqlock, and the accounting is evaluated at that
+            // same `as_of`, so nothing here is time-aligned by guesswork -- which is exactly what
+            // defeated the previous attempt, where the terms were logged hundreds of milliseconds
+            // apart while the quantity sought was 20 ms. `sum` is the four terms added back up: if it
+            // differs from `meas` the chain is not reporting what it says it is, and if it matches
+            // while `drift` does not, the missing audio is in none of the four.
+            int64_t dbg_pushed, dbg_played;
+            this->playout_mutex_.lock();
+            dbg_pushed = this->pushed_frames_total_;
+            dbg_played = this->played_frames_total_;
+            this->playout_mutex_.unlock();
+            // Conservation residuals, in frames: every boundary must satisfy
+            // received == passed-on + still-held, so a non-zero one names the stage losing audio.
+            // These were only on the boot-phase line before, which cannot see a LATER re-baseline --
+            // and the residual under investigation appears after one.
+            const int64_t rate_i = static_cast<int64_t>(rec.params.sample_rate);
+            const int64_t own_f = static_cast<int64_t>(measured.dbg_own_us) * rate_i / 1000000;
+            const int64_t xfer_f = static_cast<int64_t>(measured.dbg_xfer_us) * rate_i / 1000000;
+            const int64_t queued_f = static_cast<int64_t>(measured.dbg_queued_us) * rate_i / 1000000;
+            ESP_LOGD(TAG,
+                     "RECON drift=%" PRId32 " acct=%" PRId64 " meas=%" PRIu32 " sum=%" PRIu32 " own=%" PRIu32
+                     " xfer=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " age=%" PRId64 " pushed=%" PRId64
+                     " played=%" PRId64 " clamped=%" PRId64 " | srcrx=%" PRIu32 " srctx=%" PRIu32 " sinkrx=%" PRIu32
+                     " r_push=%" PRId64 " r_src=%" PRId64 " r_mix=%" PRId64 " r_sink=%" PRId64,
+                     fill_drift_us, accounted_us, measured.microseconds,
+                     measured.dbg_own_us + measured.dbg_xfer_us + measured.dbg_queued_us + measured.dbg_dma_us,
+                     measured.dbg_own_us, measured.dbg_xfer_us, measured.dbg_queued_us, measured.dbg_dma_us,
+                     now_us() - measured.as_of_us, dbg_pushed, dbg_played, this->dbg_clamped_frames_,
+                     measured.dbg_src_received, measured.dbg_src_consumed, measured.dbg_sink_received,
+                     dbg_pushed - static_cast<int64_t>(measured.dbg_src_received),
+                     static_cast<int64_t>(measured.dbg_src_received) -
+                         static_cast<int64_t>(measured.dbg_src_consumed) - own_f,
+                     static_cast<int64_t>(measured.dbg_src_consumed) -
+                         static_cast<int64_t>(measured.dbg_sink_received) - xfer_f,
+                     static_cast<int64_t>(measured.dbg_sink_received) - queued_f);
           }
         }
       }
@@ -2263,8 +2543,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
 
       char fill_str[96] = "";
       if (fill_ms >= 0 && fill_comparable) {
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
         snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 " us, corr %+d us)",
                  fill_ms, fill_drift_us, static_cast<int>(st.fill_corr_us));
+#else
+        // fill_corr_us is only ever SAMPLED under timing diagnostics, so with them off it
+        // is a hard zero -- and printing "corr +0 us" then reads as "measured, and it
+        // agreed" when nothing was measured at all. Same failure the branch below exists
+        // to avoid; omit the field rather than report a number we did not take.
+        snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 " us)", fill_ms, fill_drift_us);
+#endif
       } else if (fill_ms >= 0) {
         // Distinguish "no honest comparison available" from "compared, and it agreed". Silently
         // printing +0 for the first is how a broken instrument reads as a healthy device.
@@ -2276,6 +2564,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       char trim_str[112] = "";
   #ifdef USE_I2S_RATE_LOCK
       if (st.rate_lock_ok) {
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
         if (st.trim_samples > 0) {
           snprintf(trim_str, sizeof(trim_str),
                    ", trim %+.2f ppm (span %+.0f..%+.0f, railed %" PRIu32 "/%" PRIu32 ")",
@@ -2283,6 +2572,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         } else {
           snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (idle)", this->rate_lock_->applied_ppm());
         }
+#else
+        // span/railed are accumulated under timing diagnostics only, so with them off
+        // trim_samples is permanently 0 and every report claimed "(idle)" while the loop
+        // was in fact steering the clock by tens of ppm -- which is how the trim's role
+        // in the inter-device excursions stayed invisible. Print the demand alongside
+        // what the divider could actually realise; those two are the whole story here,
+        // and neither needs the diag build.
+        snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (want %+.2f)", this->rate_lock_->applied_ppm(),
+                 st.trim_applied_ppm);
+#endif
       }
   #endif
       char tsf_str[64] = "";
