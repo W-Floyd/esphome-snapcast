@@ -83,6 +83,27 @@
   Until it is settled the repair is gated on steadiness, so the disagreement is reported and
   not acted on.
 
+  Plan:
+
+  1. Log `pushed`, `played`, `own`, `xfer` and `sink` on one line per sync report in the
+     mixer harness. Everything so far is inferred from differences between two of them;
+     this attributes the disagreement directly. One QEMU run, no reflash.
+  2. Cheap discriminator, do it first: rebuild the harness with a single source speaker.
+     The sink callback subtracts `new_frames` — every frame the SINK played — from this
+     source's `pending_playback_frames_`, so any output not sourced from this speaker
+     (the other source, or mixer silence while this ring is dry) over-credits `played`.
+     If the disagreement vanishes with one source, that is the mechanism, and the fix is
+     to credit a source only for frames it contributed.
+  3. If it survives, follow the sign. `pipeline < fill` means `played` too high or
+     `pushed` too low, and step 1 says which moves. Rule `playback_delay_frames_` in or
+     out: it permanently under-credits `played` at first contribution, which pushes the
+     opposite way, so if it is involved something else is too.
+  4. Fix the guilty side, not the convenient one. If the accounting is wrong it is a
+     `mixer` fix upstream; do not adjust `buffered_audio()` to match, which would encode
+     the bug in the API.
+  5. Done when `drift` holds near zero through a mixer in QEMU. Then re-enable the repair
+     at a sane threshold, confirm it stays quiet, and only then flash hardware.
+
 - **Stale deadline on stream resumption.** With `keepalive_hold: never` the pipeline is
   held across an idle, and the first chunk afterwards carries a deadline stale by roughly
   the idle duration (14044648 ms after 3.90 h; 24888016 ms after ~6.9 h). It self-heals in
