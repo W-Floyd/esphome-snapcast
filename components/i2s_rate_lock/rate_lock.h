@@ -2,12 +2,12 @@
 
 #include "esphome/core/defines.h"
 
-#if defined(USE_ESP32) && defined(USE_CLOCK_SYNC_RATE_LOCK)
+#if defined(USE_ESP32) && defined(USE_I2S_RATE_LOCK)
 
 #include <atomic>
 #include <cstdint>
 
-namespace esphome::clock_sync {
+namespace esphome::i2s_rate_lock {
 
 /// @brief Hardware sample-rate steering ("rate lock"): trims the I2S output clock by
 /// tens of ppm so the sync servo can hold lock with zero waveform splices.
@@ -83,6 +83,6 @@ class RateLock {
   bool ours_valid_{false};
 };
 
-}  // namespace esphome::clock_sync
+}  // namespace esphome::i2s_rate_lock
 
-#endif  // USE_ESP32 && USE_CLOCK_SYNC_RATE_LOCK
+#endif  // USE_ESP32 && USE_I2S_RATE_LOCK

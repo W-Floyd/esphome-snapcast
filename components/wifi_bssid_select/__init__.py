@@ -1,9 +1,9 @@
-"""Preferred-AP (BSSID) picker, split out of the snapclient component.
+"""Preferred-AP (BSSID) picker.
 
-Nothing here is Snapcast-specific. It was written because pinning an AP removes
-mid-stream roams -- a roam scan stalls the radio long enough to starve synchronized
-audio, and a synchronized group wants every member on one AP so they share a TSF
-timebase -- but the behaviour helps anything that suffers from roaming.
+Nothing here is Snapcast-specific. Pinning an AP removes mid-stream roams -- a roam scan
+stalls the radio long enough to starve synchronized audio, and a synchronized group wants
+every member on one AP so they share a TSF timebase -- but the behaviour helps anything
+that suffers from roaming.
 
 The important design point is that the pin is a PREFERENCE, not a requirement.
 wifi's set_bssid() refuses to associate with anything else, so a hard pin on an AP

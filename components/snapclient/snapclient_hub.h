@@ -73,7 +73,7 @@ class SnapclientHub final : public Component,
   bool audio_flowing() const { return this->client_ != nullptr && this->client_->audio_flowing(); }
   void set_sync_deadband(uint32_t deadband_us) { this->sync_deadband_us_ = deadband_us; }
   void set_converge_fine(uint32_t converge_fine_us) { this->converge_fine_us_ = converge_fine_us; }
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
   void set_rate_lock_port(uint8_t port) { this->rate_lock_port_ = port; }
 #endif
 
@@ -179,7 +179,7 @@ class SnapclientHub final : public Component,
   PauseBehavior pause_behavior_{PauseBehavior::ALLOW};
   uint32_t sync_deadband_us_{128};
   uint32_t converge_fine_us_{2000};
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
   uint8_t rate_lock_port_{0};
 #endif
 

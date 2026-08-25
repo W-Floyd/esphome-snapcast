@@ -1,7 +1,16 @@
 """Snapcast client hub component, modeled on ESPHome's sendspin component."""
 
 import esphome.codegen as cg
-from esphome.components import audio, clock_sync, i2s_audio, network, ota, socket, wifi
+from esphome.components import (
+    audio,
+    clock_sync,
+    i2s_audio,
+    i2s_rate_lock,
+    network,
+    ota,
+    socket,
+    wifi,
+)
 from esphome.components.esp32 import only_on_variant
 from esphome.components.esp32.const import VARIANT_ESP32S3
 import esphome.config_validation as cv
@@ -13,9 +22,10 @@ DEPENDENCIES = ["network"]
 # audio: micro decoder libraries (FLAC, Opus); json: ArduinoJson for hello/settings payloads;
 # ring_buffer: the decoded-PCM buffer between the network and player tasks;
 # mdns: server auto-discovery via _snapcast._tcp when no server is configured.
-# clock_sync: the protocol-agnostic clock filter / TSF sync / I2S rate lock,
+# clock_sync: the protocol-agnostic clock filter and TSF sync; i2s_rate_lock: the
+# S3 hardware clock steering they are paired with,
 # which this component drives but does not own
-AUTO_LOAD = ["audio", "clock_sync", "json", "mdns", "ring_buffer"]
+AUTO_LOAD = ["audio", "clock_sync", "i2s_rate_lock", "json", "mdns", "ring_buffer"]
 DOMAIN = "snapclient"
 
 CONF_SERVER = "server"
@@ -321,7 +331,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_phase_mode(config[CONF_PHASE_INVERT]))
 
     if CONF_RATE_LOCK in config:
-        clock_sync.request_rate_lock()
+        i2s_rate_lock.request_rate_lock()
         cg.add(var.set_rate_lock_port(_resolve_i2s_port(config[CONF_RATE_LOCK])))
 
     if config[CONF_TSF_SYNC]:

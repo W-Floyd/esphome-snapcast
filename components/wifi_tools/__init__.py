@@ -1,7 +1,7 @@
-"""Radio-level WiFi utilities, split out of the snapclient example configs.
+"""Radio-level WiFi utilities.
 
-Nothing here is Snapcast-specific. Two pieces of hard-won esp_wifi knowledge that
-were living as YAML lambdas, now versioned as compiled code:
+Nothing here is Snapcast-specific -- two pieces of hard-won esp_wifi knowledge, kept as
+versioned compiled code rather than as YAML lambdas:
 
 - ``wifi_tools::set_max_tx_power(dbm)`` -- sets the radio's max TX power and logs what
   the driver ACTUALLY accepted, because it quantizes the request into bins and then

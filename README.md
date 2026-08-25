@@ -8,7 +8,8 @@ protocol client, plus a `media_source` feeding the `speaker_source` pipeline.
 | Component | |
 |---|---|
 | `snapclient` | the Snapcast client |
-| `clock_sync` | clock filter, 802.11 TSF group sync, I2S rate steering — only the last is audio-specific |
+| `clock_sync` | clock filter and 802.11 TSF group sync — no audio in it |
+| `i2s_rate_lock` | S3 I2S sample-clock steering, the audio-specific half |
 | `wifi_bssid_select` | preferred-AP picker that falls back rather than stranding the device |
 | `wifi_tools` | TX power (with driver readback) and radio diagnostics |
 

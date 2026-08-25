@@ -141,7 +141,7 @@ static constexpr int64_t FILL_CORR_MAX_US = 400000;
 // publish the group timebase", not servo precision.
 static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
 // Rate-lock PI gains. The plant is an integrator -- queue depth integrates any
 // rate mismatch, so the error's *slope* is the trim -- which is why a stepping
 // bang-bang trim (a second integrator) limit-cycled structurally on hardware
@@ -303,7 +303,7 @@ bool SnapcastClient::start() {
   }
   this->slice_buffer_ = std::make_unique<uint8_t[]>(SLICE_BUFFER_SIZE);
 
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
   this->rate_lock_ = std::make_unique<RateLock>(this->config_.rate_lock_i2s_port);
 #endif
 
@@ -463,7 +463,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // sound premise.
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
       this->fb_samples_ = 0;
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
       // The pipeline restart may have reprogrammed the I2S clock divider; re-read
       // the baseline before the next trim (the requested trim itself stays valid --
       // it is the learned crystal offset, a property of the hardware)
@@ -1438,7 +1438,7 @@ void SnapcastClient::player_task_() {
   // steps; see ServoState for what each field is and why. rate_lock_ok starts from
   // whether the hardware lock exists at all.
   ServoState st;
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
   st.rate_lock_ok = this->rate_lock_ != nullptr;
 #endif
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
@@ -1468,7 +1468,7 @@ void SnapcastClient::player_task_() {
       continue;
     }
 
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
     if (st.rate_lock_ok && rec.params.sample_rate != st.rate_lock_rate) {
       // The speaker reprograms the I2S clock for a new stream format; re-read the
       // divider baseline once the new clock is running. The rate is what lets the
@@ -1738,7 +1738,7 @@ void SnapcastClient::player_task_() {
         st.steer_dir = 0;
       }
       bool trim_holds = false;
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
       // Steady-state rate lock: steer the I2S clock instead of splicing frames.
       // Continuous PI on the median error, no deadband -- trims are inaudible, and
       // gating them through the hysteresis band re-creates the limit cycle. The
@@ -1915,7 +1915,7 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       st.err_window_filled = 0;
       st.steer_dir = 0;
       st.converged = false;
-  #ifdef USE_CLOCK_SYNC_RATE_LOCK
+  #ifdef USE_I2S_RATE_LOCK
       if (this->rate_lock_ != nullptr) {
         this->rate_lock_->invalidate_baseline();
       }
@@ -2017,7 +2017,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
       char trim_str[112] = "";
-  #ifdef USE_CLOCK_SYNC_RATE_LOCK
+  #ifdef USE_I2S_RATE_LOCK
       if (st.rate_lock_ok) {
         if (st.trim_samples > 0) {
           snprintf(trim_str, sizeof(trim_str),
@@ -2074,7 +2074,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       st.soft_dropped_frames = 0;
       st.soft_inserted_frames = 0;
       st.hard_resyncs = 0;
-  #ifdef USE_CLOCK_SYNC_RATE_LOCK
+  #ifdef USE_I2S_RATE_LOCK
       st.trim_samples = 0;
       st.trim_railed = 0;
   #endif

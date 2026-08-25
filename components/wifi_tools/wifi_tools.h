@@ -1,12 +1,11 @@
 #pragma once
 
-// Radio-level WiFi utilities, split out of the snapclient example configs where they
-// lived as YAML lambdas. Nothing here is Snapcast-specific; what it encodes is
-// hard-won knowledge about the esp_wifi driver that is worth keeping as versioned,
-// compiled code rather than as comments in three board files.
+// Radio-level WiFi utilities. Nothing here is Snapcast-specific; what it encodes is
+// hard-won knowledge about the esp_wifi driver, worth keeping as versioned compiled
+// code rather than as lambdas in three board files.
 //
-// It also confines <esp_wifi.h> to one translation unit. Previously every board file
-// needed `esphome: includes: [<esp_wifi.h>]` purely so a lambda could call into it.
+// It also confines <esp_wifi.h> to one translation unit, so no board file needs
+// `esphome: includes: [<esp_wifi.h>]` just to let a lambda call into it.
 
 #include "esphome/core/defines.h"
 

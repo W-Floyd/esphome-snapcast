@@ -5,7 +5,7 @@
 #ifdef USE_ESP32
 
 #include "control_session.h"
-#include "esphome/components/clock_sync/rate_lock.h"
+#include "esphome/components/i2s_rate_lock/rate_lock.h"
 #include "snapcast_proto.h"
 #include "esphome/components/clock_sync/time_filter.h"
 #include "esphome/components/clock_sync/tsf_sync.h"
@@ -33,11 +33,11 @@
 
 namespace esphome::snapclient {
 
-// The timing engine lives in its own component (see components/clock_sync): none of
-// it is Snapcast-specific. Imported by name so the call sites below read unchanged.
+// The timing engine lives in clock_sync and i2s_rate_lock: none of it is
+// Snapcast-specific. Imported by name so the call sites below stay short.
 using clock_sync::KalmanTimeFilter;
-#if defined(USE_ESP32) && defined(USE_CLOCK_SYNC_RATE_LOCK)
-using clock_sync::RateLock;
+#if defined(USE_ESP32) && defined(USE_I2S_RATE_LOCK)
+using i2s_rate_lock::RateLock;
 #endif
 #ifdef CLOCK_SYNC_TSF_ACTIVE
 using clock_sync::TsfSync;
@@ -69,7 +69,7 @@ struct SnapcastClientConfig {
   // above 2*sync_deadband_us and below hard_resync_threshold_ms; the Python
   // schema enforces both.
   int64_t converge_fine_us{2000};
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
   // I2S port whose output clock the hardware rate lock steers (steady-state
   // corrections become clock trims instead of frame splices where supported)
   uint8_t rate_lock_i2s_port{0};
@@ -324,7 +324,7 @@ class SnapcastClient {
     // letting it random-walk inside a deadband -- a free-walking deadband is exactly
     // what wanders the stereo image between two paired devices.
     int8_t steer_dir{0};
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
     // Rate lock: once converged, steady-state corrections become hardware clock trims
     // instead of frame splices. The PI integrator (positive = play faster) persists
     // across resyncs, flushes, and rate changes because it converges to the crystal
@@ -589,7 +589,7 @@ class SnapcastClient {
   size_t opus_output_samples_{0};
 #endif
 
-#ifdef USE_CLOCK_SYNC_RATE_LOCK
+#ifdef USE_I2S_RATE_LOCK
   // Hardware clock steering; owned here, driven by the player task's servo. The
   // speaker callback thread only pokes invalidate_baseline() (atomic flag).
   std::unique_ptr<RateLock> rate_lock_;

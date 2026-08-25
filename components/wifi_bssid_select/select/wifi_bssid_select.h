@@ -1,8 +1,7 @@
 #pragma once
 
-// Preferred-AP picker, split out of the snapclient component: nothing here is
-// Snapcast-specific. Pinning an AP removes mid-stream roams, which is why it was
-// written, but the behaviour is useful to anything that suffers from roaming.
+// Preferred-AP picker; nothing here is Snapcast-specific. Pinning an AP removes
+// mid-stream roams, which is useful to anything that suffers from roaming.
 //
 // The pin is a PREFERENCE, not a requirement -- see release_pin_() for why that
 // distinction is the whole point of this entity.
