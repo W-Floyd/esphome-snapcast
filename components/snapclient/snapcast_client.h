@@ -372,7 +372,10 @@ class SnapcastClient {
     // Rolling hard-resync count, for telling a one-shot catch-up from a storm
     int64_t storm_window_us{0};
     uint32_t storm_resyncs{0};
-    // When the drift first exceeded the repair threshold, 0 while it has not
+    // When the drift first exceeded the repair threshold, 0 while it has not, plus the
+    // range it has covered since -- a split is steady, an artefact moves.
+    int32_t drift_excess_min_us{0};
+    int32_t drift_excess_max_us{0};
     int64_t drift_excess_since_us{0};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};

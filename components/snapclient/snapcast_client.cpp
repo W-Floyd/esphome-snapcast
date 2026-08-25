@@ -249,13 +249,20 @@ static constexpr int64_t STALE_BAILOUT_US = 3000000;
 // held at that instant, so the clamp in notify_audio_played() then permanently absorbed
 // the shortfall -- drift stepped +8 -> +51 ms and stayed there, playing ~43 ms early.
 //
-// Drift that counts as a split. With the chain fully reported there is no legitimate
-// standing drift, so the floor is only the skew between sampling the accounted queue and
-// the measured latency -- sub-millisecond. 5 ms leaves a wide margin over that while
-// catching splits far earlier than the 20 ms this needed when a per-device baseline had
-// to be cleared first. Still well under hard_resync_threshold, so the correction is
-// absorbed by the proportional path instead of triggering a mute.
-static constexpr int32_t DRIFT_REPAIR_US = 5000;
+// Drift that counts as a split.
+//
+// A repair subtracts its whole magnitude from the accounted queue in one step, and the
+// servo then walks that back audibly -- measured in the field as corrections of -66 to
+// -220 ms, one per repair, every repair. So this must only fire on a number that is
+// certainly right, and being slow to act is far cheaper than acting on noise.
+static constexpr int32_t DRIFT_REPAIR_US = 20000;
+// A real split is STEADY: the original was observed rock-steady at +50.7 ms for 18
+// minutes. Measurement artefacts are not -- with a mixer in the chain, drift sawtooths
+// between ~0 and -100 ms as a source ring fills and drains, and a threshold test alone
+// happily fires on the peaks. Requiring the spread across the hold window to stay inside
+// this band is what distinguishes the two, and it is the property the hold was always
+// meant to test.
+static constexpr int32_t DRIFT_STEADY_BAND_US = 10000;
 // Held this long before acting: a real split is rock-steady (18 minutes at +50.7),
 // while a refill transient is not, and repairing a transient would inject the error
 // it is meant to remove.
@@ -1995,6 +2002,18 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         if (fill_drift_us >= DRIFT_REPAIR_US) {
           if (st.drift_excess_since_us == 0) {
             st.drift_excess_since_us = now_us();
+            st.drift_excess_min_us = fill_drift_us;
+            st.drift_excess_max_us = fill_drift_us;
+          }
+          st.drift_excess_min_us = std::min(st.drift_excess_min_us, fill_drift_us);
+          st.drift_excess_max_us = std::max(st.drift_excess_max_us, fill_drift_us);
+          if (st.drift_excess_max_us - st.drift_excess_min_us > DRIFT_STEADY_BAND_US) {
+            // Moving, so it is a measurement artefact rather than a split. Restart the
+            // window from here rather than abandoning it: a genuine split that begins
+            // during a noisy patch should still be caught once the noise passes.
+            st.drift_excess_since_us = now_us();
+            st.drift_excess_min_us = fill_drift_us;
+            st.drift_excess_max_us = fill_drift_us;
           } else if (now_us() - st.drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
             // Trust the measurement: drop the accounted queue by the whole drift. Playback was
             // running that far early, so the prediction moves later and the servo walks the phase
