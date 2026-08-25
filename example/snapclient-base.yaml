@@ -44,9 +44,9 @@ wifi:
 
 external_components:
   # A `components:` filter hides anything it does not name, including the AUTO_LOADed
-  # audio_timing.
+  # clock_sync.
   - source: github://W-Floyd/esphome-snapcast
-    components: [snapclient, audio_timing, wifi_tools, wifi_bssid_select]
+    components: [snapclient, clock_sync, wifi_tools, wifi_bssid_select]
   # - source: {type: local, path: ../components}   # working tree instead
 
   # Forked speaker stack: adds `Speaker::buffered_bytes()`, letting the sync engine see

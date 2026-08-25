@@ -4,7 +4,7 @@
 
 #include "esphome/core/log.h"
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
 #include "esphome/components/json/json_util.h"
 #endif
 
@@ -141,7 +141,7 @@ static constexpr int64_t FILL_CORR_MAX_US = 400000;
 // publish the group timebase", not servo precision.
 static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
 // Rate-lock PI gains. The plant is an integrator -- queue depth integrates any
 // rate mismatch, so the error's *slope* is the trim -- which is why a stepping
 // bang-bang trim (a second integrator) limit-cycled structurally on hardware
@@ -272,7 +272,7 @@ static constexpr int64_t DRIFT_REPAIR_HOLD_US = 10000000;
 static constexpr uint32_t RESYNC_STORM_COUNT = 8;
 static constexpr int64_t RESYNC_STORM_WINDOW_US = 2000000;
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
 // TSF unicast roster refresh cadence (only while no stream is active; blocking RPC)
 static constexpr int64_t TSF_PEER_REFRESH_US = 60000000;
 #endif
@@ -303,11 +303,11 @@ bool SnapcastClient::start() {
   }
   this->slice_buffer_ = std::make_unique<uint8_t[]>(SLICE_BUFFER_SIZE);
 
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
   this->rate_lock_ = std::make_unique<RateLock>(this->config_.rate_lock_i2s_port);
 #endif
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
   // Plausibility gate mirrors the hard-resync threshold: a shared mapping that far
   // from our own estimate would hard-resync us -- reject it instead
   this->tsf_sync_ =
@@ -463,7 +463,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // sound premise.
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
       this->fb_samples_ = 0;
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
       // The pipeline restart may have reprogrammed the I2S clock divider; re-read
       // the baseline before the next trim (the requested trim itself stays valid --
       // it is the learned crystal offset, a property of the hardware)
@@ -604,7 +604,7 @@ void SnapcastClient::connection_session_() {
   }
   this->active_host_ = host;
   this->server_id_hash_ = fnv1_hash(host + ":" + std::to_string(port));
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
   this->last_peer_refresh_us_ = 0;  // fresh roster per session
 #endif
 
@@ -923,7 +923,7 @@ void SnapcastClient::service_tx_() {
   // Persistent control session: metadata + roster + control RPCs (non-blocking)
   if (this->control_session_ != nullptr) {
     this->control_session_->service(now, this->active_host_);
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
     if (this->tsf_sync_ != nullptr) {
       std::vector<uint32_t> peers;
       if (this->control_session_->take_peers(peers)) {
@@ -973,7 +973,7 @@ void SnapcastClient::service_tx_() {
     this->set_stream_active_(false);
   }
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
   if (this->tsf_sync_ != nullptr) {
     // Unicast roster: the control session feeds it live (non-blocking); the
     // blocking one-shot fetch remains only as the fallback when the control port
@@ -1048,7 +1048,7 @@ void SnapcastClient::send_set_latency_rpc_(int32_t latency_ms) {
   freeaddrinfo(res);
 }
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
 // THREAD CONTEXT: Network task. Fetches the server's client roster so the TSF
 // leader can unicast beacons to every peer -- client-to-client multicast is
 // unreliable on many APs (isolation, IGMP snooping, mesh filtering), while unicast
@@ -1438,7 +1438,7 @@ void SnapcastClient::player_task_() {
   // steps; see ServoState for what each field is and why. rate_lock_ok starts from
   // whether the hardware lock exists at all.
   ServoState st;
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
   st.rate_lock_ok = this->rate_lock_ != nullptr;
 #endif
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
@@ -1468,7 +1468,7 @@ void SnapcastClient::player_task_() {
       continue;
     }
 
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
     if (st.rate_lock_ok && rec.params.sample_rate != st.rate_lock_rate) {
       // The speaker reprograms the I2S clock for a new stream format; re-read the
       // divider baseline once the new clock is running. The rate is what lets the
@@ -1566,7 +1566,7 @@ void SnapcastClient::player_task_() {
     // moved.
     const int64_t error_us = predicted - deadline;  // >0: this chunk would play late
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
     // RAW timing sample, for offline cross-device analysis. Deliberately built from
     // DIRECT OBSERVATIONS only -- no servo state, no predicted playout -- because every
     // wrong diagnosis in this area came from trusting a model of when audio renders.
@@ -1609,7 +1609,7 @@ void SnapcastClient::player_task_() {
       }
     }
 #endif  // USE_SNAPCLIENT_TIMING_DIAG
-#endif  // AUDIO_TIMING_TSF_ACTIVE
+#endif  // CLOCK_SYNC_TSF_ACTIVE
 
 
     st.err_accum_us += error_us;
@@ -1738,7 +1738,7 @@ void SnapcastClient::player_task_() {
         st.steer_dir = 0;
       }
       bool trim_holds = false;
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
       // Steady-state rate lock: steer the I2S clock instead of splicing frames.
       // Continuous PI on the median error, no deadband -- trims are inaudible, and
       // gating them through the hysteresis band re-creates the limit cycle. The
@@ -1819,7 +1819,7 @@ void SnapcastClient::player_task_() {
       }
     }
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
     // Report our own tracking quality to the TSF layer: a leader publishes the
     // timebase the whole group follows, so it must hand off while its own playout
     // is diverged (observed: a device stuck in a degraded buffer state kept
@@ -1843,7 +1843,7 @@ void SnapcastClient::player_task_() {
     // post-boot mutes to ~20 s of counter resets. Corrections inside 2x deadband
     // are trim-only and inaudible.
     if (std::abs(median_err_us) <= 2 * this->config_.sync_deadband_us) {
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
       // Don't unmute onto a provisional timebase: a follower still on its Kalman
       // fallback (leader's mapping rejected while our own estimate is raw) will
       // step by up to the plausibility bound when it finally adopts the shared
@@ -1915,7 +1915,7 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       st.err_window_filled = 0;
       st.steer_dir = 0;
       st.converged = false;
-  #ifdef USE_AUDIO_TIMING_RATE_LOCK
+  #ifdef USE_CLOCK_SYNC_RATE_LOCK
       if (this->rate_lock_ != nullptr) {
         this->rate_lock_->invalidate_baseline();
       }
@@ -2017,7 +2017,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
       char trim_str[112] = "";
-  #ifdef USE_AUDIO_TIMING_RATE_LOCK
+  #ifdef USE_CLOCK_SYNC_RATE_LOCK
       if (st.rate_lock_ok) {
         if (st.trim_samples > 0) {
           snprintf(trim_str, sizeof(trim_str),
@@ -2029,7 +2029,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       }
   #endif
       char tsf_str[64] = "";
-  #ifdef AUDIO_TIMING_TSF_ACTIVE
+  #ifdef CLOCK_SYNC_TSF_ACTIVE
       if (this->tsf_sync_ != nullptr) {
         // Publish our depth so the group can cross-check it (see TsfSync)
         this->tsf_sync_->set_pipeline_ms(pipeline_ms);
@@ -2074,7 +2074,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       st.soft_dropped_frames = 0;
       st.soft_inserted_frames = 0;
       st.hard_resyncs = 0;
-  #ifdef USE_AUDIO_TIMING_RATE_LOCK
+  #ifdef USE_CLOCK_SYNC_RATE_LOCK
       st.trim_samples = 0;
       st.trim_railed = 0;
   #endif
@@ -2140,7 +2140,7 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
                                this->static_delay_ms_.load(std::memory_order_relaxed)) *
       1000;
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
   // TSF group sync: prefer the AP-shared server->TSF mapping so every same-AP
   // client derives identical deadlines (estimate wander becomes common-mode)
   if (this->tsf_sync_ != nullptr) {

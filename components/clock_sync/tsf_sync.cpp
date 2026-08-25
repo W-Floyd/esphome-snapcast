@@ -1,6 +1,6 @@
 #include "tsf_sync.h"
 
-#ifdef AUDIO_TIMING_TSF_ACTIVE
+#ifdef CLOCK_SYNC_TSF_ACTIVE
 
 #include "esphome/core/log.h"
 
@@ -15,7 +15,7 @@
 #include <cstdlib>
 #include <cstring>
 
-namespace esphome::audio_timing {
+namespace esphome::clock_sync {
 
 static const char *const TAG = "snapclient.tsf";
 
@@ -757,6 +757,6 @@ float TsfSync::mapping_age_s(int64_t local_now_us) {
   return static_cast<float>(local_now_us - updated) * 1e-6f;
 }
 
-}  // namespace esphome::audio_timing
+}  // namespace esphome::clock_sync
 
-#endif  // AUDIO_TIMING_TSF_ACTIVE
+#endif  // CLOCK_SYNC_TSF_ACTIVE

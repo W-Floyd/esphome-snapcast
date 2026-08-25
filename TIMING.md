@@ -32,7 +32,7 @@ TSF sidesteps it. One elected leader publishes a single TSF→server mapping; ev
 leader included, computes deadlines from that published line, so the mapping's own error
 is common-mode and cancels. What remains per-device is only local TSF read noise.
 
-Election, failover and the Kalman fallback: `components/audio_timing/tsf_sync.h`.
+Election, failover and the Kalman fallback: `components/clock_sync/tsf_sync.h`.
 Measured: the four devices agree on the server-versus-TSF rate within 2 ppm (−16.7 to
 −18.5 ppm), an independent check that they share one timebase.
 

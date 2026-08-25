@@ -35,7 +35,7 @@ void SnapclientHub::setup() {
   config.keepalive_hold_ms = this->keepalive_hold_ms_;
   config.sync_deadband_us = this->sync_deadband_us_;
   config.converge_fine_us = this->converge_fine_us_;
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
   config.rate_lock_i2s_port = this->rate_lock_port_;
 #endif
 
@@ -101,7 +101,7 @@ void SnapclientHub::dump_config() {
                 this->server_host_.empty() ? "mDNS (_snapcast._tcp)" : "static host", get_mac_address_pretty().c_str(),
                 this->buffer_size_, this->time_sync_interval_ms_, this->hard_resync_threshold_ms_,
                 this->stream_idle_timeout_ms_);
-#ifdef USE_AUDIO_TIMING_RATE_LOCK
+#ifdef USE_CLOCK_SYNC_RATE_LOCK
   ESP_LOGCONFIG(TAG, "  Rate lock: I2S%u clock steering", this->rate_lock_port_);
 #endif
   if (this->client_ != nullptr && this->client_->is_connected()) {

@@ -51,12 +51,12 @@
   derived slightly different magnitudes from one event, which suggests each computed it
   locally against a common bad input rather than being handed the same number.
 
-- **Extract the servo into `audio_timing` — waiting on a consumer, not on tidiness.** The
+- **Extract the servo into `clock_sync` — waiting on a consumer, not on tidiness.** The
   length complaint is closed: `player_task_` is 433 lines, its 31 locals are a `ServoState`
   struct, and the re-baseline, sync report and stale bailout are named methods. What is
   left is a real extraction, and two things argue against doing it speculatively.
 
-  It has one consumer. `audio_timing`'s existing members are narrow primitives —
+  It has one consumer. `clock_sync`'s existing members are narrow primitives —
   `KalmanTimeFilter` takes RTT samples and knows nothing of their origin — where the servo
   is their *integration* with this component's I/O, so its interface would be designed from
   a single data point. And the playout feedback (`pushed_frames_total_`,
@@ -70,7 +70,7 @@
   correction split — with no rate steering, no median filter, no PI and no shared timebase.
   The MIT relicense means it *could* now take this code, which the GPL forbade. It has its
   own working implementation, though, so the trigger is somebody asking rather than the
-  licence allowing. If it happens it belongs in `audio_timing`, not a new component.
+  licence allowing. If it happens it belongs in `clock_sync`, not a new component.
 
   The portable half of this is `set_rate_adjustment` above: an API, so no licence or
   extraction question, and the only way rate steering reaches a non-S3 target at all.

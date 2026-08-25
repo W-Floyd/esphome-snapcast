@@ -8,7 +8,7 @@ protocol client, plus a `media_source` feeding the `speaker_source` pipeline.
 | Component | |
 |---|---|
 | `snapclient` | the Snapcast client |
-| `audio_timing` | clock filter, 802.11 TSF group sync, I2S rate steering — protocol-agnostic |
+| `clock_sync` | clock filter, 802.11 TSF group sync, I2S rate steering — only the last is audio-specific |
 | `wifi_bssid_select` | preferred-AP picker that falls back rather than stranding the device |
 | `wifi_tools` | TX power (with driver readback) and radio diagnostics |
 
@@ -19,10 +19,10 @@ ESP32 (esp-idf), PSRAM strongly recommended. ESPHome new enough for `media_sourc
 
 ```yaml
 external_components:
-  # snapclient AUTO_LOADs audio_timing, and a `components:` filter hides anything it
+  # snapclient AUTO_LOADs clock_sync, and a `components:` filter hides anything it
   # does not name. Omit the filter to also get wifi_bssid_select / wifi_tools.
   - source: github://W-Floyd/esphome-snapcast
-    components: [snapclient, audio_timing]
+    components: [snapclient, clock_sync]
   # Forked speaker stack, pending upstream: makes the audio between our push point and
   # the DAC readable, which the sync engine needs. Tracks a release tag; see TODO.md.
   - source:

@@ -26,10 +26,10 @@ wifi:
   password: !secret wifi_password
 
 external_components:
-  # snapclient AUTO_LOADs audio_timing, and a `components:` filter hides anything it
+  # snapclient AUTO_LOADs clock_sync, and a `components:` filter hides anything it
   # does not name. Omit the filter to get all four.
   - source: github://W-Floyd/esphome-snapcast
-    components: [snapclient, audio_timing, wifi_tools, wifi_bssid_select]
+    components: [snapclient, clock_sync, wifi_tools, wifi_bssid_select]
   # Working tree instead, so edits apply without pushing:
   # - source: {type: local, path: ../components}
 

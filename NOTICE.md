@@ -7,7 +7,7 @@ This project's source is licensed under the **MIT License** — see [LICENSE](LI
 ## What MIT covers, and what it does not
 
 MIT covers the source in this repository: the Snapcast protocol implementation, the
-timing engine (`components/audio_timing`), the ESPHome component plumbing, the example
+timing engine (`components/clock_sync`), the ESPHome component plumbing, the example
 configurations, the test harness and the documentation.
 
 It does **not** change the licence of the firmware you build from it. Every C++ file here
@@ -32,7 +32,7 @@ answer, and the source comments say so at each site.
 | [badaix/snapcast](https://github.com/badaix/snapcast) | The protocol. Message layout, Time reply semantics, ClientInfo and effective-buffer composition were verified against the server source — interface facts, implemented here from scratch |
 | [CarlosDerSeher/snapclient](https://github.com/CarlosDerSeher/snapclient) | Prior art for the playback control law. The median-filtered error signal, sample stuffing over silence insertion, and mute-until-synced are its ideas; the 128 µs engage threshold is its value. The implementation, the window length, the PI trim and the rate lock are not |
 | [esphome/esphome](https://github.com/esphome/esphome) | The component framework. The architecture follows upstream `sendspin` — hub plus children, the `media_source` player contract, codegen idioms |
-| [W-Floyd/ImmichFrame-snapweb](https://github.com/W-Floyd/ImmichFrame-snapweb) | Where the Kalman time filter was first written, by this project's author. `components/audio_timing/time_filter.h` is a C++ translation of that work — see below |
+| [W-Floyd/ImmichFrame-snapweb](https://github.com/W-Floyd/ImmichFrame-snapweb) | Where the Kalman time filter was first written, by this project's author. `components/clock_sync/time_filter.h` is a C++ translation of that work — see below |
 
 The Sage-Husa adaptive measurement noise and the Huber M-estimate weighting in
 `time_filter.h` are published methods (Mohamed & Schwarz, 1999), cited in the file.
