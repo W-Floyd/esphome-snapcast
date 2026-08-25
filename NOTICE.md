@@ -32,10 +32,19 @@ answer, and the source comments say so at each site.
 | [badaix/snapcast](https://github.com/badaix/snapcast) | The protocol. Message layout, Time reply semantics, ClientInfo and effective-buffer composition were verified against the server source — interface facts, implemented here from scratch |
 | [CarlosDerSeher/snapclient](https://github.com/CarlosDerSeher/snapclient) | Prior art for the playback control law. The median-filtered error signal, sample stuffing over silence insertion, and mute-until-synced are its ideas; the 128 µs engage threshold is its value. The implementation, the window length, the PI trim and the rate lock are not |
 | [esphome/esphome](https://github.com/esphome/esphome) | The component framework. The architecture follows upstream `sendspin` — hub plus children, the `media_source` player contract, codegen idioms |
-| [ImmichFrame-snapweb](https://github.com/immich-app/immich) | Where the Kalman time filter was first written, by this project's author, as a complete replacement for the previous sync mechanism. `components/audio_timing/time_filter.h` is a C++ translation of that work |
+| [W-Floyd/ImmichFrame-snapweb](https://github.com/W-Floyd/ImmichFrame-snapweb) | Where the Kalman time filter was first written, by this project's author. `components/audio_timing/time_filter.h` is a C++ translation of that work — see below |
 
 The Sage-Husa adaptive measurement noise and the Huber M-estimate weighting in
 `time_filter.h` are published methods (Mohamed & Schwarz, 1999), cited in the file.
+
+On the time filter specifically, since it is the one piece here translated from existing
+code rather than written for this project. `badaix/snapweb` synchronises with a
+`TimeProvider` holding a 100-sample median of `(c2s - s2c) / 2`; it contains no Kalman
+filter. The `KalmanTimeFilter` in ImmichFrame-snapweb is a different mechanism written to
+replace that one, and both commits touching the file are the author's. That fork is
+GPL-3.0, as is its upstream, but an author retains copyright in their own contributions:
+publishing this code there under the GPLv3 does not preclude licensing the same work
+under MIT here.
 
 ## Relicensing note
 
