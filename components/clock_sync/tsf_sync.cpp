@@ -24,12 +24,20 @@ static const char *const TSF_GROUP = "239.255.83.84";
 static constexpr uint16_t TSF_PORT = 47083;
 
 static constexpr uint32_t TSF_MAGIC = 0x534E5446;  // 'SNTF'
-// Bump on any wire change: mismatched packets are dropped, so a half-flashed fleet
-// falls back to per-device Kalman rather than misreading fields.
-// 2: pipeline depth widened from int16 ms to int32 us. A mixed-fleet receiver rejects on
-// version, so the group simply stops sharing a timebase and every device falls back to its
-// own Kalman estimate -- degraded but never wrong. Flash the fleet together.
-static constexpr uint8_t TSF_VERSION = 2;
+// Bump on a wire change that could make a receiver MISREAD a timebase field. Widening
+// pipeline_us from int16 to int32 was not one: it is the last field in the packet, so every
+// field the timebase depends on stays at its old offset, and the only thing an older receiver
+// gets wrong is the low half of a diagnostics-only value it never feeds into the mapping.
+//
+// It was bumped anyway, and that cost more than it saved. Rejecting on version makes a
+// half-flashed fleet lose the SHARED TIMEBASE outright -- and losing it is expensive: a group
+// whose publisher goes quiet leaves every follower unable to unmute, measured at ~50 s of
+// silence with each device's own servo already in band. Without the bump the same rollout
+// degrades one direction only (a new receiver drops an old sender's shorter packet on the runt
+// check) instead of both, and the timebase keeps flowing the other way.
+//
+// So: amend in place, and reserve the bump for a change that would genuinely be misread.
+static constexpr uint8_t TSF_VERSION = 1;
 
 // Pipeline-depth divergence alarm. Absolute playout depth is the one quantity the
 // sync median CANNOT see: the median is measured against this device's own
