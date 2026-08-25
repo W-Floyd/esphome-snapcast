@@ -10,6 +10,7 @@
 #include "esphome/components/clock_sync/time_filter.h"
 #include "esphome/components/clock_sync/tsf_sync.h"
 
+#include "esphome/components/audio/audio.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/core/helpers.h"
 
@@ -174,14 +175,18 @@ class SnapcastAudioListener {
   /// clock out, so it does not fall to zero as the queue empties.
   ///
   /// @return false when unavailable -- distinct from a reported zero.
-  virtual bool on_query_latency(uint32_t & /*microseconds*/) { return false; }
+  virtual bool on_query_latency(audio::AudioDepth & /*depth*/) { return false; }
 
   /// @brief How much of OUR OWN audio the sink still holds, as a duration. Excludes padding and
   /// anything we did not write, so this -- not on_query_latency() -- is what the accounting
   /// cross-check compares against `pushed - played`. Differencing against the latency instead
   /// yields the DMA's silence padding as a phantom split.
+  ///
+  /// The reading describes `depth.as_of_us`, which is in the past by up to one iteration of whichever
+  /// task published it. Compare it against what `pushed - played` was AT THAT INSTANT, not against
+  /// their current values -- see accounted_at_() and the drift column.
   /// @return false when unavailable -- distinct from a reported zero.
-  virtual bool on_query_audio(uint32_t & /*microseconds*/) { return false; }
+  virtual bool on_query_audio(audio::AudioDepth & /*depth*/) { return false; }
 };
 
 /// @brief Native Snapcast client core.
@@ -463,6 +468,39 @@ class SnapcastClient {
   int64_t chunk_deadline_us_(const ChunkRecord &rec);
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
+
+  /// One recorded value of a playout counter and the instant it took effect. See the histories
+  /// themselves, below, for why the accounting has to be evaluable at a past instant at all.
+  struct PlayoutMark {
+    int64_t ts_us;  // 0 marks an unused slot; no real sample can land there
+    int64_t total;  // the counter's value as of ts_us
+  };
+  /// Sized against the worst staleness seen in the field (~165 ms) and the fastest either counter
+  /// moves. Pushes are the faster of the two: a chunk is 4608 bytes at 44.1 kHz stereo against a
+  /// 4096-byte slice buffer, so two or three marks per chunk at ~38 chunks/s, and more when the
+  /// pipeline back-pressures into partial writes. Playback credits arrive per DMA buffer, ~100/s.
+  /// 64 slots covers ~600 ms of either at 2 KB across both rings; an older reading is refused
+  /// rather than answered wrongly, so being generous here only costs RAM.
+  static constexpr size_t PLAYOUT_HISTORY = 64;
+
+  /// @brief Records a counter's new value against the instant it took effect. Call under
+  /// playout_mutex_, from the thread that owns the counter.
+  static void mark_playout_(PlayoutMark *history, size_t &next, int64_t ts_us, int64_t total);
+  /// @brief The newest recorded level at or before `as_of_us`. False when the ring holds nothing that
+  /// old, which is the caller's cue to discard the sample.
+  static bool playout_level_at_(const PlayoutMark *history, int64_t as_of_us, int64_t &total);
+  /// @brief Clears both histories. Call under playout_mutex_ whenever the counters are reset or
+  /// re-baselined: a level recorded before a re-baseline says nothing about the one after it.
+  void clear_playout_history_();
+  /// @brief The accounted queue (`pushed - played`) as it stood at `as_of_us`, in frames.
+  ///
+  /// This is the whole point of the histories: it makes the accounting comparable to a sink reading
+  /// that describes a moment already past. Call under playout_mutex_.
+  ///
+  /// @return false when `as_of_us` predates what the histories still hold, in which case the sample
+  /// must be discarded rather than compared -- a wrong answer here manufactures the split it is
+  /// meant to detect.
+  bool accounted_at_(int64_t as_of_us, int64_t &frames) const;
   /// Pushes silence downstream. @return frames actually pushed.
   uint32_t push_silence_(uint32_t frames, const StreamParams &params);
   /// Pushes one copy of the most recently pushed frame (sample stuffing, like the
@@ -559,6 +597,29 @@ class SnapcastClient {
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
   std::atomic<bool> pipeline_starved_{false};
   bool starved_latched_{false};
+
+  // Recent history of the two playout counters, so the accounted queue can be evaluated at the
+  // instant a sink reading describes rather than at the instant we read it.
+  //
+  // This exists because the two are not sampled together and cannot be. The sink publishes a
+  // snapshot on ITS task's cadence; we read it on the player task at an arbitrary phase, and every
+  // frame we pushed or that rendered in between lands in `pushed - played` but not in the reading.
+  // Differencing the two directly measured that phase, not the accounting: on the fleet the residue
+  // came out quantised in whole chunks (26.1 ms at 44.1 kHz), mean wandering tens of milliseconds
+  // over hours, in opposite directions on two clients -- an order of magnitude above the ~7 us the
+  // comparison is supposed to resolve, and shaped nothing like the steady offset it is looking for.
+  //
+  // Two separate rings rather than one of (pushed, played) pairs, because the two are stamped from
+  // different clocks-in-spirit: a push is stamped when it happens, while a playback credit is
+  // stamped with the DAC time the audio actually RENDERED, which is earlier than the callback that
+  // reports it. Interleaving those into one sequence would not be monotone, and a level recorded
+  // against the wrong instant is the error this is here to remove.
+  //
+  // A reading older than the ring is rejected rather than guessed at.
+  PlayoutMark pushed_history_[PLAYOUT_HISTORY]{};
+  PlayoutMark played_history_[PLAYOUT_HISTORY]{};
+  size_t pushed_history_next_{0};
+  size_t played_history_next_{0};
 
   // --- Network task locals ---
   int sock_{-1};

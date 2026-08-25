@@ -393,6 +393,7 @@ void SnapcastClient::set_output_active(bool active) {
     this->played_frames_total_ = 0;
     this->pushed_frames_total_ = 0;
     this->fb_samples_ = 0;
+    this->clear_playout_history_();
     this->playout_mutex_.unlock();
   }
   this->output_active_.store(active, std::memory_order_relaxed);
@@ -429,8 +430,57 @@ void SnapcastClient::set_server_override(const std::string &host, uint16_t port)
   }
 }
 
+// Ring append. Newest wins on a tie: two events at the same microsecond are ordered by arrival, and
+// the later one carries the later level.
+void SnapcastClient::mark_playout_(PlayoutMark *history, size_t &next, int64_t ts_us, int64_t total) {
+  history[next] = PlayoutMark{ts_us, total};
+  next = (next + 1) % PLAYOUT_HISTORY;
+}
+
+void SnapcastClient::clear_playout_history_() {
+  for (size_t i = 0; i < PLAYOUT_HISTORY; i++) {
+    this->pushed_history_[i] = PlayoutMark{0, 0};
+    this->played_history_[i] = PlayoutMark{0, 0};
+  }
+  this->pushed_history_next_ = 0;
+  this->played_history_next_ = 0;
+}
+
+// Newest mark at or before `as_of_us`. Scans the whole ring rather than assuming it is sorted: the
+// two histories are each monotone in their own timestamps, but nothing guarantees a caller's `as_of`
+// falls after the oldest slot, and a linear scan of 32 entries twice per report is free.
+bool SnapcastClient::playout_level_at_(const PlayoutMark *history, int64_t as_of_us, int64_t &total) {
+  int64_t best_ts = 0;
+  bool found = false;
+  for (size_t i = 0; i < PLAYOUT_HISTORY; i++) {
+    if (history[i].ts_us == 0 || history[i].ts_us > as_of_us) {
+      continue;
+    }
+    if (!found || history[i].ts_us >= best_ts) {
+      best_ts = history[i].ts_us;
+      total = history[i].total;
+      found = true;
+    }
+  }
+  return found;
+}
+
+bool SnapcastClient::accounted_at_(int64_t as_of_us, int64_t &frames) const {
+  int64_t pushed_at = 0;
+  int64_t played_at = 0;
+  if (!playout_level_at_(this->pushed_history_, as_of_us, pushed_at) ||
+      !playout_level_at_(this->played_history_, as_of_us, played_at)) {
+    // The reading is older than anything we still remember, so there is no honest comparison to
+    // make. Refusing is the only safe answer: substituting the current levels is exactly the bug.
+    return false;
+  }
+  frames = pushed_at - played_at;
+  return true;
+}
+
 // THREAD CONTEXT: Speaker playback callback thread
 void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
+  bool rebaselined = false;
   this->playout_mutex_.lock();
   if (this->playout_valid_) {
     // A gap well beyond the speaker's DMA cadence means the DAC was starved
@@ -462,6 +512,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // sound premise.
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
       this->fb_samples_ = 0;
+      rebaselined = true;
 #ifdef USE_I2S_RATE_LOCK
       // The pipeline restart may have reprogrammed the I2S clock divider; re-read
       // the baseline before the next trim (the requested trim itself stays valid --
@@ -499,6 +550,16 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   this->played_frames_total_ += frames;
   this->played_last_ts_us_ = timestamp_us;
   this->playout_valid_ = true;
+
+  // Record the new level against the instant the audio RENDERED, not the instant this callback ran:
+  // a sink reading stamped `as_of` excludes exactly the frames that had rendered by `as_of`, so the
+  // level has to be attributed the same way for the two to line up. A re-baseline discards the past,
+  // so its history goes with it -- an older level says nothing about the counters after it.
+  if (rebaselined) {
+    this->clear_playout_history_();
+    this->mark_playout_(this->pushed_history_, this->pushed_history_next_, timestamp_us, this->pushed_frames_total_);
+  }
+  this->mark_playout_(this->played_history_, this->played_history_next_, timestamp_us, this->played_frames_total_);
 
   // Exponentially-weighted means of (frame index, DAC time); see the member comment.
   // Prediction extrapolates through this pivot along the exact nominal sample rate:
@@ -1525,16 +1586,21 @@ void SnapcastClient::player_task_() {
     if (st.fill_sample_countdown == 0) {
       st.fill_sample_countdown = FILL_SAMPLE_EVERY_CHUNKS;
       // Own-audio, for the same reason as the drift column: this compares against the accounted
-      // queue, which counts only frames we wrote.
-      uint32_t measured_us = 0;
+      // queue, which counts only frames we wrote. And against the accounted queue AS IT STOOD at the
+      // instant the reading describes -- see accounted_at_().
+      audio::AudioDepth measured;
+      int64_t accounted_frames = 0;
+      bool comparable = false;
       if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
-          this->audio_listener_->on_query_audio(measured_us)) {
+          this->audio_listener_->on_query_audio(measured)) {
         this->playout_mutex_.lock();
-        const int64_t accounted_frames = this->pushed_frames_total_ - this->played_frames_total_;
+        comparable = this->accounted_at_(measured.as_of_us, accounted_frames);
         this->playout_mutex_.unlock();
+      }
+      if (comparable) {
         const int64_t accounted_us =
             accounted_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
-        const int64_t sample_us = static_cast<int64_t>(measured_us) - accounted_us;
+        const int64_t sample_us = static_cast<int64_t>(measured.microseconds) - accounted_us;
         if (std::abs(sample_us) <= FILL_CORR_MAX_US) {
           st.fill_corr_us = st.fill_corr_valid
                              ? st.fill_corr_us + FILL_EWMA_ALPHA * (static_cast<float>(sample_us) - st.fill_corr_us)
@@ -1895,20 +1961,42 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       //
       // Now whole-chain: source ring, mixer transfer buffer, output ring and DMA span are all
       // included, so the previous caveat about unreported downstream stages no longer applies.
-      uint32_t buffered_us = 0;
+      //
+      // Used AS PUBLISHED, deliberately NOT aged forward for the snapshot's staleness. Aging it was
+      // tried and it caused a dropout: this is a LATENCY, and its dominant term is the i2s DMA span,
+      // which the always-fill model holds permanently full -- every task iteration writes a whole
+      // buffer, padding with silence as needed, so the span does not decay with the snapshot's age
+      // the way a draining queue would. Subtracting elapsed time from it under-anchors the
+      // accounting, the prediction then runs early, the device renders late, and it does not
+      // recover: measured on hardware as an anchor of 43 ms where the honest reading was 60, then
+      // hard resyncs at 350 ms, 2297 ms and 3581 ms late in four seconds, ending in a reconnect.
+      //
+      // The other term, the queue ahead of the DMA, would be fair to age -- but this path runs
+      // BECAUSE the pipeline drained, so that term is empty by definition and there is nothing there
+      // to correct. The staleness that matters for the accounting cross-check is handled where it
+      // belongs, in accounted_at_(), which needs no assumption about what drains.
+      audio::AudioDepth latency;
       const bool have_fill = this->audio_listener_ != nullptr && frame_bytes > 0 &&
-                             this->audio_listener_->on_query_latency(buffered_us);
+                             this->audio_listener_->on_query_latency(latency);
       const int64_t in_flight_frames =
-          have_fill ? static_cast<int64_t>(buffered_us) * rec.params.sample_rate / 1000000 : 0;
+          have_fill ? static_cast<int64_t>(latency.microseconds) * rec.params.sample_rate / 1000000 : 0;
       this->playout_mutex_.lock();
       this->playout_valid_ = false;
       this->played_frames_total_ = 0;
       this->pushed_frames_total_ = in_flight_frames;
       this->fb_samples_ = 0;
+      // The counters just jumped; anything remembered against them is now meaningless. Seed the
+      // histories at this instant so the next reading has something honest to compare against.
+      this->clear_playout_history_();
+      this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(), this->pushed_frames_total_);
+      this->mark_playout_(this->played_history_, this->played_history_next_, now_us(), this->played_frames_total_);
       this->playout_mutex_.unlock();
       if (have_fill) {
-        ESP_LOGD(TAG, "Re-baseline anchored to measured latency: %" PRIu32 " ms (%" PRId64 " frames)",
-                 buffered_us / 1000, in_flight_frames);
+        // The snapshot's age is logged but NOT applied -- see above. It is here because it is the
+        // number that would have to be wrong for this anchor to be wrong.
+        ESP_LOGD(TAG, "Re-baseline anchored to measured latency: %" PRIu32 " ms (%" PRId64
+                      " frames), snapshot %" PRId64 " ms old",
+                 latency.microseconds / 1000, in_flight_frames, (now_us() - latency.as_of_us) / 1000);
       } else {
         // Log the FALLBACK too. Without this the two cases are indistinguishable in a
         // log -- a silent fallback looks exactly like the feature working, which is
@@ -1970,17 +2058,34 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // Both sides are therefore differenced in microseconds, unrounded.
       int32_t fill_ms = -1;
       int32_t fill_drift_us = 0;
+      bool fill_comparable = false;
       {
         // OWN-AUDIO, not latency. `pushed - played` counts only frames we wrote, so differencing it
         // against the latency counts the DMA's silence padding as a split that is not one --
         // measured on hardware as a standing -71 ms and -10 ms on two clients, in the direction the
         // repair cannot even act on.
-        uint32_t measured_us = 0;
+        //
+        // And differenced AT THE READING'S OWN INSTANT. The reading is a snapshot published on the
+        // sink's task cadence; `pushed - played` moves continuously on ours. Differencing the two as
+        // read measured the phase between those cadences and almost nothing else: on the fleet the
+        // result was quantised in whole chunks (26.1 ms at 44.1 kHz, and integer multiples of it),
+        // barely autocorrelated where the accounted queue itself is smooth, with a mean that wandered
+        // tens of milliseconds over hours and in opposite directions on two clients. A real split does
+        // the opposite -- it holds. Evaluating the accounting at `as_of_us` removes the artefact
+        // rather than filtering it, which matters because the repair below acts on this number.
+        audio::AudioDepth measured;
         if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
-            this->audio_listener_->on_query_audio(measured_us)) {
-          const int64_t accounted_us = pipeline_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
-          fill_ms = static_cast<int32_t>(measured_us / 1000);
-          fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured_us));
+            this->audio_listener_->on_query_audio(measured)) {
+          fill_ms = static_cast<int32_t>(measured.microseconds / 1000);
+          int64_t accounted_then_frames = 0;
+          this->playout_mutex_.lock();
+          fill_comparable = this->accounted_at_(measured.as_of_us, accounted_then_frames);
+          this->playout_mutex_.unlock();
+          if (fill_comparable) {
+            const int64_t accounted_us =
+                accounted_then_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+            fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured.microseconds));
+          }
         }
       }
       // Repair a sustained split. Acts only on evidence: the measured latency is an independent
@@ -1998,7 +2103,10 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // within a few ms of itself, so a split growing slower than that per report was ratcheted
       // into "normal for this device" and never repaired -- observed on a client sitting at 72 ms
       // of drift having fired zero repairs across its entire log.
-      if (fill_ms >= 0 && st.converged) {
+      // fill_comparable, not just fill_ms: a reading older than the playout history cannot be
+      // differenced honestly, and a repair driven by a guessed difference injects the very offset it
+      // is meant to remove.
+      if (fill_comparable && st.converged) {
         if (fill_drift_us >= DRIFT_REPAIR_US) {
           if (st.drift_excess_since_us == 0) {
             st.drift_excess_since_us = now_us();
@@ -2022,6 +2130,13 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                 static_cast<int64_t>(fill_drift_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000;
             this->playout_mutex_.lock();
             this->pushed_frames_total_ -= excess_frames;
+            // The counter just stepped; levels recorded against its old value would make the next
+            // reading look split by the size of the repair.
+            this->clear_playout_history_();
+            this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(),
+                                this->pushed_frames_total_);
+            this->mark_playout_(this->played_history_, this->played_history_next_, now_us(),
+                                this->played_frames_total_);
             this->playout_mutex_.unlock();
             ESP_LOGW(TAG,
                      "Accounting split repaired: accounted queue ran %" PRId32 " us over measured latency "
@@ -2036,10 +2151,14 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         st.drift_excess_since_us = 0;
       }
 
-      char fill_str[80] = "";
-      if (fill_ms >= 0) {
+      char fill_str[96] = "";
+      if (fill_ms >= 0 && fill_comparable) {
         snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 " us, corr %+d us)",
                  fill_ms, fill_drift_us, static_cast<int>(st.fill_corr_us));
+      } else if (fill_ms >= 0) {
+        // Distinguish "no honest comparison available" from "compared, and it agreed". Silently
+        // printing +0 for the first is how a broken instrument reads as a healthy device.
+        snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift stale)", fill_ms);
       }
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
@@ -2217,6 +2336,7 @@ uint32_t SnapcastClient::push_silence_(uint32_t frames, const StreamParams &para
     pushed += written_frames;
     this->playout_mutex_.lock();
     this->pushed_frames_total_ += written_frames;
+    this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(), this->pushed_frames_total_);
     this->playout_mutex_.unlock();
   }
   return pushed;
@@ -2355,6 +2475,7 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
         zero_writes = 0;
         this->playout_mutex_.lock();
         this->pushed_frames_total_ += written / frame_bytes;
+        this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(), this->pushed_frames_total_);
         this->playout_mutex_.unlock();
       } else if (++zero_writes >= 20) {
         // ~2 s of refused writes: the pipeline is wedged (observed on hardware --

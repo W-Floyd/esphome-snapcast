@@ -8,6 +8,7 @@
 #include "esphome/components/speaker/speaker.h"
 #include "esphome/core/component.h"
 
+#include <esp_timer.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 
@@ -46,15 +47,19 @@ class VirtualSpeaker final : public Component, public speaker::Speaker {
   /// it the fill/drift column never appears and the starvation re-baseline anchor is never taken.
   /// Nothing downstream pads, so every buffered byte is the caller's own audio and the two
   /// questions have the same answer here.
-  bool buffered_audio(uint32_t &microseconds) const override { return this->render_latency(microseconds); }
+  bool buffered_audio(audio::AudioDepth &depth) const override { return this->render_latency(depth); }
 
-  bool render_latency(uint32_t &microseconds) const override {
+  bool render_latency(audio::AudioDepth &depth) const override {
     if (this->ring_ == nullptr) {
       return false;
     }
     const uint32_t frame_bytes = this->channels_ * 2;
-    microseconds = static_cast<uint32_t>(static_cast<uint64_t>(this->ring_->available() / frame_bytes) * 1000000 /
-                                         this->sample_rate_);
+    // Read live rather than published on a task cadence, so the instant really is now -- which makes
+    // this the one stage in the QEMU chain that contributes no staleness of its own. Anything the
+    // consumer's drift column shows there came from the stages above.
+    depth.as_of_us = esp_timer_get_time();
+    depth.microseconds = static_cast<uint32_t>(static_cast<uint64_t>(this->ring_->available() / frame_bytes) *
+                                               1000000 / this->sample_rate_);
     return true;
   }
 

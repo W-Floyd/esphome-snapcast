@@ -23,11 +23,19 @@
   branch justified by a measurement that belonged to something else — all since fixed, and
   the design changed enough that resubmission should be fresh rather than a force-push.
 
-  Blocked on the `fill` vs `pipeline` question below: the field numbers that make the
-  upstream argument are the ones currently in doubt, and resubmitting while the only
-  consumer disagrees with the API by 20–100 ms would be arguing from evidence that no
-  longer holds. Submit as three stacked PRs targeting `dev` in kahrendt's #16317 style —
-  an outside contributor cannot base a PR on a branch in their own fork.
+  No longer blocked: the `fill` vs `pipeline` question below is settled, and it settles in
+  the API's favour — the published numbers are right at the instant they are published, and
+  the 20–100 ms disagreement is the consumer differencing a stale snapshot against a live
+  accumulator. It does add one requirement, now implemented on the fork: every reading carries
+  the instant it describes (`audio::AudioDepth`, published through a seqlock), and a composing
+  stage reports the oldest instant in its total. Submit as three stacked PRs targeting `dev` in
+  kahrendt's #16317 style — an outside contributor cannot base a PR on a branch in their own
+  fork.
+
+  Send the `frames_to_microseconds` overflow fix SEPARATELY and first (see below). The field
+  numbers that make the upstream argument were corrupted by it, so the evidence in these PRs
+  is only defensible once it has landed — and bundling an unrelated arithmetic fix into a
+  feature PR invites the "why is this here" friction that closed the last round.
 - **`speaker::set_rate_adjustment(float ppm)`**, default no-op, implemented in the i2s
   speaker per-SoC. `rate_lock` pokes the S3's MCLK divider directly and would prefer a
   speaker API, keeping `i2s_rate_lock` as the fallback for older ESPHome.
@@ -56,53 +64,140 @@
   `timeout: never` was meant to remove the teardown that does, and there are zero mixer
   stops across the fleet, yet `Pipeline drained (source starvation)` still fires. Test as
   before: skip the re-baseline, watch `drift` and `sync-delta.py` across several
-  starvations. Worth doing only after the disagreement below is settled, since `drift` is
-  the instrument and it is currently untrustworthy.
+  starvations. Now unblocked: the disagreement below is settled and `drift` reads 0 or -1 us
+  on healthy hardware, so a single sample is usable rather than needing a median over many.
+  Note the one caveat there: do NOT age the anchor for the snapshot's staleness — see below
+  for the dropout that caused.
 
   This does not retire the fork either way. The sink query has three consumers — the
   re-baseline anchor, the `fill`/`drift` column, and the self-repair — and only the first
   would go.
 
-- **`fill` and `pipeline` disagree by the source ring's contents.** With a mixer in the
-  chain the measured latency exceeds the accounted queue by exactly what the SourceSpeaker's
-  own ring holds, which oscillates 20-104 ms as chunks arrive and the mixer drains them.
-  Reproducible in `tests/qemu-mixer-test.yaml`; on hardware it shows as `fill` collapsing to
-  a 52-54 ms floor in ~20% of samples, the constant term there being the i2s DMA rather than
-  a 500 ms virtual ring.
+- **`fill` and `pipeline` disagreed for TWO reasons, both in `fill`. Fixed and verified on
+  hardware.** A stale-snapshot sampling artefact, and underneath it a 32-bit overflow in
+  `frames_to_microseconds()`. Settled from the field logs (`a.log`/`b.log`, ~1500 sync
+  reports across two clients); the QEMU run was not needed to find either. `pipeline` — the
+  accounting — was never the wrong side.
 
-  Decomposed in QEMU: sink ~500 ms and steady, mixer transfer buffer 0-8 ms, source ring
-  20-104 ms. `pipeline` tracks sink + transfer; `fill` tracks all three.
+  Three independent lines of evidence, all pointing the same way.
 
-  Which side is wrong is NOT yet established. The obvious suspicion -- that `played` is
-  credited when frames leave the source ring rather than when they render -- was checked and
-  is false: `pending_playback_frames_` is incremented where the mixer mixes and drained by
-  the output speaker's own callback, so the accounting should include the ring. Settling it
-  needs `pushed`, `played` and the measured terms logged side by side from the client, which
-  the mixer harness now makes a local experiment rather than a reflash.
+  *Shape.* `pipeline` is smooth and `fill` is noise: lag-1 autocorrelation 0.84/0.90 for
+  `pipeline` against 0.29/0.45 for `fill`, and a mean report-to-report step of 13.5/13.3 ms
+  for `pipeline` against 45.6/33.3 ms for `fill` at comparable standard deviations
+  (46-55 ms both). A latched accounting error is the opposite signature — both smooth, one
+  offset.
 
-  Until it is settled the repair is gated on steadiness, so the disagreement is reported and
-  not acted on.
+  *Quantisation.* Drift takes recurring EXACT values -26100, -26101, -26122 and -26123 us,
+  plus integer combinations of those with 20000 (-46123, -54150, -74150, -80273, -97370,
+  -100273). 1152 frames at 44100 is 26.122 ms, and the 128-chunk report cadence measures
+  26.16 ms/chunk independently. The disagreement is a whole number of chunks.
 
-  Plan:
+  *Non-steadiness.* Mean drift wanders over hours, in opposite directions on the two
+  clients: -46.7 -> -6.4 ms on one, +4.7 -> -34.6 ms on the other. A real split holds — the
+  original sat at +50.7 ms for 18 minutes.
 
-  1. Log `pushed`, `played`, `own`, `xfer` and `sink` on one line per sync report in the
-     mixer harness. Everything so far is inferred from differences between two of them;
-     this attributes the disagreement directly. One QEMU run, no reflash.
-  2. Cheap discriminator, do it first: rebuild the harness with a single source speaker.
-     The sink callback subtracts `new_frames` — every frame the SINK played — from this
-     source's `pending_playback_frames_`, so any output not sourced from this speaker
-     (the other source, or mixer silence while this ring is dry) over-credits `played`.
-     If the disagreement vanishes with one source, that is the mechanism, and the fix is
-     to credit a source only for frames it contributed.
-  3. If it survives, follow the sign. `pipeline < fill` means `played` too high or
-     `pushed` too low, and step 1 says which moves. Rule `playback_delay_frames_` in or
-     out: it permanently under-credits `played` at first contribution, which pushes the
-     opposite way, so if it is involved something else is too.
-  4. Fix the guilty side, not the convenient one. If the accounting is wrong it is a
-     `mixer` fix upstream; do not adjust `buffered_audio()` to match, which would encode
-     the bug in the API.
-  5. Done when `drift` holds near zero through a mixer in QEMU. Then re-enable the repair
-     at a sane threshold, confirm it stays quiet, and only then flash hardware.
+  Mechanism: the mixer task publishes `own + xfer + sink` as one store per iteration
+  (`TASK_DELAY_MS` = 25 ms), computed BEFORE that iteration's consume and transfer, and the
+  player task reads it at an arbitrary phase. Between publish and read the player pushes in
+  whole 26.12 ms chunks while the DAC drains continuously, so
+  `drift = pushed_since - drained_since`: chunk-quantised, negative-mean, barely
+  autocorrelated. Exactly what is measured. The published number is right at the instant it
+  is published; differencing it against a live accumulator is what is wrong.
+
+  The accounting side is also ruled out structurally, which the earlier note only half
+  checked. Every bias path runs the OTHER way: the clamp in `notify_audio_played()` only
+  reduces `played`, `playback_delay_frames_` only withholds credit, and the
+  `pending_playback_frames_` / `ps.pending_frames` resets discard it. So `pushed - played`
+  can only OVER-state the queue, and `pipeline < fill` cannot come from there.
+
+  Step 2 of the old plan was a no-op and is dropped. `mix_announce` is wired to no pipeline
+  in `qemu-mixer-test.yaml`, so it never runs, never joins `speakers_with_data`, and the
+  mixer is already on its single-source copy path. Cross-source over-crediting is impossible
+  regardless: `atomic_subtract_clamped` caps each source's credit at its own contribution,
+  the mixer never writes silence to the sink (it `continue`s), and `virtual_speaker` fires
+  its callback only for frames actually consumed, never for underrun padding.
+
+  There was a SECOND defect underneath, and it was the bigger one — found only once the
+  sampling artefact above was removed and `drift` got sharp enough to show it.
+  `AudioStreamInfo::frames_to_microseconds()` computed `frames * 1000000` in uint32
+  arithmetic, which wraps at 4295 frames: 97.37 ms at 44.1 kHz, 89.5 ms at 48 kHz. The
+  result comes back short by exactly `2^32 / sample_rate` per wrap — 97391.5 us at
+  44.1 kHz — so any stage holding more than ~97 ms under-reported its depth. The example's
+  i2s ring is `buffer_duration: 100ms` = 4410 frames, over the threshold by design.
+
+  That is upstream code, present on `upstream/dev` today (verified live at b579751bdf) and
+  predating all the fork work — introduced by #8164. It is LATENT there: all three upstream
+  callers pass sub-DMA-buffer counts (`SPDIF_BLOCK_SAMPLES`, `frames_zeroed`,
+  `silence_frames`), so nothing in pristine ESPHome reaches 4295. It becomes reachable the
+  moment a caller passes a buffer occupancy, which is exactly what the depth work does.
+  Fixed with a 64-bit intermediate, along with the same defect in `ms_to_frames`,
+  `ms_to_samples`, `ms_to_bytes` and `frames_to_milliseconds_with_remainder` — those need
+  tens of seconds in one call, so they are latent-latent and labelled as such.
+
+  This retires an earlier claim in this entry, which was wrong: the collapse of `fill` to a
+  "52-54 ms DMA floor" was never the DMA span and never physical. A true 150 ms losing one
+  wrap reports as 52.6 ms. It was this overflow all along.
+
+  It also explains `a leads b`. The overflow made `fill` read ~97 ms low, so `drift` read
+  ~97 ms high, so the repair fired on a split that did not exist and subtracted ~107 ms from
+  a's accounted queue. A constant overflow is perfectly steady, so the steadiness gate could
+  not distinguish it from the real thing — the gate was working, its input was not.
+
+  Both fixed and verified on hardware. Every depth reading now carries the instant it
+  describes (`audio::AudioDepth`), published through a seqlock (`audio::DepthPublisher`) so a
+  duration can never be paired with another publish's timestamp. A composing stage reports the
+  OLDEST instant in its total, because that is the term the drain has to be measured from: the
+  i2s speaker stamps its own sample point, the mixer carries up the sink's, and the resampler
+  and router pass theirs through. `virtual_speaker` reads live and stamps now, so the QEMU
+  chain has exactly one stale stage to attribute to.
+
+  The consumer side is the other half, and without it the timestamp would be decoration. The
+  client keeps short histories of `pushed` and `played` against the instants they took effect
+  (`accounted_at_()`) and differences the reading against what the accounting said AT
+  `as_of_us` rather than now. Two rings, not one: a push is stamped when it happens while a
+  playback credit is stamped with the DAC time the audio rendered, which is earlier than the
+  callback reporting it, so interleaving them would not be monotone. Any reset — output
+  reactivation, either re-baseline, a repair — clears them.
+
+  A reading older than the history is REFUSED rather than compared: the report prints
+  `drift stale` and the repair does not arm. Printing `+0` for "could not compare" is how a
+  broken instrument reads as a healthy device.
+
+  Do NOT age the starvation re-baseline anchor. Tried, and it caused a dropout. That anchor
+  takes a LATENCY, whose dominant term is the i2s DMA span, and the always-fill model holds
+  that span permanently full — it does not decay with the snapshot's age the way a draining
+  queue does. Aging it under-anchored the accounting to 43 ms where the honest reading was 60,
+  the prediction ran early, the device rendered late, and it did not recover: hard resyncs at
+  350, 2297 and 3581 ms late within four seconds, ending in `not catching up: reconnecting`
+  — a message with zero occurrences before that build. The queue ahead of the DMA would be
+  fair to age, but this path runs BECAUSE the pipeline drained, so that term is empty.
+
+  Result on hardware, both clients, 13 reports each: `drift` reads 0 or -1 us in 11 of 13,
+  against ±26 ms of quantised noise before. `fill` reads 201-249 ms where it used to read
+  133-146 with collapses to 53. Zero repairs, zero re-baselines, zero `drift stale`, zero
+  `not catching up`, 12 of 13 reports at `-0/+0` frame corrections, median error 201 us and
+  162 us.
+
+  Still to do:
+
+  1. PR the `frames_to_microseconds` overflow to upstream ON ITS OWN, before or alongside the
+     depth series. Frame it honestly as a latent overflow on a public helper with no
+     documented ceiling — NOT as a live user-facing bug, because no current upstream caller
+     can reach it. Overselling it would repeat exactly what review objected to last time. Add
+     a gtest under `tests/components/audio/`; the harness exists and there is no
+     `AudioStreamInfo` test today, which makes the fix self-justifying without the feature.
+  2. Run the mixer harness in QEMU. Needs a quiet host — at load 12 the emulator misses its
+     deadlines and panics, which is not a firmware result.
+  3. Leave the accounting alone. It is the trustworthy side, and none of this changed it.
+
+  Residual, mechanism NOT established: a `+30000/+29999 us` outlier, 1 of 13 reports on one
+  client and 2 of 13 on the other, landing only on reports where `fill` dips 25-45 ms below
+  trend. Exactly 30 ms is too round to be physical and does not fit the wrap pattern. Not
+  currently harmful — the repair needs 20 ms held for 10 s inside a 10 ms band, and a single
+  spike opens the window only for the next report at 0 to reset it, so isolated spikes cannot
+  arm it. It would matter if it ever became persistent.
+  extremes near -165 ms, which would need a publish stall of ~6 chunks. The refusal path
+  above now makes that case visible instead of silently wrong, which is how to measure it.
 
 - **Stale deadline on stream resumption.** With `keepalive_hold: never` the pipeline is
   held across an idle, and the first chunk afterwards carries a deadline stale by roughly

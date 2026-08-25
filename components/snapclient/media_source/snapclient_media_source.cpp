@@ -255,13 +255,11 @@ size_t SnapclientMediaSource::on_audio_write(const uint8_t *data, size_t length,
   return this->write_output(data, length, timeout_ms, stream_info);
 }
 
-bool SnapclientMediaSource::on_query_latency(uint32_t &microseconds) {
-  return this->output_render_latency(microseconds);
+bool SnapclientMediaSource::on_query_latency(audio::AudioDepth &depth) {
+  return this->output_render_latency(depth);
 }
 
-bool SnapclientMediaSource::on_query_audio(uint32_t &microseconds) {
-  return this->output_buffered_audio(microseconds);
-}
+bool SnapclientMediaSource::on_query_audio(audio::AudioDepth &depth) { return this->output_buffered_audio(depth); }
 
 }  // namespace esphome::snapclient
 
