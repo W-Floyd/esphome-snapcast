@@ -5,6 +5,13 @@ binary protocol directly and plays through ESPHome's own audio stack, so announc
 volume and mixing work as usual. Structured after upstream `sendspin`: a hub owning the
 protocol client, plus a `media_source` feeding the `speaker_source` pipeline.
 
+> **Alpha — expect breaking changes, without deprecation periods.** Component names,
+> option names and defaults all still move. Recent examples: `audio_timing` was renamed
+> `clock_sync` and had `rate_lock` moved out to a new `i2s_rate_lock` component, and
+> `rate_lock` now takes `i2s_audio_id` (naming the bus) instead of `i2s_port`. Pin a ref
+> if you need a config that keeps working — `github://W-Floyd/esphome-snapcast@<tag>` —
+> and read the commit log before moving it.
+
 | Component | |
 |---|---|
 | `snapclient` | the Snapcast client |
