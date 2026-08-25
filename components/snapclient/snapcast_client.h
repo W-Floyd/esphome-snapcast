@@ -404,6 +404,14 @@ class SnapcastClient {
     // warble heard on every boot. Repaying the debt as soon as the padding actually drains -- while
     // the device is still muted and re-locking -- makes the same correction inaudible.
     int64_t padding_debt_frames{0};
+    // Running mean of the accounted queue over the report window, for the TSF group cross-check.
+    // The instantaneous depth is useless there: it sawtooths by a chunk as the source ring fills in
+    // 26 ms steps and drains continuously, so two devices sampled out of phase differ by up to
+    // +-50 ms of pure phase. Measured across a pair whose depths agreed to 0.3 ms on average, the
+    // instantaneous difference spanned 98 ms. That noise floor is why the divergence alarm sits at
+    // 100 ms and cannot see the millisecond-scale offsets that actually matter.
+    int64_t depth_accum_frames{0};
+    uint32_t depth_samples{0};
     uint32_t in_band_chunks{0};
     int64_t last_resync_log_us{0};
     // When the stream first went staler than the server's buffer, 0 while it is not

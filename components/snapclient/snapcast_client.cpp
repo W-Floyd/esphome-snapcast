@@ -2003,6 +2003,14 @@ void SnapcastClient::player_task_() {
     }
 
     this->push_chunk_(rec, drop_frames, !st.converged);
+
+    // Accumulate the accounted queue per chunk so the group cross-check can be handed a MEAN rather
+    // than a single sample of a sawtooth. One extra lock per chunk (~38/s) buys an order of
+    // magnitude on that comparison's noise floor.
+    this->playout_mutex_.lock();
+    st.depth_accum_frames += this->pushed_frames_total_ - this->played_frames_total_;
+    this->playout_mutex_.unlock();
+    st.depth_samples++;
   }
   vTaskDelete(nullptr);
 }
@@ -2284,8 +2292,14 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         // Microseconds: this delta is the only instrument that can see an absolute playout
         // offset, and the alignment it has to resolve is ~100 us, so a millisecond grid read
         // +0 across the entire range that matters.
-        this->tsf_sync_->set_pipeline_us(static_cast<int32_t>(
-            pipeline_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate)));
+        // The WINDOW MEAN, not the instant: see depth_accum_frames. Falls back to the
+        // instantaneous value only before the first chunk of a window has been counted.
+        const int64_t depth_frames =
+            st.depth_samples > 0 ? st.depth_accum_frames / static_cast<int64_t>(st.depth_samples) : pipeline_frames;
+        st.depth_accum_frames = 0;
+        st.depth_samples = 0;
+        this->tsf_sync_->set_pipeline_us(
+            static_cast<int32_t>(depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate)));
         const TsfSync::Role role = this->tsf_sync_->role();
         if (role == TsfSync::Role::LEADER) {
           snprintf(tsf_str, sizeof(tsf_str), ", tsf=leader(peers %u)", this->tsf_sync_->peer_count());
