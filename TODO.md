@@ -2,13 +2,32 @@
 
 ## Upstream ESPHome
 
-- **Expose the speaker's queued frame count.** `speaker::Speaker` offers only
-  `virtual bool has_buffered_data() const` — a bool, not a count — so the fill between our
-  feedback point and the DAC is unobservable. That is the root of the silent-offset class:
-  the accounting can re-baseline against a wrong fill and settle playing 100–250 ms out
-  while every sync metric reads ~0, because the error is measured against the same
-  corrupted prediction. A `size_t buffered_frames()` would let the re-baseline paths use
-  ground truth, and would retire the six-component fork this repo carries.
+- **Land the buffered-audio API upstream.** `speaker::Speaker` offers only
+  `virtual bool has_buffered_data() const` — a bool, not a quantity — so the fill between
+  our feedback point and the DAC is unobservable, which is the root of the silent-offset
+  class: the accounting re-baselines against a wrong fill and settles playing 100–250 ms
+  out while every sync metric reads ~0, the error being measured against a prediction
+  built from the same corrupted accounting. Landing this retires the six-component fork.
+
+  Implemented on the fork as two virtuals, because there are two questions and they differ
+  by a real quantity:
+  `render_latency()` (when will audio handed over now be heard — counts DMA silence
+  padding) and `buffered_audio()` (how much of the caller's own audio is left — does not).
+  Durations, not bytes or frames, since neither composes across a mixer's channel widening
+  or a resampler's rate change. Both published as atomic snapshots by the owning task,
+  because `RingBufferAudioSource` is single-consumer-thread by contract.
+
+  PRs #18753/#18754/#18755 were opened and closed. Review found ten defects across them —
+  unit mixing between input and output formats, SPDIF never publishing, a stopped speaker
+  reporting "cannot" instead of zero, a documented thread-safety violation, an unreachable
+  branch justified by a measurement that belonged to something else — all since fixed, and
+  the design changed enough that resubmission should be fresh rather than a force-push.
+
+  Blocked on the `fill` vs `pipeline` question below: the field numbers that make the
+  upstream argument are the ones currently in doubt, and resubmitting while the only
+  consumer disagrees with the API by 20–100 ms would be arguing from evidence that no
+  longer holds. Submit as three stacked PRs targeting `dev` in kahrendt's #16317 style —
+  an outside contributor cannot base a PR on a branch in their own fork.
 - **`speaker::set_rate_adjustment(float ppm)`**, default no-op, implemented in the i2s
   speaker per-SoC. `rate_lock` pokes the S3's MCLK divider directly and would prefer a
   speaker API, keeping `i2s_rate_lock` as the fallback for older ESPHome.
@@ -23,25 +42,26 @@
 
 ## Investigate
 
-- **Drop the starvation re-baseline.** It is a net harm as it stands. Anchoring `pushed` to
-  the sink's reported fill uses a number that excludes whatever the mixer ring and I2S DMA
-  hold at that instant, which mid-drain is substantial; the clamp in
-  `notify_audio_played()` then permanently absorbs the shortfall. Measured consequence:
-  `drift` steps to +51 ms and stays there while the device plays ~43 ms early, with both
-  sync medians reading ~40 µs. The mechanism causes the offset it exists to prevent.
+- **Re-evaluate the starvation re-baseline.** The case against it was that it anchored
+  `pushed` to a number excluding the mixer ring and I2S DMA, so the clamp in
+  `notify_audio_played()` permanently absorbed the shortfall — `drift` stepping to +51 ms
+  and staying there while the device played ~43 ms early, both medians reading ~40 µs.
 
-  The accounting is exact from a clean start — `pushed − played` is the true queue as long
-  as nothing discards — so the question is whether anything still discards. `timeout:
-  never` was meant to remove the teardown that does, and there are zero mixer stops across
-  the fleet, yet `Pipeline drained (source starvation)` still fires. Whether that drain
-  discards frames is the crux, and it is unmeasured. Test: skip the re-baseline, watch
-  `drift` and `sync-delta.py` across several starvations; no divergence means it is
-  redundant.
+  That premise no longer holds: the anchor now uses `on_query_latency()`, which reports the
+  whole chain including the DMA span, and does so deliberately — it anchors a PREDICTION of
+  when the next pushed frame renders, and padding sits ahead of that frame. So the specific
+  harm is gone and the open question is narrower: is the re-baseline still needed at all?
 
-  This does not retire the fork. `on_query_buffered()` has three consumers — the
-  re-baseline anchor, the `fill`/`drift` column, and the drift self-repair — and only the
-  first would go. The self-repair is the one independent witness to the accounting, and it
-  is what makes a split visible at all.
+  The accounting is exact from a clean start, so this reduces to whether anything discards.
+  `timeout: never` was meant to remove the teardown that does, and there are zero mixer
+  stops across the fleet, yet `Pipeline drained (source starvation)` still fires. Test as
+  before: skip the re-baseline, watch `drift` and `sync-delta.py` across several
+  starvations. Worth doing only after the disagreement below is settled, since `drift` is
+  the instrument and it is currently untrustworthy.
+
+  This does not retire the fork either way. The sink query has three consumers — the
+  re-baseline anchor, the `fill`/`drift` column, and the self-repair — and only the first
+  would go.
 
 - **`fill` and `pipeline` disagree by the source ring's contents.** With a mixer in the
   chain the measured latency exceeds the accounted queue by exactly what the SourceSpeaker's
