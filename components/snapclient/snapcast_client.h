@@ -267,6 +267,23 @@ class SnapcastClient {
   /// THREAD CONTEXT: speaker task; internally synchronized.
   void notify_audio_played(uint32_t frames, int64_t timestamp_us);
 
+  /// @brief TEST HOOK: stop handing audio downstream for `ms`, so the pipeline drains and starves
+  /// exactly as it does under an upstream stall.
+  ///
+  /// Faithful rather than synthetic: it discards at the push point, which is the same thing the
+  /// client already does to chunks whose deadline has passed, so the drain, the feedback clamp and
+  /// the starvation latch all run through their real paths. Setting pipeline_starved_ directly would
+  /// skip all three and prove nothing.
+  ///
+  /// Exists because the event under investigation is upstream and arrives group-wide, roughly every
+  /// 6-30 minutes, which makes it useless to wait for -- and because the case that plants
+  /// inter-device skew is ONE device starving while the other does not, which never happens by
+  /// chance when the cause is shared. THREAD CONTEXT: any (atomic).
+  void inject_starvation(uint32_t ms) {
+    this->starve_until_us_.store(now_us_public() + static_cast<int64_t>(ms) * 1000, std::memory_order_relaxed);
+  }
+  static int64_t now_us_public();
+
   // --- Diagnostics (main loop) ---
 
   bool is_connected() const { return this->connected_.load(std::memory_order_relaxed); }
@@ -377,6 +394,16 @@ class SnapcastClient {
     // stays false for the whole re-lock. A LEADER that reads the gap as its own fault demotes
     // and takes the group's only timebase with it. See set_playout_healthy().
     bool deadline_implausible{false};
+    // Frames of DMA SILENCE PADDING baked into the starvation re-baseline's seed, owed back once
+    // that padding drains. The seed is deliberately padding-inclusive because the prediction
+    // extrapolates "frame N renders at frame M's time plus (N-M)/rate", which is exact only while
+    // our frames render contiguously -- padding inserts gaps and would make it early by exactly the
+    // padding. But `pushed - played` is an OWN-AUDIO count, so the same padding leaves it
+    // permanently over-stated: measured as a standing +70 ms after an injected starvation, which the
+    // self-repair then walked back audibly ten seconds later, after unmute. That walk-back is the
+    // warble heard on every boot. Repaying the debt as soon as the padding actually drains -- while
+    // the device is still muted and re-locking -- makes the same correction inaudible.
+    int64_t padding_debt_frames{0};
     uint32_t in_band_chunks{0};
     int64_t last_resync_log_us{0};
     // When the stream first went staler than the server's buffer, 0 while it is not
@@ -604,6 +631,8 @@ class SnapcastClient {
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
   std::atomic<bool> pipeline_starved_{false};
   bool starved_latched_{false};
+  /// TEST HOOK, see inject_starvation(). 0 when not injecting.
+  std::atomic<int64_t> starve_until_us_{0};
   // TEMPORARY DIAGNOSTIC: frames the clamp below has silently discarded. A PARTIAL clamp
   // (available_frames > 0 but under the credit) logs nothing and flags nothing, yet it shorts
   // `played` permanently -- which is the shape of the startup offset: DMA-buffer quantised,

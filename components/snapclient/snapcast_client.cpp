@@ -230,6 +230,11 @@ static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
 // in well under a second), short enough that the silent spiral is bounded.
 static constexpr int64_t STALE_BAILOUT_US = 3000000;
 
+// Padding counts as drained below this. Not zero: the DMA holds a fractional buffer of silence
+// almost always, and waiting for exactly zero would leave the debt outstanding indefinitely. Half a
+// DMA buffer at the rates in use, so the residue left behind is under the servo's own deadband.
+static constexpr int64_t PADDING_DRAINED_US = 5000;
+
 // Re-mute policy for hard resyncs. Mute-until-synced exists because CONVERGENCE
 // splices repeatedly for seconds, which is audible as a correction storm -- not
 // because any single splice is. A one-shot catch-up is a |error| ms skip; muting for
@@ -281,6 +286,8 @@ static constexpr int64_t RTT_GATE_US = 20000;      // reject samples this far ab
 static constexpr int64_t RTT_FLOOR_LEAK_US = 500;  // floor rises this much per sample (~0.5 ms/s)
 
 static inline int64_t now_us() { return esp_timer_get_time(); }
+
+int64_t SnapcastClient::now_us_public() { return now_us(); }
 
 SnapcastClient::~SnapcastClient() {
   // Components are never destructed in practice; best-effort teardown.
@@ -1556,6 +1563,49 @@ void SnapcastClient::player_task_() {
 
     this->rebaseline_after_starvation_(st, rec, frame_bytes);
 
+    // Repay the re-baseline's padding debt as soon as the padding it was seeded with has drained.
+    // Checked only while a debt is outstanding, which is a handful of chunks after a starvation, so
+    // the listener walk costs nothing in steady state.
+    if (st.padding_debt_frames > 0) {
+      audio::AudioDepth lat_now, own_now;
+      if (this->audio_listener_ != nullptr && this->audio_listener_->on_query_latency(lat_now) &&
+          this->audio_listener_->on_query_audio(own_now)) {
+        const int64_t pad_now_us =
+            lat_now.microseconds > own_now.microseconds ? lat_now.microseconds - own_now.microseconds : 0;
+        if (pad_now_us <= PADDING_DRAINED_US) {
+          const int64_t pad_now_frames = pad_now_us * rec.params.sample_rate / 1000000;
+          const int64_t repay = st.padding_debt_frames - pad_now_frames;
+          if (repay > 0) {
+            this->playout_mutex_.lock();
+            this->pushed_frames_total_ -= repay;
+            // The counter stepped; levels recorded against the old value would read as a split.
+            this->clear_playout_history_();
+            this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(),
+                                this->pushed_frames_total_);
+            this->mark_playout_(this->played_history_, this->played_history_next_, now_us(),
+                                this->played_frames_total_);
+            this->playout_mutex_.unlock();
+            ESP_LOGD(TAG, "Repaid re-baseline padding debt: %" PRId64 " frames (%" PRId64 " us), %s",
+                     repay, repay * 1000000 / static_cast<int64_t>(rec.params.sample_rate),
+                     st.converged ? "AUDIBLE (already unmuted)" : "silent (still muted)");
+          }
+          st.padding_debt_frames = 0;
+        }
+      }
+    }
+
+    // TEST HOOK: see inject_starvation(). Discarding here is exactly what a stale chunk gets, so the
+    // pipeline drains through its real path rather than through a shortcut.
+    const int64_t starve_until = this->starve_until_us_.load(std::memory_order_relaxed);
+    if (starve_until != 0) {
+      if (now_us() < starve_until) {
+        this->discard_ring_bytes_(rec.bytes);
+        continue;
+      }
+      this->starve_until_us_.store(0, std::memory_order_relaxed);
+      ESP_LOGW(TAG, "Injected starvation window ended");
+    }
+
     const int64_t deadline = this->chunk_deadline_us_(rec);
     const int64_t hard_us = static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000;
     const uint32_t frames = rec.bytes / frame_bytes;
@@ -1998,11 +2048,26 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       // BECAUSE the pipeline drained, so that term is empty by definition and there is nothing there
       // to correct. The staleness that matters for the accounting cross-check is handled where it
       // belongs, in accounted_at_(), which needs no assumption about what drains.
-      audio::AudioDepth latency;
+      //
+      // The reseed itself was tested by REMOVING it, using inject_starvation() to fire the event on
+      // one device on demand rather than waiting for a group-wide one. It cannot go. Without it the
+      // same injected starvation left the accounting at -204 ms with nothing able to fix it -- the
+      // self-repair only acts on POSITIVE drift -- and the pair swung +-20 ms for about twenty
+      // seconds before the servo walked it out. With it: re-locked in 9 s, back to within a frame on
+      // a logic analyser. A starvation really does discard, and this seed is what recovers from it.
+      audio::AudioDepth latency, own_audio;
       const bool have_fill = this->audio_listener_ != nullptr && frame_bytes > 0 &&
                              this->audio_listener_->on_query_latency(latency);
+      const bool have_own = this->audio_listener_ != nullptr && frame_bytes > 0 &&
+                            this->audio_listener_->on_query_audio(own_audio);
       const int64_t in_flight_frames =
           have_fill ? static_cast<int64_t>(latency.microseconds) * rec.params.sample_rate / 1000000 : 0;
+      // The padding is the difference between the two queries, by definition: latency counts the
+      // DMA's silence, own-audio does not. Record it so it can be repaid, not left for the repair.
+      st.padding_debt_frames =
+          (have_fill && have_own && latency.microseconds > own_audio.microseconds)
+              ? static_cast<int64_t>(latency.microseconds - own_audio.microseconds) * rec.params.sample_rate / 1000000
+              : 0;
       this->playout_mutex_.lock();
       this->playout_valid_ = false;
       this->played_frames_total_ = 0;

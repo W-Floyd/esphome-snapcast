@@ -175,6 +175,17 @@ CONFIG_SCHEMA = cv.All(
             # half). The reference esp32 snapclient uses 128us; steering trims one
             # frame per chunk, holding a stereo pair's image pinned. Raise on very
             # jittery links if corrections chatter.
+            # The 100us floor is deliberate and tightening it does not help. Tried at 40us:
+            # each device's OWN median improved (lock at 4us and -2us, against 53us and 81us),
+            # but the inter-device skew on a logic analyser did not -- 52.4us mean before,
+            # 40.8us after, with the spread WORSE (sd 14.9 -> 16.0us, range 52 -> 68us) and
+            # the trim working harder for it (rate-difference sd 3.8 -> 12.2 ppm).
+            #
+            # That is the expected result, not a surprise: the median is measured against the
+            # device's OWN prediction, so this band controls how tightly a device tracks
+            # itself. A residual offset BETWEEN two devices' predictions is invisible to it.
+            # Closing that needs the shared timebase to agree more precisely; it is not a
+            # servo-gain question.
             cv.Optional(CONF_SYNC_DEADBAND, default="128us"): cv.All(
                 cv.positive_time_period_microseconds,
                 cv.Range(

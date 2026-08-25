@@ -31,6 +31,15 @@ logger:
   level: DEBUG
 
 api:
+  # TEST HOOK: drain the pipeline on demand so the starvation path can be exercised deliberately.
+  # The natural event is upstream and group-wide, so it cannot be aimed at ONE device -- and one
+  # device starving alone is precisely the case that plants inter-device skew.
+  actions:
+    - action: inject_starvation
+      variables:
+        ms: int
+      then:
+        - lambda: 'id(snap)->inject_starvation(ms);'
 
 ota:
   - platform: esphome
@@ -45,16 +54,23 @@ wifi:
 external_components:
   # A `components:` filter hides anything it does not name, including the AUTO_LOADed
   # clock_sync.
-  - source: github://W-Floyd/esphome-snapcast
-    components: [snapclient, clock_sync, wifi_tools, wifi_bssid_select]
-  # - source: {type: local, path: ../components}   # working tree instead
+  # - source: github://W-Floyd/esphome-snapcast
+  #   components: [snapclient, clock_sync, wifi_tools, wifi_bssid_select]
+  - source: {type: local, path: ../components}   # working tree instead
 
   # Forked speaker stack: adds `Speaker::buffered_bytes()`, letting the sync engine see
   # the audio between our push point and the DAC. Drop once upstream — see TODO.md.
-  - source:
-      type: git
-      url: https://github.com/W-Floyd/esphome
-      ref: speaker-render-latency
+  # refresh: always while the branch is moving -- the default is 1d, so a force-pushed fork
+  # keeps building against a stale cached copy and fails on symbols that are already there.
+  # - source:
+  #     type: git
+  #     url: https://github.com/W-Floyd/esphome
+  #     ref: speaker-render-latency
+  #   refresh: always
+  #   components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
+  # Local checkout instead -- flash.sh --docker mounts ../esphome at /esphome, and this repo
+  # at /config, so this one relative path is correct on the host and in the container alike:
+  - source: {type: local, path: ../../esphome/esphome/components}
     components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
 
 snapclient:

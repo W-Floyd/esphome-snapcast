@@ -154,6 +154,13 @@ void SnapclientHub::send_client_volume(uint8_t volume_percent, bool muted) {
 
 // THREAD CONTEXT: Speaker playback callback thread (forwarded from the media source);
 // SnapcastClient::notify_audio_played is internally synchronized.
+void SnapclientHub::inject_starvation(uint32_t ms) {
+  if (this->client_ != nullptr) {
+    ESP_LOGW(TAG, "Injecting starvation: discarding audio for %" PRIu32 " ms", ms);
+    this->client_->inject_starvation(ms);
+  }
+}
+
 void SnapclientHub::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
   if (this->client_ != nullptr) {
     this->client_->notify_audio_played(frames, timestamp_us);

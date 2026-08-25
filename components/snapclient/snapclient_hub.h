@@ -104,6 +104,10 @@ class SnapclientHub final : public Component,
   /// THREAD CONTEXT: speaker task; safe to call from any thread.
   void notify_audio_played(uint32_t frames, int64_t timestamp_us);
 
+  /// @brief TEST HOOK: forwards to SnapcastClient::inject_starvation(); see there for why it exists
+  /// and why it drains through the real path rather than setting the latch directly.
+  void inject_starvation(uint32_t ms);
+
   template<typename F> void add_connection_callback(F &&callback) {
     this->connection_callbacks_.add(std::forward<F>(callback));
   }
