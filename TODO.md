@@ -51,10 +51,10 @@
   derived slightly different magnitudes from one event, which suggests each computed it
   locally against a common bad input rather than being handed the same number.
 
-- **Extract the servo — waiting on a consumer, not on tidiness.** The
-  length complaint is closed: `player_task_` is 433 lines, its 31 locals are a `ServoState`
-  struct, and the re-baseline, sync report and stale bailout are named methods. What is
-  left is a real extraction, and two things argue against doing it speculatively.
+- **Extract the servo — waiting on a consumer, not on tidiness.** `player_task_` is 433
+  lines, its state is a `ServoState` struct, and the re-baseline, sync report and stale
+  bailout are named methods, so what remains is a real extraction rather than a tidy-up.
+  Two things argue against doing it speculatively.
 
   It has one consumer. `clock_sync`'s existing members are narrow primitives —
   `KalmanTimeFilter` takes RTT samples and knows nothing of their origin — where the servo
@@ -68,11 +68,10 @@
   There is a second implementation of the same concept — `sendspin-cpp`'s 936-line
   `sync_task`, same `{frames_played, finish_timestamp}` feedback contract, same hard/soft
   correction split — with no rate steering, no median filter, no PI and no shared timebase.
-  The MIT relicense means it *could* now take this code, which the GPL forbade. It has its
-  own working implementation, though, so the trigger is somebody asking rather than the
-  licence allowing.
+  MIT permits it to take this code, but it has a working implementation of its own, so
+  the trigger is somebody asking rather than the licence allowing.
 
-  It would need somewhere to live. `clock_sync` is now deliberately audio-free — a clock
+  It would need somewhere to live. `clock_sync` is deliberately audio-free — a clock
   filter and TSF distribution, neither of which knows what is being played — and the
   servo is the opposite: chunks, sample rates, frame splices, silence insertion. So it
   would be a third component alongside `i2s_rate_lock`, not a member of either.
@@ -86,14 +85,13 @@
   opt-in (`wifi_tools: diagnostics: dump_statistics`, default off), so a long capture with
   it disabled is the experiment.
 
-- **Schema-to-README drift check.** The options table and the example's commented
-  defaults are both hand-maintained against `CONFIG_SCHEMA`, and both have silently
-  drifted: `opus` was missing from the table when it landed, `converge_fine` had never
-  been there at all, and three of nineteen commented "defaults" in the example were not
-  the defaults. An AST walk over every `cv.Optional` catches all of it in ~40 lines —
-  key set and default values, plus the `unset` marker for options that have none.
-  Generating the DESCRIPTIONS is not worth it: seven options carry no source comment, so
-  the README's prose is the better text.
+- **Schema-to-README drift check.** The README's options table and the example's
+  commented defaults are hand-maintained against `CONFIG_SCHEMA`, and nothing detects a
+  new option, a changed default, or a commented value that is not the default. An AST
+  walk over every `cv.Optional` checks all three in ~40 lines: key set, default values,
+  and the `unset` marker for options that have none. Generating the DESCRIPTIONS is not
+  worth it — seven options carry no source comment, so the README's prose is better text
+  than anything derivable.
 
 ## Housekeeping
 
