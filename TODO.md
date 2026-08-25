@@ -73,11 +73,13 @@
   re-baseline anchor, the `fill`/`drift` column, and the self-repair — and only the first
   would go.
 
-- **`fill` and `pipeline` disagreed for TWO reasons, both in `fill`. Fixed and verified on
-  hardware.** A stale-snapshot sampling artefact, and underneath it a 32-bit overflow in
-  `frames_to_microseconds()`. Settled from the field logs (`a.log`/`b.log`, ~1500 sync
-  reports across two clients); the QEMU run was not needed to find either. `pipeline` — the
-  accounting — was never the wrong side.
+- **`fill` and `pipeline` disagreed for FOUR reasons. All fixed and verified on hardware;
+  `drift` now reads 0 to -1 us.** Three were in `fill` — a stale-snapshot sampling artefact, a
+  32-bit overflow in `frames_to_microseconds()`, and a mixer summing two terms either side of a
+  hand-off — and each was hiding the next, so they only became visible in that order. The fourth
+  was not in `fill` at all: a real accounting split at pipeline start that the repair could not
+  act on because of a defect in its arming test. `pipeline` — the accounting — was never the
+  wrong side, and still is not.
 
   Three independent lines of evidence, all pointing the same way.
 
@@ -172,32 +174,64 @@
   — a message with zero occurrences before that build. The queue ahead of the DMA would be
   fair to age, but this path runs BECAUSE the pipeline drained, so that term is empty.
 
-  Result on hardware, both clients, 13 reports each: `drift` reads 0 or -1 us in 11 of 13,
-  against ±26 ms of quantised noise before. `fill` reads 201-249 ms where it used to read
-  133-146 with collapses to 53. Zero repairs, zero re-baselines, zero `drift stale`, zero
-  `not catching up`, 12 of 13 reports at `-0/+0` frame corrections, median error 201 us and
-  162 us.
+  Then a THIRD defect, found only because the first two were fixed and `drift` got sharp
+  enough to show it. The reported depth dipped ~30 ms on 14-21% of samples while the accounted
+  queue did not move at all — the mixer summed its transfer buffer, read AFTER handing audio to
+  the sink, with the sink's snapshot, published BEFORE it, so the audio just moved was counted
+  in neither. Fixed by reading both on the same side of the hand-off; free space still reads
+  after, since that one wants the post-transfer figure. That dip dwelt for several samples at a
+  time, which is long enough to look steady, and a self-repair took it for a real split.
+
+  What remained after that was a constant `+20000 us`, and it turned out NOT to be an artefact
+  at all — which four successive theories of mine assumed it was, on the strength of it being a
+  suspiciously round number. Ruled out by measurement, in order: QEMU with a live-reporting sink
+  reads 0/-1/-22 us, so it is not the mixer or the client; `played` tracks the i2s speaker's
+  completed-frame count to within one DMA buffer, so no credit is lost; `dma_real_frames` equals
+  written-minus-completed exactly, so the sink's internal accounting is honest; and `sum == meas`
+  in 217 of 217 samples, so the four stages add up to precisely what is reported.
+
+  It is a REAL latched split, established at pipeline start, and it varies per start: 20000 and
+  40000 us on one client, 20000, 25510 and 30000 on the other, across three starts each. Mostly
+  whole DMA buffers, not always. That is the signature of whatever was in flight when the source
+  first contributed, not of any constant in the code.
+
+  The defect was the repair GATE, not the measurement. It required every sample to clear
+  DRIFT_REPAIR_US and cleared the hold window on any that did not, so a drift alternating between
+  19999 and 20000 could never arm — the value most in need of repair was the one value that could
+  not get it. Arming and holding are now separate tests (see `ce05a75`). Verified across four
+  repairs on two clients, each returning the drift to 0 or -1 us.
+
+  Result on hardware, both clients: `drift` reads 0 or -1 us for runs of ~70 consecutive reports,
+  against ±26 ms of quantised noise before. `fill` reads 201-249 ms where it used to read 133-146
+  with collapses to 53. Zero starvations, zero re-baselines, zero `drift stale`, zero
+  `not catching up`, `-0/+0` frame corrections on every report, median error in the tens of us.
 
   Still to do:
 
   1. PR the `frames_to_microseconds` overflow to upstream ON ITS OWN, before or alongside the
      depth series. Frame it honestly as a latent overflow on a public helper with no
      documented ceiling — NOT as a live user-facing bug, because no current upstream caller
-     can reach it. Overselling it would repeat exactly what review objected to last time. Add
-     a gtest under `tests/components/audio/`; the harness exists and there is no
-     `AudioStreamInfo` test today, which makes the fix self-justifying without the feature.
-  2. Run the mixer harness in QEMU. Needs a quiet host — at load 12 the emulator misses its
-     deadlines and panics, which is not a firmware result.
+     can reach it. Overselling it would repeat exactly what review objected to last time. The
+     gtest is written and lands with it under `tests/components/audio/`, which had no tests.
+  2. Find why a pipeline start leaves 2-4 DMA buffers of the client's audio uncredited. The
+     mechanism to examine is `playback_delay_frames_`: on a stream cycle the SourceSpeaker
+     restarts and resets `has_contributed_` while the mixer task keeps running and retains
+     `frames_in_pipeline_`, so the delay is captured from that leftover. Reading the code the
+     ordering looks correct — the delay is taken BEFORE the first mix is added to
+     `pending_playback_frames_` — so either that reading is wrong or the leftover is stale.
+     Instrument the value AT THE MOMENT IT IS SET rather than reasoning about it; every attempt
+     to reason ahead of the data in this entry was wrong.
   3. Leave the accounting alone. It is the trustworthy side, and none of this changed it.
 
-  Residual, mechanism NOT established: a `+30000/+29999 us` outlier, 1 of 13 reports on one
-  client and 2 of 13 on the other, landing only on reports where `fill` dips 25-45 ms below
-  trend. Exactly 30 ms is too round to be physical and does not fit the wrap pattern. Not
-  currently harmful — the repair needs 20 ms held for 10 s inside a 10 ms band, and a single
-  spike opens the window only for the next report at 0 to reset it, so isolated spikes cannot
-  arm it. It would matter if it ever became persistent.
-  extremes near -165 ms, which would need a publish stall of ~6 chunks. The refusal path
-  above now makes that case visible instead of silently wrong, which is how to measure it.
+  Method note, earned the hard way. Log the terms at ONE instant or not at all: an attempt to
+  attribute the offset by logging each stage from its own task sampled them up to 0.4 s apart,
+  which at 44.1 kHz is ±17640 frames of noise against an 882-frame signal, and produced a column
+  of pure noise that looked like data. The reconciliation only worked once the decomposition was
+  carried inside the depth snapshot itself, under the same seqlock. Two other traps: throttle a
+  diagnostic BY TIME, never by iteration count, because a task loop with no guaranteed cadence
+  will spin and flood the log hard enough to stall an OTA; and when an experiment ages a
+  timestamp, age the VALUE it describes too, or it measures a mismatch you invented rather than
+  the one you are hunting.
 
 - **Stale deadline on stream resumption.** With `keepalive_hold: never` the pipeline is
   held across an idle, and the first chunk afterwards carries a deadline stale by roughly
