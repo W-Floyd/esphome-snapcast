@@ -474,6 +474,13 @@ bool SnapcastClient::accounted_at_(int64_t as_of_us, int64_t &frames) const {
     // make. Refusing is the only safe answer: substituting the current levels is exactly the bug.
     return false;
   }
+
+  // Both counters are read as STEP functions, and `played` deliberately so. Interpolating `played`
+  // between credits at the nominal rate was tried, on the theory that the DAC drains continuously
+  // while credits arrive in lumps. It is wrong: a sink's reported depth steps at the same instants
+  // its credits do -- both are updated from the same task iteration -- so the stepped reconstruction
+  // is already aligned with what is being compared against. Interpolating breaks that alignment.
+  // Measured in QEMU, it took a drift of 0 to -1 us and made it -9209 us median.
   frames = pushed_at - played_at;
   return true;
 }
@@ -2085,6 +2092,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int64_t accounted_us =
                 accounted_then_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
             fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured.microseconds));
+
           }
         }
       }
@@ -2106,20 +2114,34 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // fill_comparable, not just fill_ms: a reading older than the playout history cannot be
       // differenced honestly, and a repair driven by a guessed difference injects the very offset it
       // is meant to remove.
+      //
+      // ARMING and HOLDING are separate tests, and they have to be. Requiring every sample to clear
+      // DRIFT_REPAIR_US made a drift sitting exactly ON the threshold unrepairable: measured on
+      // hardware, a client held a real 882-frame split for its entire uptime while alternating
+      // between 19999 and 20000 us, and every 19999 reset the hold window one sample before it could
+      // complete. The value most in need of repair was the one value that could never get it, while
+      // its peer -- which came up at 25510 us, comfortably clear -- was repaired within seconds.
+      //
+      // So arm on a sample that warrants repair, then hold while the drift STAYS PUT, which is what
+      // the steadiness band already measures. A dip of 1 us is inside the band and keeps the window;
+      // a collapse to zero blows the band and restarts it, disarmed unless that sample independently
+      // warrants arming.
       if (fill_comparable && st.converged) {
-        if (fill_drift_us >= DRIFT_REPAIR_US) {
-          if (st.drift_excess_since_us == 0) {
-            st.drift_excess_since_us = now_us();
-            st.drift_excess_min_us = fill_drift_us;
-            st.drift_excess_max_us = fill_drift_us;
-          }
+        if (fill_drift_us >= DRIFT_REPAIR_US && st.drift_excess_since_us == 0) {
+          st.drift_excess_since_us = now_us();
+          st.drift_excess_min_us = fill_drift_us;
+          st.drift_excess_max_us = fill_drift_us;
+        }
+        if (st.drift_excess_since_us != 0) {
           st.drift_excess_min_us = std::min(st.drift_excess_min_us, fill_drift_us);
           st.drift_excess_max_us = std::max(st.drift_excess_max_us, fill_drift_us);
           if (st.drift_excess_max_us - st.drift_excess_min_us > DRIFT_STEADY_BAND_US) {
-            // Moving, so it is a measurement artefact rather than a split. Restart the
-            // window from here rather than abandoning it: a genuine split that begins
-            // during a noisy patch should still be caught once the noise passes.
-            st.drift_excess_since_us = now_us();
+            // Moving, so it is a measurement artefact rather than a split. Restart the window from
+            // here rather than abandoning it: a genuine split that begins during a noisy patch should
+            // still be caught once the noise passes. Restarting DISARMED unless this sample would
+            // have armed it on its own -- otherwise a drift that collapsed to zero would keep a
+            // window open on the strength of a magnitude it no longer has.
+            st.drift_excess_since_us = (fill_drift_us >= DRIFT_REPAIR_US) ? now_us() : 0;
             st.drift_excess_min_us = fill_drift_us;
             st.drift_excess_max_us = fill_drift_us;
           } else if (now_us() - st.drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
@@ -2144,10 +2166,9 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                      fill_drift_us, DRIFT_REPAIR_HOLD_US / 1000000);
             st.drift_excess_since_us = 0;
           }
-        } else {
-          st.drift_excess_since_us = 0;
         }
       } else {
+        // Nothing to compare against, or not yet converged: no window may be open.
         st.drift_excess_since_us = 0;
       }
 
