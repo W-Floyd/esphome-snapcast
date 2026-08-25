@@ -1,0 +1,98 @@
+# QEMU integration test with a MIXER in the chain.
+#
+# The plain harness runs snapclient -> virtual_speaker, so every reported quantity comes from
+# a single buffer and the multi-stage summation is never exercised -- which is where the
+# format bugs lived, and where `fill` was seen collapsing to a constant ~53 ms floor in ~20%
+# of samples on hardware. This reproduces the real shape:
+#
+#   snapclient -> SourceSpeaker ring -> mixer transfer buffer -> sink
+#
+# Watch `fill` against `pipeline`: they should track. A periodic collapse of `fill` to a
+# constant floor is the defect.
+# QEMU integration test: runs the real snapclient firmware on an emulated ESP32
+# (espressif QEMU, OpenCores ethernet) against a snapserver on the host.
+#
+#   qemu-system-xtensa -nographic -M esp32 -m 4M \
+#     -drive file=flash.bin,if=mtd,format=raw \
+#     -nic user,model=open_eth
+#
+# QEMU user-mode NAT exposes the host at 10.0.2.2. QEMU has no I2S device, so the
+# virtual_speaker component consumes the audio at exactly the sample rate and provides
+# the DAC-write feedback the sync engine instruments.
+esphome:
+  name: snapclient-qemu-mixer
+
+# The mixer's source rings plus the PCM ring do not fit the PSRAM-less ESP32 the base
+# harness uses -- without this it boot-loops before app_main. QEMU emulates the SPI RAM
+# (`-m 4M` in run-qemu-test.sh).
+psram:
+  mode: quad
+  speed: 40MHz
+
+esp32:
+  board: esp32dev
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  baud_rate: 115200
+
+# Native API for host-side state inspection in tests: forward guest port 6053 with
+#   -nic user,model=open_eth,hostfwd=tcp::6053-:6053
+# and subscribe with aioesphomeapi to watch entity states (volume/mute propagation).
+api:
+
+ethernet:
+  type: OPENETH
+
+external_components:
+  - source:
+      type: local
+      path: ../components
+  - source:
+      type: local
+      path: components
+  # Same forked speaker stack the README tells consumers to pin: the component does not
+  # compile without `Speaker::buffered_bytes()`. See TODO.md.
+  - source:
+      type: git
+      url: https://github.com/W-Floyd/esphome
+      ref: speaker-render-latency
+    refresh: always
+    components: [speaker, i2s_audio, mixer, audio, media_source, speaker_source]
+
+snapclient:
+  id: snap
+  server: 10.0.2.2  # the host, via QEMU user-mode NAT
+  buffer_size: 65536  # no PSRAM on the emulated ESP32; ~340 ms of 48 kHz stereo
+
+media_source:
+  - platform: snapclient
+    id: snap_source
+    snapclient_id: snap
+
+speaker:
+  - platform: virtual_speaker
+    id: vspeaker
+    sample_rate: 48000
+    num_channels: 2
+  # The chain the base harness lacks: the media pipeline writes into a SourceSpeaker ring,
+  # the mixer task moves it through its output transfer buffer, and only then does it reach
+  # the sink. That is three reported stages instead of one.
+  - platform: mixer
+    output_speaker: vspeaker
+    num_channels: 2
+    source_speakers:
+      - id: mix_media
+      - id: mix_announce
+
+media_player:
+  - platform: speaker_source
+    name: QEMU Media Player
+    media_pipeline:
+      speaker: mix_media
+      sources:
+        - snap_source
+      sample_rate: 48000
+      num_channels: 2
