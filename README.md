@@ -116,9 +116,8 @@ corrections steer the I2S clock rather than splicing.
 why the gains are what they are, the measured error budget, and which quantities the
 on-device metrics structurally *cannot* see — plus `scripts/raw-sync.py`, which can.
 
-Derived from `sendspin` (architecture), `badaix/snapcast` (protocol),
-`CarlosDerSeher/snapclient` (control law, channel modes) and `badaix/snapweb` (Kalman
-filter) — see [NOTICE.md](NOTICE.md).
+Credit to `sendspin` (architecture), `badaix/snapcast` (protocol) and
+`CarlosDerSeher/snapclient` (prior art for the control law) — see [NOTICE.md](NOTICE.md).
 
 ## Flashing
 
@@ -151,5 +150,7 @@ in the idle task, which is the emulator missing deadlines, not a firmware fault.
 
 ## License
 
-[GPLv3](LICENSE), inherited rather than chosen: ESPHome's C++ runtime is GPLv3 and parts
-of the timing engine are ports of GPLv3 code. [NOTICE.md](NOTICE.md) has the attributions.
+[MIT](LICENSE) for the source here. Note that a firmware built from it is a combined work
+with ESPHome's GPLv3 C++ runtime, so distributed binaries still carry GPLv3 obligations —
+the usual arrangement for an ESPHome external component. [NOTICE.md](NOTICE.md) has the
+details and the credits.

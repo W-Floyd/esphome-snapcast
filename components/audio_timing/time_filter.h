@@ -20,8 +20,9 @@ namespace esphome::audio_timing {
 /// R̂ is intentionally NOT reset on reset() — the learned network characteristics
 /// carry over so re-sync after a reconnect converges faster.
 ///
-/// Ported from the TypeScript KalmanTimeFilter in ImmichFrame-snapweb's snapstream.ts,
-/// itself derived from esp32 snapclient's timefilter/TimeFilter.c.
+/// C++ translation of the author's own KalmanTimeFilter from ImmichFrame-snapweb's
+/// snapstream.ts, written there as a complete replacement for the previous sync
+/// mechanism. Sage-Husa and the Huber M-estimate are published methods; see above.
 ///
 /// THREAD CONTEXT: not internally synchronized; callers guard with a mutex.
 class KalmanTimeFilter {
