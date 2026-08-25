@@ -258,12 +258,12 @@ static constexpr float DRIFT_LEARN_ALPHA = 1.0f / 64.0f;
 // REPAIR-1 ms is too small to repair, so it would be absorbed into the baseline and
 // the next split of the same size would be measured from there, hiding the error a
 // slice at a time. Outside this band the drift is reported and left alone.
-static constexpr float DRIFT_LEARN_BAND_MS = 5.0f;
+static constexpr float DRIFT_LEARN_BAND_US = 5000.0f;
 // Excess over the learned baseline that counts as a split. Well above the observed
 // baselines, well below the ~43 ms that needs catching. Also stays under
 // hard_resync_threshold so the correction is absorbed by the proportional path
 // instead of triggering a mute.
-static constexpr int32_t DRIFT_REPAIR_MS = 20;
+static constexpr int32_t DRIFT_REPAIR_US = 20000;
 // Held this long before acting: a real split is rock-steady (18 minutes at +50.7),
 // while a refill transient is not, and repairing a transient would inject the error
 // it is meant to remove.
@@ -1962,14 +1962,20 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // by that much -- permanently, since every metric agrees with itself. Reported as
       // `fill <measured> ms (drift <accounted-measured>)`; a drift that holds for
       // minutes IS the audible offset, and its sign says which way.
+      // Drift is a difference of two near-equal quantities, so it needs finer resolution than either
+      // operand's display. Differencing the rounded millisecond values carried up to ~2 ms of
+      // quantisation -- an order of magnitude above the servo's ~200 us residual and the 128 us
+      // deadband, i.e. coarse enough to read as "+0" while the accounting was meaningfully split.
+      // Both sides are therefore differenced in microseconds, unrounded.
       int32_t fill_ms = -1;
-      int32_t fill_drift_ms = 0;
+      int32_t fill_drift_us = 0;
       {
         uint32_t measured_us = 0;
         if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
             this->audio_listener_->on_query_latency(measured_us)) {
+          const int64_t accounted_us = pipeline_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
           fill_ms = static_cast<int32_t>(measured_us / 1000);
-          fill_drift_ms = pipeline_ms - fill_ms;
+          fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured_us));
         }
       }
       // Repair a sustained split. Acts only on evidence: the measured fill is an
@@ -1977,11 +1983,11 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // DRIFT_REPAIR_HOLD_US is the accounting being wrong, not the pipeline moving.
       if (fill_ms >= 0 && st.converged) {
         if (!st.drift_baseline_valid) {
-          st.drift_baseline_ms = static_cast<float>(fill_drift_ms);
+          st.drift_baseline_us = static_cast<float>(fill_drift_us);
           st.drift_baseline_valid = true;
         }
-        const int32_t excess_ms = fill_drift_ms - static_cast<int32_t>(st.drift_baseline_ms);
-        if (excess_ms >= DRIFT_REPAIR_MS) {
+        const int32_t excess_us = fill_drift_us - static_cast<int32_t>(st.drift_baseline_us);
+        if (excess_us >= DRIFT_REPAIR_US) {
           if (st.drift_excess_since_us == 0) {
             st.drift_excess_since_us = now_us();
           } else if (now_us() - st.drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
@@ -1989,23 +1995,23 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             // was running that far early, so the prediction moves later and the servo
             // walks the phase back through the proportional band.
             const int64_t excess_frames =
-                static_cast<int64_t>(excess_ms) * static_cast<int64_t>(rec.params.sample_rate) / 1000;
+                static_cast<int64_t>(excess_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000;
             this->playout_mutex_.lock();
             this->pushed_frames_total_ -= excess_frames;
             this->playout_mutex_.unlock();
             ESP_LOGW(TAG,
-                     "Accounting split repaired: accounted queue ran %" PRId32 " ms over measured fill "
-                     "(baseline %+.1f) for %" PRId64 " s; playback was that far early",
-                     excess_ms, st.drift_baseline_ms, DRIFT_REPAIR_HOLD_US / 1000000);
+                     "Accounting split repaired: accounted queue ran %" PRId32 " us over measured fill "
+                     "(baseline %+.0f us) for %" PRId64 " s; playback was that far early",
+                     excess_us, st.drift_baseline_us, DRIFT_REPAIR_HOLD_US / 1000000);
             st.drift_excess_since_us = 0;
           }
         } else {
           st.drift_excess_since_us = 0;
         }
         // Learn only from values near the baseline, so a split can never be absorbed
-        // into it -- see DRIFT_LEARN_BAND_MS
-        if (std::abs(static_cast<float>(fill_drift_ms) - st.drift_baseline_ms) < DRIFT_LEARN_BAND_MS) {
-          st.drift_baseline_ms += DRIFT_LEARN_ALPHA * (static_cast<float>(fill_drift_ms) - st.drift_baseline_ms);
+        // into it -- see DRIFT_LEARN_BAND_US
+        if (std::abs(static_cast<float>(fill_drift_us) - st.drift_baseline_us) < DRIFT_LEARN_BAND_US) {
+          st.drift_baseline_us += DRIFT_LEARN_ALPHA * (static_cast<float>(fill_drift_us) - st.drift_baseline_us);
         }
       } else {
         st.drift_excess_since_us = 0;
@@ -2013,8 +2019,8 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
 
       char fill_str[80] = "";
       if (fill_ms >= 0) {
-        snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 ", corr %+d ms)", fill_ms,
-                 fill_drift_ms, static_cast<int>(st.fill_corr_us / 1000.0f));
+        snprintf(fill_str, sizeof(fill_str), ", fill %" PRId32 " ms (drift %+" PRId32 " us, corr %+d us)",
+                 fill_ms, fill_drift_us, static_cast<int>(st.fill_corr_us));
       }
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(

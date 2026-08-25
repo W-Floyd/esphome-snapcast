@@ -366,7 +366,7 @@ class SnapcastClient {
     int64_t storm_window_us{0};
     uint32_t storm_resyncs{0};
     // Learned accounted-vs-measured baseline, and when the excess over it began
-    float drift_baseline_ms{0.0f};
+    float drift_baseline_us{0.0f};
     bool drift_baseline_valid{false};
     int64_t drift_excess_since_us{0};
     // Format of the last chunk played, for keepalive silence during a delivery gap
