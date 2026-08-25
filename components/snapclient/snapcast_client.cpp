@@ -1685,7 +1685,6 @@ void SnapcastClient::player_task_() {
 #endif  // USE_SNAPCLIENT_TIMING_DIAG
 #endif  // CLOCK_SYNC_TSF_ACTIVE
 
-
     st.err_accum_us += error_us;
     st.err_peak_us = std::max(st.err_peak_us, std::abs(error_us));
 
@@ -1725,6 +1724,15 @@ void SnapcastClient::player_task_() {
       }
       st.storm_resyncs++;
       mute_now = st.storm_resyncs >= RESYNC_STORM_COUNT || std::abs(error_us) > stale_us;
+      if (std::abs(error_us) > stale_us) {
+        // Past the server's own bufferMs the DEADLINE is wrong, not our clock, and it is wrong
+        // for the whole group at once -- measured on a pause/resume as a 2111 ms and a 2091 ms
+        // excursion on two devices within 3 ms of each other. Latch it: the splice absorbs the
+        // error within a window or two, so an instantaneous test stops being true long before
+        // the re-lock finishes, and a leader in that gap demotes for something that was never
+        // its fault. Cleared on convergence, below.
+        st.deadline_implausible = true;
+      }
       if (st.converged && !mute_now && st.storm_resyncs == 1) {
         // INFO because it IS audible -- a skip of roughly this length. Logged only for
         // the first of a window so a storm cannot flood the link on its way to muting.
@@ -1899,9 +1907,15 @@ void SnapcastClient::player_task_() {
     // is diverged (observed: a device stuck in a degraded buffer state kept
     // leading, with every peer following its mapping)
     if (this->tsf_sync_ != nullptr) {
+      // The second argument is the LATCH, not the live median. A leader must hold its timer for
+      // as long as it is recovering from a group-wide bad deadline, which is the whole re-lock --
+      // not merely while the median is still enormous. Observed before this: both clients logged
+      // "Stepping down (own playout unsynced)" after a pause, the group lost its only publisher,
+      // and every follower sat muted for ~47 s with its own servo already in band, because the
+      // unmute gate rightly refuses to unmute a follower onto a dead timebase.
       this->tsf_sync_->set_playout_healthy(
           st.converged && st.err_window_filled == MEDIAN_WINDOW && std::abs(median_err_us) < PLAYOUT_HEALTHY_US,
-          std::abs(median_err_us) > stale_us);
+          st.deadline_implausible || std::abs(median_err_us) > stale_us);
     }
 #endif
 
@@ -1930,6 +1944,8 @@ void SnapcastClient::player_task_() {
 #endif
       if (!st.converged && st.err_window_filled == MEDIAN_WINDOW && timebase_settled && ++st.in_band_chunks >= MEDIAN_WINDOW) {
         st.converged = true;
+        // Recovery is over, so the leader-side hold is released with it.
+        st.deadline_implausible = false;
         ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us), unmuting", median_err_us);
       }
     } else {

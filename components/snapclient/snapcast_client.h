@@ -370,6 +370,13 @@ class SnapcastClient {
     uint32_t fill_sample_countdown{0};
     // Mute-until-synced: real audio flows only after a full window of in-band medians
     bool converged{false};
+    // Latched from an excursion so large the DEADLINE, not our clock, must be wrong, and held
+    // until convergence returns. The instantaneous test cannot do this job: an implausible
+    // deadline is a single huge error, and the splice that absorbs it drops the median back
+    // under the bar within a window or two, while `converged` -- and therefore "healthy" --
+    // stays false for the whole re-lock. A LEADER that reads the gap as its own fault demotes
+    // and takes the group's only timebase with it. See set_playout_healthy().
+    bool deadline_implausible{false};
     uint32_t in_band_chunks{0};
     int64_t last_resync_log_us{0};
     // When the stream first went staler than the server's buffer, 0 while it is not
@@ -597,6 +604,10 @@ class SnapcastClient {
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
   std::atomic<bool> pipeline_starved_{false};
   bool starved_latched_{false};
+  // TEMPORARY DIAGNOSTIC: frames the clamp below has silently discarded. A PARTIAL clamp
+  // (available_frames > 0 but under the credit) logs nothing and flags nothing, yet it shorts
+  // `played` permanently -- which is the shape of the startup offset: DMA-buffer quantised,
+  // varying per start. Remove once explained.
 
   // Recent history of the two playout counters, so the accounted queue can be evaluated at the
   // instant a sink reading describes rather than at the instant we read it.
