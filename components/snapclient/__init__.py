@@ -213,6 +213,19 @@ CONFIG_SCHEMA = cv.All(
             # logs are most wanted -- chasing dropouts -- is the one where that extra
             # traffic on a congested channel does the most harm. Off by default.
             cv.Optional(CONF_TIMING_DIAGNOSTICS, default=False): cv.boolean,
+            # What a local PAUSE or STOP does. A fixed multiroom speaker and a desk
+            # speaker want opposite answers, so this is configurable:
+            #
+            #   allow   honoured; the client stays silent until something plays it again
+            #   resume  honoured, then undone once audio is flowing again -- survives a
+            #           "stop everything" automation, at the cost of a real audible gap
+            #   ignore  refused outright, so there is no gap at all; the media player
+            #           keeps reporting PLAYING and the transport button does nothing.
+            #           A deliberate stop is refused too, so anything that relies on
+            #           stopping this player will not work.
+            cv.Optional(CONF_PAUSE_BEHAVIOR, default="allow"): cv.enum(
+                PAUSE_BEHAVIORS, lower=True
+            ),
             # How long a chunk gap is bridged with keepalive silence before the
             # stream is allowed to end. Ending it tears the audio pipeline down, and
             # rebuilding playout phase costs a mute plus 7-16 s of re-lock -- so an
@@ -229,19 +242,6 @@ CONFIG_SCHEMA = cv.All(
             # back with a 6.9 h stale deadline and took 9.6-16 s to settle, with the
             # pipeline held the entire time. The residual cost there was the servo
             # settling plus a TSF re-election, not the teardown this prevents.
-            # What a local PAUSE or STOP does. A fixed multiroom speaker and a desk
-            # speaker want opposite answers, so this is configurable:
-            #
-            #   allow   honoured; the client stays silent until something plays it again
-            #   resume  honoured, then undone once audio is flowing again -- survives a
-            #           "stop everything" automation, at the cost of a real audible gap
-            #   ignore  refused outright, so there is no gap at all; the media player
-            #           keeps reporting PLAYING and the transport button does nothing.
-            #           A deliberate stop is refused too, so anything that relies on
-            #           stopping this player will not work.
-            cv.Optional(CONF_PAUSE_BEHAVIOR, default="allow"): cv.enum(
-                PAUSE_BEHAVIORS, lower=True
-            ),
             cv.Optional(CONF_KEEPALIVE_HOLD, default=CONF_NEVER): cv.Any(
                 cv.positive_time_period_milliseconds,
                 cv.one_of(CONF_NEVER, lower=True),
