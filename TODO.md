@@ -43,6 +43,26 @@
   first would go. The self-repair is the one independent witness to the accounting, and it
   is what makes a split visible at all.
 
+- **`fill` and `pipeline` disagree by the source ring's contents.** With a mixer in the
+  chain the measured latency exceeds the accounted queue by exactly what the SourceSpeaker's
+  own ring holds, which oscillates 20-104 ms as chunks arrive and the mixer drains them.
+  Reproducible in `tests/qemu-mixer-test.yaml`; on hardware it shows as `fill` collapsing to
+  a 52-54 ms floor in ~20% of samples, the constant term there being the i2s DMA rather than
+  a 500 ms virtual ring.
+
+  Decomposed in QEMU: sink ~500 ms and steady, mixer transfer buffer 0-8 ms, source ring
+  20-104 ms. `pipeline` tracks sink + transfer; `fill` tracks all three.
+
+  Which side is wrong is NOT yet established. The obvious suspicion -- that `played` is
+  credited when frames leave the source ring rather than when they render -- was checked and
+  is false: `pending_playback_frames_` is incremented where the mixer mixes and drained by
+  the output speaker's own callback, so the accounting should include the ring. Settling it
+  needs `pushed`, `played` and the measured terms logged side by side from the client, which
+  the mixer harness now makes a local experiment rather than a reflash.
+
+  Until it is settled the repair is gated on steadiness, so the disagreement is reported and
+  not acted on.
+
 - **Stale deadline on stream resumption.** With `keepalive_hold: never` the pipeline is
   held across an idle, and the first chunk afterwards carries a deadline stale by roughly
   the idle duration (14044648 ms after 3.90 h; 24888016 ms after ~6.9 h). It self-heals in
