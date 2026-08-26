@@ -552,6 +552,9 @@ class SnapcastClient {
     int32_t splice_sum{0};
     bool fast_splice_active{false};
     uint32_t fast_splice_frames{0};  // frames spliced in the current episode, for the log
+    // Instant of the last accounting repair. A repair STEPS the prediction, so the median error
+    // jumps by the size of the split with no audio having moved -- see FAST_SPLICE_REPAIR_HOLDOFF_US.
+    int64_t last_repair_us{0};
 
     // Re-anchor after a RE-LOCK: armed by whatever dropped convergence (a session start, a mute,
     // a starvation re-baseline), fired once convergence returns and settles. See

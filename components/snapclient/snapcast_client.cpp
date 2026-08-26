@@ -548,6 +548,21 @@ static constexpr int64_t FAST_SPLICE_RELEASE_US = 300;
 // ~2.9 ms at 44.1 kHz, comfortably more than any planted offset measured (1.4 ms) and far less
 // than the server's buffer. An episode that hits this is a bug report, not a correction.
 static constexpr uint32_t FAST_SPLICE_MAX_FRAMES = 128;
+// Do not chase an ACCOUNTING STEP by position. A repair moves the prediction by the size of the
+// split -- ~2.5 ms for a forced re-anchor -- and the median error jumps by that much although no
+// audio has moved. Position correction answering that would splice real frames against a
+// bookkeeping change, and since the forced re-anchor's bias is always above the engage threshold,
+// every re-anchor would be followed by one.
+//
+// Observed on the first firing: a repair at 18:11:10 was followed 0.4 s later by "Fast splice
+// engaged: -2315 us standing", 62 frames in 1.65 s -- and the wire moved neither its offset
+// (-46.9 -> -50.0 us) nor its frame_lag (-2 -> -1), where 62 frames is 1.4 ms of content and
+// should have shown as one or the other. Whether that means the splice corrected the prediction
+// without moving audio, or the analyser masked a real shift (rival was 0.89, i.e. an ambiguous
+// correlation lock), is NOT established -- and until it is, these two mechanisms must not act on
+// each other. The PI keeps the repair's step, which is what every landing-offset measurement so
+// far was taken with.
+static constexpr int64_t FAST_SPLICE_REPAIR_HOLDOFF_US = 30000000;
 // TEST HOOK ramp rate, see inject_split(). 100 us/s is chosen to sit at or under the disturbance
 // the servo already tracks unaided -- the clock-offset estimate wanders ~100 us/s on wifi jitter --
 // so the injected bias arrives as ordinary drift rather than as a transient the servo fights. At
@@ -3082,7 +3097,9 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t median_err_us, uint
   const int8_t retired = st.splice_hist[st.splice_hist_idx];
   int32_t applied = 0;
 
-  if (threshold > 0 && frame_us > 0 && st.converged && !split_pending) {
+  const bool repair_settling =
+      st.last_repair_us != 0 && now_us() - st.last_repair_us < FAST_SPLICE_REPAIR_HOLDOFF_US;
+  if (threshold > 0 && frame_us > 0 && st.converged && !split_pending && !repair_settling) {
     // What the median has NOT yet seen. A splice moves the error immediately, but the median is
     // an average over 31 chunks, so about half a window of corrections are still invisible to it.
     const int64_t in_flight_us = static_cast<int64_t>(st.splice_sum) * frame_us;
@@ -3608,6 +3625,9 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             // the size of the split. Nulling that fast is what limits how long the displacement
             // integrates -- and the repair's displacement is the largest single term measured.
             this->mark_kp_event_(st, "split repair");
+            // Position correction stands down for a while: the jump the servo is about to see is
+            // this step, not a displacement. See FAST_SPLICE_REPAIR_HOLDOFF_US.
+            st.last_repair_us = now_us();
             st.drift_excess_since_us = 0;
           }
         }
