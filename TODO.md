@@ -31,183 +31,137 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-**THE WIRE OFFSET IS THE INTEGRAL OF THE DIFFERENTIAL RATE, AND NOTHING ELSE.** Measured against
-the analyser's new `fs_a_hz`/`fs_b_hz` columns over three quiet runs of 92–499 s:
+**THE WIRE OFFSET IS THE INTEGRAL OF THE DIFFERENTIAL RATE, AND NOTHING ELSE.** Measured with the
+analyser's `fs_a_hz`/`fs_b_hz` columns over three quiet runs of 92–499 s:
 
     integral of (fs_b − fs_a) vs the measured offset
       corr −0.997 / −0.999 / −1.000     slope −0.996 / −0.983 / −1.008
       offset sd 4.7 / 3.3 / 24.2 µs  ->  residual sd 0.38 / 0.14 / 0.31 µs   (99–100% explained)
 
-Slope −1.0 with a sub-µs residual, so there is no second term to find. Every "static offset" chased
-in this file was accumulated rate difference that stopped accumulating — which is why it was
-invisible to every on-device metric and why it re-planted at every event.
+Slope −1.0 with a sub-µs residual, so there is no second term to look for. This retires a whole
+class of hypothesis: every "static offset" chased in this file — the per-boot values, the ones no
+on-device field could see, the ones that re-planted at every event — was accumulated rate difference
+that stopped accumulating. It explains the invisibility directly, since each device compares itself
+against its own prediction and a rate difference integrated in the past leaves no trace in any
+present-tense field. **Read this before proposing a mechanism for a static offset.**
 
-**What is missing on-device is one measurement: the achieved rate against server time.** The
-differential TRIM already predicts the differential rate at corr −0.778, and the only reason
-integrating it explains 13–19% instead of ~100% is that the report samples one trim snapshot per
-3.3 s of a continuously moving quantity — an aliasing problem, not a physics one. Log the
-time-MEAN applied trim over the report window rather than the snapshot, and better, measure the
-achieved rate directly as frames-played against server time (the shared timebase supplies the
-conversion). That single quantity does two jobs:
-  1. it is the outside-the-loop reference the pivot correction needs, which is exactly what both
-     failed attempts below lacked, and
-  2. published in the beacon beside `drift_ppm`, it lets each device integrate the difference and
-     know its own relative offset — the "no on-device instrument sees this" problem, closed.
+Current floor, measured within clean segments after the last revert: **static ~2 µs, sd 3.3–4.7 µs,
+p2p ~10 µs**, reboot recovery ~42 s. Simultaneous restarts land within ±10 µs; a lone restart or a
+recovery event lands anywhere in ±130 µs, and that spread is the integral above, not a separate
+defect.
 
-Current floor: MAD 1–3 µs steady state, p2p ~15 µs, reboot recovery ~42 s. The static term was
-the offset filter's tracking lag and is now fed forward (see `OFFSET_RATE_*` in `tsf_sync.cpp`).
-What is left is a static offset planted at every accounting re-anchor — see the first item, which
-is now the largest error in the chain by an order of magnitude.
-
-- **The feedback pivot is the dominant differential term, and the loop around it is why the error
-  oscillates.** Closed form: an EWMA at α lags a ramp by `c = (1−α)/α = 63` steps, and
-  `S·2205 = 50000 µs` exactly, so
+- **THE ONE MISSING MEASUREMENT: achieved rate, referenced outside the servo loop.** It would do two
+  jobs — de-trend the prediction (see the pivot item) and, published in the beacon beside
+  `drift_ppm`, let each device integrate the difference and know its own relative offset without an
+  analyser. Differential TRIM already predicts differential rate at corr −0.778, so the information
+  exists; integrating those snapshots explains only 13–19% because the report samples one value per
+  3.3 s of a continuously moving quantity. That is aliasing, not physics. **The cheap first step is
+  to log the time-MEAN applied trim per report window instead of the end-of-window snapshot.**
+  Measuring it from the credit stream was tried and failed on jitter — see the pivot item.
+- **The feedback pivot is the dominant differential term, and the loop around it is why the residual
+  oscillates rather than looking like noise.** Closed form: an EWMA at α lags a ramp by
+  `c = (1−α)/α = 63` steps, and `S·2205 = 50000 µs` exactly, so
 
       predicted − ideal = c·(S·2205 − Δt) = c · 50000 · δ = 3.15 µs per ppm of δ
 
-  where δ is the ACHIEVED rate against nominal. Measured directly, with `fs_a_hz`/`fs_b_hz` in the
-  analyser CSV:
-    - δ = **+38 ppm** on both boards → **+120 µs of common absolute latency**, scaling with the
+  where δ is the ACHIEVED rate against nominal. Measured with `fs_a_hz`/`fs_b_hz`:
+    - δ = **+38 ppm** on both boards → **+120 µs of COMMON absolute latency**, scaling with the
       pivot's smoothing. Inaudible for imaging, real for lip-sync.
-    - differential rate: mean +0.024 ppm but **sd 1.644 ppm**, p2p 12.3 ppm — the boards' rates
-      agree on AVERAGE and wander instantaneously, because the trim wanders (differential trim
-      sd 1.78 ppm, the same quantity).
-    - so differential pivot bias = 3.15 × 1.644 = **5.18 µs**, against 7.14 µs of differential
-      median noise to explain. About 70% of the floor.
-  **And it closes a loop:** median → trim (`TRIM_KP_RUN` 0.25) → achieved rate → pivot bias
-  (3.15 µs/ppm) → median. Loop gain `0.25 × 3.15 = 0.79`, just under unity, which is why the wire
-  shows a smooth ~20 s oscillation rather than white noise, and why lowering KP helps more than its
-  own factor.
-  **Smoothing it is the wrong fix** — smoothing scales the bias with `c`, so it makes this worse,
-  as the offset filter did before it was fed forward. Subtracting the bias is right in principle,
-  and TWO WAYS OF DOING IT HAVE BEEN TRIED AND FAILED. Both failures are about the reference the
-  trim is measured against, not about the mechanism:
-    - **Deviation from a slow mean of the applied trim (tried, made it much worse).** The mean
-      carries the ACQUISITION transient: the trim rails to hundreds of ppm while acquiring, and at
-      a 110 s time constant the mean sat at +611 to +748 ppm for minutes, pinning the deviation at
-      its ±50 ppm clamp and injecting a constant ~45 µs of prediction bias that then decayed
-      slowly. The servo chased it: medians of 250–460 µs and a +3.1 ppm residual rate difference,
-      with the wire ramping past +540 µs and still climbing 40 s later.
-    - **Seeding the mean at convergence does not fix that**, because the trim still travels from
-      several hundred ppm down to ~50 ppm AFTER converging, and that settling occupies the same
-      10–40 s band as the oscillation the mean has to preserve. No time constant separates them.
-    - **Using the applied trim absolutely** removes the wander but introduces a STATIC differential
-      of 3.15 µs/ppm × the boards' ~5 ppm crystal difference ≈ 16 µs, because the residual is then
-      `3.15 × crystal_i`, a per-board constant the servo cannot absorb.
-    - **Measuring the achieved rate from the credit stream (tried, much worse).** This was supposed
-      to be the fix — a rate measured from the plant instead of inferred from the controller, the
-      same shape as the offset filter's feed-forward. Two independent reasons it failed, both worth
-      keeping:
-        1. **The credit timestamps are far too jittery.** Per-window measurements over a 30 s
-           baseline read +66.8, +48.6, +45.6, +55.2, +57.6, +43.7 ppm — a spread of ~±10 ppm, which
-           implies ~300 µs of jitter on the credit instants, not the ~20 µs assumed. Even after a
-           1/4 EWMA the residual is ~3.4 s × 5 ppm ≈ 17 µs, i.e. THREE TIMES the 5.2 µs it removes.
-           A two-endpoint baseline cannot work here; a least-squares fit over all ~600 credits in
-           the window would divide that by √N and is the only version worth trying.
-        2. **A multiplicative scale on the span is unsafe.** It multiplies
-           `pushed − fb_mean_frames`, and a re-baseline resets those two counters at different
-           instants — `r_push` was measured at −7958592 frames, a span of −180 s. At 50 ppm that
-           injects 9 ms. Measured: the pair sat at +5753 µs, then jumped to −6094 µs, each position
-           held with a within-window MAD near 1 µs. Before the change the scale was exactly 1.0, so
-           a corrupt span cost nothing extra; afterwards it costs milliseconds. Any future version
-           must bound the span it trusts, or apply an absolute µs correction computed from a sane
-           span rather than scaling whatever span it is handed.
-  So all three attempts are dead, and the surviving direction is the one that avoids the
-  extrapolation entirely: make the comparison frames-based rather than time-based, which removes the
-  nominal-rate assumption the bias comes from at its root.
-  A previous note here claimed the opposite -- that the pivot cancels between devices, on the
-  strength of the 0.018 ppm MEAN differential rate. Wrong quantity: the mean says the rates agree
-  over 30 s, the sd says they do not at any instant, and it is the instantaneous value the pivot
-  multiplies.
-- **The −42 ms split spike.** Recurs at −42223..−42246 µs on both boards, to within 20 µs, so it
-  is structural. Rejected by the median so it is harmless, but unexplained. Suspect a stale or
-  partial depth snapshot that `accounted_at_()` then differences against. New clue: every
-  occurrence caught with the residuals logged had `xfer=50000` — its maximum, equal to `dma` — and
-  `r_mix=441` frames (10 ms), which is nowhere near the 42 ms and so does not explain it. Start
-  from why `xfer` is railed at exactly one DMA buffer whenever this fires. Since the in-flight fix
-  it reads −52245/−49343 — the same spike plus the 10 ms `inflight` those samples carry — and the
-  terms are self-consistent there (`sum == meas`, `r_mix == 0`), so it is not a conservation
-  failure. Every occurrence has `xfer=50000`, `inflight=10000`, `queued=70000`, `dma=50000` and
-  `age≈33 ms`: a full transfer buffer, i.e. the sink briefly not accepting.
-- **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured.
-- **The re-baseline anchor is now reproducible on demand and measured at chunk resolution.** Fire
-  `inject_starvation(ms)` (an API action in `snapclient-base.yaml`; there is a helper at
-  `scripts/`-adjacent scratch or four lines of `aioesphomeapi`, plaintext API, no noise PSK) and the
-  seed arms an 80-chunk `EARLY[n] seed` burst at ~26 ms. Two injections, 900 ms and 2500 ms:
-    - **The residual is constant WITHIN an event and varies BETWEEN events.** Measured −51747 µs
-      (2282 frames) on one injection and −201225 µs (8874 frames) on another, each held to ±1 µs
-      across the whole 3.3 s burst. An earlier note here claimed the first value decomposed as
-      exactly one DMA buffer plus exactly 77 frames and called that structural; with a second
-      sample it is plainly a coincidence of one event, and the claim is withdrawn. What survives is
-      the shape: the seed plants a fixed offset, instantly, and it does not drift afterwards.
-      `debt` was 0 and every conservation residual was 0 in both, so it is neither the padding path
-      nor a stage losing audio.
-    - **The seed can anchor audio that does not exist.** `latency=50000 own=0 dma=0 debt=2205
-      seed=2205` — no real audio anywhere in the chain, 2205 frames anchored. That is the padding
-      path working as designed (seed on `latency`, repay `debt` once the padding drains), but see
-      the next point for when it repays. Not reproducible on demand: it needs the DMA to be dry of
-      real audio at the instant the seed runs, and four injections since all produced `debt=0`
-      because audio had refilled the DMA by then. The one that produced it was a three-seed cascade.
-    - **The repayment lands while the pipeline is still refilling.** `PAYDBG debt=2205 repay=2205
-      acct_after=66530 lat=126530 own=126530 resid=-60000`: after repaying, the accounting is 60 ms
-      below the chain where it would have been 10 ms below without repaying. `pad_now` reaching 0
-      is not sufficient evidence that the seeded padding is what drained — by then the real audio
-      behind it has arrived. A repayment keyed on the seeded padding having been *credited* rather
-      than on the current padding being empty would not have this problem.
-  **The repayment trigger has been changed but NOT exercised.** It now repays the whole debt on a
-  deadline set at the seed (`seed instant + latency then`), the point being that the seeded silence
-  sits behind the real audio in the resident descriptors and the DAC plays at real time, so the
-  deadline needs no query. The old trigger — current padding reading empty, minus its own frames —
-  could fire early (the DMA is a rolling window, so `pad_now` hits zero as soon as one full buffer
-  of real audio is queued) or repay only a fraction and leave the rest planted. The "never below
-  played" clamp is retained, so the catastrophic mode recorded there is still guarded. It has not
-  run once: every seed since has had `debt=0`. Exercise it on the next natural starvation that
-  leaves the DMA dry before trusting it.
-
-  Ruled out along the way, with the sign as the argument: `own` and `latency` are computed
-  correctly by the sink (`queued + dma_real` vs `queued + dma_span`), and `held` is the DMA SPAN,
-  not silence — so there is no field inconsistency, and `debt=0` really does mean the DMA held real
-  audio. Earlier note that ~30 ms of audio "does not reach the DAC" is superseded: the sink never
-  stopped (`I2SDBG` continuous, `written`/`completed` advancing) and `srcrx` stayed cumulative
-  across the seed, so neither ring was discarded.
-- **Two candidate mechanisms for the per-start offset are now dead**, both recorded at their sites
-  in the fork (`449574cc5`): `playback_delay` was ZERO on all 18 starts measured, and padded
-  silence does not displace (two boards differing by 877 ms of accumulated padding sat 133 µs
-  apart, so the sink's per-descriptor real-frame bookkeeping handles it). `pad` is now published
-  through `AudioDepth` and printed in RECON, so both stay cheap to re-check.
-- **Test prospectively whether an offset only ever appears after a re-baseline or repair.** The
-  boots that needed neither landed at −5, +7.8 and +7.7 µs; the events that planted 30–133 µs all
-  involved one. Not yet conclusive: one lone replug settled at −56 µs with nothing logged, and b's
-  log history before 02:57 was lost when its stream was restarted, so the correlation could not be
-  checked against the earlier samples. Needs a few more events with both logs continuous.
-- **Re-measure the per-boot absolute offset now that the depth report is complete.** It was ±30 µs
-  and invisible on-device (differential median −2.0 ±3 µs against +30 µs on the wire) before the
-  mixer fix; the boot after it settled at −0.5 to −9 µs with 8–23 µs p2p, which is at or below the
-  analyser's own floor. One boot is not a distribution: reboot one board 4–5 times and record where
-  each lands before deciding whether anything is left here.
-- **Every accounting re-anchor plants a static wire offset of tens of µs.** Now the dominant
-  term, and only visible on the analyser. Measured in one session at MAD 1–3 µs of noise, so the
-  residual is resolved to 1 part in 40 — far better SNR than the 8.5 ms this was chased at:
-    - three boards restarted together: **+0.9 µs**
-    - board b alone, twice: **+89 µs**, then **+115 µs** (26 µs apart, so not frame-quantised)
-    - both boards together: **+26 µs**, then b's split repair fired and it went to **+85 µs**
-  The chain on that last one is now understood and was a CASCADE: the mixer's incomplete depth
-  report showed +25509 µs, the repair fired on it at 02:24:46, and subtracting those 1125 frames
-  from `pushed` is what created the −25488 µs split that the second repair answered 14 s later.
-  Two repairs, the second undoing the first, neither needed — the frames were only in flight.
-  `MIX_RESIDUAL_MATCH_US` stops it at the head; the two gate-era boots landed at −15 and +30 µs
-  against +85 to +115 µs before it.
-  Instrument the seed and the first credits at the instant they happen.
-- **Leave `TRIM_KP_RUN` at 0.25.** Re-measured after the feed-forward and the trade has inverted.
-  KP multiplies the DIFFERENTIAL MEDIAN, and that input has fallen 6× since the gain was chosen
-  (sd 43.0 → 6.7 µs; differential trim sd 20.9 → 1.7 ppm), so the 35 µs the setting was said to
-  cost is now most of a 15.7 µs p2p budget. 0.1 would buy ~2–3 µs of the 5.1 µs sd and cost 3.6×
-  on reboot recovery (42 s → 150 s). Revisit only if the recovery trough goes away.
-- **Stale deadline on stream resumption.** With `keepalive_hold: never`, the first chunk after a
-  long idle carries a deadline stale by roughly the idle duration. Self-heals in ~2.5 s and the
-  magnitude rule mutes correctly, so it is bounded. Closing it needs the snapserver side.
-- **Why did lateness spiral to 4.9 s** before the stale bailout fired? Probably self-inflicted by
-  an accounting error since reverted, but unconfirmed.
+    - differential rate: mean +0.024 ppm but **sd 1.644 ppm**, p2p 12.3 — the rates agree on average
+      and never at an instant, because the trim wanders (differential trim sd 1.78 ppm, same thing).
+    - so differential pivot bias = 3.15 × 1.644 = **5.18 µs** of the 7.14 µs differential median
+      floor. About 70%.
+    - **loop gain:** median → trim (`TRIM_KP_RUN` 0.25) → achieved rate → pivot bias (3.15 µs/ppm) →
+      median = `0.79`. Just under unity, hence the smooth ~20 s oscillation, and hence lowering KP
+      buys more than its own factor.
+  Smoothing it is the WRONG fix: smoothing scales the bias with `c`. **Three corrections have been
+  tried on hardware and all three failed.** The mechanism is not in doubt; the reference is.
+    1. **Deviation of the applied trim from a slow mean** — much worse. The mean carries the
+       acquisition transient: the trim rails to hundreds of ppm while acquiring, so at a 110 s time
+       constant the mean sat at +611 to +748 ppm for minutes, pinning the deviation at its ±50 ppm
+       clamp and injecting ~45 µs of prediction bias that then decayed slowly. Medians of 250–460 µs,
+       +3.1 ppm residual rate difference, wire ramping past +540 µs and still climbing at 40 s.
+    2. **Seeding that mean at convergence** does not rescue it — the trim still travels from hundreds
+       of ppm down to ~50 ppm AFTER converging, and that settling shares the 10–40 s band with the
+       oscillation the mean must preserve. No time constant separates them. (Not flashed; reasoned.)
+    3. **Achieved rate measured from the credit stream** — much worse, for two independent reasons,
+       both worth keeping:
+         - **The credit timestamps carry ~300 µs of jitter**, not the ~20 µs assumed. A 30 s
+           two-endpoint baseline read +66.8, +48.6, +45.6, +55.2, +57.6, +43.7 ppm — spread ±10 ppm —
+           so even after a 1/4 EWMA the residual is ~3.4 s × 5 ppm ≈ 17 µs, THREE TIMES the 5.2 µs it
+           removes. Only a least-squares fit over all ~600 credits in the window divides that down.
+         - **A multiplicative scale on the span is unsafe at any rate accuracy.** It multiplies
+           `pushed − fb_mean_frames`, and a re-baseline leaves those counters inconsistent — `r_push`
+           has been measured at −7958592 frames, a span of −180 s, which at 50 ppm injects 9 ms.
+           Observed: the pair sat at +5753 µs, then jumped to −6094 µs, each position held with a
+           within-window MAD near 1 µs. At scale exactly 1.0 a corrupt span costs nothing; with a
+           scale it costs milliseconds. Bound the span, or apply an absolute µs correction from a
+           span known to be sane.
+  Also do not retry the note, since withdrawn, that the pivot CANCELS between devices: that used the
+  0.018 ppm MEAN differential rate where the pivot multiplies the instantaneous value.
+  **Surviving direction:** avoid the extrapolation entirely — compare in FRAMES rather than time,
+  which removes the nominal-rate assumption the bias comes from at its root.
+- **`TRIM_KP_RUN` stays at 0.25 for now, but the case for 0.1 is stronger than it looks.** KP
+  multiplies the differential median, and that input fell 6× across this work (sd 43.0 → 7.1 µs;
+  differential trim sd 20.9 → 1.78 ppm). Straight linear scaling says 0.1 buys only 2–3 µs and costs
+  3.6× on reboot recovery (42 s → 150 s) — but the loop gain above is `KP × 3.15`, so 0.1 takes it
+  from 0.79 to 0.32 and removes the 1/(1−G) ≈ 4.8× amplification as well. Worth measuring rather
+  than reasoning about, and worth doing BEFORE the pivot work since it is a one-line experiment.
+- **Events plant an offset because the two servos hunt independently through recovery.** Not a
+  separate defect — the integral above — but the events are what make it large, and they are all in
+  the logs. Landing values measured in one session:
+    - three boards restarted together **+0.9 µs**; both boards together **−5, +7.7, +26 µs**
+    - board b alone **+89, +115, −56, +127 µs**
+    - after b's repair cascade **+85 µs**; after an injected starvation + repair **−133 µs**
+  The cascade is understood: the mixer's incomplete depth report showed +25509 µs, the repair fired
+  on it, and subtracting those 1125 frames from `pushed` created the −25488 µs split that a second
+  repair answered 14 s later. Neither was needed. `MIX_RESIDUAL_MATCH_US` stops it at the head, and
+  is now a regression guard rather than a live defence since the mixer reports `dbg_inflight_us`.
+- **The re-baseline anchor plants a fixed offset, reproducibly, and can be studied on demand.** Fire
+  `inject_starvation(ms)` (API action in `snapclient-base.yaml`; four lines of `aioesphomeapi`,
+  plaintext API, no noise PSK) and the seed arms an 80-chunk `EARLY[n] seed` burst at ~26 ms.
+    - **The residual is constant within an event and varies between events**: −51747 µs (2282 frames)
+      on one injection, −201225 µs (8874 frames) on another, each held to ±1 µs across 3.3 s. `debt`
+      was 0 and every conservation residual 0 in both, so it is neither the padding path nor a stage
+      losing audio. (An earlier note called the first value "one DMA buffer plus exactly 77 frames"
+      and structural; two samples show that was a coincidence. Withdrawn.)
+    - **The seed can anchor audio that does not exist**: `latency=50000 own=0 dma=0 debt=2205
+      seed=2205`. That is the padding path as designed — seed on `latency`, repay `debt` when the
+      padding drains. Hard to reproduce: it needs the DMA dry of real audio at the instant the seed
+      runs, and four injections since produced `debt=0` because audio had refilled by then. The one
+      occurrence came from a three-seed cascade.
+    - **The repayment trigger was changed and has NEVER EXECUTED.** It now repays the whole debt on a
+      deadline set at the seed (`seed instant + latency then`), because the seeded silence sits behind
+      the real audio in the resident descriptors and the DAC plays at real time, so no query is
+      needed. The old trigger fired on current padding reading empty, which the rolling DMA window
+      makes wrong in both directions; measured before the change, repaying 2205 frames left the
+      accounting 60 ms below the chain where not repaying would have left 10 ms. The "never below
+      played" clamp is retained, so the catastrophic mode is still guarded. **Treat as a proposal
+      until a starvation leaves the DMA dry.**
+  Ruled out along the way, with the sign as the argument: nothing is losing audio (the sink never
+  stopped — `I2SDBG` continuous with `written`/`completed` advancing — and `srcrx` stayed cumulative
+  across the seed, so neither ring was discarded), and the sink computes `own` vs `latency` correctly
+  (`queued + dma_real` vs `queued + dma_span`), with `held` being the DMA SPAN and not silence.
+- **Two mechanisms for the per-start offset are dead**, recorded at their sites in the fork
+  (`449574cc5`): `playback_delay` was ZERO on all 18 starts measured, and padded silence does not
+  displace audio — two boards differing by 877 ms of accumulated padding sat 133 µs apart, so the
+  sink's per-descriptor real-frame bookkeeping handles it. `pad` is published through `AudioDepth`
+  and printed in RECON, so both stay cheap to re-check.
+- **The −42 ms split spike.** Recurs at −42223..−42246 µs on both boards to within 20 µs, so it is
+  structural; rejected by the median, so harmless, but unexplained. Since the in-flight fix it reads
+  −52245/−49343 — the same spike plus the 10 ms `inflight` those samples carry — and the terms are
+  self-consistent (`sum == meas`, `r_mix == 0`), so it is not a conservation failure. Every
+  occurrence has `xfer=50000` (its maximum, equal to `dma`), `inflight=10000`, `queued=70000`,
+  `dma=50000`, `age≈33 ms`: a full transfer buffer, i.e. the sink briefly not accepting. Start from
+  why `xfer` is railed at exactly one DMA buffer whenever this fires.
+- **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured, but
+  not re-checked since the in-flight fix changed what `meas` contains.
+- **Stale deadline on stream resumption.** With `keepalive_hold: never`, the first chunk after a long
+  idle carries a deadline stale by roughly the idle duration. Self-heals in ~2.5 s and the magnitude
+  rule mutes correctly, so it is bounded. Closing it needs the snapserver side.
+- **Why did lateness spiral to 4.9 s** before the stale bailout fired? Probably self-inflicted by an
+  accounting error since reverted, but unconfirmed. One natural occurrence was captured at 2.4 s and
+  recovered through the starvation re-baseline.
 
 ## Housekeeping
 
@@ -257,6 +211,27 @@ Earned expensively; ignoring these cost hours.
   differenced, it read −15.5 ±8.5 µs against +85 µs on the wire. Wrong sign, ~12σ out. It
   consumes `(pushed − played)`, so an accounting error and the audio offset it causes cancel —
   which is exactly the class of defect it was built to find. Do not use it for absolute offset.
+- **The mean and the sd answer different questions, and picking the wrong one costs a day.** The
+  pivot term was declared disproven off a differential rate whose MEAN was 0.018 ppm — true, and
+  irrelevant, because the bias multiplies the instantaneous value and its sd was 1.64 ppm. Before
+  concluding that a term cancels, check which moment of it the mechanism actually multiplies.
+- **Anything derived from the controller's output is inside the loop.** Three attempts to correct the
+  pivot bias from the applied trim failed for this reason: a slow mean lags acquisition, an
+  instantaneous value carries full loop gain, and the absolute value carries the crystal offset. A
+  reference has to be measured from the plant, or the comparison restructured so it is not needed.
+- **Never read a slope across a data gap.** A boot leaves ~25 s with no audio to correlate
+  (`pcm_coef` 0, offset NaN), and joining the endpoints either side produced a convincing 40 ppm
+  ramp that nothing in the audio did. `scripts/i2s-skew.py` now breaks the line, shades the gap and
+  fits the slope over the longest contiguous segment only — but the habit generalises to every
+  instrument here.
+- **Credit timestamps carry ~300 µs of jitter.** Measured, not assumed: a 30 s two-endpoint baseline
+  resolves only ±10 ppm. Anything derived from differencing two credit instants needs a fit over
+  many of them.
+- **A device reboots without saying so.** `safe_mode: Boot seems successful` only prints after a
+  POWER CYCLE, so a clean OTA reboot never logs it; waiting for that line cost 25 minutes of a
+  session. The reliable signal is `I2SDBG written=` resetting, since it is cumulative since boot.
+  `scripts/flash.sh -p` can also print "OTA successful" for one board and never reach "All devices
+  flashed successfully" — check for that line.
 - **Two boards following the same leader can be differenced.** `delta(b) − delta(a)` from the
   `Render phase` line is the cheapest on-device stand-in for the analyser, and the medians need
   ~70 samples each before they mean anything (single samples carry ±100 µs).
