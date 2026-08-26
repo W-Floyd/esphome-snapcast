@@ -379,17 +379,13 @@ defect.
       at the moment it is most sensitive. The median window exists to prevent exactly that.
       Reverted; the stale-median account of the residual is unsupported and the residual's cause is
       open.
-    - **SUPERSEDED, kept for the reasoning: the repair left the median window stale.** The 33% is
-      short of the ~0 the model predicts for a frozen trim, and the residual is the servo chasing
-      the prediction step the REPAIR ITSELF makes: `pushed` steps, so every error still in
-      `st.err_window` was measured against the old prediction, and the servo steers from that stale
-      median for a full window afterwards. The repair already clears the playout histories for
-      exactly this reason — *"the counters just jumped, so anything remembered against them is
-      meaningless"* — and the median window is the same kind of memory, overlooked. Now cleared
-      (with `steer_dir`), which lets the median fall back to the instantaneous error, honest
-      post-repair because it uses the corrected prediction. The integrator is deliberately kept: it
-      holds the crystal offset, which the repair says nothing about.
-      **Prediction: substantially below 187 us. If not, the stale-median account is wrong.**
+    - **SO THE RESIDUAL 222 µs IS UNEXPLAINED, and that is the current state.** The reasoning that
+      motivated fix 2 — that the servo chases the prediction step the repair itself makes, using
+      `st.err_window` samples taken against the old prediction — sounded right and matched the
+      convention at `clear_playout_history_`, but the measurement rejected it. Whatever accounts
+      for the remaining displacement is open. Do not re-attempt the median clear; if the stale
+      window is still suspected, the way to test it is to let the window REFILL before the PI acts
+      again (hold the trim for a further window after the repair) rather than to empty it.
     - **Consequence, and it is a design tension worth stating:** the 3 s hold exists to avoid acting
       on a spike, but during those 3 s the servo steers real audio against a prediction the code is
       *about to declare wrong*. The damage is done before the correction lands, and it is permanent
@@ -398,24 +394,10 @@ defect.
     - Note the step scales with KP, so it pulls the opposite way to the landing offset: lower KP
       shrinks the repair's displacement while *enlarging* the planted offset after a recovery. Any
       future KP change should be judged on both.
-    - **ANSWERED, in quiet conditions: the repair DOES displace real audio.** A natural repair on
-      board b, 4 s after a re-lock, with the wire quiet:
-
-          board   t       repaired_us   step_us   floor
-              b   176.2       +20000     +491.3    0.71   STEP
-
-      **+491 µs of permanent wire step against a 0.71 µs floor — 690×.** So the repair path is a
-      confirmed mechanism for planting a static offset, and it is invisible afterwards precisely
-      because the accounting has just been reconciled: every residual reads 0 while the audio sits
-      491 µs from where it belongs. That is ~70× the ~7 µs steady-state floor and well outside the
-      ±130 µs band recorded for events.
-        - **The step is NOT the repaired magnitude** (491 µs against 20 ms), which is expected: the
-          servo had `DRIFT_REPAIR_HOLD_US` = 3 s to act on the wrong prediction before the repair
-          landed, so what survives is whatever it moved in that window, not the split itself.
-        - **n = 1 for quiet repairs.** This event is unambiguous on its own floor, but whether every
-          repair does this, and what sets the size, is not established. Collect more quiet ones —
-          and do NOT inject, since injected starvations put the floor at 162–1291 µs and destroy
-          the measurement.
+    - The first quiet natural repair (+20000 µs → **+491.3 µs**, floor 0.71) is what opened this
+      thread; the n=5 table above supersedes it as the quantification. Kept because it is the only
+      NATURAL point and so the only one free of any injection artefact — and it sits on the model's
+      line, which is part of why the model is credible.
     - **Also settled by a NATURAL event: the empty ring precedes everything.** The 11:57:40 burst on
       board b, at chunk resolution:
 
@@ -451,6 +433,23 @@ defect.
       carry each chunk's server timestamp through to the playout feedback, so the played frame's
       server time is known directly rather than derived from `pushed`. Validate any such rework
       against the analyser BEFORE steering on it; the current one failed exactly that check.
+- **`inject_split(us)` provokes the self-repair without the chaos.** API action in
+  `snapclient-base.yaml`, alongside `inject_starvation`. Perturbs only the playout accounting and
+  leaves the audio alone, RAMPED in at ~100 µs/s so the servo absorbs it as ordinary drift.
+    - **It must ramp, not step.** A stepped version measured its own disturbance instead of the
+      repair's: +10 ms injected produced a −3.9 ms excursion and left the wire's fit floor at
+      822–1204 µs against the few hundred µs being measured. Nature ramps (the accounting diverges
+      over seconds, so the servo tracks it out and only the REPAIR steps); a step hands the servo a
+      large instantaneous error and contributes a second, larger step of its own.
+    - **The accounting has no unit finer than a frame** (22.7 µs at 44.1 kHz), so a sub-frame
+      per-chunk budget truncates to zero and the ramp silently never moves. Fixed with a carry that
+      spends whole frames every few chunks; rates below one frame per chunk (868 µs/s) are only
+      reachable that way. The bug was visible solely because the request line prints the running
+      remainder.
+    - **Space points on a QUIET-WIRE GATE, not a fixed sleep.** Each repair plants a few hundred µs
+      that then takes ~42 s to stop moving, so 110 s spacing left the next point's floor at 15.69 µs
+      against 1.05 µs for a settled one. `scratchpad/waitquiet.py` polls until the 30 s MAD is
+      ≤3 µs; a settled wire measures 0.71 µs.
 - **The re-baseline anchor plants a fixed offset, reproducibly, and can be studied on demand.** Fire
   `inject_starvation(ms)` (API action in `snapclient-base.yaml`; four lines of `aioesphomeapi`,
   plaintext API, no noise PSK) and the seed arms an 80-chunk `EARLY[n] seed` burst at ~26 ms.
@@ -654,6 +653,18 @@ Earned expensively; ignoring these cost hours.
   never harmless to the hard-resync path, which deliberately tests the instantaneous error so it can
   react to genuine steps. When a known artifact is dismissed as "rejected by the median", check
   which consumers actually go through that median.
+- **Search this file for a rule that contradicts the change BEFORE flashing it.** Three changes in
+  one session had flaws already documented here. The discard cap ignored that unbounded discarding
+  is the recovery path. The stepped `inject_split` ignored that the servo reacts to steps and not to
+  slow drift. Clearing the median window at the repair ignored *"sd is the wrong summary here"* — it
+  made the median fall back to a single raw sample, and steering on one noisy sample at KP = 0.25
+  commands 250 ppm of trim, which took the repair's displacement from 222 µs to 366 µs, worse than
+  doing nothing. Each was argued from mechanism, each was plausible, and each was refuted by a note
+  already in this repository. Reading for the contradiction is cheaper than a flash cycle.
+- **Do not quote a result from one point.** A 42% improvement quoted off the first measurement
+  became 33% at n=2; the "205 ms I2S stall", the "200 ms host log delay" and "the −52 ms spike is
+  post-seed" were all n=1 and all wrong. One point with a clean floor establishes that an effect
+  EXISTS; it does not size it.
 - **Anything derived from the controller's output is inside the loop.** Three attempts to correct the
   pivot bias from the applied trim failed for this reason: a slow mean lags acquisition, an
   instantaneous value carries full loop gain, and the absolute value carries the crystal offset. A

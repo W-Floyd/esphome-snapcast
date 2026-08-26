@@ -118,14 +118,34 @@ in the beacon.
 **Refuted, by counting:** the −52 ms split spike is *not* post-seed — 337 spike episodes against
 47 seeds, only 2–6% with a seed within 60 s.
 
-**The live lead:** the **split repair fires 23 times** on splits of 4.7–57 ms. Each firing means
-3 s of the servo steering real audio against a prediction wrong by that much, after which the
-repair fixes the *accounting* and the displacement becomes invisible to every on-device metric.
-The test is built and pointed at repair timestamps; **it needs repairs during QUIET operation** —
-the only ones captured so far were during injected starvations, where the fit floor was
-162–1291 µs against a quiet floor of 0.05 µs, so no verdict either way.
+**RESOLVED, and it is the session's main result: the split repair displaces real audio, and the
+size is set by the trim applied during the hold.** It fires 23 times per session on splits of
+4.7–57 ms. Each firing spends `DRIFT_REPAIR_HOLD_US` = 3 s steering real audio against a prediction
+the code is *about to declare wrong*, then fixes the accounting — after which the displacement is
+invisible to every on-device metric, because every residual reads 0.
 
-**Do not inject while collecting this** — injecting is what destroyed the signal-to-noise.
+    stage                  +-2500 us split -> step        mean      n
+    baseline               +329.6 +311.1 -347.4           329 us    3
+    + trim hold  (KEPT)    +187.3 -256.9                  222 us    2
+    + median clear (REVERTED) +375.0 -357.7               366 us    2
+
+The model, which held across an 8x range of split sizes: step = trim x hold, saturated by the
++-1000 ppm clamp, at 0.16–0.18 efficiency (2500 -> 625 ppm -> 330 µs; 20000 -> clamped 1000 ppm ->
+491 µs). That is why a much larger split yields only a slightly larger step, and it is what
+identified the TRIM rather than the split as the thing doing the damage.
+
+**`TRIM_KP_RUN` interacts with this in the opposite direction** to the landing offset: the step
+scales with KP, so a lower gain shrinks the repair's displacement while *enlarging* the offset a
+recovery leaves. Judge any future KP change on both — the last one was judged on neither.
+
+**Still open:** the 222 µs that survives the trim hold. The stale-median explanation was tested and
+refuted (see `TODO.md`), so its cause is unknown. If the stale window is still suspected, test it by
+letting the median REFILL before the PI acts again, not by emptying it.
+
+**Method for collecting more:** `inject_split(us)` provokes a repair on demand — ramped, never
+stepped — and points must be spaced on a quiet-wire gate rather than a fixed sleep. Both constraints
+were learned the hard way and are recorded in `TODO.md`. **Do not use `inject_starvation` for this**;
+it puts the fit floor at 162–1291 µs against 0.71 µs quiet.
 
 ## Step 3 — achieved rate against server time, published in the beacon
 
@@ -155,8 +175,15 @@ crystal offset by construction.
   at −180 s of span, and a corrupt span is milliseconds of error the moment anything scales it.
 - **Publish as an absolute µs-free quantity** (ppm vs nominal), diagnostics-only like
   `pipeline_us` — never feeds the timebase.
-- **Beacon compatibility:** `TsfPacket` is packed and versioned. Adding a field changes the size,
-  so bump the version byte or accept both lengths during the mixed-fleet window.
+- **Beacon compatibility — solved, with a working precedent.** `crystal_ppm` was appended to
+  `TsfPacket` this session: append at the END, do NOT bump the version (a bump costs a half-flashed
+  fleet its shared timebase in BOTH directions, which the note at `TSF_VERSION` explains), and make
+  the receiver accept both lengths, defaulting the missing field to NaN. Copy that pattern.
+- **Note the topology limit before designing the consumer:** followers never beacon (all three
+  `broadcast_` sites are leader-gated), so a follower sees only the LEADER's published value and two
+  followers cannot see each other's — which is the normal case for a stereo pair. Publish the RAW
+  rate, since raw values from any two peers difference to what the pair needs; a delta-vs-leader does
+  not.
 
 ## Step 4 — the pivot, frames-based
 
@@ -212,13 +239,24 @@ forward if upstream submission has any calendar pressure.
   `MIXER_TASK_ALL_BITS` in the STOPPED handler, which would discard a pending
   `MIXER_TASK_COMMAND_START`. **Unconfirmed** — nobody has established whether a START was issued
   and lost or never issued because the player task was already blocked. Instrument before fixing.
+- **The wedge has a SECOND variant: the pipeline never starts after a boot.** Same end state,
+  different entry — the main loop and `wifi_diag` live while every audio task is dead from boot, and
+  no `Stopped` appears at all. That points away from the STOPPED handler and toward task startup, so
+  a fix aimed only at stop/restart would miss it. Both variants need a replug.
 - **Why the ring empties in the first place.** Upstream of the resync runaway and of the wedge, and
   still unexplained. This is the first defect in the chain; the others are consequences.
+- **A silent board is not always a wedge.** Both boards once went quiet together with no audio-task
+  lines; the cause was `stream 'Spotify': status='idle'` on the server. Query
+  `Server.GetStatus` on `192.168.1.2:1780` before diagnosing firmware — and note the tell: a real
+  wedge leaves the net task and main loop running, so if those are alive AND the stream never
+  started, look upstream.
 
 ## State
 
-- Both probed SuperMinis on `c93f6cd`-era firmware and playing; steady-state medians 7–37 µs at
-  KP = 0.25. The M5Stamp missed the last two flashes (mDNS did not resolve) and is unprobed.
+- All three boards flashed at `360ee13` (trim hold in, median clear reverted) and playing;
+  steady-state medians 7–37 µs at KP = 0.25. The M5Stamp intermittently fails to resolve over mDNS
+  at flash time — re-run `reflash.sh` and check the success count, since it is a group member and an
+  old-firmware leader would not publish `crystal_ppm`.
 - `snapclient-esphome` main pushed and clean; `../esphome` on `speaker-render-latency`, and
   `render-latency` still lacks `07f80de5e` (step 6).
 - `2cfd294` committed but never executed (step 5).
@@ -241,6 +279,12 @@ forward if upstream submission has any calendar pressure.
 - **Check which of two same-named fields the evidence came from.** A whole "blocker" was recorded
   against the rate reference because a log line was added for `tsf_rate_ppm_` (leader-only) instead
   of `offset_rate_ppm_` (all roles) — the header states the difference explicitly.
+- **Search the repo for a rule that contradicts the change before flashing it.** Three changes this
+  session had flaws already written down here: the discard cap (unbounded discarding IS the recovery
+  path), the stepped split injection (the servo reacts to steps, not slow drift), and clearing the
+  median window (single samples are not measurements — it made things worse than doing nothing).
+- **One clean point establishes that an effect exists; it does not size it.** A 42% improvement
+  quoted from the first measurement became 33% at n=2.
 - **An offset fitted across a gap is as wrong as a slope across a gap.** Anchoring device time with
   one median over a log spanning reboots put the axis 2000 s away, and it failed by reporting
   "0 paired windows", which reads as thin data rather than a broken axis.
