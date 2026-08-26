@@ -422,6 +422,18 @@ class SnapcastClient {
     double trim_integral_ppm_s{0.0};
     float trim_covered_s{0.0f};
     float trim_window_s{0.0f};
+    // Time throttle for the line above, independent of the 128-chunk report -- that boundary
+    // also gates the accounting-split repair, so it must not be moved for a diagnostic.
+    int64_t trim_log_us{0};
+#endif
+    // Per-chunk resync trace: bounded burst, armed by an excursion and rate-limited so a long
+    // storm cannot re-arm indefinitely. drops counts discards within the current episode, which
+    // is what makes the error's response to discarding readable line by line.
+    uint16_t resync_trace_left{0};
+    uint16_t resync_trace_idx{0};
+    int64_t resync_trace_arm_us{0};
+    uint32_t resync_drops{0};
+#ifdef USE_I2S_RATE_LOCK
 #endif
     uint32_t raw_sample_countdown{1};
     // Smoothed accounted-vs-observed disagreement (us); 0 when the accounting is honest

@@ -363,6 +363,22 @@ static constexpr int64_t KEEPALIVE_SLICE_US = 50000;
 
 // At most one hard-resync log line this often; the sync report carries full counts
 static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
+// Trim time-mean cadence. Independent of the 128-chunk sync report because that boundary also
+// gates the accounting-split repair, and because a diagnostic must be throttled by time rather
+// than iteration count. Measured budget when this was chosen: 2.5 log lines/s/device total,
+// against the ~38/s the config flags as enough to stall an OTA -- so ~1 s is affordable where
+// the per-chunk 38/s is not. The wire is sampled at ~58 Hz, so the firmware series is the
+// coarse one in every comparison; this closes part of that gap without touching the statistic,
+// since a time-mean is a time-mean at any window length.
+static constexpr int64_t TRIM_WINDOW_LOG_INTERVAL_US = 1000000;
+// Per-chunk resync trace: how many chunks, and how often the burst may re-arm. 80 chunks is
+// ~2.1 s at the 26 ms cadence when playing normally and much less during a storm, where the
+// loop discards as fast as it iterates -- which is the case worth capturing. Matches the
+// existing seed trace's budget, so the burst cost is already precedented. Rate-limited to once
+// per 10 s so a sustained storm produces one readable burst rather than a flood competing with
+// the audio stream for the same congested link.
+static constexpr uint16_t RESYNC_TRACE_CHUNKS = 80;
+static constexpr int64_t RESYNC_TRACE_ARM_INTERVAL_US = 10000000;
 // How long the stream may stay staler than the server's whole buffer before the
 // player gives up on it and forces a reconnect. Long enough that a burst of
 // congestion which TCP eventually outruns is ridden out rather than punished
@@ -2044,6 +2060,39 @@ void SnapcastClient::player_task_() {
       }
     }
 
+    // PER-CHUNK RESYNC TRACE. Armed by an excursion, bounded, and rate-limited, so it costs
+    // nothing in steady state.
+    //
+    // It exists because the question this path raises cannot be answered from the throttled
+    // lines below. Dropping a chunk buys exactly one chunk of deadline, so a REAL lateness
+    // should shrink ~1:1 with the audio discarded, while a bad prediction or a bad deadline
+    // reads the same excess on every following chunk. Those two demand opposite responses and
+    // produce the same coarse symptom -- an error that grows while discards happen -- which is
+    // precisely how a discard cap got written, flashed and reverted. `drops` against `err` on
+    // consecutive lines is the discriminator.
+    //
+    // Placed BEFORE the late-resync branch on purpose: that branch ends in `continue`, so it
+    // skips dbg_early_recon_ entirely and a storm currently leaves no chunk-resolution trace at
+    // all. ring= is here because the other open question is whether the ring drains because the
+    // client is behind or because the correction is draining it.
+    if (st.resync_trace_left == 0 && std::abs(error_us) > hard_us &&
+        now_us() - st.resync_trace_arm_us >= RESYNC_TRACE_ARM_INTERVAL_US) {
+      st.resync_trace_arm_us = now_us();
+      st.resync_trace_left = RESYNC_TRACE_CHUNKS;
+      st.resync_trace_idx = 0;
+      st.resync_drops = 0;
+    }
+    if (st.resync_trace_left > 0) {
+      st.resync_trace_left--;
+      const uint32_t ring_ms = static_cast<uint32_t>(static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 /
+                                                     (frame_bytes * rec.params.sample_rate));
+      ESP_LOGD(TAG, "RSYNC[%u] t=%" PRId64 " err=%" PRId64 " med=%" PRId64 " ring=%" PRIu32 " drops=%" PRIu32,
+               st.resync_trace_idx++, now_us(), error_us, median_err_us, ring_ms, st.resync_drops);
+    }
+    if (error_us <= hard_us && error_us >= -hard_us) {
+      st.resync_drops = 0;  // episode closed
+    }
+
     // Hard-resync logging is throttled to one line per RESYNC_LOG_INTERVAL_US: during
     // a recovery storm this fires per chunk, and when logs stream over the api the
     // log traffic competes with the audio stream on the already-congested link — a
@@ -2068,6 +2117,7 @@ void SnapcastClient::player_task_() {
                  error_us / 1000, st.storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
       }
       st.converged = st.converged && !mute_now;
+      st.resync_drops++;
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
@@ -2272,6 +2322,40 @@ void SnapcastClient::player_task_() {
         st.trim_integral_ppm_s +=
             static_cast<double>(this->rate_lock_->applied_ppm()) * static_cast<double>(chunk_s);
         st.trim_covered_s += chunk_s;
+      }
+      // Emitted on its OWN TIME THROTTLE, deliberately not on the 128-chunk report boundary.
+      // Two reasons. The report interval also gates the accounting-split REPAIR, so shortening
+      // it to get finer diagnostics would make a self-repair fire four times as often -- a
+      // control change wearing a diagnostics hat. And the project rule is to throttle
+      // diagnostics by time, never by iteration count, because a loop with no guaranteed
+      // cadence floods the log.
+      //
+      // ~1 s against the report's 3.35 s. The window MEAN is what defeats the aliasing that
+      // made the end-of-window snapshot useless, and it stays a true time-mean at any window
+      // length, so this is 3.3x the resolution at no cost to the statistic. Going to per-chunk
+      // (38 lines/s/device) is the documented flood that stalls an OTA; the armed burst trace
+      // covers events instead.
+      //
+      // t= is esp_timer microseconds since boot, the SAME clock clock_sync stamps its lines
+      // with. The host's "[HH:MM:SS]" prefix is RECEIVE time and was measured carrying 200 ms
+      // of delay typically and up to 1 s, with truncated and interleaved lines on top -- which
+      // at a 1 s cadence is 20-100% of the interval, i.e. enough to make a faster series
+      // useless. Placing points by this field instead of the prefix is what makes the extra
+      // resolution mean anything.
+      if (now_us() - st.trim_log_us >= TRIM_WINDOW_LOG_INTERVAL_US && st.trim_window_s > 0.0f) {
+        st.trim_log_us = now_us();
+        const float covered_pct = 100.0f * st.trim_covered_s / st.trim_window_s;
+        if (st.trim_covered_s > 0.0f) {
+          ESP_LOGD(TAG, "Trim window: mean %+.3f ppm over %.2f s audio (covered %.0f%%) t=%" PRId64,
+                   static_cast<float>(st.trim_integral_ppm_s / static_cast<double>(st.trim_covered_s)),
+                   st.trim_window_s, covered_pct, now_us());
+        } else {
+          ESP_LOGD(TAG, "Trim window: no trim programmed over %.2f s audio t=%" PRId64, st.trim_window_s,
+                   now_us());
+        }
+        st.trim_integral_ppm_s = 0.0;
+        st.trim_covered_s = 0.0f;
+        st.trim_window_s = 0.0f;
       }
     }
 #endif
@@ -3096,27 +3180,6 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       st.soft_inserted_frames = 0;
       st.hard_resyncs = 0;
   #ifdef USE_I2S_RATE_LOCK
-      // Its OWN line. The sync report above is at the 256-byte formatting ceiling and
-      // silently truncates its last field, so a new diagnostic added there reads as missing
-      // data rather than as a formatting problem.
-      //
-      // Both numbers are needed to form the integral this measures: mean x time. Coverage is
-      // printed unconditionally rather than only when short, because "compared, and it
-      // agreed" and "there was nothing to compare" must not look the same -- the same
-      // distinction the fill/drift branches above are built around.
-      if (st.trim_window_s > 0.0f) {
-        const float covered_pct = 100.0f * st.trim_covered_s / st.trim_window_s;
-        if (st.trim_covered_s > 0.0f) {
-          ESP_LOGD(TAG, "Trim window: mean %+.3f ppm over %.2f s audio (covered %.0f%%)",
-                   static_cast<float>(st.trim_integral_ppm_s / static_cast<double>(st.trim_covered_s)),
-                   st.trim_window_s, covered_pct);
-        } else {
-          ESP_LOGD(TAG, "Trim window: no trim programmed over %.2f s audio", st.trim_window_s);
-        }
-      }
-      st.trim_integral_ppm_s = 0.0;
-      st.trim_covered_s = 0.0f;
-      st.trim_window_s = 0.0f;
       st.trim_samples = 0;
       st.trim_railed = 0;
   #endif

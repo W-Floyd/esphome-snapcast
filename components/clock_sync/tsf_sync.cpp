@@ -128,7 +128,14 @@ static constexpr uint32_t SANDWICH_FLOOR_BLOCK = 256;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 // Beacons arrive once a second; the render phase moves far slower than that.
-static constexpr int64_t RENDER_LOG_INTERVAL_US = 4000000;
+// Render phase is recomputed on every leader beacon, i.e. at BEACON_INTERVAL_US, so anything
+// slower than that throws away data the device already has. Measured before this was lowered:
+// 2 lines in 600 s, because the log also sits behind follower-role and valid-leader-phase
+// conditions, so a 4 s throttle on top produced a series far too sparse to compare against a
+// ~58 Hz wire measurement. At one line per second this is the cheapest resolution in the
+// system -- and it is differenced between two followers of one leader to stand in for the
+// analyser, which is exactly the comparison that needs the points.
+static constexpr int64_t RENDER_LOG_INTERVAL_US = 1000000;
 
 // Player-side TSF-vs-local rate, used to DE-TREND the offset filter (see
 // shared_server_offset_us). Endpoints are trusted sandwiches, whose midpoint noise is a few us
@@ -507,8 +514,12 @@ void TsfSync::check_render_phase_(int64_t leader_phase_us, int64_t local_now_us)
   // delta(b) - delta(a) is what a logic analyser between them should read.
   if (local_now_us - this->last_render_log_us_ >= RENDER_LOG_INTERVAL_US) {
     this->last_render_log_us_ = local_now_us;
-    ESP_LOGD(TAG, "Render phase mine %+" PRId64 " leader %+" PRId64 " delta %+" PRId64 " us", mine, leader_phase_us,
-             mine - leader_phase_us);
+    // t= is esp_timer microseconds since boot, the same clock the snapclient diagnostics stamp
+    // with, so both components' series land on one axis. The host log prefix cannot do that
+    // job: it is receive time, measured carrying 200 ms of delay typically and up to 1 s, which
+    // at this cadence is a large fraction of the interval.
+    ESP_LOGD(TAG, "Render phase mine %+" PRId64 " leader %+" PRId64 " delta %+" PRId64 " us t=%" PRId64, mine,
+             leader_phase_us, mine - leader_phase_us, local_now_us);
   }
   // Clamped into int32 for reporting: a delta beyond +-2 s is not a playout offset, it is a
   // device that has not settled, and saturating is more honest than wrapping.
@@ -571,6 +582,26 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     if (std::fabs(measured_ppm) < 100.0f) {
       this->tsf_rate_ppm_ = this->tsf_rate_valid_ ? 0.5f * this->tsf_rate_ppm_ + 0.5f * measured_ppm : measured_ppm;
       this->tsf_rate_valid_ = true;
+      // Logged HERE, at its own update, rather than only inside the Offset ramp line below.
+      // That line is gated by the OFFSET_RATE_WINDOW_US baseline (8 s) while this quantity
+      // refreshes every RATE_WINDOW_US (4 s), so half of it was being discarded.
+      //
+      // Worth the line on its own account: the DIFFERENCE of this field between two boards is
+      // their crystal difference, measured against the radio timebase and therefore outside
+      // the audio servo loop. Measured at -5.347 ppm differential, which accounts for the
+      // whole of the differential trim's constant offset from the true rate and takes the
+      // integrated error from 505 to 17 us per 100 s. It is the only outside-the-loop rate
+      // reference the device currently has.
+      //
+      // Do NOT try to make this faster by shortening RATE_WINDOW_US: it is a two-endpoint
+      // rate measurement, so a shorter window divides the same TSF sampling jitter by less
+      // time. That is the mistake already recorded against measuring achieved rate from the
+      // credit stream. 4 s is the information rate; logging faster would repeat a stale value.
+      //
+      // t= is esp_timer microseconds since boot, matching the snapclient diagnostics, because
+      // the host log prefix is receive time and carries up to 1 s of delay.
+      ESP_LOGD(TAG, "Rate ref: tsf-local %+.3f ppm (raw %+.3f) t=%" PRId64, this->tsf_rate_ppm_,
+               measured_ppm, local_mid);
     }
     this->rate_ref_tsf_us_ = tsf_now;
     this->rate_ref_local_us_ = local_mid;
