@@ -3166,24 +3166,6 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             // The counter just stepped; levels recorded against its old value would make the next
             // reading look split by the size of the repair.
             this->clear_playout_history_();
-            // The MEDIAN WINDOW is the same kind of stale memory the histories above are cleared
-            // for, and was overlooked. `pushed` has just stepped, so every error still in the
-            // window was measured against the OLD prediction and is now meaningless -- yet the
-            // servo goes on steering real audio from that median for a whole window afterwards.
-            //
-            // Measured: with the trim held through the confirmation hold, a +-2500 us split still
-            // planted +187.3 us where it had planted ~330 us before, a 42% cut but not the ~0 the
-            // model predicted. This is the remaining term -- the servo chasing the prediction step
-            // that the REPAIR ITSELF creates, using pre-repair samples to do it.
-            //
-            // Clearing is safe and is the honest choice: with the window empty the median falls
-            // back to the instantaneous error, and post-repair that error is computed from the
-            // CORRECTED prediction, so it is the one trustworthy number available. The integrator
-            // is deliberately left alone -- it converges to this board's crystal offset, a hardware
-            // property the repair says nothing about, and discarding it would throw away the
-            // cancellation and cause a far larger transient than the one being fixed.
-            st.err_window_filled = 0;
-            st.steer_dir = 0;
             this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(),
                                 this->pushed_frames_total_);
             this->mark_playout_(this->played_history_, this->played_history_next_, now_us(),
