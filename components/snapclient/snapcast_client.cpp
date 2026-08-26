@@ -2337,11 +2337,14 @@ void SnapcastClient::player_task_() {
       // covers events instead.
       //
       // t= is esp_timer microseconds since boot, the SAME clock clock_sync stamps its lines
-      // with. The host's "[HH:MM:SS]" prefix is RECEIVE time and was measured carrying 200 ms
-      // of delay typically and up to 1 s, with truncated and interleaved lines on top -- which
-      // at a 1 s cadence is 20-100% of the interval, i.e. enough to make a faster series
-      // useless. Placing points by this field instead of the prefix is what makes the extra
-      // resolution mean anything.
+      // with, so the two components' series share one axis.
+      //
+      // What it is worth, measured once the stamp made the measurement possible: the host
+      // "[HH:MM:SS]" prefix is receive time, and against the device clock it reads p50 0 ms,
+      // p90 7.7 ms, p99 28 ms -- under 3% of a 1 s interval. An earlier claim of 200 ms typical
+      // and up to 1 s was WRONG, drawn from one truncated and interleaved line. Keep the field
+      // anyway: it is free, it cannot degrade under the log congestion a receive timestamp is
+      // exposed to, and it is what turns "the host clock is probably fine" into a number.
       if (now_us() - st.trim_log_us >= TRIM_WINDOW_LOG_INTERVAL_US && st.trim_window_s > 0.0f) {
         st.trim_log_us = now_us();
         const float covered_pct = 100.0f * st.trim_covered_s / st.trim_window_s;

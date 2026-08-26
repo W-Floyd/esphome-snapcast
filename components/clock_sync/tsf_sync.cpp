@@ -515,9 +515,16 @@ void TsfSync::check_render_phase_(int64_t leader_phase_us, int64_t local_now_us)
   if (local_now_us - this->last_render_log_us_ >= RENDER_LOG_INTERVAL_US) {
     this->last_render_log_us_ = local_now_us;
     // t= is esp_timer microseconds since boot, the same clock the snapclient diagnostics stamp
-    // with, so both components' series land on one axis. The host log prefix cannot do that
-    // job: it is receive time, measured carrying 200 ms of delay typically and up to 1 s, which
-    // at this cadence is a large fraction of the interval.
+    // with, so both components' series land on one axis, and the SPACING between points is the
+    // device's own rather than the host's.
+    //
+    // Honest accounting of what this buys: once the stamp existed it became possible to measure
+    // the host prefix against it, and the prefix turns out to be good -- p50 0 ms, p90 7.7 ms,
+    // p99 28 ms over 139 lines, i.e. under 3% of a 1 s interval. An earlier claim of "200 ms
+    // typical, up to 1 s" was wrong; it came from a single truncated and interleaved line, n=1.
+    // So this is cheap insurance and a self-check, not a fix for a measured problem -- and it is
+    // still the right field to place points by, because it cannot degrade under log congestion
+    // the way a receive timestamp can.
     ESP_LOGD(TAG, "Render phase mine %+" PRId64 " leader %+" PRId64 " delta %+" PRId64 " us t=%" PRId64, mine,
              leader_phase_us, mine - leader_phase_us, local_now_us);
   }
@@ -598,8 +605,9 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
       // time. That is the mistake already recorded against measuring achieved rate from the
       // credit stream. 4 s is the information rate; logging faster would repeat a stale value.
       //
-      // t= is esp_timer microseconds since boot, matching the snapclient diagnostics, because
-      // the host log prefix is receive time and carries up to 1 s of delay.
+      // t= is esp_timer microseconds since boot, matching the snapclient diagnostics. See the
+      // render-phase log for what this is actually worth: the host prefix measures good to
+      // ~30 ms worst case here, so this is insurance rather than a correction.
       ESP_LOGD(TAG, "Rate ref: tsf-local %+.3f ppm (raw %+.3f) t=%" PRId64, this->tsf_rate_ppm_,
                measured_ppm, local_mid);
     }

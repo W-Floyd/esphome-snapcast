@@ -686,10 +686,15 @@ SYNC_RE = re.compile(
 
 # DEVICE TIMESTAMP, esp_timer microseconds since boot, appended to every series line the
 # firmware emits for plotting. Preferred over the "[HH:MM:SS]" prefix for placing points,
-# because that prefix is the HOST's receive time: measured carrying ~200 ms of delay
-# typically and up to 1 s, with truncated and interleaved lines on top. At the 3-8 s
-# cadences these lines used to run at that was a few percent; at 1 s it is 20-100% of the
-# interval. Optional, so a log from older firmware still plots off the prefix.
+# because the prefix is the HOST's receive time and so is exposed to log-delivery delay in a
+# way a device clock is not.
+#
+# How much delay, measured on hardware once this field made the comparison possible: p50 0 ms,
+# p90 7.7 ms, p99 28 ms over 139 lines -- under 3% of a 1 s interval. An earlier claim of
+# "200 ms typical, up to 1 s" was WRONG; it came from one truncated and interleaved line, n=1.
+# So this field is cheap insurance and a continuous self-check, not a fix for a measured fault,
+# and device_anchor prints the residual so a future regression in the host path is visible
+# rather than assumed. Optional: a log from older firmware still plots off the prefix.
 DEV_T_RE = re.compile(r"\bt=(\d+)")
 
 # "Rate ref: tsf-local +42.237 ppm (raw +42.100) t=..." -- each board's local clock against
@@ -1297,13 +1302,42 @@ def rate_derivative(series, window):
     return [(float(x), float(v)) for x, v in zip(xs[ok], slope[ok])], window
 
 
-def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None):
-    """Extra plot panels: temperature, absolute I2S rate, its derivative, differential trim."""
+def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None,
+                 skew=None, ppm_series=None):
+    """Extra plot panels: A-B rate, temperature, absolute I2S rate and its derivative,
+    differential trim, firmware ramp."""
     panels = []
+    win = lambda ser: [(x, v) for x, v in ser if lo <= x <= hi]
+
+    # How fast the A-B offset is changing -- the derivative of the panel above, in ppm.
+    # Three independent routes to the same quantity, which is the point of putting them on
+    # one axis: they should agree, and where they do not, one of them is wrong.
+    ab = {}
+    if skew:
+        d, w = rate_derivative(win(skew), args.rate_window)
+        # skew is ns against seconds, so the slope is ns/s -- ppm is that over 1000.
+        if d:
+            ab[f"d(skew)/dt, {w:.2g}s fit"] = [(x, v / 1000.0) for x, v in d]
+    if ppm_series:
+        p = win(ppm_series)
+        if p:
+            ab["per-capture slope"] = p
+    ra_, rb_ = win(rate_a), win(rate_b)
+    if ra_ and rb_:
+        # Independent of the offset entirely: each board's own rate, differenced. Paired by
+        # nearest timestamp because the two series are sampled on the same rows anyway.
+        bx = np.array([x for x, _ in rb_])
+        bv = np.array([v for _, v in rb_])
+        idx = np.clip(np.searchsorted(bx, [x for x, _ in ra_]), 0, bx.size - 1)
+        diff = [(x, (bv[j] - v) / v * 1e6) for (x, v), j in zip(ra_, idx) if v > 0]
+        if diff:
+            ab["fs_b - fs_a"] = diff
+    if ab:
+        panels.append(("A-B rate of change (ppm)", ab))
+
     t2 = trim_temps(temps, lo, hi)
     if t2:
         panels.append(("temperature (\u00b0C)", t2))
-    win = lambda ser: [(x, v) for x, v in ser if lo <= x <= hi]
     ra, rb = win(rate_a), win(rate_b)
     if ra or rb:
         panels.append(("I2S frame rate (Hz)", {"a rate": ra, "b rate": rb}))
