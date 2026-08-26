@@ -59,10 +59,18 @@ timing diagnostics.
   on the device knows it. Being a rate it integrates forever: **~540 µs per 100 s** against a
   steady-state floor of **6.96 µs sd**. The trim offset integral explains **1–6%** where the `fs`
   columns explain **96–99%**.
-- **Calibrating the constant away for free would still not be enough, and this is what closes the
-  route.** After fitting out the constant *and* the slope, the residual is **0.708 ppm** in steady
-  state, ≈**71 µs per 100 s** — more than **10×** the floor it would need to resolve. So no
-  crystal-difference calibration scheme is worth building.
+- **The constant is now SOLVED on-device and validated against the wire.** Each device publishes
+  its own clock rate against the radio timebase in the beacon (`crystal_ppm`); two peers'
+  values difference to their crystal difference. Measured with both probed boards following one
+  leader: **+5.425 ± 0.128 ppm on-device against +5.25…+5.40 ppm on the analyser**, a 0.100 ppm
+  agreement — **535 µs per 100 s of integrated error becomes ~10 µs**, at a ~7 µs floor. Needs
+  ~40 s of settling after boot (at 18.6 s it was 4 ppm out) and is reproducible across a power
+  cycle to 0.002 ppm.
+- **The RESIDUAL is what still blocks the route.** After the constant is removed the trim tracks
+  the true rate only to **0.708 ppm** per window, ≈**71 µs per 100 s**, still ~10× the floor. So
+  the trim plus the crystal correction is a much better reference than the trim alone and remains
+  insufficient on its own. Reducing that residual is the surviving work, and it is what the
+  least-squares achieved-rate measurement against server time is for.
 - **De-meaning is not the fix.** It drops the analyser's own check from 96% to 2%, because the true
   differential rate has a real nonzero mean (+0.61 ppm on one run = a genuine 177 µs ramp over
   290 s) and de-meaning deletes exactly the term the offset is made of. The constant must be

@@ -114,16 +114,30 @@ defect.
       so the AP's own crystal cancels. **Diagnostics only — nothing steers on it**, and nothing
       should until the 0.708 ppm residual after correction (~71 µs per 100 s against a ~7 µs
       floor) is understood.
-        - First hardware reading: `mine +36.543 leader -7.835 delta +44.379 ppm`, arithmetic
-          self-consistent, stable across samples. The mechanism works end to end.
-        - **The prediction of ≈ −5.35 ppm FAILED, for a reason that was an assumption not a
-          measurement:** −5.35 is the *a↔b* difference, and b's leader is not a. It is one of the
-          unprobed boards, whose crystal reads −7.835 ppm. So nothing here contradicts the wire —
-          but nothing here confirms it either, and it must not be written up as confirmation.
-        - **VALIDATION STILL OWED.** It needs the two analyser-probed boards in a leader/follower
-          relationship *with each other*. Leadership goes to the lowest MAC, so in a fleet of five
-          that pair may never form: run only the two probed boards, or difference their raw
-          published values rather than their deltas.
+        - **VALIDATED AGAINST THE WIRE.** With both probed boards following the SAME leader, their
+          published rates difference to the pair's crystal difference:
+
+              on-device (a.mine  - b.mine ) = +5.425 +- 0.128 ppm   (9 paired settled samples)
+              cross-check (a.delta - b.delta) = +5.421 ppm          (matches to 0.004, as it must)
+              logic analyser, same pair       = +5.25 .. +5.40 ppm
+              on-device minus wire midpoint   = +0.100 ppm  ->  10 us per 100 s
+
+          So the constant that made the trim useless as a rate reference is now measurable on the
+          device to within the wire's own spread: **535 µs per 100 s of integrated error becomes
+          ~10 µs**, against a ~7 µs floor. The 0.100 ppm offset is inside one sd of the sample
+          spread, so the honest claim is "agrees within measurement precision", not "0.1 ppm off".
+        - Two conditions on using it, both measured. **It needs ~40 s of settling**: at 18.6 s
+          uptime the estimate read 4 ppm from its settled value, which integrates to 400 µs per
+          100 s — worse than the error it removes. Samples above were filtered to uptime > 60 s.
+          And it is **reproducible across a power cycle to 0.002 ppm** (+36.808 against +36.810),
+          so once settled it is as stable as a hardware constant should be.
+        - A first reading of `delta +44.379 ppm` looked like a failed prediction of −5.35, but the
+          leader was an unprobed board at −7.835 ppm, not board a. The delta against *whoever
+          leads* is not the pair quantity; differencing two peers' raw rates is, which is why
+          publishing the raw value rather than only the delta was the right primitive.
+        - **What this does NOT fix:** the residual. After the constant is removed the trim still
+          tracks the true rate only to 0.708 ppm per window, ~71 µs per 100 s, ~10× the floor.
+          The constant is solved; the residual is the remaining blocker.
     - **TOPOLOGY LIMITATION, and it bites the actual use case: followers never beacon.** All three
       `broadcast_` call sites are leader-gated (`role == Role::LEADER`, the leader cadence block,
       and the moment of assuming leadership). So a follower only ever sees the LEADER's
