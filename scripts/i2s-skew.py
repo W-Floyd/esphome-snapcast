@@ -44,7 +44,11 @@ recovered numbers against the truth.
 """
 
 import argparse
+import bisect
+import concurrent.futures
 import math
+import queue
+import threading
 import os
 import re
 import subprocess
@@ -114,6 +118,98 @@ def capture_logic(args):
     if buf.size < args.samples // 2:
         raise RuntimeError(f"expected ~{args.samples} bytes of logic data, got {buf.size}")
     return buf
+
+
+def stream_blocks(args):
+    """Yield fixed-size blocks from a long-lived sigrok process.
+
+    Restarting sigrok per capture costs the decode time as blind time -- measured 0.24 s
+    of every 1.27 s, a 77% duty cycle. Reading blocks out of one running acquisition
+    instead gives 99%, and the blocks are contiguous: the BCLK cadence continues across
+    the seam (gap 18 vs a median of 17 samples), so nothing is missed between them.
+
+    --continuous emits nothing on this build/driver, so each acquisition is bounded by
+    --time and simply restarted when it ends. The restart IS a real gap, which is why
+    it defaults to once a minute rather than once a second.
+    """
+    block = args.samples
+    while True:
+        cmd = [args.sigrok_cli,
+               "-d", args.driver + (f":conn={args.conn}" if args.conn else ""),
+               "-c", f"samplerate={args.samplerate}",
+               "--time", str(int(args.stream_seconds * 1000)), "-O", "binary"]
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                bufsize=0)
+        # sigrok's stderr must be drained continuously: if that 64 KB pipe fills, the
+        # process blocks on write and the acquisition stops dead.
+        errbuf = []
+        threading.Thread(target=lambda: errbuf.append(proc.stderr.read()),
+                         daemon=True).start()
+        try:
+            while True:
+                chunks, got = [], 0
+                while got < block:
+                    d = proc.stdout.read(min(1 << 22, block - got))
+                    if not d:
+                        break
+                    chunks.append(d)
+                    got += len(d)
+                if got < block:
+                    break                      # acquisition ended; restart below
+                yield np.frombuffer(b"".join(chunks), dtype=np.uint8)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            err = (errbuf[0].decode(errors="replace").strip() if errbuf else "")
+        if err and ("LIBUSB" in err or "Failed to open" in err):
+            raise RuntimeError("cannot claim the analyser -- is PulseView open?\n  " + err)
+
+
+def stream_reader(args, depth=3):
+    """stream_blocks in a thread, buffered, so slow processing cannot stall sigrok.
+
+    Anything that takes longer than a block -- the first log parse reads tens of MB, and
+    was measured stalling the loop for 30 s -- otherwise stops the pipe being read, the
+    acquisition backs up behind it, and coverage is silently lost. Here the reader keeps
+    consuming; if the queue is full the block is DROPPED and counted, so falling behind
+    shows up as a reported gap instead of a stall.
+    """
+    q = queue.Queue(maxsize=depth)
+    state = {"dropped": 0, "error": None, "done": False}
+
+    def run():
+        try:
+            for blk in stream_blocks(args):
+                try:
+                    q.put_nowait(blk)
+                except queue.Full:
+                    state["dropped"] += 1
+        except Exception as e:                      # surfaced on the consumer side
+            state["error"] = e
+        finally:
+            state["done"] = True
+            try:
+                q.put_nowait(None)
+            except queue.Full:
+                pass
+
+    threading.Thread(target=run, daemon=True).start()
+
+    def take():
+        while True:
+            if state["error"]:
+                raise RuntimeError(str(state["error"]))
+            try:
+                blk = q.get(timeout=5.0)
+            except queue.Empty:
+                if state["done"]:
+                    raise RuntimeError("stream ended")
+                continue
+            if blk is None:
+                raise RuntimeError("stream ended")
+            return blk
+
+    return take, state
 
 
 def bit(buf, ch):
@@ -267,6 +363,47 @@ def frame_lag(a, b, maxlag, prefer=None):  # prefer kept for call compatibility
     return k - maxlag, float(w[k]), rival, frac
 
 
+def rolling_lag(la, lb, k0, win, hop, span):
+    """Frame lag as a function of time WITHIN one capture: [(frame_index, lag), ...].
+
+    The capture-level correlation yields a single alignment, which is wrong if the
+    boards step mid-capture -- a hard resync inside a 1 s window would be averaged
+    across rather than seen. This re-estimates the lag in a sliding window.
+
+    The search is deliberately confined to k0 +- span. An unconstrained short window is
+    not trustworthy: with the boards 194 ms apart and no shared audio, 12 ms windows
+    happily produced coefficients of 0.9 at lags scattered over +-174 frames. Anchoring
+    to the capture-level answer means this can only report a CHANGE of a few frames,
+    which is exactly what a resync looks like, and cannot invent a large one.
+    """
+    n = min(la.size, lb.size)
+    out = []
+    if n < win + hop:
+        return out
+    span = int(span)
+    for start in range(0, n - win, hop):
+        x = la[start:start + win].astype(np.float64)
+        x = x - x.mean()
+        nx = np.linalg.norm(x)
+        if nx == 0:
+            continue
+        best, bestc = k0, -2.0
+        for d in range(k0 - span, k0 + span + 1):
+            lo, hi = start + d, start + d + win
+            if lo < 0 or hi > n:
+                continue
+            y = lb[lo:hi].astype(np.float64)
+            y = y - y.mean()
+            ny = np.linalg.norm(y)
+            if ny == 0:
+                continue
+            c = float(np.dot(x, y) / (nx * ny))
+            if c > bestc:
+                best, bestc = d, c
+        out.append((start + win // 2, best, bestc))
+    return out
+
+
 def skew_series(buf, chan, args, prefer=None):
     """Per-frame skew between the boards: (skew_ns, frame_rate, info).
 
@@ -297,11 +434,27 @@ def skew_series(buf, chan, args, prefer=None):
         per, ratio = clock_health(bit(buf, chan[ch]))
         info[f"bclk_{tag}"], info[f"gap_{tag}"] = per, ratio
 
-    maxlag = max(4, int(args.maxlag_ms * 1e-3 * info["fs"][0])) \
-        if np.isfinite(info["fs"][0]) else 4096
+    # The search range is bounded by the capture itself: an offset larger than the
+    # window means the two boards share no audio in it, so there is nothing to match.
+    # Default to 40% of the window, which keeps at least 60% overlap at full deflection.
+    nframes = min(la.size, lb.size)
+    if args.maxlag_ms:
+        maxlag = max(4, int(args.maxlag_ms * 1e-3 * info["fs"][0])) \
+            if np.isfinite(info["fs"][0]) else 4096
+    else:
+        maxlag = max(4, int(nframes * 0.40))
+    info["window_ms"] = nframes / info["fs"][0] * 1e3 if np.isfinite(info["fs"][0]) else 0
     k, coef, rival, frac = frame_lag(la, lb, maxlag, prefer)
     info["frame_lag"], info["coef"], info["rival"] = k, coef, rival
+    info["overlap"] = max(0.0, 1.0 - abs(k) / max(nframes, 1))
     if coef < MIN_PCM_COEF:
+        # Distinguish "no match" from "match is outside what this capture can see".
+        # Measured: with the boards 194 ms apart a 100 ms capture shares no audio at
+        # all and correlates noise at coef 0.40 -- indistinguishable from a fault
+        # unless the window limit is stated.
+        info["hint"] = (f"best coef {coef:.2f} over a {info['window_ms']:.0f} ms window; "
+                        f"if the boards are further apart than that they share no audio "
+                        f"in it -- raise --samples (1 s = 24000000 at 24 MS/s)")
         return np.empty(0), info["fs"][0], info
     # frame_lag returns k with b[m] == a[m - k], so board B's frame m carries the audio
     # board A played in its frame m-k; the skew is between those frames' LRC edges. This
@@ -323,9 +476,16 @@ def skew_series(buf, chan, args, prefer=None):
     return skew, info["fs"][0], info
 
 
-def measure_capture(buf, chan, args, prefer=None):
+def measure_capture(buf, chan, args, prefer=None, dump=None, dump_t0=0.0):
     """One capture -> offset at midpoint (ns), rate difference (ppm), diagnostics."""
     skew, fr, info = skew_series(buf, chan, args, prefer)
+    if dump is not None and skew.size and np.isfinite(fr):
+        # One row per audio frame: the LRC edges already give ~44100 skew values per
+        # second of capture, which the per-capture row reduces to a line fit. Formatted
+        # in one numpy call -- a Python loop over 44k rows per block is real time in a
+        # loop that only has ~0.7 s of slack.
+        t = dump_t0 + np.arange(skew.size) / fr
+        np.savetxt(dump, np.column_stack((t, skew)), fmt="%.6f,%.1f")
     if skew.size == 0 or not np.isfinite(fr):
         return float("nan"), float("nan"), info.get("coef", 0.0), info
     t = np.arange(skew.size, dtype=np.float64) / fr        # seconds within the capture
@@ -479,6 +639,15 @@ def match_temperature(line):
     return None
 
 
+# Above this many samples the plot is decimated for drawing (the data is untouched).
+MAX_PLOT_POINTS = 2500
+
+# TSF role, e.g. "tsf=leader(peers 5)" / "tsf=follower(0.9s, depth +2267 us)". Matched on
+# the first letter only: the Sync line is long and the logger truncates it mid-token, so
+# "tsf=follow", "tsf=foll" and "tsf=le" all occur and must not be missed.
+ROLE_RE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?\btsf=([lf])")
+
+
 LOG_COVERAGE = {}
 LOG_STATE = {}
 TEMPS = {}
@@ -490,7 +659,7 @@ SYNC_RE = re.compile(
 
 
 def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=None,
-                      sync_us=200, peak_us=600, pipe_ms=25):
+                      sync_us=200, peak_us=600, pipe_ms=25, tail_bytes=0):
     """Clock-affecting events from a device log: (time_of_day_s, kind, text).
 
     Three kinds, all read off the one Sync line the firmware emits every ~3.3 s:
@@ -510,12 +679,32 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     ev, temps = [], []
     last_trim, last_resync = state.get("trim"), state.get("resync")
     last_pipe = state.get("pipe")
+    last_role = state.get("role")
     try:
         f = open(path, errors="replace")
     except OSError:
         return [], start_offset, state, []
-    f.seek(start_offset)
+    if start_offset == 0 and tail_bytes:
+        try:
+            size = os.fstat(f.fileno()).st_size
+            if size > tail_bytes:
+                f.seek(size - tail_bytes)
+                f.readline()          # discard the partial line at the seek point
+        except OSError:
+            pass
+    else:
+        f.seek(start_offset)
     for line in f:
+        # Role is read independently of SYNC_RE: a truncated line may lose the trim
+        # field that SYNC_RE requires while still carrying the role.
+        rm = ROLE_RE.match(line)
+        if rm:
+            tod_r = (int(rm.group(1)) * 3600 + int(rm.group(2)) * 60 + int(rm.group(3))
+                     + int(rm.group(4)) / (10 ** len(rm.group(4))))
+            role = "leader" if rm.group(5) == "l" else "follower"
+            if last_role is not None and role != last_role:
+                ev.append((tod_r, "role", f"{board}: {last_role} -> {role}"))
+            last_role = role
         m = SYNC_RE.match(line)
         if not m:
             t = match_temperature(line)
@@ -557,6 +746,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     end = f.tell()
     f.close()
     state["trim"], state["resync"], state["pipe"] = last_trim, last_resync, last_pipe
+    state["role"] = last_role
     return ev, end, state, temps
 
 
@@ -574,8 +764,8 @@ def tod_to_unix(tod, ref_unix):
     return best
 
 
-def write_svg(path, ts, ys, title, ylabel, fit=None, include_zero=True,
-              xlabel="elapsed (s)", log_axes=False, events=(), panel2=None,
+def write_svg(path, ts, ys, title, ylabel, include_zero=True,
+              xlabel="elapsed (s)", log_axes=False, events=(), panel2=None, stats=None,
               panel2_label="temperature (\u00b0C)"):
     """Plot without a plotting dependency -- the rest of scripts/ is stdlib too.
 
@@ -627,6 +817,8 @@ def write_svg(path, ts, ys, title, ylabel, fit=None, include_zero=True,
          f'font-family="-apple-system,sans-serif" font-size="12">',
          f'<rect width="{W}" height="{H}" fill="white"/>',
          f'<text x="{ML}" y="26" font-size="15" font-weight="600">{title}</text>']
+    if stats:
+        o.append(f'<text x="{ML}" y="44" font-size="11" fill="#666">{stats}</text>')
 
     def axis(p0, p1, v0, v1, lab, pyf, xticks):
         for k in range(6):
@@ -665,7 +857,7 @@ def write_svg(path, ts, ys, title, ylabel, fit=None, include_zero=True,
 
     bar_bottom = bot1 if has2 else top1
     colours = {"corrected": "#d9534f", "resync": "#8e44ad", "trim": "#e0a800",
-               "sync": "#1a7f37", "pipeline": "#0969da"}
+               "sync": "#1a7f37", "pipeline": "#0969da", "role": "#000000"}
     for i, (ex, kind, label) in enumerate(sorted(events)):
         if not (x0 <= ex <= x1):
             continue
@@ -679,17 +871,19 @@ def write_svg(path, ts, ys, title, ylabel, fit=None, include_zero=True,
         o.append(f'<text x="{xx-3:.1f}" y="{ly:.1f}" font-size="9" fill="{col}" '
                  f'transform="rotate(-90 {xx-3:.1f} {ly:.1f})">{txt}</text>')
 
-    if fit:
-        sl, ic = fit
-        o.append(f'<line x1="{px(x0):.1f}" y1="{py(ic+sl*x0):.1f}" x2="{px(x1):.1f}" '
-                 f'y2="{py(ic+sl*x1):.1f}" stroke="#d9534f" stroke-width="1.5" '
-                 f'stroke-dasharray="6 4"/>')
-        o.append(f'<text x="{ML+8}" y="{M-10}" fill="#d9534f">'
-                 f'fit {sl:+,.1f} ns/s ({sl/1000:+.4f} ppm)</text>')
-    o.append(f'<polyline points="{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in pts)}" '
+    # Decimate for drawing: beyond a few thousand points the extra vertices are below
+    # one pixel, and a run of 100k captures would otherwise emit a multi-megabyte SVG
+    # that is rewritten after every capture.
+    draw = pts
+    if len(pts) > MAX_PLOT_POINTS:
+        step = len(pts) / MAX_PLOT_POINTS
+        draw = [pts[min(int(i * step), len(pts) - 1)] for i in range(MAX_PLOT_POINTS)]
+        draw.append(pts[-1])
+    o.append(f'<polyline points="{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in draw)}" '
              f'fill="none" stroke="#2b6cb0" stroke-width="1.5"/>')
-    for t, v in pts:
-        o.append(f'<circle cx="{px(t):.1f}" cy="{py(v):.1f}" r="2.5" fill="#2b6cb0"/>')
+    if len(draw) <= 800:
+        for t, v in draw:
+            o.append(f'<circle cx="{px(t):.1f}" cy="{py(v):.1f}" r="2.5" fill="#2b6cb0"/>')
 
     if has2:
         allv = [v for series in panel2.values() for _, v in series]
@@ -716,6 +910,9 @@ def write_svg(path, ts, ys, title, ylabel, fit=None, include_zero=True,
 SCHEMA = "elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,reason"
 
 
+DUMP_SCHEMA = "elapsed_s,skew_ns"
+
+
 def load_existing(path):
     """Rows from a previous run, but only if the file is really ours.
 
@@ -731,6 +928,20 @@ def load_existing(path):
         if line.startswith("elapsed_s"):
             head = line.strip()
             break
+    if head == DUMP_SCHEMA:
+        # A --dump-skew file: one row per audio frame rather than one per block. Same
+        # quantity, ~440x denser, so it plots through the identical path.
+        for line in open(path):
+            if line[:1] in "#e":
+                continue
+            f = line.strip().split(",")
+            if len(f) >= 2:
+                try:
+                    ts.append(float(f[0]))
+                    ys.append(float(f[1]))
+                except ValueError:
+                    pass
+        return ts, ys, None
     if head and head != SCHEMA:
         sys.exit(f"{path} has a different column layout:\n  found  {head}\n  "
                  f"expect {SCHEMA}\nPass a different --out, or move the old file aside.")
@@ -764,7 +975,27 @@ def trim_temps(temps, lo, hi):
     return out
 
 
+def stats_caption(ts, ys):
+    """One-line summary for the plot header: spread first, slope last."""
+    v = [y for y in ys if math.isfinite(y)]
+    if not v:
+        return ""
+    parts = [f"n={len(v)}", f"mean {np.mean(v)/1000:+.3f} us",
+             f"sd {np.std(v)/1000:.3f} us",
+             f"p2p {(max(v)-min(v))/1000:.3f} us"]
+    f = fit_slope(ts, ys)
+    if f:
+        parts.append(f"slope {f[0]:+,.1f} ns/s ({f[0]/1000:+.4f} ppm)")
+    return "   ".join(parts)
+
+
 def fit_slope(ts, ys):
+    """Least-squares slope in y-units per second. Reported as a number only.
+
+    Not drawn: across a series that wanders and resyncs, a straight line through the
+    whole run describes nothing and reads as a trend that is not there. The value is
+    still worth having next to the spread.
+    """
     pts = [(t, y) for t, y in zip(ts, ys) if math.isfinite(y)]
     if len(pts) < 3:
         return None
@@ -776,10 +1007,6 @@ def fit_slope(ts, ys):
     return float(sl), float(ic)
 
 
-# Intervals at which stability is reported. A tau is only meaningful if a single
-# capture holds many windows of that length, so the largest usable tau is roughly a
-# tenth of the chunk duration -- 4 s chunks at 24 MS/s (96 MB, measured drop-free)
-# support tau up to a few hundred ms with useful confidence.
 STABILITY_TAUS = (0.001, 0.002, 0.005, 0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0)
 
 
@@ -901,7 +1128,7 @@ def run_stability(args, chan, capture):
         write_svg(args.plot, [math.log10(r[0]) for r in rows],
                   [math.log10(max(r[1], 1e-9)) for r in rows],
                   "MTIE: worst peak-to-peak skew within any window",
-                  "MTIE (ns)", None, include_zero=False,
+                  "MTIE (ns)", include_zero=False,
                   xlabel="interval tau (s)", log_axes=True)
     print(f"  data {args.out}   plot {args.plot}")
 
@@ -920,8 +1147,9 @@ def main():
                    help="I2S slot width; detected from LRC/BCLK spacing if omitted")
     p.add_argument("--bit-delay", type=int, default=None, choices=[0, 1],
                    help="BCLK delay before the first data bit; detected if omitted")
-    p.add_argument("--maxlag-ms", type=float, default=50.0,
-                   help="frame-offset search half-range")
+    p.add_argument("--maxlag-ms", type=float, default=None,
+                   help="frame-offset search half-range; default is 40%% of the capture "
+                        "window, which is the most that leaves usable overlap")
     p.add_argument("--driver", default="fx2lafw")
     p.add_argument("--conn", default=None)
     p.add_argument("--sigrok-cli", default="sigrok-cli")
@@ -936,6 +1164,10 @@ def main():
                    help="--annotate: mark a Sync report whose peak error reaches this")
     p.add_argument("--pipeline-ms", type=float, default=25.0,
                    help="--annotate: mark a step in pipeline depth of at least this")
+    p.add_argument("--log-tail-mb", type=float, default=4.0,
+                   help="--annotate: how much of each log's tail to read on the first "
+                        "poll. Reading whole multi-MB logs inside the capture loop "
+                        "stalled it for 30 s; the tail is all that baselines need")
     p.add_argument("--trim-ppm", type=float, default=100.0,
                    help="--annotate: minimum trim step to mark (it moves every report)")
     p.add_argument("--replot", action="store_true",
@@ -950,6 +1182,33 @@ def main():
                    help="frame-lag change between captures treated as implausible for a "
                         "clock difference (50 frames ~ 1.1 ms at 44.1 kHz). Held, then "
                         "accepted if the next capture repeats it")
+    p.add_argument("--rolling", action="store_true",
+                   help="re-estimate the frame alignment in a sliding window inside each "
+                        "capture, to catch a resync that happens mid-capture")
+    p.add_argument("--rolling-span", type=int, default=8,
+                   help="--rolling: frames either side of the capture lag to search")
+    p.add_argument("--stream", action="store_true",
+                   help="read contiguous blocks from one running acquisition instead of "
+                        "restarting sigrok per capture: ~99%% duty and no gap between "
+                        "blocks, so coverage is continuous")
+    p.add_argument("--stream-seconds", type=float, default=60.0,
+                   help="--stream: seconds per sigrok acquisition before restarting")
+    p.add_argument("--no-prefetch", dest="prefetch", action="store_false",
+                   help="do not overlap the next capture with this one's decode")
+    p.add_argument("--max-frame-correct", type=int, default=0,
+                   help="cap on the whole-frame ambiguity undone per row (0 = no cap). "
+                        "The ambiguity is not small -- it was measured wandering over "
+                        "+-10 frames -- so a cap mainly re-breaks the series")
+    p.add_argument("--plot-window", type=float, default=0.0,
+                   help="plot only the last N seconds (0 = the whole run). A live chart "
+                        "wants a bounded window: the cost of a write grows with the "
+                        "points in it, so an unbounded run slows the refresh over time")
+    p.add_argument("--plot-every", type=float, default=2.0,
+                   help="seconds between plot rewrites; the CSV is always written per "
+                        "capture. Redrawing every capture makes a long run quadratic")
+    p.add_argument("--dump-skew", default=None,
+                   help="write the PER-FRAME skew series (one row per audio frame, "
+                        "~44100/s) to this CSV, not just one row per capture")
     p.add_argument("--y-free", action="store_true",
                    help="scale the vertical axis to the data instead of always including "
                         "zero; use when the shape of the variation matters more than its "
@@ -980,7 +1239,14 @@ def main():
         print("channel map: " + "  ".join(
             f"{k}=D{chan[k]}" for k in ("DIN_ONE", "BCLK_ONE", "LRC_ONE",
                                         "DIN_TWO", "BCLK_TWO", "LRC_TWO")))
-        capture, sim = (lambda: capture_logic(args)), None
+        if args.stream:
+            capture, stream_state = stream_reader(args)
+            sim = None
+            args.prefetch = False          # the stream is already gapless
+            print(f"  streaming: {args.samples/args_rate_hz(args)*1e3:.0f} ms blocks read "
+                  f"from one acquisition, restarted every {args.stream_seconds:g}s")
+        else:
+            capture, sim, stream_state = (lambda: capture_logic(args)), None, None
 
     # A run is one continuous acquisition, so the CSV starts fresh by default. Carrying
     # rows over from a previous invocation fabricates continuity: the elapsed axis
@@ -998,7 +1264,8 @@ def main():
             ev, end, st, tp = parse_sync_events(path, board, args.trim_ppm,
                                                 offsets.get(path, 0), span,
                                                 LOG_STATE.get(path), args.sync_us,
-                                                args.peak_us, args.pipeline_ms)
+                                                args.peak_us, args.pipeline_ms,
+                                                args.log_tail_mb * (1 << 20))
             offsets[path], LOG_STATE[path] = end, st
             for tod, name, val in tp:
                 TEMPS.setdefault(name, []).append(
@@ -1027,7 +1294,7 @@ def main():
         for x, kind, label in sorted(ev)[:40]:
             print(f"   t={x:8.2f}s  {kind:9s} {label}")
         t2 = trim_temps(TEMPS, ts0[0] - 1, ts0[-1] + 1)
-        if not t2:
+        if args.annotate and not t2:
             print(f"   no temperature found in {', '.join(args.annotate)} within the "
                   f"run window -- looked for 'Sending state N C', 'NAMETEMP N C', "
                   f"and 'temp=N'")
@@ -1036,7 +1303,8 @@ def main():
                 f"{k} ({len(v)} pts, {min(v_ for _, v_ in v):.1f}-"
                 f"{max(v_ for _, v_ in v):.1f} C)" for k, v in sorted(t2.items())))
         write_svg(args.plot, ts0, ys0, "I2S playout skew",
-                  "board B - board A (ns)   [+ = B later]", fit_slope(ts0, ys0),
+                  "board B - board A (ns)   [+ = B later]",
+                  stats=stats_caption(ts0, ys0),
                   include_zero=not args.y_free, events=ev, panel2=t2)
         print(f"  plot {args.plot}")
         return
@@ -1066,18 +1334,40 @@ def main():
 
     t_start = anchor if (args.append and anchor is not None) else time.time()
     ppms, n, shown_cfg, prefer, pending, last_off = [], 0, False, None, None, None
-    events, log_off = [], None
+    events, log_off, last_plot = [], None, 0.0
+    # A window of recent values, long enough to out-vote a run of bad blocks but short
+    # enough to follow a real move.
+    ncorr = 0
+    dumpf = None
+    if args.dump_skew:
+        dumpf = open(args.dump_skew, "w", buffering=1 << 20)
+        dumpf.write("# per-frame skew; elapsed_s is the capture start plus frame index\n")
+        dumpf.write("elapsed_s,skew_ns\n")
     print(f"{'elapsed':>9} {'offset':>13} {'ppm':>9} {'coef':>7} {'flag':>6} "
           f"{'rival':>6} {'scatter':>9}  note")
+    # Acquisition is the floor -- a 1 s window costs 1 s -- so the ~0.2 s of decode
+    # afterwards is pure blind time. Kick off the next capture before processing this
+    # one and it overlaps instead, taking the duty cycle from ~79% to ~95%. Only ever
+    # one sigrok-cli at a time: the next is submitted after the previous has returned.
+    pool = pending = None
+    if args.prefetch and not args.simulate:
+        pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
         while args.count == 0 or n < args.count:
             wall = time.time()
             elapsed = (n * args.interval) if args.simulate else (wall - t_start)
             try:
-                buf = capture()
-                off, ppm, coef, info = measure_capture(buf, chan, args, prefer)
+                if pool is None:
+                    buf = capture()
+                else:
+                    buf = pending.result() if pending is not None else capture()
+                    more = (args.count == 0 or n + 1 < args.count)
+                    pending = pool.submit(capture) if more else None
+                off, ppm, coef, info = measure_capture(buf, chan, args, prefer,
+                                                      dumpf, elapsed)
             except RuntimeError as e:
                 print(f"{elapsed:9.1f}   capture failed: {e}", file=sys.stderr)
+                pending = None
                 n += 1
                 if args.count and n >= args.count:
                     break
@@ -1113,16 +1403,41 @@ def main():
             # of zero out to -250 us. Two guards: the correction is relative to this
             # capture's own raw value, and it applies only when the step is within 30% of
             # a whole frame -- a real 15 us movement is left alone, a 22.0 us jump is not.
+            # Reference is the MEDIAN of recent accepted values, not the previous one.
+            # Measured on a 60 Hz run: the lag toggled +3/-3/+3/-3 frames between blocks,
+            # which a previous-value reference cannot fix (each step looks like a real
+            # move away, then back) and a +-2 clamp could not reach anyway. Tonal content
+            # leaves many lags near-tied -- rival ran at 0.915 -- so an excursion of a few
+            # frames is expected and is exactly what this undoes. A sustained shift moves
+            # the median with it, so a genuine resync is still tracked.
+            # Reconstruct the whole-frame count from continuity, not from the
+            # correlation. Measured on a 60 Hz run: the correlation's integer lag wandered
+            # over +-10 frames at coef 0.99 -- tonal content leaves many lags near-tied
+            # (rival 0.915) -- while 391 of 393 observed jumps sat within 0.03 of a whole
+            # frame, i.e. pure ambiguity rather than motion. Meanwhile the TRUE skew moves
+            # 0.16 ns per block at 60 Hz and 10 ppm, so the nearest whole frame to the
+            # previous value is the right one by an enormous margin. Replaying that run:
+            # bad steps 393 -> 2.
+            #
+            # No clamp, because the ambiguity is not small; but the guard stays. A real
+            # move of more than 0.3 frame between blocks (>40 ppm at 60 Hz) fails the
+            # guard and is left alone, so a genuine fast slew is not quietly folded away.
             nwrap = 0
             if math.isfinite(off) and fperiod > 0 and last_off is not None:
-                dv = off - last_off
-                cand = int(np.clip(round(-dv / fperiod), -2, 2))
-                if cand and abs(dv + cand * fperiod) < 0.3 * fperiod:
-                    nwrap = cand
+                cand = round((last_off - off) / fperiod)
+                if args.max_frame_correct:
+                    cand = int(np.clip(cand, -args.max_frame_correct,
+                                       args.max_frame_correct))
+                if cand and abs(off + cand * fperiod - last_off) < 0.3 * fperiod:
+                    nwrap = int(cand)
                     off += nwrap * fperiod
+                    ncorr += 1
             if math.isfinite(off):
                 last_off = off
-            reason = "" if math.isfinite(off) else f"no frame match (coef {coef:.2f})"
+            reason = ("" if math.isfinite(off)
+                      else info.get("hint", f"no frame match (coef {coef:.2f})"))
+            if math.isfinite(off) and info.get("overlap", 1.0) < 0.75:
+                reason = ""  # still a valid measurement, just note the reduced overlap
             k = info.get("frame_lag", 0)
             if math.isfinite(off):
                 if prefer is not None and abs(k - prefer) > args.max_jump_frames:
@@ -1146,6 +1461,14 @@ def main():
                       f"{info.get('scatter_ns',float('nan')):.1f},{reason}\n")
 
             note = reason
+            if info.get("lag_steps"):
+                note = (note + "  " if note else "") + \
+                    f"frame lag moved {info['lag_steps']} WITHIN the capture"
+            if math.isfinite(off) and info.get("overlap", 1.0) < 0.75 and not nwrap:
+                note = (f"offset is {abs(info['frame_lag'])/info['fs'][0]*1e3:.0f} ms of a "
+                        f"{info['window_ms']:.0f} ms window -- only "
+                        f"{info['overlap']*100:.0f}% overlap; a longer --samples would "
+                        f"raise the coefficient")
             if nwrap and not reason:
                 note = f"unwrapped {nwrap:+d} frame(s)"
             if args.simulate and math.isfinite(off):
@@ -1168,6 +1491,8 @@ def main():
                 write_wavs(f"{args.wav_prefix}-{n:03d}", a_[0], b_[0], info["fs"][0])
 
             first_poll = log_off is None
+            now = time.time()
+            due = (now - last_plot >= args.plot_every) or (n + 1 >= args.count > 0)
             new_ev, log_off = collect_events(t_start, log_off)
             if first_poll:
                 # The first poll reads the whole file to establish trim/resync
@@ -1179,17 +1504,42 @@ def main():
             for e in new_ev:
                 print(f"  event t={e[0]:7.1f}s  {e[1]:9s} {e[2]}")
             events.extend(new_ev)
-            write_svg(args.plot, ts, ys, "I2S playout skew",
-                      "board B - board A (ns)   [+ = B later]", fit_slope(ts, ys),
-                      include_zero=not args.y_free, events=events,
-                      panel2=trim_temps(TEMPS, -1, ts[-1] + 1))
+            if due:
+                last_plot = now
+                pt, py_ = ts, ys
+                if args.plot_window > 0 and ts:
+                    cut = ts[-1] - args.plot_window
+                    i0 = bisect.bisect_left(ts, cut)
+                    pt, py_ = ts[i0:], ys[i0:]
+                write_svg(args.plot, pt, py_, "I2S playout skew",
+                          "board B - board A (ns)   [+ = B later]",
+                          stats=stats_caption(pt, py_),
+                          include_zero=not args.y_free, events=events,
+                          panel2=trim_temps(TEMPS, pt[0] - 1, pt[-1] + 1))
             n += 1
             if (args.count == 0 or n < args.count) and args.interval > 0 \
                     and not args.simulate:
                 time.sleep(args.interval)
     except KeyboardInterrupt:
         print("\ninterrupted")
+    finally:
+        if pending is not None:
+            pending.cancel()
+        if pool is not None:
+            pool.shutdown(wait=False)
 
+    if ts:      # always leave a current plot behind, whatever the throttle did
+        write_svg(args.plot, ts, ys, "I2S playout skew",
+                  "board B - board A (ns)   [+ = B later]",
+                  stats=stats_caption(ts, ys),
+                  include_zero=not args.y_free, events=events,
+                  panel2=trim_temps(TEMPS, -1, ts[-1] + 1))
+    if ncorr:
+        print(f"\n  {ncorr} of {len(ys)} rows had a whole-frame ambiguity "
+              f"corrected by continuity with the previous row")
+    if stream_state and stream_state.get("dropped"):
+        print(f"\n  WARNING: {stream_state['dropped']} stream block(s) dropped -- "
+              f"processing fell behind the acquisition, so coverage has gaps")
     good = [v for v in ys if math.isfinite(v)]
     print(f"\n{len(good)}/{len(ys)} usable")
     if good:
@@ -1200,9 +1550,12 @@ def main():
               f"sd {np.std(ppms):.4f} ppm")
     f = fit_slope(ts, ys)
     if f:
-        print(f"  drift across captures {f[0]:+,.1f} ns/s "
-              f"({f[0]/1000:+.4f} ppm) over {ts[-1]-ts[0]:.0f} s")
+        print(f"  least-squares slope {f[0]:+,.1f} ns/s ({f[0]/1000:+.4f} ppm) over "
+              f"{ts[-1]-ts[0]:.0f} s  (reported only -- not drawn)")
     print(f"  data {args.out}   plot {args.plot}")
+    if dumpf:
+        dumpf.close()
+        print(f"  per-frame skew {args.dump_skew}")
     log.close()
 
 
