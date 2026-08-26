@@ -31,6 +31,29 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**THE WIRE OFFSET IS THE INTEGRAL OF THE DIFFERENTIAL RATE, AND NOTHING ELSE.** Measured against
+the analyser's new `fs_a_hz`/`fs_b_hz` columns over three quiet runs of 92–499 s:
+
+    integral of (fs_b − fs_a) vs the measured offset
+      corr −0.997 / −0.999 / −1.000     slope −0.996 / −0.983 / −1.008
+      offset sd 4.7 / 3.3 / 24.2 µs  ->  residual sd 0.38 / 0.14 / 0.31 µs   (99–100% explained)
+
+Slope −1.0 with a sub-µs residual, so there is no second term to find. Every "static offset" chased
+in this file was accumulated rate difference that stopped accumulating — which is why it was
+invisible to every on-device metric and why it re-planted at every event.
+
+**What is missing on-device is one measurement: the achieved rate against server time.** The
+differential TRIM already predicts the differential rate at corr −0.778, and the only reason
+integrating it explains 13–19% instead of ~100% is that the report samples one trim snapshot per
+3.3 s of a continuously moving quantity — an aliasing problem, not a physics one. Log the
+time-MEAN applied trim over the report window rather than the snapshot, and better, measure the
+achieved rate directly as frames-played against server time (the shared timebase supplies the
+conversion). That single quantity does two jobs:
+  1. it is the outside-the-loop reference the pivot correction needs, which is exactly what both
+     failed attempts below lacked, and
+  2. published in the beacon beside `drift_ppm`, it lets each device integrate the difference and
+     know its own relative offset — the "no on-device instrument sees this" problem, closed.
+
 Current floor: MAD 1–3 µs steady state, p2p ~15 µs, reboot recovery ~42 s. The static term was
 the offset filter's tracking lag and is now fed forward (see `OFFSET_RATE_*` in `tsf_sync.cpp`).
 What is left is a static offset planted at every accounting re-anchor — see the first item, which
