@@ -728,6 +728,17 @@ CRYSTAL_RE = re.compile(
 # prediction it anchors and reads ~0 while the audio sits that far off. Unobservable on-device by
 # construction, so the wire has to arbitrate -- report_seed_steps pairs each seed against the
 # offset step at that instant.
+# "SEEDDRAIN anchored=220000 actual=237412 err=+17412 frames=9702 t=..." -- the anchor error,
+# measured ON-DEVICE and without any prediction in the path. The seed asserts the resident audio
+# will take `anchored` us to drain; the playout FEEDBACK (ground truth from the speaker callback,
+# not from `pushed`) says it took `actual`. err is the difference, and it is exactly the term that
+# is invisible to every other on-device metric: the servo measures against the prediction this
+# error corrupts, so it reads ~0 while the audio sits err away from where it belongs.
+#
+# Pair err against the wire step at the same seed. The hypothesis predicts they match.
+SEEDDRAIN_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SEEDDRAIN anchored=(-?\d+) actual=(-?\d+) err=(-?\d+)")
+
 SEEDANCHOR_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SEEDANCHOR latency=(\d+) age=(-?\d+) frames=(-?\d+)")
 
@@ -858,13 +869,20 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
                 extras.setdefault(key, []).append(
                     (tod_x, int(dv.group(1)) if dv else None, float(mx.group(grp))))
                 break
+        dr = SEEDDRAIN_RE.match(line)
+        if dr:
+            # Attached to the most recent seed: the measurement completes one drain interval after
+            # the anchor it belongs to, and only one can be armed at a time.
+            if seeds:
+                seeds[-1] = seeds[-1][:5] + (int(dr.group(7)),)
+            continue
         sa = SEEDANCHOR_RE.match(line)
         if sa:
             tod_s = (int(sa.group(1)) * 3600 + int(sa.group(2)) * 60 + int(sa.group(3))
                      + int(sa.group(4)) / (10 ** len(sa.group(4))))
             dv = DEV_T_RE.search(line)
             seeds.append((tod_s, int(dv.group(1)) if dv else None, int(sa.group(5)),
-                          int(sa.group(6)), int(sa.group(7))))
+                          int(sa.group(6)), int(sa.group(7)), None))
             continue
         rs = RSYNC_RE.match(line)
         if rs:
@@ -1879,7 +1897,7 @@ def report_seed_steps(ts, ys, settle_s=4.0):
         return
     printed = False
     for board, rows in sorted(SEEDS.items()):
-        for t0, lat, age, frames in rows:
+        for t0, lat, age, frames, aerr in rows:
             before = [v for t, v in pts if t0 - settle_s <= t < t0]
             after = [v for t, v in pts if t0 < t <= t0 + settle_s]
             if len(before) < 5 or len(after) < 5:
@@ -1906,15 +1924,27 @@ def report_seed_steps(ts, ys, settle_s=4.0):
             if not printed:
                 print("   seed anchors (does a re-baseline STEP the wire?)")
                 print(f"      {'board':>5s} {'t':>8s} {'latency_ms':>11s} {'age_ms':>7s}"
-                      f" {'before_us':>10s} {'after_us':>10s} {'step_us':>9s} {'floor':>7s}")
+                      f" {'step_us':>9s} {'floor':>7s} {'anchor_err':>11s} {'match':>7s}")
                 printed = True
             verdict = "STEP" if abs(step) > max(6.0 * mad, 5.0) else "no step"
+            # THE TEST: the on-device anchor error against the step the wire saw. If the anchor's
+            # latency error is what plants the offset, these are the same number. Reported per seed
+            # rather than as a correlation, because latency itself was near-constant across seeds
+            # and correlating against a constant proved worthless.
+            if aerr is None:
+                ae, match = f"{'--':>11s}", f"{'--':>7s}"
+            else:
+                ae = f"{aerr:+11d}"
+                match = "yes" if abs(step) > 1e-9 and abs(aerr - step) <= max(0.25 * abs(step), 5.0) \
+                        else "NO"
+                match = f"{match:>7s}"
             print(f"      {board:>5s} {t0:8.1f} {lat/1000.0:11.1f} {age/1000.0:7.1f}"
-                  f" {b_med:10.1f} {a_med:10.1f} {step:+9.1f} {mad:7.2f}  {verdict}")
+                  f" {step:+9.1f} {mad:7.2f} {ae} {match}  {verdict}")
     if printed:
         print("      a STEP supports the anchor planting the offset; a ramp with no step means the"
-              "\n      servo integrated to a new resting point instead. Compare step_us against"
-              "\n      latency_ms ACROSS seeds: the hypothesis predicts they track.")
+              "\n      servo integrated to a new resting point instead. anchor_err is the SAME"
+              "\n      quantity measured on-device, with no prediction in its path -- if the"
+              "\n      anchor's latency error is what plants the offset, anchor_err == step_us.")
 
 
 def report_resync_bursts(lo, hi):
@@ -2352,9 +2382,9 @@ def main():
                 RSYNCS.setdefault(board, []).append(
                     (p if p is not None else host(tod), n, err, med, ring, drops))
             placed, _jit, _n = place_device_times(sd, lambda r: host(r[0]), lambda r: r[1])
-            for (tod, _dev, lat, age, frames), p in zip(sd, placed):
+            for (tod, _dev, lat, age, frames, aerr), p in zip(sd, placed):
                 SEEDS.setdefault(board, []).append(
-                    (p if p is not None else host(tod), lat, age, frames))
+                    (p if p is not None else host(tod), lat, age, frames, aerr))
             if n_all:
                 DEV_ANCHOR[board] = (0.0, max(jit_all), n_all)
             if span[0] is not None:

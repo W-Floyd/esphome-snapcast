@@ -749,6 +749,30 @@ class SnapcastClient {
   std::atomic<int64_t> starve_suppress_until_us_{0};
   /// TEST HOOK, see inject_starvation(). 0 when not injecting.
   std::atomic<int64_t> starve_until_us_{0};
+  /// @brief ANCHOR ERROR measurement, armed by a re-baseline. Player task only.
+  ///
+  /// The seed asserts that the audio resident at that instant will take `latency` us to drain --
+  /// a falsifiable prediction, and the one everything downstream depends on. If it is wrong by E,
+  /// the accounting is off by E, the prediction built on it is off by E, and the servo steers the
+  /// real audio E away from where it belongs while its own error reads ~0, because that error is
+  /// measured against the very prediction E corrupts. That is why a planted offset is invisible
+  /// here and needs an analyser.
+  ///
+  /// The playout FEEDBACK can answer it though, and it is ground truth: it comes from the speaker
+  /// callback, not from `pushed`. When `played` reaches the frame count deemed in flight at the
+  /// seed, that audio has actually drained. The elapsed time is the TRUE latency, so
+  ///
+  ///     E = (time for the resident audio to drain) - (latency the seed anchored to)
+  ///
+  /// with no prediction anywhere in it. 0 target = not armed.
+  int64_t seed_drain_target_frames_{0};
+  int64_t seed_drain_from_us_{0};
+  int64_t seed_drain_latency_us_{0};
+  int64_t seed_drain_prev_frames_{0};
+  /// @brief Timestamp of the PREVIOUS playout-feedback report, so the crossing frame's render
+  /// instant can be interpolated inside the batch that contains it rather than quantised to the
+  /// batch boundary (~50 ms, against the tens of microseconds being measured).
+  int64_t played_prev_ts_us_{0};
   // TEMPORARY DIAGNOSTIC: frames the clamp below has silently discarded. A PARTIAL clamp
   // (available_frames > 0 but under the credit) logs nothing and flags nothing, yet it shorts
   // `played` permanently -- which is the shape of the startup offset: DMA-buffer quantised,

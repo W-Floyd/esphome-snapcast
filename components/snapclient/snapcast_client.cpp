@@ -785,6 +785,30 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   this->played_last_ts_us_ = timestamp_us;
   this->playout_valid_ = true;
 
+  // ANCHOR ERROR: has the audio that was resident at the last seed finished draining?
+  //
+  // INTERPOLATED within the crossing report, not taken at its timestamp. Feedback arrives in
+  // DMA-sized batches (~50 ms), so using the report instant would quantise the answer to the
+  // batch and swamp the tens of microseconds being looked for. The batch is contiguous audio at a
+  // known rate, so where inside it the target frame sits is exact arithmetic.
+  if (this->seed_drain_target_frames_ > 0 && this->played_frames_total_ >= this->seed_drain_target_frames_ &&
+      frames > 0) {
+    const int64_t into_batch = this->seed_drain_target_frames_ - this->seed_drain_prev_frames_;
+    const int64_t batch_us = timestamp_us - this->played_prev_ts_us_;
+    const int64_t crossed_us =
+        (into_batch > 0 && into_batch <= static_cast<int64_t>(frames) && batch_us > 0)
+            ? this->played_prev_ts_us_ + batch_us * into_batch / static_cast<int64_t>(frames)
+            : timestamp_us;
+    const int64_t drained_us = crossed_us - this->seed_drain_from_us_;
+    ESP_LOGD(TAG,
+             "SEEDDRAIN anchored=%" PRId64 " actual=%" PRId64 " err=%" PRId64 " frames=%" PRId64 " t=%" PRId64,
+             this->seed_drain_latency_us_, drained_us, drained_us - this->seed_drain_latency_us_,
+             this->seed_drain_target_frames_, now_us());
+    this->seed_drain_target_frames_ = 0;
+  }
+  this->seed_drain_prev_frames_ = this->played_frames_total_;
+  this->played_prev_ts_us_ = timestamp_us;
+
   // Record the new level against the instant the audio RENDERED, not the instant this callback ran:
   // a sink reading stamped `as_of` excludes exactly the frames that had rendered by `as_of`, so the
   // level has to be attributed the same way for the two to line up. A re-baseline discards the past,
@@ -2684,6 +2708,15 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       this->clear_playout_history_();
       this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(), this->pushed_frames_total_);
       this->mark_playout_(this->played_history_, this->played_history_next_, now_us(), this->played_frames_total_);
+      // Arm the anchor-error measurement HERE, under the mutex. notify_audio_played reads these
+      // from the speaker callback thread while holding it, so setting them after the unlock below
+      // would be a plain data race on the very fields the measurement depends on.
+      if (have_fill) {
+        this->seed_drain_target_frames_ = in_flight_frames;
+        this->seed_drain_from_us_ = now_us();
+        this->seed_drain_latency_us_ = latency.microseconds;
+        this->seed_drain_prev_frames_ = this->played_frames_total_;
+      }
       this->playout_mutex_.unlock();
       if (have_fill) {
         // The snapshot's age is logged but NOT applied -- see above. It is here because it is the
@@ -2715,6 +2748,10 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
         // and is the reason this anchor is the suspect.
         ESP_LOGD(TAG, "SEEDANCHOR latency=%" PRIu32 " age=%" PRId64 " frames=%" PRId64 " t=%" PRId64,
                  latency.microseconds, (now_us() - latency.as_of_us), in_flight_frames, now_us());
+        // The measurement itself is armed above, under the mutex. Armed even when
+        // in_flight_frames is small: a fully dry pipeline anchors at one DMA buffer, and that case
+        // matters most, because the wire cannot measure it at all -- with the audio stopped the
+        // analyser loses PCM lock and reads NaN either side of the seed.
       } else {
         // Log the FALLBACK too. Without this the two cases are indistinguishable in a
         // log -- a silent fallback looks exactly like the feature working, which is
