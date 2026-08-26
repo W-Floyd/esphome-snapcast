@@ -606,6 +606,20 @@ defect.
       stated reason for not zeroing) while removing exactly the term that displaces audio. Predicted
       step: ~0.17 x 50 ppm x 3 s ≈ 25 µs, i.e. a 4x cut, and it is a three-line change at the hold.
 
+- **FORCED RE-ANCHOR, FIRST GRADE ON A LONE RESTART (n=1): landed at −1.8 µs.**
+  `reanchor_after_reconnect: true`, board b OTA'd alone so the restart was lone rather than
+  simultaneous:
+
+        pre +51.2 -> post -1.8 us     LANDING -53.0 us   (post MAD 5.21)
+        16:45:57  Sync locked (median 78 us), unmuting
+        16:46:07  Re-anchoring after re-lock: forcing one repair cycle (+2500 us bias)
+        16:46:31  Accounting split repaired: accounted queue ran +2561 us
+
+  Against **+145.7 µs** on the same test this morning without it, and 1.3–1.4 ms for today's
+  outage-planted offsets. The device landed essentially ON alignment rather than tens or hundreds
+  of µs away. n=1, so this establishes that the cycle fires on a lone restart and that the landing
+  can be inside the ±50 µs residual — not that it always is. Repeat before believing the size.
+
 - **CONFIRMED n=12, 2026-08-26: THE SPLIT REPAIR IS A CORRECTIVE MECHANISM. It removes ~2/3 of
   whatever standing offset the device carries, per firing.** This inverts the framing everything
   above was written under.
