@@ -52,14 +52,17 @@ timing diagnostics.
   tracks the true differential achieved rate at **corr +0.976..+0.979**, against **−0.778** for the
   end-of-window snapshot. Sampling was throwing away most of the signal.
 - **The trim still cannot be the offset reference, for a more fundamental reason than aliasing: an
-  unknown constant.** The differential trim sits **−5.25 ppm** from the true differential rate
-  (−5.246 and −5.272 on the two runs, so stable rather than scatter). That is the **crystal
-  difference** — each board's trim converges to cancel its *own* crystal error, so the differential
-  carries the difference between two crystals, and nothing on the device knows it. Being a rate it
-  integrates forever: **527 µs per 100 s** against a 13–15 µs floor. The trim offset integral
-  explains **1%** where the `fs` columns explain **96–99%**.
-- **Calibrating the constant away would still not be enough:** residual 0.70–0.75 ppm, ≈70 µs per
-  100 s.
+  unknown constant.** The differential trim sits **−5.25..−5.40 ppm** from the true differential
+  rate (−5.246, −5.272, −5.400 across three runs including one in steady state, so stable rather
+  than scatter). That is the **crystal difference** — each board's trim converges to cancel its
+  *own* crystal error, so the differential carries the difference between two crystals, and nothing
+  on the device knows it. Being a rate it integrates forever: **~540 µs per 100 s** against a
+  steady-state floor of **6.96 µs sd**. The trim offset integral explains **1–6%** where the `fs`
+  columns explain **96–99%**.
+- **Calibrating the constant away for free would still not be enough, and this is what closes the
+  route.** After fitting out the constant *and* the slope, the residual is **0.708 ppm** in steady
+  state, ≈**71 µs per 100 s** — more than **10×** the floor it would need to resolve. So no
+  crystal-difference calibration scheme is worth building.
 - **De-meaning is not the fix.** It drops the analyser's own check from 96% to 2%, because the true
   differential rate has a real nonzero mean (+0.61 ppm on one run = a genuine 177 µs ramp over
   290 s) and de-meaning deletes exactly the term the offset is made of. The constant must be
