@@ -128,6 +128,21 @@ static constexpr uint32_t SANDWICH_FLOOR_BLOCK = 256;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 
+// Player-side TSF-vs-local rate, used to DE-TREND the offset filter (see
+// shared_server_offset_us). Endpoints are trusted sandwiches, whose midpoint noise is a few us
+// (the bracket WIDTH varies by ~7 us peak-to-peak; the bias itself is constant), so an 8 s
+// baseline resolves the ratio to well under 1 ppm, and the EWMA below divides that again. The
+// quantity is a crystal ratio -- it moves with temperature over minutes, not seconds -- so
+// heavy smoothing costs nothing.
+static constexpr int64_t OFFSET_RATE_WINDOW_US = 8000000;
+static constexpr double OFFSET_RATE_ALPHA = 0.25;
+// Crystals differ by well under +-100 ppm; anything larger is a TSF discontinuity, not a rate.
+static constexpr double OFFSET_RATE_MAX_PPM = 100.0;
+// Longest interval the feed-forward will extrapolate across in one step. The filter is called
+// per chunk (~26 ms); a gap this long means the player was not running, and predicting across it
+// is guessing. Bounds a single step to ~100 us at 50 ppm.
+static constexpr int64_t OFFSET_FF_MAX_GAP_US = 2000000;
+
 // The published mapping is slew-limited toward the live Kalman estimate: anchoring
 // each beacon to the instantaneous estimate broadcast its sample-to-sample jitter
 // (~±100-300 us) as 1 Hz deadline steps that every member's servo then chased
@@ -253,11 +268,18 @@ bool TsfSync::sample_tsf_(int64_t &tsf_us, int64_t &local_us, int64_t *width_out
 }
 
 TsfSync::EvalResult TsfSync::evaluate_mapping_(int64_t tsf_base_us, int64_t tsf_minus_server_us, float drift_ppm,
-                                               int64_t &offset_us, int64_t &extrapolation_us, int64_t *width_out) {
+                                               int64_t &offset_us, int64_t &extrapolation_us, int64_t *width_out,
+                                               int64_t *tsf_out, int64_t *local_out) {
   int64_t tsf_now, local_now;
   extrapolation_us = 0;
   if (!sample_tsf_(tsf_now, local_now, width_out)) {
     return EvalResult::NO_TSF;
+  }
+  if (tsf_out != nullptr) {
+    *tsf_out = tsf_now;
+  }
+  if (local_out != nullptr) {
+    *local_out = local_now;
   }
   extrapolation_us = tsf_now - tsf_base_us;
   // Small negative skew is legitimate: two stations' TSF free-run on their own
@@ -788,7 +810,10 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   int64_t extrapolation_us;
   int64_t raw_us;
   int64_t sandwich_us = 0;
-  if (evaluate_mapping_(tsf_base, tms_base, drift_ppm, raw_us, extrapolation_us, &sandwich_us) != EvalResult::OK) {
+  int64_t sample_tsf_us = 0;
+  int64_t sample_local_us = 0;
+  if (evaluate_mapping_(tsf_base, tms_base, drift_ppm, raw_us, extrapolation_us, &sandwich_us, &sample_tsf_us,
+                        &sample_local_us) != EvalResult::OK) {
     this->offset_filter_valid_ = false;
     return false;
   }
@@ -816,6 +841,67 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
     this->sandwich_block_n_ = 0;
   }
   const int64_t trust_us = this->sandwich_floor_us_ * SANDWICH_TRUST_FACTOR;
+
+  // Track d(tsf - local)/dt from the samples already in hand, and use it to DE-TREND the filter
+  // input. This is the fix for the static inter-device offset described at length below: the
+  // filter's input is a ramp, an EWMA lags a ramp by rate * tau, and because the two devices'
+  // crystals differ (measured 4.8 ppm apart) their lags differ and the DIFFERENCE lands on the
+  // wire -- 32 us of it at tau 6.7 s, against a measured static skew of -42 to -50 us.
+  //
+  // Predicting the ramp forward between calls removes the lag on each device, so both sit at
+  // ~zero and the difference goes with it. What makes this safe where the reverted alpha-beta
+  // tracker was not: the rate here is NOT estimated from the filter's own residuals -- there is
+  // no feedback path, so no way for a rate error to be amplified by the loop it drives -- and it
+  // is a pure hardware ratio between two oscillators, which is why it can be averaged over
+  // minutes. A leader change, a mapping re-anchor or a slew cannot corrupt it, because none of
+  // those touch either clock. The residual is the rate ERROR times tau: sub-0.5 ppm gives ~3 us.
+  //
+  // Only trusted sandwiches are used as endpoints, for the same reason they are the only reads
+  // allowed to move the filter -- a wide bracket is interrupt latency, and here it would be
+  // divided by the baseline and become a rate error that persists for the whole EWMA.
+  if (sandwich_us <= trust_us) {
+    if (this->offset_rate_ref_local_us_ == 0) {
+      this->offset_rate_ref_tsf_us_ = sample_tsf_us;
+      this->offset_rate_ref_local_us_ = sample_local_us;
+    } else if (sample_local_us - this->offset_rate_ref_local_us_ >= OFFSET_RATE_WINDOW_US) {
+      const double dl = static_cast<double>(sample_local_us - this->offset_rate_ref_local_us_);
+      const double dt = static_cast<double>(sample_tsf_us - this->offset_rate_ref_tsf_us_);
+      const double measured_ppm = (dt - dl) / dl * 1e6;
+      if (std::fabs(measured_ppm) < OFFSET_RATE_MAX_PPM) {
+        this->offset_rate_ppm_ = this->offset_rate_valid_
+                                     ? this->offset_rate_ppm_ + OFFSET_RATE_ALPHA * (measured_ppm - this->offset_rate_ppm_)
+                                     : measured_ppm;
+        this->offset_rate_valid_ = true;
+        // Once per baseline (~8 s), i.e. slower than the sync report, and it cannot go in that
+        // report: that line is already at the 256-byte formatting ceiling and silently truncates
+        // its last field. Both terms are printed because the DIFFERENCE is what the filter
+        // predicts with, and a fault in either one shows as a drifting static skew that no
+        // on-device field would otherwise name.
+        ESP_LOGD(TAG, "Offset ramp %+.2f ppm (tsf-local %+.2f, map %+.2f), raw %+.2f",
+                 this->offset_rate_ppm_ - static_cast<double>(drift_ppm), this->offset_rate_ppm_,
+                 static_cast<double>(drift_ppm), measured_ppm);
+      }
+      this->offset_rate_ref_tsf_us_ = sample_tsf_us;
+      this->offset_rate_ref_local_us_ = sample_local_us;
+    }
+  }
+
+  // Feed the ramp forward before comparing against the raw sample, so the snap test below judges
+  // the disagreement against where the filter SHOULD be rather than where it was left.
+  //
+  //   d(raw)/d(local) = d(tsf - local)/dt - d(tsf - server)/dt
+  //
+  // the first term measured above, the second read straight off the mapping (no differencing, so
+  // no step sensitivity). What is deliberately NOT predicted is the leader's slew of tms_base --
+  // up to TMS_SLEW_MAX_US_PER_S, and not knowable from the mapping alone -- so the filter still
+  // lags that. That lag is shared: the slew is identical on every device and the lags differ only
+  // by the crystal ratio, so it stays common-mode, which is the property that matters.
+  if (this->offset_filter_seeded_ && this->offset_rate_valid_ && this->offset_filter_local_us_ != 0) {
+    const int64_t gap_us = std::clamp<int64_t>(sample_local_us - this->offset_filter_local_us_, 0, OFFSET_FF_MAX_GAP_US);
+    this->offset_filter_us_ +=
+        (this->offset_rate_ppm_ - static_cast<double>(drift_ppm)) * 1e-6 * static_cast<double>(gap_us);
+  }
+  this->offset_filter_local_us_ = sample_local_us;
 
   // Snap on a genuine step, filter otherwise. NOT keyed on adopt_: that runs once per
   // beacon, so re-anchoring there would reset the filter every second and filter nothing.
@@ -859,10 +945,12 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   // reporting agreement within ~20 us and tbjit at 1-3 us -- i.e. invisible on-device, which is
   // the exact failure class this work exists to remove.
   //
-  // So a bounded predictable error beats an unbounded unpredictable one. If the 32 us is ever
-  // worth removing, the way to do it is to make the two devices' lags EQUAL rather than zero --
-  // they already share the mapping, so a shared rate estimate would cancel in the difference
-  // where two independent ones do not.
+  // So a bounded predictable error beats an unbounded unpredictable one -- but bounded is not
+  // free, and 32 us of it was the largest single term left on the wire. It is now removed by the
+  // feed-forward above, which differs from the alpha-beta in the one way that matters: the rate
+  // it uses is a measured crystal ratio, taken from the sandwich samples and never from the
+  // filter's own error, so it cannot be driven by the loop it corrects. The EWMA still owns the
+  // POSITION -- a rate error only shows up multiplied by tau, it cannot integrate.
   //
   // Carrying the filter across an invalidation is kept, and is separate from the above: the filter
   // is invalidated whenever the mapping is momentarily unavailable, which happens around a

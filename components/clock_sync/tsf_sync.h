@@ -162,8 +162,11 @@ class TsfSync {
   /// Evaluates a mapping at a fresh TSF sample. NO_TSF: TSF unreadable (sampling
   /// failed). AGE_CLAMP: extrapolation negative or too old (AP reboot resets TSF;
   /// extrapolating across that would produce garbage deadlines).
+  /// @param tsf_out,local_out the sandwich sample the evaluation used, so a caller that
+  /// tracks the TSF-vs-local crystal ratio does not have to take a second read for it.
   static EvalResult evaluate_mapping_(int64_t tsf_base_us, int64_t tsf_minus_server_us, float drift_ppm,
-                                      int64_t &offset_us, int64_t &extrapolation_us, int64_t *width_out = nullptr);
+                                      int64_t &offset_us, int64_t &extrapolation_us, int64_t *width_out = nullptr,
+                                      int64_t *tsf_out = nullptr, int64_t *local_out = nullptr);
 
   const int64_t plausibility_us_;
 
@@ -240,6 +243,20 @@ class TsfSync {
   /// such a gap is what stops a leadership handover stepping the deadline by the filter's
   /// accumulated tracking lag. Never cleared once set.
   bool offset_filter_seeded_{false};
+  /// @brief Local instant the offset filter's state describes -- the midpoint of the sandwich
+  /// that last moved it. The feed-forward step below is a rate times an interval, and this is
+  /// the interval's start. 0 = no sample yet.
+  int64_t offset_filter_local_us_{0};
+  /// @brief This device's TSF-vs-esp_timer rate, d(tsf - local)/dt in ppm, measured from the
+  /// samples the offset filter already takes. A crystal ratio: stable, hardware-only, and in
+  /// particular independent of the mapping, so a leader change or a slew cannot corrupt it.
+  /// Distinct from tsf_rate_ppm_, which is the same quantity measured on the network task and
+  /// only while leading -- this one is needed on every device in every role.
+  /// THREAD CONTEXT: player task only.
+  double offset_rate_ppm_{0.0};
+  bool offset_rate_valid_{false};
+  int64_t offset_rate_ref_tsf_us_{0};
+  int64_t offset_rate_ref_local_us_{0};
   // Per-device sandwich floor, so the trust threshold is derived rather than assumed
   int64_t sandwich_floor_us_{0};
   int64_t sandwich_block_min_us_{0};

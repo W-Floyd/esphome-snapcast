@@ -26,12 +26,10 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-Current floor: sd 4.6 µs steady state, ~50 µs static offset, reboot recovery ~42 s.
+Current floor: sd 5.1 µs steady state, +0.9 µs static offset, p2p 15.7 µs, reboot recovery ~42 s.
+The static term was the offset filter's tracking lag and is now fed forward (see
+`OFFSET_RATE_*` in `tsf_sync.cpp`); what is left is the pivot and the two split artefacts.
 
-- **Static ~50 µs offset.** ~32 µs is the offset filter's lag difference — the boards'
-  local-vs-server drifts differ by 4.8 ppm and lag is `rate × τ` at τ = 6.7 s. Fix is a
-  **shared** rate estimate published in the beacon alongside `drift_ppm`, so it cancels in the
-  difference. Two independent local estimates do not cancel (tried; 11× worse).
 - **The feedback pivot** advances in 50 ms DMA granules (`inflight=2205`) with each board at a
   different sub-granule phase. The remaining half of the differential noise; untouched.
 - **The −42 ms split spike.** Recurs at −42223..−42246 µs on both boards, to within 20 µs, so it
@@ -44,9 +42,10 @@ Current floor: sd 4.6 µs steady state, ~50 µs static offset, reboot recovery ~
   another way to suppress the second seed.
 - **Pipeline start leaves 2–4 DMA buffers of the client's audio uncredited.** Instrument
   `playback_delay_frames_` at the moment it is set rather than reasoning about the ordering.
-- **`TRIM_KP_RUN = 0.25` is a comfort setting.** It trades steady-state noise for recovery speed
-  (15 µs at 0.1, 35 µs at 0.25, 45–100 µs at 0.5; the relation is linear). Lower it once the
-  anchor stops planting offsets, since there will be little left to converge from.
+- **Retry `TRIM_KP_RUN` at 0.1.** It trades steady-state noise for recovery speed (15 µs at 0.1,
+  35 µs at 0.25, 45–100 µs at 0.5; the relation is linear), and 0.25 was chosen while a 42 µs
+  static offset made the recovery speed worth paying for. At sd 5.1 µs the 35 µs it costs is now
+  the largest term in the budget.
 - **Stale deadline on stream resumption.** With `keepalive_hold: never`, the first chunk after a
   long idle carries a deadline stale by roughly the idle duration. Self-heals in ~2.5 s and the
   magnitude rule mutes correctly, so it is bounded. Closing it needs the snapserver side.
