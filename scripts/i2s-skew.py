@@ -1971,7 +1971,11 @@ def report_repair_steps(ts, ys):
             verdict = "STEP" if abs(step) > max(6.0 * floor, 5.0) else "no step"
             # Tag repairs that a deliberate injection caused, so a provoked point is never mistaken
             # for a natural one and the two are never averaged together.
-            inj = [u for t, u in INJECTS.get(board, []) if 0 <= t0 - t <= 12.0]
+            # 90 s, not 12: the split is RAMPED in at ~100 us/s, so the repair fires a ramp
+            # duration plus DRIFT_REPAIR_HOLD_US after the request -- 23 s for a 2500 us target,
+            # and proportionally longer for a bigger one. A 12 s window silently left provoked
+            # repairs untagged and therefore indistinguishable from natural ones.
+            inj = [u for t, u in INJECTS.get(board, []) if 0 <= t0 - t <= 90.0]
             tag = f"  <- injected {inj[-1]:+d} us" if inj else ""
             print(f"      {board:>5s} {t0:8.1f} {us:+12d} {step:+9.1f} {floor:7.2f}  {verdict}{tag}")
     if printed:
