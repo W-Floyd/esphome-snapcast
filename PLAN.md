@@ -83,16 +83,49 @@ The same work makes the **central finding reproducible on demand** rather than r
 (`0239695`): the replot path double-counted every `--annotate` log, and `--simulate` had always
 crashed at the end of a run, which had quietly disabled the only no-hardware regression check.
 
-## Step 2 — `TRIM_KP_RUN = 0.1`, measured
+## Step 2 — `TRIM_KP_RUN = 0.1` — ✅ MEASURED AND REVERTED (`4393039`)
 
-One line. The machinery already adapts: KI tracks `kp²/4`, and the bumpless-transfer block handles
-the acquire→run switch at the new gain. Loop gain drops 0.79 → 0.32, removing a 1/(1−G) ≈ 4.8×
-amplification, so the win should beat the linear 2–3 µs estimate.
+Tried, measured, reverted; back at 0.25. The loop-gain argument (0.79 → 0.32, removing a
+1/(1−G) ≈ 4.8× amplification) is still sound. The cost side was underpriced:
 
-Measure three things, not one: differential median (predicted ~3× better than linear), wire sd on
-a quiet 100 s+ run, and reboot recovery time (the priced cost: 42 s → up to ~150 s). Run **after**
-step 1 lands so the better instrument sees the experiment. Fold in the free rider: re-check board
-a's `split +22 µs` (stale since the in-flight fix changed what `meas` contains).
+- **tau 80 s, settled 295 s** against ~42 s at 0.25 — worse than the ~135 s expected
+- **landed at −155 µs**, outside the ±130 µs band recorded at 0.25
+
+The second term is the one nobody had priced, and it follows directly from the organising fact
+above: the offset *is* the integral of the differential rate, so a recovery freezes wherever the
+integral has reached when the servo nulls the rate. Lower gain nulls slower → the integral runs
+longer → **the planted offset is larger.** KP trades steady-state noise against recovery time
+*and* against the size of the static offset every event leaves — which is the problem this whole
+plan exists to solve. Revisit only once the anchor stops planting an offset.
+
+## Step 2b — THE OFFSET-PLANTING MECHANISM (new, and now the live thread)
+
+Everything above converges here: a static offset is planted by an event and then persists because
+no device can see its own absolute relative position. Today's instrumentation opened this up.
+
+**Instruments built and validated** (all diagnostics-only, nothing steers on them):
+`SEEDANCHOR` / `SEEDDRAIN` (the anchor's latency error, measured from playout feedback with no
+prediction in the path), per-chunk `RSYNC` bursts, wire-step detection at seeds *and* at split
+repairs (fit-and-extrapolate both sides, so a ramp cannot masquerade as a step), and `crystal_ppm`
+in the beacon.
+
+**Established:**
+- **Discards are the RECOVERY, not the cause.** Nine bursts: 6 with a full ring → *zero* discards;
+  3 with the ring already at 26 ms → 79/32/4 discards. The empty ring comes first.
+- **A re-baseline does step the wire** (3/3 seeds, >100× the noise floor).
+- **`SEEDDRAIN` reads ≈ −7 ms** with playback continuous (−6778, −7383 µs — consistent).
+
+**Refuted, by counting:** the −52 ms split spike is *not* post-seed — 337 spike episodes against
+47 seeds, only 2–6% with a seed within 60 s.
+
+**The live lead:** the **split repair fires 23 times** on splits of 4.7–57 ms. Each firing means
+3 s of the servo steering real audio against a prediction wrong by that much, after which the
+repair fixes the *accounting* and the displacement becomes invisible to every on-device metric.
+The test is built and pointed at repair timestamps; **it needs repairs during QUIET operation** —
+the only ones captured so far were during injected starvations, where the fit floor was
+162–1291 µs against a quiet floor of 0.05 µs, so no verdict either way.
+
+**Do not inject while collecting this** — injecting is what destroyed the signal-to-noise.
 
 ## Step 3 — achieved rate against server time, published in the beacon
 
@@ -169,10 +202,45 @@ forward if upstream submission has any calendar pressure.
   (start from why it rails), and the ~200 s serial-log gaps (`dump_statistics: off` is the
   experiment).
 
+## Two open defects, neither fixed, both deliberately left alone
+
+- **The mixer-lifecycle wedge.** `speaker_mixer: Stopped` on a server disconnect, then the reconnect
+  succeeds and reports PLAYING while the mixer task stays deallocated and the player task blocks
+  writing into it — `dma_real=0`, permanent silence, needs a replug. Fired **five times** on one
+  board (10:14, 10:32, 10:36, 10:49, 11:06), three of them after the discard cap was reverted, so
+  it is pre-existing and not that change. Suspect: `mixer_speaker.cpp:466-471` clears
+  `MIXER_TASK_ALL_BITS` in the STOPPED handler, which would discard a pending
+  `MIXER_TASK_COMMAND_START`. **Unconfirmed** — nobody has established whether a START was issued
+  and lost or never issued because the player task was already blocked. Instrument before fixing.
+- **Why the ring empties in the first place.** Upstream of the resync runaway and of the wedge, and
+  still unexplained. This is the first defect in the chain; the others are consequences.
+
 ## State
 
-- Three boards flashed with `172b274` (two SuperMinis + one M5Stamp S3); wire at ~2 µs static,
-  sd 3.3–4.7 µs.
-- `snapclient-esphome` main at `172b274`, ~29 ahead of origin; `../esphome` on
-  `speaker-render-latency`. Nothing pushed (see step 0).
+- Both probed SuperMinis on `c93f6cd`-era firmware and playing; steady-state medians 7–37 µs at
+  KP = 0.25. The M5Stamp missed the last two flashes (mDNS did not resolve) and is unprobed.
+- `snapclient-esphome` main pushed and clean; `../esphome` on `speaker-render-latency`, and
+  `render-latency` still lacks `07f80de5e` (step 6).
 - `2cfd294` committed but never executed (step 5).
+- **Schema note:** `i2s-skew.csv` gained `phase_*`, `ramp_*` then `crystal_*` columns today. The
+  layout check refuses a mismatch rather than misreading, so a capture running across a schema
+  change needs restarting.
+
+## Method notes earned today, the expensive way
+
+- **Three control changes were written on plausible stories and two had to be reverted.** The
+  discard cap made things strictly worse by capping a load-bearing recovery path; `TRIM_KP_RUN = 0.1`
+  cost more than it bought. Both were argued from mechanism and neither was measured first.
+- **"X appeared immediately after Y" failed three times today** — the 205 ms I2S stall (a log
+  artifact), the 200 ms host log delay (n=1, from one mangled line), and the −52 ms spike as
+  post-seed (2–6% of episodes). Each time the fix was to count how often X appears *without* Y.
+  Do that first, not after writing it up as understood.
+- **When one observable is consistent with both the defect and correct operation, no change to the
+  response is justified yet.** A growing error during discards is produced both by a spurious
+  trigger and by a real backlog being fixed too slowly. Instrument to separate them.
+- **Check which of two same-named fields the evidence came from.** A whole "blocker" was recorded
+  against the rate reference because a log line was added for `tsf_rate_ppm_` (leader-only) instead
+  of `offset_rate_ppm_` (all roles) — the header states the difference explicitly.
+- **An offset fitted across a gap is as wrong as a slope across a gap.** Anchoring device time with
+  one median over a log spanning reboots put the axis 2000 s away, and it failed by reporting
+  "0 paired windows", which reads as thin data rather than a broken axis.
