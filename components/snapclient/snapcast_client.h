@@ -713,6 +713,16 @@ class SnapcastClient {
   // per-report logging cannot watch it appear. This counts chunks from the first push so the same
   // one-instant reconciliation can run from the very beginning, at chunk resolution.
   uint32_t dbg_early_chunks_{0};
+  /// @brief TEMPORARY DIAGNOSTIC: chunks of full-cadence reconciliation still to log after a
+  /// re-baseline. The seed's damage is done inside ~150 ms, which the 3.3 s report cannot see and
+  /// the every-other-chunk startup sampling would only catch half of; this runs every chunk for
+  /// about two seconds so the seed instant and its immediate aftermath are both in the trace.
+  /// Player task only.
+  uint32_t dbg_seed_trace_left_{0};
+  uint32_t dbg_seed_trace_idx_{0};
+  /// @brief Set by either re-baseline site, consumed by the player task. The flush-path re-baseline
+  /// runs on the speaker callback thread, so arming cannot be a plain write.
+  std::atomic<bool> dbg_seed_trace_arm_{false};
   int64_t dbg_clamped_frames_{0};
   uint32_t dbg_clamp_events_{0};
   int64_t dbg_clamp_last_log_us_{0};

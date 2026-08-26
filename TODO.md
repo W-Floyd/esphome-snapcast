@@ -49,19 +49,31 @@ is now the largest error in the chain by an order of magnitude.
   failure. Every occurrence has `xfer=50000`, `inflight=10000`, `queued=70000`, `dma=50000` and
   `age≈33 ms`: a full transfer buffer, i.e. the sink briefly not accepting.
 - **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured.
-- **The re-baseline anchor still plants an accounting error**, and the reason is now measured
-  rather than inferred: audio that is in the chain at seed time does not all reach the DAC.
-  Captured end to end on one starvation with every field logged at one instant — seed
-  `latency=280158 own=280158 debt=0`, 12354 frames, snapshot 26 ms old; 150 ms later `meas` read
-  93 ms having played 140 ms of credits plus 754 clamped frames (17 ms):
-
-      280 ms seeded − 157 ms played = 123 ms should remain, 93 ms measured → ~30 ms gone unplayed
-
-  The planted split was `+57075 µs`, held to ±1 µs across five reports, repaired after 3 s, and
-  the settled residual on the wire was **−133 µs**. Staleness cannot explain the SIGN — a 26 ms
-  old snapshot of a refilling pipeline under-reports — so this is not the disproven staleness
-  hypothesis. The next instrument is a count of frames discarded downstream of the source ring:
-  the clamp sees 754 of them, and the gap is ~1300.
+- **The re-baseline anchor is now reproducible on demand and measured at chunk resolution.** Fire
+  `inject_starvation(ms)` (an API action in `snapclient-base.yaml`; there is a helper at
+  `scripts/`-adjacent scratch or four lines of `aioesphomeapi`, plaintext API, no noise PSK) and the
+  seed arms an 80-chunk `EARLY[n] seed` burst at ~26 ms. Two injections, 900 ms and 2500 ms:
+    - **The residual is exact and constant.** `acct − meas` sat at **−51747 µs = 2282.0 frames** from
+      the first sample after the seed and never moved by more than 1 µs across 3.3 s. That is
+      **one DMA buffer (2205 frames, 50000 µs) plus exactly 77 frames (1747 µs)**. Both integers.
+      Unexplained, and the interesting part: `debt` was 0 for that seed and every conservation
+      residual was 0, so it is neither the padding path nor a stage losing audio.
+    - **The seed can anchor audio that does not exist.** `latency=50000 own=0 dma=0 debt=2205
+      seed=2205` — no real audio anywhere in the chain, 2205 frames anchored. That is the padding
+      path working as designed (seed on `latency`, repay `debt` once the padding drains), but see
+      the next point for when it repays.
+    - **The repayment lands while the pipeline is still refilling.** `PAYDBG debt=2205 repay=2205
+      acct_after=66530 lat=126530 own=126530 resid=-60000`: after repaying, the accounting is 60 ms
+      below the chain where it would have been 10 ms below without repaying. `pad_now` reaching 0
+      is not sufficient evidence that the seeded padding is what drained — by then the real audio
+      behind it has arrived. A repayment keyed on the seeded padding having been *credited* rather
+      than on the current padding being empty would not have this problem.
+  Ruled out along the way, with the sign as the argument: `own` and `latency` are computed
+  correctly by the sink (`queued + dma_real` vs `queued + dma_span`), and `held` is the DMA SPAN,
+  not silence — so there is no field inconsistency, and `debt=0` really does mean the DMA held real
+  audio. Earlier note that ~30 ms of audio "does not reach the DAC" is superseded: the sink never
+  stopped (`I2SDBG` continuous, `written`/`completed` advancing) and `srcrx` stayed cumulative
+  across the seed, so neither ring was discarded.
 - **Two candidate mechanisms for the per-start offset are now dead**, both recorded at their sites
   in the fork (`449574cc5`): `playback_delay` was ZERO on all 18 starts measured, and padded
   silence does not displace (two boards differing by 877 ms of accumulated padding sat 133 µs

@@ -674,6 +674,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
       this->fb_samples_ = 0;
       rebaselined = true;
+      this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
 #ifdef USE_I2S_RATE_LOCK
       // The pipeline restart may have reprogrammed the I2S clock divider; re-read
       // the baseline before the next trim (the requested trim itself stays valid --
@@ -2339,12 +2340,26 @@ void SnapcastClient::player_task_() {
 // snapshot's instant, so nothing here is aligned by guesswork. Bounded and sampled so it cannot
 // flood. Remove once the startup offset is explained.
 void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase) {
-  if (this->dbg_early_chunks_ >= 240) {
-    return;
+  // A re-baseline arms a full-cadence burst, which takes precedence over the startup sampling: the
+  // seed's whole story happens inside ~150 ms, so every other chunk is not enough resolution and the
+  // 240-chunk startup budget may long since have been spent.
+  if (this->dbg_seed_trace_arm_.exchange(false, std::memory_order_relaxed)) {
+    this->dbg_seed_trace_left_ = 80;  // ~2.1 s at the 26 ms chunk cadence
+    this->dbg_seed_trace_idx_ = 0;
   }
-  const uint32_t n = this->dbg_early_chunks_++;
-  if ((n % 2) != 0) {
-    return;
+  uint32_t n;
+  if (this->dbg_seed_trace_left_ > 0) {
+    this->dbg_seed_trace_left_--;
+    n = this->dbg_seed_trace_idx_++;
+    phase = "seed";
+  } else {
+    if (this->dbg_early_chunks_ >= 240) {
+      return;
+    }
+    n = this->dbg_early_chunks_++;
+    if ((n % 2) != 0) {
+      return;
+    }
   }
   audio::AudioDepth m;
   if (this->audio_listener_ == nullptr || !this->audio_listener_->on_query_audio(m)) {
@@ -2366,9 +2381,7 @@ void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase)
   //   r_mix  : the mixer -- taken from the source ring, minus handed to the sink, minus its transfer
   //            buffer and what is in flight to the sink. Omitting that last stage is what made this
   //            residual equal the stage itself, and downstream that read as an accounting split.
-  //   r_sink : the sink ring -- taken in, minus written to DMA, minus what it still holds
   const int64_t own_frames = static_cast<int64_t>(m.dbg_own_us) * rate / 1000000;
-  const int64_t queued_frames = static_cast<int64_t>(m.dbg_queued_us) * rate / 1000000;
   const int64_t xfer_frames = static_cast<int64_t>(m.dbg_xfer_us) * rate / 1000000;
   const int64_t r_push = p_now - static_cast<int64_t>(m.dbg_src_received);
   const int64_t r_src = static_cast<int64_t>(m.dbg_src_received) - static_cast<int64_t>(m.dbg_src_consumed) -
@@ -2376,16 +2389,15 @@ void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase)
   const int64_t inflight_frames = static_cast<int64_t>(m.dbg_inflight_us) * rate / 1000000;
   const int64_t r_mix = static_cast<int64_t>(m.dbg_src_consumed) - static_cast<int64_t>(m.dbg_sink_received) -
                         xfer_frames - inflight_frames;
-  const int64_t r_sink = static_cast<int64_t>(m.dbg_sink_received) - queued_frames;
   ESP_LOGD(TAG,
            "EARLY[%" PRIu32 "] %s ok=%d acct=%" PRId64 " live=%" PRId64 " meas=%" PRIu32 " own=%" PRIu32
-           " xfer=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " pushed=%" PRId64 " played=%" PRId64
-           " | srcrx=%" PRIu32 " srctx=%" PRIu32 " sinkrx=%" PRIu32 " r_push=%" PRId64 " r_src=%" PRId64
-           " r_mix=%" PRId64 " r_sink=%" PRId64 " age=%" PRId64,
+           " xfer=%" PRIu32 " inflight=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " pushed=%" PRId64
+           " played=%" PRId64 " clamp=%" PRId64 " pad=%" PRIu32 " | srcrx=%" PRIu32 " srctx=%" PRIu32
+           " sinkrx=%" PRIu32 " r_push=%" PRId64 " r_src=%" PRId64 " r_mix=%" PRId64 " age=%" PRId64,
            n, phase, ok ? 1 : 0, ok ? acct_frames * 1000000 / rate : -1, (p_now - pl_now) * 1000000 / rate,
-           m.microseconds, m.dbg_own_us, m.dbg_xfer_us, m.dbg_queued_us, m.dbg_dma_us, p_now, pl_now,
-           m.dbg_src_received, m.dbg_src_consumed, m.dbg_sink_received, r_push, r_src, r_mix, r_sink,
-           now_us() - m.as_of_us);
+           m.microseconds, m.dbg_own_us, m.dbg_xfer_us, m.dbg_inflight_us, m.dbg_queued_us, m.dbg_dma_us, p_now,
+           pl_now, this->dbg_clamped_frames_, m.dbg_padded_frames, m.dbg_src_received, m.dbg_src_consumed,
+           m.dbg_sink_received, r_push, r_src, r_mix, now_us() - m.as_of_us);
 }
 
 // THREAD CONTEXT: player task. Consumes the pipeline_starved_ latch.
@@ -2544,6 +2556,7 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       }
   #endif
       ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
+      this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
     }
 }
 
