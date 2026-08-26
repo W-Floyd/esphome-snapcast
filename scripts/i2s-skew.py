@@ -680,6 +680,8 @@ DEV_ANCHOR = {}
 RSYNCS = {}
 # board -> [(elapsed_s, latency_us, age_us, frames)] from each re-baseline anchor.
 SEEDS = {}
+# board -> [(elapsed_s, repaired_us)] from each accounting-split repair.
+REPAIRS = {}
 
 SYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?"
@@ -736,6 +738,16 @@ CRYSTAL_RE = re.compile(
 # error corrupts, so it reads ~0 while the audio sits err away from where it belongs.
 #
 # Pair err against the wire step at the same seed. The hypothesis predicts they match.
+# "Accounting split repaired: accounted queue ran -51747 us against measured latency for 3 s"
+# -- the self-repair correcting a sustained accounted-vs-measured split. Instrumented because each
+# firing means the accounting was off by that much for DRIFT_REPAIR_HOLD_US (3 s) while the servo
+# steered real audio against a prediction wrong by the same amount, and then the repair fixes the
+# ACCOUNTING, which makes any resulting audio displacement invisible to every on-device metric.
+# Measured 23 times across two logs on splits from 4.7 to 57 ms, i.e. far more often than seeds.
+REPAIR_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Accounting split repaired: accounted queue ran "
+    r"([+-]?\d+) us")
+
 SEEDDRAIN_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SEEDDRAIN anchored=(-?\d+) actual=(-?\d+) err=(-?\d+)")
 
@@ -804,6 +816,8 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     rsyncs = []
     # (tod, dev_us, latency_us, age_us, frames) per re-baseline anchor
     seeds = []
+    # (tod, dev_us, repaired_us) per accounting-split repair; dev_us is None (no t= on that line)
+    repairs = []
     last_trim, last_resync = state.get("trim"), state.get("resync")
     last_pipe = state.get("pipe")
     last_role = state.get("role")
@@ -812,7 +826,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     except OSError:
         # Same arity as the normal return: it was short by one, so an unreadable log
         # would have crashed the caller's unpacking rather than being skipped.
-        return [], start_offset, state, [], [], {}, [], []
+        return [], start_offset, state, [], [], {}, [], [], []
     if start_offset == 0 and tail_bytes:
         try:
             size = os.fstat(f.fileno()).st_size
@@ -869,6 +883,12 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
                 extras.setdefault(key, []).append(
                     (tod_x, int(dv.group(1)) if dv else None, float(mx.group(grp))))
                 break
+        rp = REPAIR_RE.match(line)
+        if rp:
+            tod_p = (int(rp.group(1)) * 3600 + int(rp.group(2)) * 60 + int(rp.group(3))
+                     + int(rp.group(4)) / (10 ** len(rp.group(4))))
+            repairs.append((tod_p, None, int(rp.group(5))))
+            continue
         dr = SEEDDRAIN_RE.match(line)
         if dr:
             # Attached to the most recent seed: the measurement completes one drain interval after
@@ -933,7 +953,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     f.close()
     state["trim"], state["resync"], state["pipe"] = last_trim, last_resync, last_pipe
     state["role"] = last_role
-    return ev, end, state, temps, trims, extras, rsyncs, seeds
+    return ev, end, state, temps, trims, extras, rsyncs, seeds, repairs
 
 
 def place_device_times(rows, host_of, dev_of):
@@ -1875,6 +1895,69 @@ def report_recovery(ts, ys):
               f"(band +-{tol:.1f} us, floor MAD {mad:.2f} us)")
 
 
+def measure_step(pts, t0, settle_s=4.0):
+    """(before, after, step, floor) at t0, or None when either side is too thin.
+
+    Each side is fitted and EXTRAPOLATED to t0 rather than summarised by a median, because
+    differencing medians across the gap turns any ramp into an apparent step -- the windows are
+    centred a window apart, so a mere 3.5 us/s slope reads as +6.8 us of "step". Fitting measures
+    the DISCONTINUITY, which is the only thing that separates "something displaced the audio here"
+    from "it was already moving through here".
+    """
+    before = [(t, v) for t, v in pts if t0 - settle_s <= t < t0]
+    after = [(t, v) for t, v in pts if t0 < t <= t0 + settle_s]
+    if len(before) < 5 or len(after) < 5:
+        return None
+
+    def edge(seg):
+        tt = np.array([t for t, _v in seg])
+        vv = np.array([v for _t, v in seg])
+        if np.ptp(tt) < 1e-9:
+            return float(np.median(vv)), 0.0
+        sl, ic = np.polyfit(tt, vv, 1)
+        return float(sl * t0 + ic), float(np.std(vv - (sl * tt + ic)))
+
+    b_val, b_res = edge(before)
+    a_val, a_res = edge(after)
+    # Floor from the fit residuals, so "step" means bigger than the scatter around the local
+    # trend rather than bigger than the scatter including it.
+    return b_val, a_val, a_val - b_val, max(min(b_res, a_res), 0.05)
+
+
+def report_repair_steps(ts, ys):
+    """Does an accounting-split REPAIR displace the audio?
+
+    The repair fires on a split that has held for DRIFT_REPAIR_HOLD_US (3 s). For those 3 s the
+    servo was steering real audio against a prediction wrong by the split, so the audio may already
+    have moved -- and the repair then corrects the ACCOUNTING, which makes that displacement
+    invisible to every on-device metric afterwards. Only the wire can say whether it happened.
+
+    Measured 23 times across two logs on splits from 4.7 to 57 ms, so if each one displaces audio
+    this is a far more frequent source of planted offsets than re-baselines are.
+    """
+    pts = [(t, y / 1000.0) for t, y in zip(ts, ys) if math.isfinite(y)]
+    if not pts or not REPAIRS:
+        return
+    printed = False
+    for board, rows in sorted(REPAIRS.items()):
+        for t0, us in rows:
+            m = measure_step(pts, t0)
+            if m is None:
+                continue
+            b_val, a_val, step, floor = m
+            if not printed:
+                print("   split repairs (does the repair displace the audio?)")
+                print(f"      {'board':>5s} {'t':>8s} {'repaired_us':>12s} {'step_us':>9s}"
+                      f" {'floor':>7s}")
+                printed = True
+            verdict = "STEP" if abs(step) > max(6.0 * floor, 5.0) else "no step"
+            print(f"      {board:>5s} {t0:8.1f} {us:+12d} {step:+9.1f} {floor:7.2f}  {verdict}")
+    if printed:
+        print("      a STEP means the repair path displaced real audio, which no on-device metric"
+              "\n      reports once the accounting is reconciled. Compare step_us against"
+              "\n      repaired_us: they need not match, since the servo had 3 s to act on it.")
+
+
 def report_seed_steps(ts, ys, settle_s=4.0):
     """Does a re-baseline STEP the wire offset, and by how much?
 
@@ -2036,6 +2119,7 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
         print(f"   {board}: device clock anchored from {n} stamped line(s); "
               f"host log delay MAD {jitter_ms:.0f} ms")
     report_seed_steps(ts, ys)
+    report_repair_steps(ts, ys)
     report_resync_bursts(ts[0] - 1 if ts else -1, ts[-1] + 1 if ts else 0)
     report_recovery(ts, ys)
     print("   offset integral (is the offset the integral of the differential rate?)")
@@ -2349,7 +2433,7 @@ def main():
         for path in args.annotate:
             board = os.path.basename(path).split(".")[0]
             span = [None, None]
-            ev, end, st, tp, tw, xt, rs, sd = parse_sync_events(path, board, args.trim_ppm,
+            ev, end, st, tp, tw, xt, rs, sd, rpr = parse_sync_events(path, board, args.trim_ppm,
                                                                 offsets.get(path, 0), span,
                                                                 LOG_STATE.get(path), args.sync_us,
                                                                 args.peak_us, args.pipeline_ms,
@@ -2385,6 +2469,8 @@ def main():
             for (tod, _dev, lat, age, frames, aerr), p in zip(sd, placed):
                 SEEDS.setdefault(board, []).append(
                     (p if p is not None else host(tod), lat, age, frames, aerr))
+            for tod, _dev, us in rpr:
+                REPAIRS.setdefault(board, []).append((host(tod), us))
             if n_all:
                 DEV_ANCHOR[board] = (0.0, max(jit_all), n_all)
             if span[0] is not None:
@@ -2463,6 +2549,7 @@ def main():
         FIRMWARE.clear()
         RSYNCS.clear()
         SEEDS.clear()
+        REPAIRS.clear()
         DEV_ANCHOR.clear()
         ev, _ = collect_events(anchor0 or time.time())
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]
