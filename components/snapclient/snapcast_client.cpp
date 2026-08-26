@@ -405,6 +405,10 @@ static constexpr uint32_t DRIFT_SAMPLE_EVERY_CHUNKS = 4;
 // above that rather than at the floor, because a split that is still settling should restart
 // the window rather than be repaired mid-move.
 static constexpr int32_t DRIFT_STEADY_BAND_US = 2000;
+// How close the mixer's conservation residual has to be to the split before the split is treated as
+// the residual's doing rather than the accounting's. Measured agreement was 1 us (drift +25509 us
+// against r_mix 25510 us); the band is wide enough for snapshot rounding and nothing else.
+static constexpr int32_t MIX_RESIDUAL_MATCH_US = 2000;
 // Held this long before acting: a real split is rock-steady (18 minutes at +50.7),
 // while a refill transient is not, and repairing a transient would inject the error
 // it is meant to remove.
@@ -2581,6 +2585,10 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       int32_t fill_ms = -1;
       int32_t fill_drift_us = 0;
       bool fill_comparable = false;
+      // Mixer conservation residual, in us: taken in, minus passed on, minus what it says it holds.
+      // Must be zero. Non-zero says the depth reading is not describing the whole pipeline, and the
+      // repair below refuses to act on the difference when this explains it. See the gate.
+      int32_t mix_residual_us = 0;
       {
         // OWN-AUDIO, not latency. `pushed - played` counts only frames we wrote, so differencing it
         // against the latency counts the DMA's silence padding as a split that is not one --
@@ -2607,6 +2615,19 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int64_t accounted_us =
                 accounted_then_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
             fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured.microseconds));
+            // Conservation across the mixer, at the same instant and from the same snapshot as the
+            // drift itself. src_consumed and sink_received are CUMULATIVE while xfer is a level, which
+            // is what makes this worth computing: frames merely in flight inside the mixer show up
+            // here and then go back to zero when they are passed on, while frames genuinely lost
+            // there leave a residual that never returns.
+            {
+              const int64_t rate_r = static_cast<int64_t>(rec.params.sample_rate);
+              const int64_t xfer_f = static_cast<int64_t>(measured.dbg_xfer_us) * rate_r / 1000000;
+              const int64_t resid_f = static_cast<int64_t>(measured.dbg_src_consumed) -
+                                      static_cast<int64_t>(measured.dbg_sink_received) - xfer_f;
+              mix_residual_us = static_cast<int32_t>(
+                  std::clamp<int64_t>(resid_f * 1000000 / rate_r, INT32_MIN / 2, INT32_MAX / 2));
+            }
 
             // TEMPORARY DIAGNOSTIC: every term of the comparison at ONE instant. The reading carries
             // the chain's split with it under the same seqlock, and the accounting is evaluated at that
@@ -2725,14 +2746,46 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         // sawtooth" that no longer exists -- most likely removed when the mixer began reading the
         // sink and its transfer buffer on the same side of the hand-off -- and a 20 ms floor could
         // not see the 8.5 ms offset measured on the wire earlier tonight at all.
+        //
+        // REFUSED when the mixer's conservation residual already accounts for the split. The repair's
+        // premise is "trust the measurement", and this is the one cheap test of whether the
+        // measurement is self-consistent: r_mix must be zero, and when it is not, the depth reading
+        // is not describing the whole pipeline. Subtracting the difference from `pushed` would then
+        // corrupt an accounting that was correct.
+        //
+        // Measured on hardware, which is why the tolerance is this tight: a device came up with
+        // drift +25509 us held steady for 14 s -- far longer than DRIFT_REPAIR_HOLD_US, so the
+        // steadiness test passed -- against r_mix of 1125 frames, i.e. 25510 us. One microsecond
+        // apart. Those frames were being HELD by the mixer, not lost: r_mix returned to 0, the drift
+        // went with it to +22 us, and no repair was needed or wanted. The sign of that phantom was
+        // the one the servo then answered with a 1260-frame insertion, and the pair ended up ~85 us
+        // apart on a logic analyser.
+        //
+        // A genuine loss inside the mixer does NOT hide behind this gate: src_consumed and
+        // sink_received are cumulative, so lost frames leave r_mix permanently offset while the
+        // drift they cause matches it -- and that case is the mixer's bug to fix, not something to
+        // paper over by moving our own counters. The other splits seen tonight are unaffected: the
+        // -25488 us one had r_mix exactly 0 and repaired as before, and the -42246 us spike had
+        // r_mix 441 frames against a 42 ms drift, nowhere near explaining it.
         const int32_t drift_for_repair = drift_med_us;
-        if (drift_for_repair != INT32_MIN && std::abs(drift_for_repair) >= DRIFT_REPAIR_US &&
+        const bool residual_explains =
+            drift_for_repair != INT32_MIN && std::abs(mix_residual_us) >= DRIFT_REPAIR_US / 2 &&
+            std::abs(drift_for_repair - mix_residual_us) <= MIX_RESIDUAL_MATCH_US;
+        if (residual_explains) {
+          if (st.drift_excess_since_us != 0) {
+            ESP_LOGW(TAG,
+                     "Accounting split %+" PRId32 " us left alone: the mixer's conservation residual is "
+                     "%+" PRId32 " us, so the depth reading is not describing the whole pipeline",
+                     drift_for_repair, mix_residual_us);
+          }
+          st.drift_excess_since_us = 0;
+        } else if (drift_for_repair != INT32_MIN && std::abs(drift_for_repair) >= DRIFT_REPAIR_US &&
             st.drift_excess_since_us == 0) {
           st.drift_excess_since_us = now_us();
           st.drift_excess_min_us = drift_for_repair;
           st.drift_excess_max_us = drift_for_repair;
         }
-        if (st.drift_excess_since_us != 0 && drift_for_repair != INT32_MIN) {
+        if (st.drift_excess_since_us != 0 && drift_for_repair != INT32_MIN && !residual_explains) {
           st.drift_excess_min_us = std::min(st.drift_excess_min_us, drift_for_repair);
           st.drift_excess_max_us = std::max(st.drift_excess_max_us, drift_for_repair);
           if (st.drift_excess_max_us - st.drift_excess_min_us > DRIFT_STEADY_BAND_US) {
