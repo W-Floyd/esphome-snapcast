@@ -897,6 +897,52 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     return ev, end, state, temps, trims, extras, rsyncs
 
 
+def place_device_times(rows, host_of, dev_of):
+    """Map each row's device timestamp onto the host axis, ANCHORED PER BOOT.
+
+    Returns (placed_times, jitter_ms, n_stamped). placed_times[i] is None where the row has no
+    device stamp, so the caller falls back to the host prefix.
+
+    The anchor must be fitted per boot epoch and this is the whole subtlety. esp_timer counts
+    from boot, so every reboot sends the device clock back to ~0 while host time keeps running:
+    a single median of (host - device) over a log spanning reboots is fitted across a
+    discontinuity and lands nowhere. Measured when it was: the placed axis came out at
+    -1941..-836 s against a capture at 0..272 s, no overlap at all, so every window silently
+    found no analyser samples and the comparison reported nothing rather than failing loudly.
+    That is the project's own "never read a slope across a gap" in a new costume -- here it was
+    an OFFSET across a gap.
+
+    Rows must be in log order, since epochs are detected by the device clock going backwards and
+    device values from different epochs overlap, so order is the only thing that separates them.
+    """
+    epochs, cur, prev = [], [], None
+    for i, r in enumerate(rows):
+        d = dev_of(r)
+        if d is not None:
+            if prev is not None and d < prev:
+                epochs.append(cur)
+                cur = []
+            prev = d
+        cur.append(i)
+    epochs.append(cur)
+    placed = [None] * len(rows)
+    resid, n = [], 0
+    for idx in epochs:
+        pairs = [(host_of(rows[i]), dev_of(rows[i]) / 1e6) for i in idx if dev_of(rows[i]) is not None]
+        if not pairs:
+            continue
+        diffs = sorted(h - d for h, d in pairs)
+        off = diffs[len(diffs) // 2]
+        resid += [abs(x - off) for x in diffs]
+        n += len(pairs)
+        for i in idx:
+            d = dev_of(rows[i])
+            if d is not None:
+                placed[i] = d / 1e6 + off
+    jitter = sorted(resid)[len(resid) // 2] * 1000.0 if resid else None
+    return placed, jitter, n
+
+
 def device_anchor(pairs):
     """(offset_s, jitter_ms, n) mapping one board's esp_timer clock onto the host axis.
 
@@ -1913,9 +1959,12 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
                                  window_means(dfs, windows)):
             print(f"      the constant offset is the CRYSTAL DIFFERENCE: each board's trim "
                   f"cancels its own\n      crystal error, so the differential trim carries "
-                  f"their difference, and nothing on\n      the device knows it. Being a "
-                  f"rate it integrates without bound, which is why a\n      high correlation "
-                  f"here still leaves the offset integral below at ~1%.")
+                  f"their difference. Being a rate it\n      integrates without bound, which "
+                  f"is why a high correlation here still leaves the\n      offset integral "
+                  f"below at ~1%. The device now measures this itself and publishes it\n"
+                  f"      (crystal_ppm in the beacon, agreeing with the wire to 0.1 ppm), so "
+                  f"compare the\n      constant above against the crystal delta panel: they "
+                  f"should be the same number.")
     report_integral(
         f"trim mean   (offset integral, {nb} - {na})", dtrim, offset_us, breaks,
         expect=("fails while the constant above is unknown -- recorded so a change is "
@@ -2193,36 +2242,35 @@ def main():
                                                             LOG_STATE.get(path), args.sync_us,
                                                             args.peak_us, args.pipeline_ms,
                                                             args.log_tail_mb * (1 << 20))
-            # One anchor per board, fitted across every line that carried a device stamp, then
-            # used for all of them. Placing each point by its own host prefix is what the
-            # device stamp exists to avoid; placing them by device time with a median-fitted
-            # offset keeps the SPACING exact and only the common origin approximate.
-            pairs = [(tod_to_unix(tod, t_start) - t_start, dev / 1e6)
-                     for pts in xt.values() for tod, dev, _v in pts if dev is not None]
-            pairs += [(tod_to_unix(tod, t_start) - t_start, dev / 1e6)
-                      for tod, _m, _a, dev in tw if dev is not None]
-            off, jitter_ms, npair = device_anchor(pairs)
-            if off is not None:
-                DEV_ANCHOR[board] = (off, jitter_ms, npair)
-            place = (lambda tod, dev: dev / 1e6 + off) if off is not None else \
-                    (lambda tod, dev: tod_to_unix(tod, t_start) - t_start)
+            # Device time is placed on the host axis PER BOOT EPOCH -- see place_device_times for
+            # why a single offset across a log spanning reboots lands nowhere. Each series is
+            # anchored from its own rows, in log order, so the epoch split is well defined.
+            host = lambda tod: tod_to_unix(tod, t_start) - t_start
+            jit_all, n_all = [], 0
             for key, pts in xt.items():
+                placed, jit, nst = place_device_times(pts, lambda r: host(r[0]), lambda r: r[1])
+                if jit is not None:
+                    jit_all.append(jit)
+                    n_all += nst
                 dst = FIRMWARE.setdefault((board, key), [])
-                for tod, dev, val in pts:
-                    dst.append((place(tod, dev) if dev is not None
-                                else tod_to_unix(tod, t_start) - t_start, val))
+                for (tod, _dev, val), p in zip(pts, placed):
+                    dst.append((p if p is not None else host(tod), val))
             offsets[path], LOG_STATE[path] = end, st
             for tod, name, val in tp:
-                TEMPS.setdefault(name, []).append(
-                    (tod_to_unix(tod, t_start) - t_start, val))
-            for tod, mean_ppm, audio_s, dev in tw:
+                TEMPS.setdefault(name, []).append((host(tod), val))
+            placed, jit, nst = place_device_times(tw, lambda r: host(r[0]), lambda r: r[3])
+            if jit is not None:
+                jit_all.append(jit)
+                n_all += nst
+            for (tod, mean_ppm, audio_s, _dev), p in zip(tw, placed):
                 TRIMS.setdefault(board, []).append(
-                    (place(tod, dev) if dev is not None else tod_to_unix(tod, t_start) - t_start,
-                     mean_ppm, audio_s))
-            for tod, n, dev, err, med, ring, drops in rs:
+                    (p if p is not None else host(tod), mean_ppm, audio_s))
+            placed, _jit, _n = place_device_times(rs, lambda r: host(r[0]), lambda r: r[2])
+            for (tod, n, _dev, err, med, ring, drops), p in zip(rs, placed):
                 RSYNCS.setdefault(board, []).append(
-                    (place(tod, dev) if dev is not None else tod_to_unix(tod, t_start) - t_start,
-                     n, err, med, ring, drops))
+                    (p if p is not None else host(tod), n, err, med, ring, drops))
+            if n_all:
+                DEV_ANCHOR[board] = (0.0, max(jit_all), n_all)
             if span[0] is not None:
                 LOG_COVERAGE[path] = (tod_to_unix(span[0], t_start) - t_start,
                                       tod_to_unix(span[1], t_start) - t_start)
