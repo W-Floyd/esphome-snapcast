@@ -41,6 +41,20 @@ a dependency-free SVG plot is rewritten after each capture.
 Verify the whole analysis path without hardware via --simulate, which rasterises two
 synthetic I2S buses with a known offset and known clock difference and checks the
 recovered numbers against the truth.
+
+OFFSET INTEGRAL. The offset between two boards is the integral of their differential
+achieved rate and nothing else -- integrating the fs_a_hz/fs_b_hz columns reproduces the
+measured offset at corr -0.997..-1.000, slope -1.0, residual sd 0.14-0.38 us over runs of
+92-499 s, so there is no second term and no static offset to explain. That check runs on
+every replot, so the result stays testable rather than remembered.
+
+Given --annotate logs from firmware that emits the "Trim window:" line, the same check
+runs a second time against the trim the BOARDS reported, which asks whether a device can
+see its own relative offset without an analyser -- the thing it would need in order to
+correct one. The first two --annotate logs are taken as board A and board B in that
+order; a swap shows up as slope +1 instead of -1.
+
+    python3 scripts/i2s-skew.py --replot --annotate a.log b.log
 """
 
 import argparse
@@ -651,11 +665,29 @@ ROLE_RE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?\btsf=([lf])")
 LOG_COVERAGE = {}
 LOG_STATE = {}
 TEMPS = {}
+# board -> [(elapsed_s, mean_ppm | None, audio_s)] from the firmware's "Trim window:" line.
+# None marks a window with no trim programmed at all, which is a hole in the integral and
+# not a zero; see integral_fit.
+TRIMS = {}
 
 SYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?"
     r"corrected -(\d+)/\+(\d+) frames,\s*(\d+) hard resyncs.*?"
     r"trim ([+-][\d.]+) ppm")
+
+# "Trim window: mean +12.345 ppm over 3.31 s audio (covered 100%)" -- the window's
+# TIME-MEAN applied trim, on its own line because the Sync line above is at the 256-byte
+# formatting ceiling. This is the quantity the offset integral needs; the end-of-window
+# snapshot on the Sync line is one sample per 3.3 s of a continuously moving value, and
+# integrating those explained only 13-19% of the measured offset where the analyser's own
+# rate columns explained 99-100%.
+TRIM_WINDOW_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Trim window: mean ([+-][\d.]+) ppm "
+    r"over ([\d.]+) s audio \(covered (\d+)%\)")
+# The no-trim variant of the same line. Parsed rather than ignored precisely because it
+# marks real audio time the integral cannot account for.
+TRIM_NONE_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Trim window: no trim programmed over ([\d.]+) s audio")
 
 
 def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=None,
@@ -676,7 +708,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     # against nothing and emit almost no events -- the annotations would silently dry up
     # the moment the run went live, having worked fine on a whole-file --replot.
     state = state if state is not None else {}
-    ev, temps = [], []
+    ev, temps, trims = [], [], []
     last_trim, last_resync = state.get("trim"), state.get("resync")
     last_pipe = state.get("pipe")
     last_role = state.get("role")
@@ -705,6 +737,20 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
             if last_role is not None and role != last_role:
                 ev.append((tod_r, "role", f"{board}: {last_role} -> {role}"))
             last_role = role
+        # The trim window is its own log line, so it is matched before SYNC_RE's continue
+        # rather than alongside the fields on the Sync line.
+        tw = TRIM_WINDOW_RE.match(line)
+        if tw:
+            tod_w = (int(tw.group(1)) * 3600 + int(tw.group(2)) * 60 + int(tw.group(3))
+                     + int(tw.group(4)) / (10 ** len(tw.group(4))))
+            trims.append((tod_w, float(tw.group(5)), float(tw.group(6))))
+            continue
+        tn = TRIM_NONE_RE.match(line)
+        if tn:
+            tod_w = (int(tn.group(1)) * 3600 + int(tn.group(2)) * 60 + int(tn.group(3))
+                     + int(tn.group(4)) / (10 ** len(tn.group(4))))
+            trims.append((tod_w, None, float(tn.group(5))))
+            continue
         m = SYNC_RE.match(line)
         if not m:
             t = match_temperature(line)
@@ -747,7 +793,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     f.close()
     state["trim"], state["resync"], state["pipe"] = last_trim, last_resync, last_pipe
     state["role"] = last_role
-    return ev, end, state, temps
+    return ev, end, state, temps, trims
 
 
 def tod_to_unix(tod, ref_unix):
@@ -1079,8 +1125,8 @@ def rate_derivative(series, window):
     return [(float(x), float(v)) for x, v in zip(xs[ok], slope[ok])], window
 
 
-def build_panels(args, rate_a, rate_b, temps, lo, hi):
-    """Extra plot panels, in order: temperature, absolute I2S rate, its derivative."""
+def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None):
+    """Extra plot panels: temperature, absolute I2S rate, its derivative, differential trim."""
     panels = []
     t2 = trim_temps(temps, lo, hi)
     if t2:
@@ -1094,6 +1140,13 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi):
         if da or db:
             panels.append((f"d(rate)/dt (Hz/s), {max(wa, wb):.2g}s fit",
                            {"a d/dt": da, "b d/dt": db}))
+    # The boards' own view of the differential rate, on the same time axis as the offset
+    # above it: this is the quantity whose integral the offset is supposed to be, so the
+    # two panels should be visibly derivative and integral of one another.
+    if dtrim:
+        dt = win(dtrim)
+        if dt:
+            panels.append(("differential trim mean (ppm)", {"b - a": dt}))
     return panels
 
 
@@ -1146,6 +1199,226 @@ def stats_caption(ts, ys):
             note = "" if len(segs) == 1 else f" over {span:.0f}s of {len(segs)} runs"
             parts.append(f"slope {f[0]:+,.1f} ns/s ({f[0]/1000:+.4f} ppm){note}")
     return "   ".join(parts)
+
+
+# Pairing tolerance between two boards' report streams. Each runs a ~3.3 s window on its
+# own phase, so half a window is the most that can be demanded without discarding good rows.
+PAIR_WINDOW_S = 1.8
+# A window whose reported AUDIO time falls short of the wall clock since the previous report
+# did not spend that gap playing continuously -- a starvation, a stall, a re-baseline. The
+# integral has no idea what happened in the missing time, so the segment breaks there.
+AUDIO_SHORTFALL_S = 0.5
+# Below this a segment's correlation is noise. The finding's own runs were 92-499 s, i.e.
+# 28-150 windows.
+MIN_FIT_ROWS = 10
+
+
+def nearest_at(series, t):
+    """Nearest (t, ...) row in a time-sorted series, or None if empty."""
+    if not series:
+        return None
+    lo, hi = 0, len(series) - 1
+    while lo < hi:
+        mid = (lo + hi) // 2
+        if series[mid][0] < t:
+            lo = mid + 1
+        else:
+            hi = mid
+    best = series[lo]
+    if lo > 0 and abs(series[lo - 1][0] - t) < abs(best[0] - t):
+        best = series[lo - 1]
+    return best
+
+
+def pair_diff(a, b, to_ppm=None):
+    """Pair two per-board series on time and return [(t, differential)] as b - a.
+
+    to_ppm converts the paired values to ppm when they are not already: the fs columns are
+    absolute Hz, so their difference is scaled by the pair's own mean rather than by an
+    assumed 44.1 or 48 kHz.
+    """
+    out = []
+    for t, va in a:
+        hit = nearest_at(b, t)
+        if hit is None or abs(hit[0] - t) > PAIR_WINDOW_S:
+            continue
+        vb = hit[1]
+        if va is None or vb is None:
+            continue
+        out.append((t, to_ppm(va, vb) if to_ppm else vb - va))
+    return out
+
+
+def trim_diff(a, b):
+    """([(t, dppm)], breaks) from two boards' trim-window series, as b - a.
+
+    Rows are (t, mean_ppm | None, audio_s). A break is recorded wherever the integral goes
+    blind: either board reporting no programmed trim, or either board reporting less AUDIO
+    time than the wall clock since its previous window -- a starvation, stall or re-baseline
+    means the trim in the missing time is unknown, and joining across it would read the
+    interpolation rather than the data.
+    """
+    out, breaks = [], []
+    prev_t = None
+    # A dropped window cannot carry the break itself: it contributes no differential point,
+    # so a break recorded at ITS timestamp would match no row and split nothing. Carry the
+    # break forward to the next row that is actually emitted.
+    pending = False
+    for t, mean_a, audio_a in a:
+        hit = nearest_at(b, t)
+        if hit is None or abs(hit[0] - t) > PAIR_WINDOW_S:
+            prev_t, pending = None, True
+            continue
+        _tb, mean_b, audio_b = hit
+        if mean_a is None or mean_b is None:
+            prev_t, pending = None, True
+            continue
+        if prev_t is not None:
+            dt = t - prev_t
+            if dt <= 0 or min(audio_a, audio_b) < dt - AUDIO_SHORTFALL_S:
+                pending = True
+        if pending:
+            breaks.append(t)
+            pending = False
+        out.append((t, mean_b - mean_a))
+        prev_t = t
+    return out, breaks
+
+
+def integral_fit(dppm, offset_us, breaks=()):
+    """Integrate a differential rate and fit the result against the measured wire offset.
+
+    The wire offset IS the integral of the differential achieved rate: integrating the
+    analyser's own fs columns reproduces it at corr -0.997..-1.000, slope -1.0, residual sd
+    0.14-0.38 us. This runs that comparison for any differential-ppm series, so the same
+    check can be pointed at the boards' own reported trim -- the question of whether a
+    device can see its own offset without an analyser.
+
+    Sign: positive trim plays faster, so board B running fast renders a given frame EARLIER
+    and the CSV's "B minus A, positive means B later" goes DOWN. The expected slope is -1.
+
+    Units are free: 1 ppm sustained for 1 s is exactly 1 us, so ppm*s IS microseconds.
+
+    Segments never span a gap or a break. Fitted across one, the integral measures the
+    interpolation -- the same failure that made a post-boot hole read as a tidy 40 ppm ramp.
+    Yields one result dict per segment long enough to mean anything.
+    """
+    if len(dppm) < 2:
+        return
+    brk = set(breaks)
+    # Gap-split on the differential's own cadence, then split again at explicit breaks
+    # (a window that did not account for its wall clock as played audio).
+    segs = []
+    for seg in split_gaps(dppm):
+        cur = []
+        for row in seg:
+            if row[0] in brk and cur:
+                segs.append(cur)
+                cur = []
+            cur.append(row)
+        if cur:
+            segs.append(cur)
+    for seg in segs:
+        # Running integral. The first row defines the origin and contributes no interval;
+        # the arbitrary constant is absorbed by the fit's intercept.
+        integral, xs, ys = 0.0, [], []
+        prev_t = seg[0][0]
+        for t, dv in seg:
+            integral += dv * (t - prev_t)
+            prev_t = t
+            hit = nearest_at(offset_us, t)
+            if hit is None or abs(hit[0] - t) > PAIR_WINDOW_S:
+                continue
+            xs.append(integral)
+            ys.append(hit[1])
+        if len(xs) < MIN_FIT_ROWS:
+            continue
+        x = np.array(xs)
+        y = np.array(ys)
+        if np.ptp(x) < 1e-12 or np.ptp(y) < 1e-12:
+            continue
+        slope, icept = np.polyfit(x, y, 1)
+        resid = y - (slope * x + icept)
+        off_sd = float(np.std(y))
+        resid_sd = float(np.std(resid))
+        yield {
+            "span_s": seg[-1][0] - seg[0][0],
+            "n": len(xs),
+            "corr": float(np.corrcoef(x, y)[0, 1]),
+            "slope": float(slope),
+            "off_sd": off_sd,
+            "resid_sd": resid_sd,
+            # How much of the measured offset's spread the fit removes, reported the way
+            # the fs-column result was. sd is defensible for a fit residual: the
+            # medians-not-sd rule is about network events dominating a raw field.
+            "explained": 100.0 * (1.0 - resid_sd / off_sd) if off_sd > 0 else float("nan"),
+            "dppm_sd": float(np.std([d for _, d in seg])),
+        }
+
+
+def report_integral(label, dppm, offset_us, breaks=(), expect=None):
+    """Print integral_fit's per-segment table. Returns True if anything was fitted."""
+    rows = list(integral_fit(dppm, offset_us, breaks))
+    if not rows:
+        print(f"   {label}: no segment of {MIN_FIT_ROWS}+ paired rows to fit "
+              f"({len(dppm)} differential point(s))")
+        return False
+    print(f"   {label}: {len(rows)} segment(s), expected slope -1.0")
+    print(f"      {'span_s':>7s} {'n':>4s} {'d_sd_ppm':>9s} {'off_sd_us':>10s}"
+          f" {'corr':>7s} {'slope':>7s} {'resid_us':>9s} {'expl':>6s}")
+    for r in rows:
+        print(f"      {r['span_s']:7.1f} {r['n']:4d} {r['dppm_sd']:9.3f} {r['off_sd']:10.2f}"
+              f" {r['corr']:+7.3f} {r['slope']:+7.3f} {r['resid_sd']:9.2f}"
+              f" {r['explained']:5.0f}%")
+    if expect:
+        print(f"      {expect}")
+    return True
+
+
+def report_offset_integral(args, ts, ys, rate_a, rate_b):
+    """Does the integral of the differential rate reproduce the measured wire offset?
+
+    Run against both references available here, which answer different questions:
+
+      fs columns    the analyser's own achieved rates. This is the measurement that
+                    established the offset has no second term; kept runnable so the
+                    result stays checkable instead of remembered.
+      trim mean     what the boards themselves reported. The open question is whether a
+                    device can see its own relative offset WITHOUT an analyser, which is
+                    what would let it correct one.
+
+    Returns the differential trim series for plotting, or [].
+    """
+    offset_us = [(t, y / 1000.0) for t, y in zip(ts, ys) if math.isfinite(y)]
+    if len(offset_us) < MIN_FIT_ROWS:
+        return []
+    print("   offset integral (is the offset the integral of the differential rate?)")
+    report_integral(
+        "fs columns  (analyser)",
+        pair_diff(rate_a, rate_b, to_ppm=lambda a, b: (b - a) / ((a + b) / 2.0) * 1e6),
+        offset_us,
+        expect="established: corr -0.997..-1.000, slope -1.0, resid sd 0.14-0.38 us")
+
+    names = [os.path.basename(p).split(".")[0] for p in (args.annotate or [])]
+    have = [n for n in names if TRIMS.get(n)]
+    if len(have) < 2:
+        if args.annotate:
+            missing = [n for n in names if not TRIMS.get(n)]
+            print(f"   trim mean   (on-device): needs 'Trim window:' lines from two logs; "
+                  f"none in {', '.join(missing) or 'any log'}"
+                  f"{' (firmware predates the line)' if missing else ''}")
+        return []
+    na, nb = have[0], have[1]
+    dtrim, breaks = trim_diff(TRIMS[na], TRIMS[nb])
+    # --annotate order decides which log is A: the analyser's A/B comes from the probe
+    # wiring and nothing in the logs can confirm it. A swap shows up as slope +1 rather
+    # than -1, so say so here instead of leaving a sign to be puzzled over.
+    report_integral(
+        f"trim mean   (on-device, {nb} - {na})", dtrim, offset_us, breaks,
+        expect=("snapshots managed 13-19% explained; if the time-mean does not clear that "
+                "decisively the aliasing\n              explanation is wrong. A slope near "
+                f"+1 means {na}/{nb} are swapped against the analyser's probes."))
+    return dtrim
 
 
 def fit_slope(ts, ys):
@@ -1316,7 +1589,9 @@ def main():
     p.add_argument("--out", default="i2s-skew.csv")
     p.add_argument("--annotate", nargs="+", metavar="LOG", default=None,
                    help="device logs (e.g. a.log b.log) to mark on the plot as vertical "
-                        "bars: frame corrections, hard resyncs, and large trim steps")
+                        "bars: frame corrections, hard resyncs, and large trim steps. The "
+                        "first two are taken as board A and board B, in that order, for the "
+                        "offset-integral check against their reported trim")
     p.add_argument("--sync-us", type=float, default=200.0,
                    help="--annotate: mark a Sync report whose |median| reaches this")
     p.add_argument("--peak-us", type=float, default=600.0,
@@ -1401,15 +1676,18 @@ def main():
         for path in args.annotate:
             board = os.path.basename(path).split(".")[0]
             span = [None, None]
-            ev, end, st, tp = parse_sync_events(path, board, args.trim_ppm,
-                                                offsets.get(path, 0), span,
-                                                LOG_STATE.get(path), args.sync_us,
-                                                args.peak_us, args.pipeline_ms,
-                                                args.log_tail_mb * (1 << 20))
+            ev, end, st, tp, tw = parse_sync_events(path, board, args.trim_ppm,
+                                                    offsets.get(path, 0), span,
+                                                    LOG_STATE.get(path), args.sync_us,
+                                                    args.peak_us, args.pipeline_ms,
+                                                    args.log_tail_mb * (1 << 20))
             offsets[path], LOG_STATE[path] = end, st
             for tod, name, val in tp:
                 TEMPS.setdefault(name, []).append(
                     (tod_to_unix(tod, t_start) - t_start, val))
+            for tod, mean_ppm, audio_s in tw:
+                TRIMS.setdefault(board, []).append(
+                    (tod_to_unix(tod, t_start) - t_start, mean_ppm, audio_s))
             if span[0] is not None:
                 LOG_COVERAGE[path] = (tod_to_unix(span[0], t_start) - t_start,
                                       tod_to_unix(span[1], t_start) - t_start)
@@ -1470,14 +1748,15 @@ def main():
         if not ts0:
             sys.exit(f"{args.out} has no rows to plot")
         # Priming above already read each log once, against a placeholder anchor, and the
-        # call below re-reads all of it from byte zero against the CSV's real anchor. TEMPS
-        # APPENDS per line, so without a reset every point is recorded twice -- harmless
-        # looking on a plot that just draws duplicates, but for a time series the axis then
-        # runs forward, jumps back to the start and runs forward again, which is a gap-split
-        # into two overlapping segments where there is one run. (LOG_COVERAGE is already
-        # cleared after priming for the same reason.) The live path must NOT do this: there,
-        # priming's read is the only copy, since the loop reads only bytes appended after it.
+        # call below re-reads all of it from byte zero against the CSV's real anchor. These
+        # series APPEND per line, so without a reset every point is recorded twice -- which
+        # for a time series is not merely redundant: the axis runs forward, jumps back and
+        # runs forward again, so gap-splitting sees two overlapping segments and every fit
+        # is reported twice over. (LOG_COVERAGE is already cleared after priming for the
+        # same reason.) The live path must NOT do this: there, priming's data is the only
+        # copy, since the loop reads only bytes appended after it.
         TEMPS.clear()
+        TRIMS.clear()
         ev, _ = collect_events(anchor0 or time.time())
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]
         print(f"replot: {len(ts0)} rows spanning {ts0[-1]-ts0[0]:.1f} s, "
@@ -1500,12 +1779,13 @@ def main():
             print(f"   temperature series: " + ", ".join(
                 f"{k} ({len(v)} pts, {min(v_ for _, v_ in v):.1f}-"
                 f"{max(v_ for _, v_ in v):.1f} C)" for k, v in sorted(t2.items())))
+        dtrim = report_offset_integral(args, ts0, ys0, ra0, rb0)
         write_svg(args.plot, ts0, ys0, "I2S playout skew",
                   "board B - board A (ns)   [+ = B later]",
                   stats=stats_caption(ts0, ys0),
                   include_zero=not args.y_free, events=ev,
                   panels=build_panels(args, ra0, rb0, TEMPS,
-                                      ts0[0] - 1, ts0[-1] + 1))
+                                      ts0[0] - 1, ts0[-1] + 1, dtrim))
         print(f"  plot {args.plot}")
         return
 
@@ -1751,11 +2031,14 @@ def main():
             pool.shutdown(wait=False)
 
     if ts:      # always leave a current plot behind, whatever the throttle did
+        # Fitted once, at the end: the run is complete here, and a fit per plot tick would
+        # be both wasteful and unreadable while the integral is still a few points long.
+        dtrim = report_offset_integral(args, ts, ys, rate_a, rate_b)
         write_svg(args.plot, ts, ys, "I2S playout skew",
                   "board B - board A (ns)   [+ = B later]",
                   stats=stats_caption(ts, ys),
                   include_zero=not args.y_free, events=events,
-                  panels=build_panels(args, rate_a, rate_b, TEMPS, -1, ts[-1] + 1))
+                  panels=build_panels(args, rate_a, rate_b, TEMPS, -1, ts[-1] + 1, dtrim))
     if ncorr:
         print(f"\n  {ncorr} of {len(ys)} rows had a whole-frame ambiguity "
               f"corrected by continuity with the previous row")
