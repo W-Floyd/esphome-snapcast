@@ -110,6 +110,21 @@ baseline, since the schedule only differs after an event; (2) the landing offset
 restart, previously ±130 µs, which is the term it exists to reduce. Only then consider moving the
 RUN endpoint toward 0.1, which is the change this is supposed to make affordable.
 
+## Step 2d — FORCE A RE-ANCHOR AFTER A RECONNECT (new, and the biggest lever measured)
+
+Measured 2026-08-26, n=12 injections on a quiet-gated wire: the split repair removes **~2/3 of
+whatever standing offset the device carries**, per firing (`post = +0.33 x pre − 6.4`). Two repairs
+took a board from −1377 µs to −35 µs. Its own displacement, measured where it is visible at all, is
+±50 µs rather than the 222 µs on record.
+
+So the repair is corrective, and what it corrects — an accounting anchor that disagrees with
+measured latency — is exactly what a reconnect's pipeline restart leaves behind. Both ~1.3 ms
+offsets planted today were recovered this way. The change: after a reconnect/pipeline restart and
+re-lock, force the re-anchor instead of trusting the fresh anchor and waiting for a natural split to
+be detected over DRIFT_REPAIR_HOLD_US.
+
+Grade it on a lone reconnect: the planted offset should collapse from ~1.3 ms to the ±50 µs residual.
+
 ## Step 2b — THE OFFSET-PLANTING MECHANISM (new, and now the live thread)
 
 Everything above converges here: a static offset is planted by an event and then persists because

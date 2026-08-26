@@ -606,6 +606,41 @@ defect.
       stated reason for not zeroing) while removing exactly the term that displaces audio. Predicted
       step: ~0.17 x 50 ppm x 3 s ≈ 25 µs, i.e. a 4x cut, and it is a three-line change at the hold.
 
+- **CONFIRMED n=12, 2026-08-26: THE SPLIT REPAIR IS A CORRECTIVE MECHANISM. It removes ~2/3 of
+  whatever standing offset the device carries, per firing.** This inverts the framing everything
+  above was written under.
+
+        pre_us    post_us   step_us     (injected +2500 us each, board b, quiet-gated)
+        -1377.0   -509.8    +867.2      63% of the standing error removed
+         -509.8    -34.7    +475.1      93%
+          -34.7    -82.8     -48.1      already aligned: residual scatter only
+          -82.9    -33.8     +49.0
+          -33.8    +11.7     +45.5
+          +11.8    -54.6     -66.4
+
+    - **post = +0.33 x pre − 6.4.** That is the test that matters: 0 would mean the repair lands on
+      a fixed point, +1 would mean it displaces from wherever it started and carries the old error
+      forward. It is neither -- it removes a FRACTION (~2/3) per firing, which is why two repairs
+      took the board from −1377 µs to −35 µs. Post levels: median −44.7 µs, MAD 24.5.
+    - **DO NOT use the step-vs-pre regression** that the first run reported at −1.25. `step = post −
+      pre`, so noise in `pre` forces that slope negative on its own. It is confounded by
+      construction. Regress POST on PRE.
+    - **The residual displacement, measured where it can be seen (device already aligned), is
+      ±50 µs**, not the 222 µs on record. Those earlier points were taken near alignment too, so
+      they are samples of this same scatter -- one clean point establishes existence, not size, and
+      three of them with varying sign is what scatter looks like.
+    - **Consequence: outage-planted offsets are recoverable, and the mechanism already exists.** The
+      repair re-anchors the accounting to MEASURED latency, which is exactly what a pipeline restart
+      leaves wrong. Twice today an outage planted ~1.3-1.4 ms; both times injected repairs pulled it
+      back to tens of µs. The change this argues for is to force that re-anchor after a
+      reconnect/pipeline restart rather than trusting the fresh anchor and waiting for a natural
+      split to be detected. Not built -- this is the proposal, and it is the biggest lever measured.
+    - **Environment note from the same run:** two of fourteen attempted points were eaten by natural
+      supply outages (one reset the split window so the injection was never repaired; one wedged
+      board a). Any campaign here needs a per-point timeout and a wall-clock validity gate -- the
+      analyser emits nan while a board is silent, and windowing on the last VALID sample will
+      happily grade pre-outage data as "quiet now".
+
 - **NEW LEAD, 2026-08-26: A FORCED REPAIR UNDID AN OUTAGE-PLANTED OFFSET, EXACTLY.** Measured on
   board b, n=1, and it points the opposite way to everything recorded above about repairs.
     - 13:51:53 a natural supply outage (`RPRE` supply ratio 0.17, no OTA running) ran the full
