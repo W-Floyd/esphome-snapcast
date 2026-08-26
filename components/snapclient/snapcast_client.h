@@ -788,6 +788,11 @@ class SnapcastClient {
   /// ramps down. Accumulates, so a second request while one is in flight adds to it rather than
   /// discarding it.
   int64_t split_ramp_remaining_us_{0};
+  /// @brief Sub-frame carry for the ramp, us. The accounting moves in whole frames (22.7 us at
+  /// 44.1 kHz), so a rate gentler than one frame per chunk -- 868 us/s -- can only be expressed by
+  /// spending a frame every few chunks. Without this the per-chunk budget truncated to zero frames
+  /// and the ramp never moved at all.
+  int64_t split_ramp_carry_us_{0};
   /// TEST HOOK, see inject_starvation(). 0 when not injecting.
   std::atomic<int64_t> starve_until_us_{0};
   /// @brief ANCHOR ERROR measurement, armed by a re-baseline. Player task only.

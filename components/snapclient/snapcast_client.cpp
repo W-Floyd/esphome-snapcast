@@ -2487,8 +2487,23 @@ void SnapcastClient::player_task_() {
       const double chunk_s = static_cast<double>(frames) / rec.params.sample_rate;
       const int64_t budget = static_cast<int64_t>(SPLIT_RAMP_US_PER_S * chunk_s + 0.5);
       const int64_t inc = std::clamp<int64_t>(this->split_ramp_remaining_us_, -budget, budget);
-      const int64_t shift = inc * rec.params.sample_rate / 1000000;
-      if (shift != 0) {
+      // ACCUMULATE in us and spend whole frames, because the accounting has no finer unit than a
+      // frame. Converting each chunk's budget straight to frames truncated to zero and the ramp
+      // silently never moved: at 100 us/s a 26 ms chunk earns ~3 us, while one frame is 22.7 us, so
+      // `inc * rate / 1e6` was 0 every time and `remaining` just accumulated. The bug was visible
+      // only because the request line prints the running remainder -- it reached +5000 with drift
+      // still reading -1.
+      //
+      // With a carry, any rate below one frame per chunk (868 us/s at 44.1 kHz) becomes reachable:
+      // frames are applied every few chunks instead of every chunk, which is what a rate gentler
+      // than the frame grid has to look like.
+      this->split_ramp_carry_us_ += inc;
+      const int64_t whole = this->split_ramp_carry_us_ * rec.params.sample_rate / 1000000;
+      if (whole != 0) {
+        const int64_t shift = whole;
+        // Keep the unspent remainder, so the rate stays right on average rather than losing the
+        // fraction every chunk.
+        this->split_ramp_carry_us_ -= shift * 1000000 / rec.params.sample_rate;
         this->pushed_frames_total_ += shift;
         this->split_ramp_remaining_us_ -= inc;
         // Histories describe levels against the old counter, so they are re-marked rather than
@@ -2499,9 +2514,11 @@ void SnapcastClient::player_task_() {
         if (this->split_ramp_remaining_us_ == 0) {
           ESP_LOGW(TAG, "SPLITINJECT ramp complete t=%" PRId64, now_us());
         }
+      } else {
+        // No whole frame yet: the budget is consumed into the carry, not dropped, so a sub-frame
+        // rate still advances -- just over several chunks.
+        this->split_ramp_remaining_us_ -= inc;
       }
-      // If the budget rounded to zero frames this chunk, nothing is applied and nothing is
-      // consumed, so the remainder carries to the next chunk rather than being silently dropped.
     }
     st.depth_accum_frames += this->pushed_frames_total_ - this->played_frames_total_;
     this->playout_mutex_.unlock();
