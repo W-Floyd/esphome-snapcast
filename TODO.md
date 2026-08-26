@@ -134,12 +134,48 @@ defect.
   0.018 ppm MEAN differential rate where the pivot multiplies the instantaneous value.
   **Surviving direction:** avoid the extrapolation entirely — compare in FRAMES rather than time,
   which removes the nominal-rate assumption the bias comes from at its root.
-- **`TRIM_KP_RUN` stays at 0.25 for now, but the case for 0.1 is stronger than it looks.** KP
-  multiplies the differential median, and that input fell 6× across this work (sd 43.0 → 7.1 µs;
-  differential trim sd 20.9 → 1.78 ppm). Straight linear scaling says 0.1 buys only 2–3 µs and costs
-  3.6× on reboot recovery (42 s → 150 s) — but the loop gain above is `KP × 3.15`, so 0.1 takes it
-  from 0.79 to 0.32 and removes the 1/(1−G) ≈ 4.8× amplification as well. Worth measuring rather
-  than reasoning about, and worth doing BEFORE the pivot work since it is a one-line experiment.
+- **`TRIM_KP_RUN` is now 0.1, COMMITTED BUT UNMEASURED.** KP multiplies the differential median, and
+  that input fell 6× across this work (sd 43.0 → 7.1 µs; differential trim sd 20.9 → 1.78 ppm).
+  Straight linear scaling says 0.1 buys only 2–3 µs and costs 3.6× on reboot recovery
+  (42 s → 150 s) — but the loop gain above is `KP × 3.15`, so 0.1 takes it from 0.79 to 0.32 and
+  removes the 1/(1−G) ≈ 4.8× amplification as well.
+    - **Baseline to beat, at KP = 0.25 in steady state over 180 s:** wire offset **sd 6.20 µs**,
+      differential achieved rate **sd 1.515 ppm**, on-device differential median **MAD 6.00 µs**.
+      The analyser's own rate columns reproduced the offset at corr −0.999 / slope −0.992 /
+      residual 0.33 µs over that window, so the instrument is trustworthy at this floor.
+    - **Judge it on the wire and on the differential MAD, never on sd of the differential median** —
+      network events put that at 209 µs against a MAD of 6, which is the medians-not-sd rule in the
+      one place it is easiest to forget.
+    - The 0.1 measurement has NOT been taken: every window attempted so far graded a post-flash
+      transient (medians −298…+239 µs, trim railed to +376 ppm). Recovery settling is now measurable
+      rather than eyeballed — `i2s-skew.py` reports tau and time-to-settle per recovery — but note
+      that a large excursion recovers under `TRIM_KP_ACQUIRE` while muted, so coarse re-lock speed is
+      governed by the acquire gain and `KP_RUN` governs only the fine settling after unmute. The
+      quoted 42 s / 150 s figures do not say which they measured.
+- **Dynamic KP is the right answer, but ONLY scheduled on something outside the loop.** The
+  0.25-vs-0.1 bake-off is choosing a compromise between two things a schedule would give you both
+  of, so it is worth less than fixing the schedule. Two forms have already failed on hardware
+  (recorded at the PI block): **scheduling the gain on `|median error|` with hysteresis
+  limit-cycled**, and a **one-way latch on sustained smallness** did not cycle but was
+  history-dependent and did not address the starvation-recovery case that justified it.
+    - **Why the `|error|` schedule cannot work.** The loop *trails a ramp by* `rate/KP` (measured
+      ±1–2 ms at KP = 0.1 against ~200 µs at KP = 0.5), and differential trim is `KP ×` differential
+      median to within a few percent in every session measured. So the steady-state error is
+      **inversely proportional to the very gain being scheduled**: raising KP shrinks the error the
+      schedule watches, which lowers KP, which grows the error back through the threshold. Hysteresis
+      does not remove that, it only sets the period — which is what "limit-cycled" means. The plant
+      being an integrator is why the related bang-bang trim also limit-cycled *structurally*.
+    - **Why the CURRENT switch is safe, and what the rule is.** KP is already dynamic (0.5 acquiring,
+      0.1 converged); it survives because it keys off `st.converged`, a LATCH set by a full in-band
+      median window and cleared only by a resync/mute event. It is scheduled on a discrete REGIME,
+      not on the continuous variable the gain controls, so no path runs from the gain back to the
+      scheduling input. Hence the code's "keep this switch boring".
+    - **The form worth building:** decay KP from ACQUIRE toward RUN over a time constant after the
+      last disturbance EVENT (boot, re-baseline, leadership change, hard resync) instead of stepping
+      once at convergence. Open-loop in the error, so a cycle is structurally impossible, and it
+      gives fast recovery right after an event with a low steady-state gain. The earlier
+      "history-dependent" objection does not apply: history is only dangerous when the history IS the
+      controlled variable, and a timer since a discrete observable event is not.
 - **Events plant an offset because the two servos hunt independently through recovery.** Not a
   separate defect — the integral above — but the events are what make it large, and they are all in
   the logs. Landing values measured in one session:
