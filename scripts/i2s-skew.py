@@ -678,6 +678,8 @@ FIRMWARE = {}
 DEV_ANCHOR = {}
 # board -> [(elapsed_s, n, err_us, med_us, ring_ms, drops)] from the armed per-chunk burst.
 RSYNCS = {}
+# board -> [(elapsed_s, latency_us, age_us, frames)] from each re-baseline anchor.
+SEEDS = {}
 
 SYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?"
@@ -720,6 +722,15 @@ CRYSTAL_RE = re.compile(
 # is flat or rising across drops, the trigger is a bad prediction or a bad deadline and
 # discarding cannot close it. Those two want opposite fixes and look identical at report
 # resolution, which is how a discard cap got flashed and reverted.
+# "SEEDANCHOR latency=217755 age=1234 frames=9602 t=..." -- a re-baseline anchoring the playout
+# accounting to this device's OWN measured pipeline latency. Under test: the per-device error in
+# that latency becomes a permanent static offset, because the servo then measures against the
+# prediction it anchors and reads ~0 while the audio sits that far off. Unobservable on-device by
+# construction, so the wire has to arbitrate -- report_seed_steps pairs each seed against the
+# offset step at that instant.
+SEEDANCHOR_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SEEDANCHOR latency=(\d+) age=(-?\d+) frames=(-?\d+)")
+
 RSYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RSYNC\[(\d+)\] t=(\d+) err=(-?\d+) med=(-?\d+) "
     r"ring=(\d+) drops=(\d+)")
@@ -780,6 +791,8 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     extras = {}
     # Per-chunk resync bursts: (tod, n, dev_us, err_us, med_us, ring_ms, drops)
     rsyncs = []
+    # (tod, dev_us, latency_us, age_us, frames) per re-baseline anchor
+    seeds = []
     last_trim, last_resync = state.get("trim"), state.get("resync")
     last_pipe = state.get("pipe")
     last_role = state.get("role")
@@ -788,7 +801,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     except OSError:
         # Same arity as the normal return: it was short by one, so an unreadable log
         # would have crashed the caller's unpacking rather than being skipped.
-        return [], start_offset, state, [], [], {}, []
+        return [], start_offset, state, [], [], {}, [], []
     if start_offset == 0 and tail_bytes:
         try:
             size = os.fstat(f.fileno()).st_size
@@ -845,6 +858,14 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
                 extras.setdefault(key, []).append(
                     (tod_x, int(dv.group(1)) if dv else None, float(mx.group(grp))))
                 break
+        sa = SEEDANCHOR_RE.match(line)
+        if sa:
+            tod_s = (int(sa.group(1)) * 3600 + int(sa.group(2)) * 60 + int(sa.group(3))
+                     + int(sa.group(4)) / (10 ** len(sa.group(4))))
+            dv = DEV_T_RE.search(line)
+            seeds.append((tod_s, int(dv.group(1)) if dv else None, int(sa.group(5)),
+                          int(sa.group(6)), int(sa.group(7))))
+            continue
         rs = RSYNC_RE.match(line)
         if rs:
             tod_r = (int(rs.group(1)) * 3600 + int(rs.group(2)) * 60 + int(rs.group(3))
@@ -894,7 +915,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     f.close()
     state["trim"], state["resync"], state["pipe"] = last_trim, last_resync, last_pipe
     state["role"] = last_role
-    return ev, end, state, temps, trims, extras, rsyncs
+    return ev, end, state, temps, trims, extras, rsyncs, seeds
 
 
 def place_device_times(rows, host_of, dev_of):
@@ -1836,6 +1857,66 @@ def report_recovery(ts, ys):
               f"(band +-{tol:.1f} us, floor MAD {mad:.2f} us)")
 
 
+def report_seed_steps(ts, ys, settle_s=4.0):
+    """Does a re-baseline STEP the wire offset, and by how much?
+
+    The hypothesis: a planted static offset is the per-device error in the `latency` the seed
+    anchors to. That error is unobservable on-device -- the servo measures against the very
+    prediction it anchors, so it reads ~0 while the audio sits that far off -- so the wire is the
+    only witness.
+
+    A step is the signature that distinguishes the two candidate stories, and they want different
+    fixes. If the anchor plants the offset, the wire should JUMP at the seed instant. If instead
+    the offset arrives because the servo integrates a rate difference to a new resting point, it
+    should ramp over the servo's time constant with no step at all. Today's recovery ramped (tau
+    80 s, 94% explained by the rate integral), so the step is what needs establishing separately.
+
+    Reported per seed as the offset just before against just after, using medians over a short
+    window either side so a single noisy sample cannot invent a step.
+    """
+    pts = [(t, y / 1000.0) for t, y in zip(ts, ys) if math.isfinite(y)]
+    if not pts or not SEEDS:
+        return
+    printed = False
+    for board, rows in sorted(SEEDS.items()):
+        for t0, lat, age, frames in rows:
+            before = [v for t, v in pts if t0 - settle_s <= t < t0]
+            after = [v for t, v in pts if t0 < t <= t0 + settle_s]
+            if len(before) < 5 or len(after) < 5:
+                continue
+            # EXTRAPOLATED to the seed instant from each side, not differenced medians.
+            # Differencing medians turns any ramp into an apparent step, because the two windows
+            # are centred a window apart: a synthetic 3.5 us/s ramp with no discontinuity at all
+            # read as a +6.8 us "step" that way. Fitting each side and evaluating both at t0
+            # measures the DISCONTINUITY, which is the thing that separates "the anchor planted
+            # it" from "the servo integrated to a new resting point".
+            def edge(seg, lo_t, hi_t):
+                tt = np.array([t for t, _v in pts if lo_t <= t <= hi_t])
+                vv = np.array(seg)
+                if tt.size != vv.size or tt.size < 5 or np.ptp(tt) < 1e-9:
+                    return float(np.median(vv)), 0.0
+                sl, ic = np.polyfit(tt, vv, 1)
+                return float(sl * t0 + ic), float(np.std(vv - (sl * tt + ic)))
+            b_med, b_res = edge(before, t0 - settle_s, t0 - 1e-9)
+            a_med, a_res = edge(after, t0 + 1e-9, t0 + settle_s)
+            # Floor from the fit residuals: "step" must beat the scatter around the local trend,
+            # not the scatter including it.
+            mad = max(min(b_res, a_res), 0.05)
+            step = a_med - b_med
+            if not printed:
+                print("   seed anchors (does a re-baseline STEP the wire?)")
+                print(f"      {'board':>5s} {'t':>8s} {'latency_ms':>11s} {'age_ms':>7s}"
+                      f" {'before_us':>10s} {'after_us':>10s} {'step_us':>9s} {'floor':>7s}")
+                printed = True
+            verdict = "STEP" if abs(step) > max(6.0 * mad, 5.0) else "no step"
+            print(f"      {board:>5s} {t0:8.1f} {lat/1000.0:11.1f} {age/1000.0:7.1f}"
+                  f" {b_med:10.1f} {a_med:10.1f} {step:+9.1f} {mad:7.2f}  {verdict}")
+    if printed:
+        print("      a STEP supports the anchor planting the offset; a ramp with no step means the"
+              "\n      servo integrated to a new resting point instead. Compare step_us against"
+              "\n      latency_ms ACROSS seeds: the hypothesis predicts they track.")
+
+
 def report_resync_bursts(lo, hi):
     """Per-chunk resync bursts: did discarding actually close the error?
 
@@ -1924,6 +2005,7 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
     for board, (off, jitter_ms, n) in sorted(DEV_ANCHOR.items()):
         print(f"   {board}: device clock anchored from {n} stamped line(s); "
               f"host log delay MAD {jitter_ms:.0f} ms")
+    report_seed_steps(ts, ys)
     report_resync_bursts(ts[0] - 1 if ts else -1, ts[-1] + 1 if ts else 0)
     report_recovery(ts, ys)
     print("   offset integral (is the offset the integral of the differential rate?)")
@@ -2237,11 +2319,11 @@ def main():
         for path in args.annotate:
             board = os.path.basename(path).split(".")[0]
             span = [None, None]
-            ev, end, st, tp, tw, xt, rs = parse_sync_events(path, board, args.trim_ppm,
-                                                            offsets.get(path, 0), span,
-                                                            LOG_STATE.get(path), args.sync_us,
-                                                            args.peak_us, args.pipeline_ms,
-                                                            args.log_tail_mb * (1 << 20))
+            ev, end, st, tp, tw, xt, rs, sd = parse_sync_events(path, board, args.trim_ppm,
+                                                                offsets.get(path, 0), span,
+                                                                LOG_STATE.get(path), args.sync_us,
+                                                                args.peak_us, args.pipeline_ms,
+                                                                args.log_tail_mb * (1 << 20))
             # Device time is placed on the host axis PER BOOT EPOCH -- see place_device_times for
             # why a single offset across a log spanning reboots lands nowhere. Each series is
             # anchored from its own rows, in log order, so the epoch split is well defined.
@@ -2269,6 +2351,10 @@ def main():
             for (tod, n, _dev, err, med, ring, drops), p in zip(rs, placed):
                 RSYNCS.setdefault(board, []).append(
                     (p if p is not None else host(tod), n, err, med, ring, drops))
+            placed, _jit, _n = place_device_times(sd, lambda r: host(r[0]), lambda r: r[1])
+            for (tod, _dev, lat, age, frames), p in zip(sd, placed):
+                SEEDS.setdefault(board, []).append(
+                    (p if p is not None else host(tod), lat, age, frames))
             if n_all:
                 DEV_ANCHOR[board] = (0.0, max(jit_all), n_all)
             if span[0] is not None:
@@ -2346,6 +2432,7 @@ def main():
         # overlapping segments rather than merely duplicating points.
         FIRMWARE.clear()
         RSYNCS.clear()
+        SEEDS.clear()
         DEV_ANCHOR.clear()
         ev, _ = collect_events(anchor0 or time.time())
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]

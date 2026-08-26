@@ -208,23 +208,34 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // takes over once unmuted, where the error is mostly differential measurement noise and the
 // gain is the multiplier turning that noise into audible inter-device skew.
 static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
-static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.1f;
-// UNDER MEASUREMENT: 0.25 -> 0.1. The straight noise-vs-recovery trade below was priced before
-// the loop around the feedback pivot was understood, and it undersells the change. The loop is
+static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.25f;
+// TRIED AT 0.1 AND REVERTED. The loop-gain argument for lowering it is still sound -- the loop is
 // median -> trim (KP) -> achieved rate -> pivot bias (3.15 us/ppm) -> median, so its gain is
-// KP * 3.15: 0.79 at 0.25, 0.32 at 0.1. That removes a 1/(1-G) ~ 4.8x amplification as well as
-// the linear factor, so 0.1 should buy considerably more than the 2-3 us the linear estimate
-// predicts. It is also why the residual oscillates smoothly over ~20 s rather than looking like
-// noise -- a gain just under unity.
+// KP * 3.15, and 0.79 at 0.25 against 0.32 at 0.1 removes a 1/(1-G) ~ 4.8x amplification on top of
+// the linear factor. What the measurement showed is that the cost side was underpriced, in a way
+// the original note did not consider at all.
 //
-// Baseline to beat, measured in steady state with the boards settled and both instruments
-// agreeing (KP = 0.25, 180 s): wire offset sd 6.20 us, differential achieved rate sd 1.515 ppm,
-// on-device differential median MAD 6.00 us. Judge it on those, NOT on sd of the differential
-// median -- network events put that at 209 us against a MAD of 6.
+// Measured at 0.1 on a recovery, on the analyser: trough +548 us, tau 80 s, SETTLED 295 s --
+// against ~42 s at 0.25, and worse than the ~135 s this was expected to cost. But the number that
+// decided it is the one nobody had priced: the offset the recovery LEAVES BEHIND. It landed at
+// -155 us, outside the +-130 us band recorded at 0.25.
 //
-// The priced cost is recovery: ~42 s at 0.25, and the note below measured ~135 s to settle at
-// 0.1 before the input noise fell 6x. Re-measure it, because that is the number that decides
-// whether this stays.
+// That is not a coincidence and it is the point. The wire offset is the integral of the
+// differential rate, so a recovery freezes wherever the integral has got to when the servo finally
+// nulls the rate. A lower gain nulls it more slowly, so the integral runs for longer and the
+// planted offset is LARGER. KP therefore trades steady-state noise against both recovery time and
+// the size of the static offset every event leaves -- and the second was the whole problem this
+// work is trying to solve.
+//
+// Baseline it had to beat, measured in steady state with both instruments agreeing (KP = 0.25,
+// 180 s): wire offset sd 6.20 us, differential achieved rate sd 1.515 ppm, on-device differential
+// median MAD 6.00 us. Judge any future attempt on those, NOT on sd of the differential median --
+// network events put that at 209 us against a MAD of 6. And judge it on the LANDING OFFSET after
+// a lone restart, which is the term that was missed.
+//
+// Lowering KP is only worth revisiting once the re-baseline anchor stops planting an offset in the
+// first place (see the seed path): with little left to converge from, the integration window
+// shrinks and the landing-offset cost goes with it.
 //
 // 0.1 -> 0.25 buys recovery time at the cost of steady-state skew, and the two are the SAME
 // dial: for this plant the error obeys e'' + KP*e' + KI*e = 0, so the envelope decays as
@@ -2685,6 +2696,25 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
         ESP_LOGD(TAG, "Re-baseline anchored to measured latency: %" PRIu32 " ms (%" PRId64
                       " frames), snapshot %" PRId64 " ms old",
                  latency.microseconds / 1000, in_flight_frames, (now_us() - latency.as_of_us) / 1000);
+        // SEED ANCHOR, on its own line and stamped, so the wire can be asked what this anchor
+        // actually did. The hypothesis under test: a planted static offset is the per-device ERROR
+        // in this `latency`, which is unobservable here by construction -- the servo then measures
+        // against the prediction this anchors, so it reads ~0 while the audio sits that far off,
+        // and only an external instrument can see it.
+        //
+        // What makes it testable is that the error should appear on the wire as a STEP at this
+        // instant, whose size varies between events and correlates with the anchored value. So the
+        // fields are the ones needed to pair a seed against a wire step: the anchored latency, the
+        // snapshot age (the term that would have to be wrong for the anchor to be wrong), and t=.
+        // age is included because a stale snapshot is the most likely source of the error and it
+        // is deliberately NOT compensated for -- see the note above.
+        //
+        // Compare across boards only for a SIMULTANEOUS event. Recorded landing values say
+        // simultaneous restarts land within +-10 us while a lone restart lands anywhere in
+        // +-130 us, which is exactly what correlated versus uncorrelated pipeline state predicts,
+        // and is the reason this anchor is the suspect.
+        ESP_LOGD(TAG, "SEEDANCHOR latency=%" PRIu32 " age=%" PRId64 " frames=%" PRId64 " t=%" PRId64,
+                 latency.microseconds, (now_us() - latency.as_of_us), in_flight_frames, now_us());
       } else {
         // Log the FALLBACK too. Without this the two cases are indistinguishable in a
         // log -- a silent fallback looks exactly like the feature working, which is
