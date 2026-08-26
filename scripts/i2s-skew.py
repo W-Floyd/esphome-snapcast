@@ -1414,13 +1414,22 @@ def stats_caption(ts, ys):
     return "   ".join(parts)
 
 
-# Pairing tolerance between two boards' report streams. Each runs a ~3.3 s window on its
-# own phase, so half a window is the most that can be demanded without discarding good rows.
+# Pairing tolerance between two boards' report streams. Each runs its window on its own phase,
+# so half a window is the most that can be demanded without discarding good rows. Derived from
+# the observed cadence rather than fixed, because the trim line moved from 3.35 s to 1 s and a
+# constant tuned for the old cadence silently changes meaning at the new one.
 PAIR_WINDOW_S = 1.8
 # A window whose reported AUDIO time falls short of the wall clock since the previous report
 # did not spend that gap playing continuously -- a starvation, a stall, a re-baseline. The
 # integral has no idea what happened in the missing time, so the segment breaks there.
-AUDIO_SHORTFALL_S = 0.5
+#
+# RELATIVE, not absolute. At the old 3.35 s cadence 0.5 s was a 15% tolerance; at the 1 s
+# cadence the same constant is 50%, which would let a 400 ms starvation through unbroken -- and
+# catching exactly that is what makes the fit honest. Expressed as a fraction of the interval
+# with a small absolute floor for scheduling jitter, so it keeps its meaning if the cadence
+# moves again.
+AUDIO_SHORTFALL_FRAC = 0.15
+AUDIO_SHORTFALL_FLOOR_S = 0.05
 # Below this a segment's correlation is noise. The finding's own runs were 92-499 s, i.e.
 # 28-150 windows.
 MIN_FIT_ROWS = 10
@@ -1488,7 +1497,8 @@ def trim_diff(a, b):
             continue
         if prev_t is not None:
             dt = t - prev_t
-            if dt <= 0 or min(audio_a, audio_b) < dt - AUDIO_SHORTFALL_S:
+            slack = max(AUDIO_SHORTFALL_FRAC * dt, AUDIO_SHORTFALL_FLOOR_S)
+            if dt <= 0 or min(audio_a, audio_b) < dt - slack:
                 pending = True
         if pending:
             breaks.append(t)
