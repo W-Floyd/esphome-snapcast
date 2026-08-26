@@ -328,10 +328,36 @@ defect.
       accounting, which makes the audio displacement invisible to every on-device metric
       afterwards. That is a candidate mechanism for planted static offsets that fires far more often
       than seeds do, and it does not depend on the seed hypothesis being right.
-    - **The test, and it reuses what is already built:** point the step detector at the repair
-      timestamps instead of the seed timestamps. If each repair coincides with a wire offset step,
-      the repair path is displacing audio; if not, the 3 s of wrong prediction is being absorbed
-      somewhere. Not yet done.
+    - **ANSWERED, in quiet conditions: the repair DOES displace real audio.** A natural repair on
+      board b, 4 s after a re-lock, with the wire quiet:
+
+          board   t       repaired_us   step_us   floor
+              b   176.2       +20000     +491.3    0.71   STEP
+
+      **+491 µs of permanent wire step against a 0.71 µs floor — 690×.** So the repair path is a
+      confirmed mechanism for planting a static offset, and it is invisible afterwards precisely
+      because the accounting has just been reconciled: every residual reads 0 while the audio sits
+      491 µs from where it belongs. That is ~70× the ~7 µs steady-state floor and well outside the
+      ±130 µs band recorded for events.
+        - **The step is NOT the repaired magnitude** (491 µs against 20 ms), which is expected: the
+          servo had `DRIFT_REPAIR_HOLD_US` = 3 s to act on the wrong prediction before the repair
+          landed, so what survives is whatever it moved in that window, not the split itself.
+        - **n = 1 for quiet repairs.** This event is unambiguous on its own floor, but whether every
+          repair does this, and what sets the size, is not established. Collect more quiet ones —
+          and do NOT inject, since injected starvations put the floor at 162–1291 µs and destroy
+          the measurement.
+    - **Also settled by a NATURAL event: the empty ring precedes everything.** The 11:57:40 burst on
+      board b, at chunk resolution:
+
+          RSYNC[0] err= 99748 ring=26 drops=0    <- ring already empty, before any discard
+          RSYNC[1] err= 73627 ring=26 drops=1    <- one drop closed 26121 us = exactly one chunk
+          RSYNC[2] err= 97504 ring=26 drops=2    <- then it grows
+          RSYNC[7] err=853062 ring=26 drops=7
+
+      The ring is at 26 ms at chunk ZERO, and the first discard closes exactly one chunk (1:1, as
+      designed). So discarding works and is the recovery; the error runs away because with the ring
+      empty there is nothing left to discard. Confirms the injected-burst finding on a natural
+      event, and puts the remaining question squarely on the SUPPLY: why does the ring empty?
     - **`SEEDDRAIN` reads err ≈ −7 ms when playback is continuous** (−6778 and −7383 µs on
       `frames` 11801 and 10336 — consistent), which is a *different and smaller* quantity than the
       51.7 ms split. Both are real; do not conflate them.
