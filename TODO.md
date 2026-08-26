@@ -55,11 +55,28 @@ is now the largest error in the chain by an order of magnitude.
   (3.15 µs/ppm) → median. Loop gain `0.25 × 3.15 = 0.79`, just under unity, which is why the wire
   shows a smooth ~20 s oscillation rather than white noise, and why lowering KP helps more than its
   own factor.
-  **The fix is not to smooth it.** Smoothing scales the bias with `c`, so it makes this worse — as
-  the offset filter did before it was fed forward. The bias is a known deterministic function of
-  values the client already holds: `rate_lock_->applied_ppm()` plus the learned crystal baseline
-  give δ with no new measurement noise, so subtract `c · 50000 · δ` from the prediction and the
-  loop gain goes with it. Same shape as the fix that removed the offset filter's lag.
+  **Smoothing it is the wrong fix** — smoothing scales the bias with `c`, so it makes this worse,
+  as the offset filter did before it was fed forward. Subtracting the bias is right in principle,
+  and TWO WAYS OF DOING IT HAVE BEEN TRIED AND FAILED. Both failures are about the reference the
+  trim is measured against, not about the mechanism:
+    - **Deviation from a slow mean of the applied trim (tried, made it much worse).** The mean
+      carries the ACQUISITION transient: the trim rails to hundreds of ppm while acquiring, and at
+      a 110 s time constant the mean sat at +611 to +748 ppm for minutes, pinning the deviation at
+      its ±50 ppm clamp and injecting a constant ~45 µs of prediction bias that then decayed
+      slowly. The servo chased it: medians of 250–460 µs and a +3.1 ppm residual rate difference,
+      with the wire ramping past +540 µs and still climbing 40 s later.
+    - **Seeding the mean at convergence does not fix that**, because the trim still travels from
+      several hundred ppm down to ~50 ppm AFTER converging, and that settling occupies the same
+      10–40 s band as the oscillation the mean has to preserve. No time constant separates them.
+    - **Using the applied trim absolutely** removes the wander but introduces a STATIC differential
+      of 3.15 µs/ppm × the boards' ~5 ppm crystal difference ≈ 16 µs, because the residual is then
+      `3.15 × crystal_i`, a per-board constant the servo cannot absorb.
+  What would work is a reference that is neither the trim nor an average of it: δ is the achieved
+  rate against nominal, and it is measurable on-device as frames-played against SERVER time (the
+  shared timebase already provides the conversion). That is the same shape as the offset filter's
+  feed-forward — a directly measured rate rather than one inferred from the control output — and it
+  is the next thing to try. Alternatively, make the comparison frames-based rather than
+  time-based, which removes the nominal-rate assumption the bias comes from at its root.
   A previous note here claimed the opposite -- that the pivot cancels between devices, on the
   strength of the 0.018 ppm MEAN differential rate. Wrong quantity: the mean says the rates agree
   over 30 s, the sd says they do not at any instant, and it is the instantaneous value the pivot
