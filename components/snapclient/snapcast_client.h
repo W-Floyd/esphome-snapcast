@@ -365,14 +365,6 @@ class SnapcastClient {
     // letting it random-walk inside a deadband -- a free-walking deadband is exactly
     // what wanders the stereo image between two paired devices.
     int8_t steer_dir{0};
-    // Late-hard-resync discard budget, per episode. Dropping a chunk buys exactly one
-    // chunk of deadline, so closing L us of REAL lateness costs ~L us of audio. Once more
-    // than that has been discarded without the error closing, the error is not lateness --
-    // it is a bad prediction or a bad deadline -- and discarding cannot fix it while it
-    // empties the ring. Both are zero when no episode is open.
-    int64_t resync_discard_us{0};
-    int64_t resync_budget_us{0};
-    int64_t resync_giveup_log_us{0};
 #ifdef USE_I2S_RATE_LOCK
     // Rate lock: once converged, steady-state corrections become hardware clock trims
     // instead of frame splices. The PI integrator (positive = play faster) persists

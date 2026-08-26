@@ -2014,23 +2014,6 @@ void SnapcastClient::player_task_() {
         1000;
     this->check_stale_bailout_(st, error_us, stale_us);
 
-    // How much audio one discard buys, and whether the late path may still spend it. See
-    // the budget note at the late path itself. Decided HERE, before the storm accounting,
-    // because a refused resync must not be counted: counting it would mute on the very
-    // spike the budget exists to absorb, re-creating the outage by another route.
-    const int64_t chunk_us = static_cast<int64_t>(frames) * 1000000 / rec.params.sample_rate;
-    if (error_us <= hard_us) {
-      // Back in band (or early): the episode is over.
-      st.resync_discard_us = 0;
-      st.resync_budget_us = 0;
-    } else if (st.resync_budget_us == 0) {
-      // Opening an episode. Budget = the lateness that opened it, plus one threshold of
-      // slack for the error growing while we work through it.
-      st.resync_budget_us = error_us + hard_us;
-    }
-    const bool discard_ok =
-        error_us > hard_us && st.resync_discard_us + chunk_us <= st.resync_budget_us;
-
     // Decide ONCE, for both directions, whether this excursion should mute. Muting is
     // for storms; a lone splice is cheaper than a re-lock. Magnitude still overrides
     // the count: both devices once logged a simultaneous 24888016 ms error (a ~6.9 h
@@ -2038,22 +2021,22 @@ void SnapcastClient::player_task_() {
     // far outside the server's buffer is meaningless -- so anything past bufferMs
     // mutes on the spot, and the bailout above reconnects if it persists.
     bool mute_now = false;
-    // The implausible-deadline latch is about the DEADLINE, not about our response to it,
-    // so it is tested on the raw magnitude whether or not we act on the resync below.
-    if (std::abs(error_us) > stale_us) {
-      st.deadline_implausible = true;
-    }
-    if (std::abs(error_us) > hard_us && (error_us < 0 || discard_ok)) {
+    if (std::abs(error_us) > hard_us) {
       if (now_us() - st.storm_window_us > RESYNC_STORM_WINDOW_US) {
         st.storm_window_us = now_us();
         st.storm_resyncs = 0;
       }
       st.storm_resyncs++;
-      // Past the server's own bufferMs the DEADLINE is wrong, not our clock, and it is wrong
-      // for the whole group at once -- measured on a pause/resume as a 2111 ms and a 2091 ms
-      // excursion on two devices within 3 ms of each other. The latch itself is set above,
-      // on the raw magnitude, so it survives a refused resync.
       mute_now = st.storm_resyncs >= RESYNC_STORM_COUNT || std::abs(error_us) > stale_us;
+      if (std::abs(error_us) > stale_us) {
+        // Past the server's own bufferMs the DEADLINE is wrong, not our clock, and it is wrong
+        // for the whole group at once -- measured on a pause/resume as a 2111 ms and a 2091 ms
+        // excursion on two devices within 3 ms of each other. Latch it: the splice absorbs the
+        // error within a window or two, so an instantaneous test stops being true long before
+        // the re-lock finishes, and a leader in that gap demotes for something that was never
+        // its fault. Cleared on convergence, below.
+        st.deadline_implausible = true;
+      }
       if (st.converged && !mute_now && st.storm_resyncs == 1) {
         // INFO because it IS audible -- a skip of roughly this length. Logged only for
         // the first of a window so a storm cannot flood the link on its way to muting.
@@ -2066,39 +2049,13 @@ void SnapcastClient::player_task_() {
     // log traffic competes with the audio stream on the already-congested link — a
     // feedback loop that prolongs the outage. The periodic sync report carries the
     // full per-window count either way.
-    if (error_us > hard_us && !discard_ok) {
-      // BUDGET SPENT. Dropping a chunk buys exactly one chunk of deadline, so closing L us
-      // of real lateness costs ~L us of audio. More than that has now gone without the
-      // error closing, which means the error is NOT lateness -- a bad prediction or a bad
-      // deadline reads exactly the same here, and neither is fixed by discarding, because
-      // every following chunk reports the same excess.
-      //
-      // Unbounded, this drained the whole ring: measured on hardware, a 50 ms reading took
-      // the ring from 1724 ms to 26 ms in under a second, left the DMA at queued=0 /
-      // inflight=0 / written==completed, and cost 37 resyncs, a starvation re-baseline and
-      // 22 s muted -- from a momentary trigger. The response was the outage, not the event.
-      // (The prediction then gets WORSE as the pipeline empties, since the playout feedback
-      // the pivot smooths stops arriving: positive feedback into the drain.)
-      //
-      // So play it late instead. A bounded lateness is audible once; an emptied ring is a
-      // re-lock. The aggressive soft-correction band below closes a residual of this size
-      // over a few seconds, and check_stale_bailout_ still reconnects a backlog that really
-      // cannot be caught up.
-      if (now_us() - st.resync_giveup_log_us >= RESYNC_LOG_INTERVAL_US) {
-        st.resync_giveup_log_us = now_us();
-        ESP_LOGW(TAG,
-                 "Hard resync: discarded %" PRId64 " ms without closing a %" PRId64
-                 " ms error -- not lateness, playing on (throttled log)",
-                 st.resync_discard_us / 1000, error_us / 1000);
-      }
-    } else if (error_us > hard_us) {
+    if (error_us > hard_us) {
       // Hard resync, late: drop whole chunks until we catch back up
       if (now_us() - st.last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
         st.last_resync_log_us = now_us();
         ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunks (throttled log)", error_us / 1000);
       }
       st.hard_resyncs++;
-      st.resync_discard_us += chunk_us;
       st.err_window_filled = 0;
       st.steer_dir = 0;
       // INFO on the true->false edge: this is the moment audio goes silent, and it
