@@ -154,7 +154,28 @@ static constexpr int64_t TMS_SNAP_US = 20000;
 // 1/64 over per-chunk calls (~26 ms) is a ~1.7 s time constant, cutting uncorrelated
 // read noise by ~8x. Nearly free in lag terms: the mapping is drift-compensated, so the
 // filtered quantity is near-constant rather than a moving signal.
-static constexpr double OFFSET_EWMA_ALPHA = 1.0 / 64.0;
+// 1/64 -> 1/256. Per-chunk calls (~26 ms) make this a ~6.7 s time constant, cutting the
+// uncorrelated TSF read noise by ~16x rather than ~8x.
+//
+// This is the one disturbance that does NOT cancel between devices. The shared mapping makes
+// the offset ESTIMATE common-mode, but each device re-reads the TSF on every call and that read
+// noise is its own -- so it lands differentially in the deadline, which is exactly the quantity
+// stereo imaging cares about. Measured tonight against a logic analyser, with everything else
+// tightened: common-mode disturbance MAD 122 us against a differential of MAD 12 us, and a wire
+// floor of 31.5 us peak-to-peak. The differential is what is left to remove.
+//
+// The cost is tracking lag, and it is affordable BECAUSE it is common-mode. What the filter has
+// to follow is the local-versus-server crystal difference, measured here at -48 to -52 ppm, so a
+// 6.7 s constant lags by ~340 us. Both devices share the same server clock and lag identically,
+// so that is 340 us of absolute latency and 0 us of inter-device skew. Room-to-room and
+// lip-sync would notice; a stereo pair would not.
+//
+// Cheap in lag terms for a second reason: the published mapping carries drift_ppm and
+// evaluate_mapping_ extrapolates with it, so the filtered quantity is already drift-compensated
+// and near-constant. The 340 us above is the residual the compensation does not remove.
+//
+// If absolute latency ever matters more than imaging, this is the first constant to put back.
+static constexpr double OFFSET_EWMA_ALPHA = 1.0 / 256.0;
 // Above this, the raw sample is a real re-anchor (leader change, reconnect), not slew or
 // noise: the published mapping moves at most TMS_SLEW_CATCHUP_US_PER_S, and read
 // noise is bounded by the sandwich. Snap instead of smearing it in over ~0.8 s.

@@ -1806,6 +1806,19 @@ void SnapcastClient::player_task_() {
     }
 
     const int64_t deadline = this->chunk_deadline_us_(rec);
+    {
+      // See dl_off_* in ServoState: isolates the timebase's contribution to the error so it can be
+      // told apart from the prediction's.
+      const int64_t dl_off = deadline - rec.server_ts_us;
+      if (!st.dl_off_valid) {
+        st.dl_off_valid = true;
+        st.dl_off_min_us = st.dl_off_max_us = dl_off;
+      } else {
+        st.dl_off_min_us = std::min(st.dl_off_min_us, dl_off);
+        st.dl_off_max_us = std::max(st.dl_off_max_us, dl_off);
+      }
+      st.dl_off_last_us = dl_off;
+    }
     const int64_t hard_us = static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000;
     const uint32_t frames = rec.bytes / frame_bytes;
     const int64_t predicted = this->predict_next_play_us_(rec.params.sample_rate);
@@ -2755,14 +2768,22 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         st.drift_excess_since_us = 0;
       }
 
+      char dl_str[64] = "";
+      if (st.dl_off_valid) {
+        // Span only. The absolute value carries this device's local epoch (deadline is local time,
+        // server_ts is server time), so it is not comparable between devices and not interesting on
+        // one -- and the report has a length limit that truncated trim and tsf when it was included.
+        snprintf(dl_str, sizeof(dl_str), ", tbspan %" PRId64, st.dl_off_max_us - st.dl_off_min_us);
+        st.dl_off_valid = false;
+      }
       char drift_str[96] = "";
       if (st.drift_samples > 0) {
         // Median over the window: the spikes are rare and fixed-size, so a median rejects them
         // where a mean carries them in at spike/n.
-        snprintf(drift_str, sizeof(drift_str),
-                 ", split med %+" PRId32 " mean %+" PRId64 " (%+" PRId32 "..%+" PRId32 ", n=%" PRIu32 ")",
-                 drift_med_us, st.drift_accum_us / static_cast<int64_t>(st.drift_samples), st.drift_min_us,
-                 st.drift_max_us, st.drift_samples);
+        // Median plus range. The mean was dropped for line length: the range already exposes the
+        // spikes the median is rejecting, which is what it was there to show.
+        snprintf(drift_str, sizeof(drift_str), ", split %+" PRId32 " (%+" PRId32 "..%+" PRId32 ")", drift_med_us,
+                 st.drift_min_us, st.drift_max_us);
       }
       st.drift_accum_us = 0;
       st.drift_samples = 0;
@@ -2906,11 +2927,11 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, feedback %" PRId64
-               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s%s%s over %" PRIu32
+               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s%s%s%s over %" PRIu32
                " chunks",
                st.err_accum_us / st.err_count, st.err_peak_us, median_err_us, st.soft_dropped_frames, st.soft_inserted_frames,
                st.hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, drift_str,
-               trim_str, tsf_str, st.err_count);
+               dl_str, trim_str, tsf_str, st.err_count);
       st.err_accum_us = 0;
       st.err_peak_us = 0;
       st.err_count = 0;

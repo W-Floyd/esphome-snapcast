@@ -433,6 +433,18 @@ class SnapcastClient {
     // useless until it became a window mean, and it is why the repair needs a 10 s hold to
     // see through it. Accumulate min/max/mean so the wave can be characterised before
     // deciding whether the mean is a fit input for the repair.
+    // Timebase contribution to the error, isolated. The median error is predicted - deadline, and
+    // a +-500 us COMMON-MODE swing (both boards together) is what drives the differential residue
+    // that lands on the wire. Which of the two terms moves decides the fix entirely: a wandering
+    // shared offset needs smoothing in clock_sync, a wandering prediction needs the feedback pivot.
+    //
+    // deadline = server_ts + buffer - shared_offset, and buffer is constant, so (deadline -
+    // server_ts) isolates the timebase term exactly. Tracked as a spread across the report window:
+    // steady means the timebase is innocent and the pivot is the source.
+    int64_t dl_off_min_us{0};
+    int64_t dl_off_max_us{0};
+    int64_t dl_off_last_us{0};
+    bool dl_off_valid{false};
     // A MEDIAN, not a mean. The wave this was built to average through turned out not to be a
     // wave: measured, 31 samples of a window read ~0 and one reads a fixed large negative spike,
     // so the means came out quantised in exact multiples of spike/32 (-1320, -2640, -3960 for
