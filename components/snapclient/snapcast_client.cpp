@@ -209,6 +209,38 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // gain is the multiplier turning that noise into audible inter-device skew.
 static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
 static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.25f;
+// DECAY between them, keyed on TIME SINCE THE LAST DISTURBANCE EVENT rather than on a single step
+// at convergence. See trim_kp_() for the schedule and mark_kp_event_() for what counts as an event.
+//
+// Why a schedule at all: KP trades three things, not two. High gain nulls a disturbance fast, which
+// both shortens recovery AND shrinks the offset the recovery leaves behind -- the wire offset is
+// the integral of the differential rate, so the planted offset is set by how long the integral runs
+// before the servo nulls it. Low gain is what keeps steady-state differential noise small, and that
+// noise is audible skew. A fixed value has to pick one; that is why 0.1 lost (tau 80 s, landed
+// -155 us) and why 0.25 is a compromise rather than a choice.
+//
+// Why THIS schedule and not the two that failed: both earlier attempts scheduled the gain on the
+// error, which is the variable the gain controls -- the loop trails a ramp by rate/KP, so raising
+// KP shrinks the very quantity the schedule reads, and it limit-cycles structurally. A timer since
+// a discrete event has no path from the gain back to the scheduling input; it is open-loop in the
+// error by construction, which is the only property that makes a schedule safe here.
+//
+// The residual feedback path, stated so it can be checked rather than assumed: a hard resync IS an
+// event, and resyncs are triggered by error. But that trigger is 50 ms against a steady-state error
+// of single-digit us -- four orders of magnitude of separation -- and the measured triggers are
+// supply outages, not gain. If resyncs ever start firing at a rate that tracks KP, this schedule is
+// the first suspect.
+//
+// TAU = 20 s: recovery at 0.25 measures tau ~14 s and ~54 s to settle, so the gain must stay high
+// across the fine settling that follows an unmute and be back at RUN before the next quiet window
+// is graded. Three tau (60 s) covers it. Endpoints are DELIBERATELY UNCHANGED from the fixed
+// switch, so the first measurement grades the schedule alone; lowering the RUN endpoint toward 0.1
+// is the follow-up the schedule is supposed to make affordable, and it is a separate change with
+// its own measurement.
+static constexpr float TRIM_KP_DECAY_TAU_S = 20.0f;
+// Past this age the decay is inside 5% of RUN, so it is snapped there -- both to keep the gain
+// exactly comparable to the old fixed value in steady state and to skip the expf on every chunk.
+static constexpr float TRIM_KP_DECAY_SPAN_S = 3.0f * TRIM_KP_DECAY_TAU_S;
 // TRIED AT 0.1 AND REVERTED. The loop-gain argument for lowering it is still sound -- the loop is
 // median -> trim (KP) -> achieved rate -> pivot bias (3.15 us/ppm) -> median, so its gain is
 // KP * 3.15, and 0.79 at 0.25 against 0.32 at 0.1 removes a 1/(1-G) ~ 4.8x amplification on top of
@@ -1765,6 +1797,10 @@ void SnapcastClient::player_task_() {
 #ifdef USE_I2S_RATE_LOCK
   st.rate_lock_ok = this->rate_lock_ != nullptr;
 #endif
+  // A boot is a disturbance like any other, and the largest one measured: the re-baseline anchor
+  // starts a power cycle ~620 us out. Stamped here rather than left at 0 so the first convergence
+  // hands off to a decaying gain instead of dropping straight to RUN.
+  this->mark_kp_event_(st, "boot");
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
@@ -2116,6 +2152,20 @@ void SnapcastClient::player_task_() {
     // skips dbg_early_recon_ entirely and a storm currently leaves no chunk-resolution trace at
     // all. ring= is here because the other open question is whether the ring drains because the
     // client is behind or because the correction is draining it.
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+    // A LEADERSHIP CHANGE swaps the timebase the deadline is computed against, so whatever the
+    // servo had converged to is now measured against a different clock. Checked per chunk (an
+    // atomic load) rather than at report cadence, because a 3.3 s delay would spend most of the
+    // decay before the schedule noticed the event.
+    if (this->tsf_sync_ != nullptr) {
+      const int8_t role_now = static_cast<int8_t>(this->tsf_sync_->role());
+      if (st.kp_last_role >= 0 && role_now != st.kp_last_role) {
+        this->mark_kp_event_(st, "role change");
+      }
+      st.kp_last_role = role_now;
+    }
+#endif
+
     // Ring level in ms of audio. Computed every chunk now, because the pre-trigger history
     // below needs it on chunks where nothing is being logged at all.
     const uint32_t ring_ms =
@@ -2159,6 +2209,10 @@ void SnapcastClient::player_task_() {
         ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms late, dropping chunks (throttled log)", error_us / 1000);
       }
       st.hard_resyncs++;
+      // Re-arm the gain schedule: this is the disturbance the fast gain exists for, and the point
+      // where nulling quickly is worth the noise it costs. Marked on EVERY resync of a storm, not
+      // just the first -- the decay should run from the last one, not the first.
+      this->mark_kp_event_(st, "hard resync (late)");
       st.err_window_filled = 0;
       st.steer_dir = 0;
       // INFO on the true->false edge: this is the moment audio goes silent, and it
@@ -2187,6 +2241,7 @@ void SnapcastClient::player_task_() {
         ESP_LOGD(TAG, "Hard resync: %" PRId64 " ms early, inserting silence (throttled log)", -error_us / 1000);
       }
       st.hard_resyncs++;
+      this->mark_kp_event_(st, "hard resync (early)");
       st.err_window_filled = 0;
       st.steer_dir = 0;
       if (st.converged && mute_now) {
@@ -2248,8 +2303,10 @@ void SnapcastClient::player_task_() {
         // hysteresis (limit-cycled), and a one-way latch on sustained smallness (did not
         // cycle, but was history-dependent, did not address the starvation-recovery case it
         // was justified by, and existed only to correct the error let through by a widened
-        // unmute gate that should not have been widened). Keep this switch boring.
-        const float kp = st.converged ? TRIM_KP_RUN_PPM_PER_US : TRIM_KP_ACQUIRE_PPM_PER_US;
+        // unmute gate that should not have been widened). The schedule that replaced the step
+        // keeps that rule: it reads a TIMER SINCE A DISCRETE EVENT, never the error.
+        const float kp = this->trim_kp_(st);
+        st.kp_active = kp;
         // Bumpless transfer. The gains differ 5x, so switching would step the output by
         // (kp_hi - kp_lo) * error. At the schedule threshold that is 0.4 * 300 = 120 ppm --
         // a real rate step on one board, applied while unmuted, which is precisely the
@@ -2444,9 +2501,14 @@ void SnapcastClient::player_task_() {
         st.trim_log_us = now_us();
         const float covered_pct = 100.0f * st.trim_covered_s / st.trim_window_s;
         if (st.trim_covered_s > 0.0f) {
-          ESP_LOGD(TAG, "Trim window: mean %+.3f ppm over %.2f s audio (covered %.0f%%) t=%" PRId64,
+          // kp is on this line because the gain is now a CONTINUOUS quantity, and an invisible
+          // one reads as "the schedule did nothing" exactly the way the trim snapshot once read
+          // "(idle)" for a loop steering by tens of ppm. Appended at the END so the existing
+          // parser keeps matching. Not the mean over the window -- the value last APPLIED, which
+          // is what the trim beside it was produced with.
+          ESP_LOGD(TAG, "Trim window: mean %+.3f ppm over %.2f s audio (covered %.0f%%) t=%" PRId64 " kp=%.3f",
                    static_cast<float>(st.trim_integral_ppm_s / static_cast<double>(st.trim_covered_s)),
-                   st.trim_window_s, covered_pct, now_us());
+                   st.trim_window_s, covered_pct, now_us(), st.kp_active);
         } else {
           ESP_LOGD(TAG, "Trim window: no trim programmed over %.2f s audio t=%" PRId64, st.trim_window_s,
                    now_us());
@@ -2887,9 +2949,40 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
         this->rate_lock_->invalidate_baseline();
       }
   #endif
+      // The seed moves the accounting under the servo, which is exactly the "measured wrong, then
+      // corrected" shape the fast gain is for.
+      this->mark_kp_event_(st, "re-baseline");
       ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
       this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
     }
+}
+
+// THREAD CONTEXT: player task. The gain schedule; see TRIM_KP_DECAY_TAU_S for the argument.
+float SnapcastClient::trim_kp_(const ServoState &st) const {
+  if (!st.converged) {
+    // Muted acquisition is unchanged: nothing is audible, and the error must be nulled fast enough
+    // to satisfy the unmute gate. The schedule only governs what happens AFTER the handoff.
+    return TRIM_KP_ACQUIRE_PPM_PER_US;
+  }
+  const float age_s = static_cast<float>(now_us() - st.kp_event_us) / 1000000.0f;
+  if (!(age_s < TRIM_KP_DECAY_SPAN_S)) {
+    return TRIM_KP_RUN_PPM_PER_US;  // also the path for a never-set (0) event stamp
+  }
+  return TRIM_KP_RUN_PPM_PER_US +
+         (TRIM_KP_ACQUIRE_PPM_PER_US - TRIM_KP_RUN_PPM_PER_US) * std::exp(-age_s / TRIM_KP_DECAY_TAU_S);
+}
+
+void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
+  const int64_t now = now_us();
+  // Logged only when the schedule was actually near RUN, i.e. when this re-arm is a real change
+  // of regime rather than the tenth chunk of one storm. Without the throttle a storm emits one
+  // line per chunk on a link that is usually the thing that caused the storm.
+  if (now - st.kp_event_log_us >= static_cast<int64_t>(TRIM_KP_DECAY_TAU_S * 1000000.0f)) {
+    st.kp_event_log_us = now;
+    ESP_LOGD(TAG, "KP re-armed to %.2f (%s), decaying to %.2f over %.0f s t=%" PRId64,
+             TRIM_KP_ACQUIRE_PPM_PER_US, why, TRIM_KP_RUN_PPM_PER_US, TRIM_KP_DECAY_SPAN_S, now);
+  }
+  st.kp_event_us = now;
 }
 
 // PRE-TRIGGER HISTORY for the resync trace. THREAD CONTEXT: player task, all three.
@@ -3293,6 +3386,10 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                      "Accounting split repaired: accounted queue ran %+" PRId32 " us against measured latency "
                      "for %" PRId64 " s; playback was that far %s",
                      drift_for_repair, DRIFT_REPAIR_HOLD_US / 1000000, drift_for_repair > 0 ? "early" : "late");
+            // The repair steps the accounting, so the median error the PI sees is about to move by
+            // the size of the split. Nulling that fast is what limits how long the displacement
+            // integrates -- and the repair's displacement is the largest single term measured.
+            this->mark_kp_event_(st, "split repair");
             st.drift_excess_since_us = 0;
           }
         }

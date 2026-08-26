@@ -491,6 +491,22 @@ class SnapcastClient {
     uint16_t resync_trace_idx{0};
     int64_t resync_trace_arm_us{0};
     uint32_t resync_drops{0};
+    // Gain schedule: the instant of the last DISTURBANCE EVENT, from which KP decays ACQUIRE ->
+    // RUN. Not the instant of the last error -- see TRIM_KP_DECAY_TAU_S for why that distinction
+    // is the whole safety argument. Set to the player task's start so a boot counts as an event.
+    int64_t kp_event_us{0};
+    // Instant of the last event that was LOGGED, so a resync storm re-arms the schedule on every
+    // chunk (which is correct) without logging on every chunk (which is not).
+    int64_t kp_event_log_us{0};
+    // What the schedule last handed the PI, for the report. Carried rather than recomputed because
+    // the report runs on a different chunk from the PI and would otherwise print a gain that was
+    // never applied.
+    float kp_active{0.0f};
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+    // Last observed TSF role, for detecting a leadership change. -1 = not yet observed, so the
+    // first chunk records the role rather than reporting a change that never happened.
+    int8_t kp_last_role{-1};
+#endif
     // PRE-TRIGGER history cursors for that trace. The burst above is armed BY the threshold
     // crossing, so its first line already shows the ring empty and it structurally cannot show
     // the emptying. These carry the rolling window of the chunks BEFORE the arm; the samples
@@ -694,6 +710,13 @@ class SnapcastClient {
   int64_t chunk_deadline_us_(const ChunkRecord &rec);
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
+
+  /// The PI's proportional gain for this chunk: ACQUIRE while unconverged, otherwise decaying
+  /// ACQUIRE -> RUN with time since the last disturbance event. Open-loop in the error by
+  /// construction; see TRIM_KP_DECAY_TAU_S.
+  float trim_kp_(const ServoState &st) const;
+  /// Re-arms that decay. @p why is logged, throttled, so a schedule change is never invisible.
+  void mark_kp_event_(ServoState &st, const char *why);
 
   /// Appends one chunk to the resync trace's rolling pre-trigger history. Called on EVERY chunk
   /// the servo sees; a no-op while a dump is replaying. Costs five stores.
