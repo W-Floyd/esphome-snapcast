@@ -206,11 +206,21 @@ defect.
   0.018 ppm MEAN differential rate where the pivot multiplies the instantaneous value.
   **Surviving direction:** avoid the extrapolation entirely — compare in FRAMES rather than time,
   which removes the nominal-rate assumption the bias comes from at its root.
-- **`TRIM_KP_RUN` is now 0.1, COMMITTED BUT UNMEASURED.** KP multiplies the differential median, and
-  that input fell 6× across this work (sd 43.0 → 7.1 µs; differential trim sd 20.9 → 1.78 ppm).
-  Straight linear scaling says 0.1 buys only 2–3 µs and costs 3.6× on reboot recovery
-  (42 s → 150 s) — but the loop gain above is `KP × 3.15`, so 0.1 takes it from 0.79 to 0.32 and
-  removes the 1/(1−G) ≈ 4.8× amplification as well.
+- **`TRIM_KP_RUN` stays at 0.25. 0.1 was tried, measured, and REVERTED.** The loop-gain argument
+  for lowering it is still sound — gain is `KP × 3.15`, so 0.79 against 0.32, removing a
+  1/(1−G) ≈ 4.8× amplification on top of the linear factor. The cost side was underpriced.
+    - Measured at 0.1 on a recovery: **trough +548 µs, tau 80 s, settled 295 s**, against ~42 s at
+      0.25 and worse than the ~135 s expected.
+    - **The deciding term, which nobody had priced: the offset the recovery LEAVES BEHIND.** It
+      landed at **−155 µs**, outside the ±130 µs band recorded at 0.25.
+    - That follows directly from the finding at the top of this section and should have been
+      predicted. The offset is the integral of the differential rate, so a recovery freezes
+      wherever the integral has reached when the servo nulls the rate. Lower gain nulls it more
+      slowly → the integral runs longer → **the planted offset is larger.** So KP trades
+      steady-state noise against recovery time *and* against the size of the static offset every
+      event leaves — and that last term is the whole problem this work exists to solve.
+    - Revisit only once the anchor stops planting an offset: with little to converge from, the
+      integration window shrinks and this cost goes with it.
     - **Baseline to beat, at KP = 0.25 in steady state over 180 s:** wire offset **sd 6.20 µs**,
       differential achieved rate **sd 1.515 ppm**, on-device differential median **MAD 6.00 µs**.
       The analyser's own rate columns reproduced the offset at corr −0.999 / slope −0.992 /
@@ -258,6 +268,32 @@ defect.
   on it, and subtracting those 1125 frames from `pushed` created the −25488 µs split that a second
   repair answered 14 s later. Neither was needed. `MIX_RESIDUAL_MATCH_US` stops it at the head, and
   is now a regression guard rather than a live defence since the mixer reports `dbg_inflight_us`.
+- **NEXT: is the anchor's per-device `latency` error the source of the planted offset?** This is the
+  root-cause candidate for the whole static-offset problem, and the code already names it: *"the
+  reason a reboot starts 620 us out at all is the re-baseline anchor planting an offset. Fix that
+  and there is little left to converge from, and KP stops mattering."*
+    - Mechanism: the seed sets `pushed = played + latency` from **this device's own** measured
+      pipeline latency. Any per-device error in that latency becomes a PERMANENT phase offset,
+      because the servo then measures against the very prediction it anchored and reads ~0 while
+      the audio sits that far off. Unobservable on-device by construction.
+    - The recorded landing values already fit it: three boards restarted **together** landed at
+      **+0.9 µs**, both together at −5/+7.7/+26 µs, but **board b alone** at +89/+115/−56/+127 µs.
+      Simultaneous restarts have correlated pipeline states so their latency errors cancel; a lone
+      restart's does not.
+    - **The test, now instrumented.** `SEEDANCHOR` logs the anchored latency, the snapshot age and
+      `t=` at each seed; `i2s-skew.py` reports the wire offset step at each seed, extrapolating
+      both sides to the seed instant so a ramp cannot masquerade as a step. Two outcomes, wanting
+      different fixes: a **step** means the anchor plants it; a **ramp with no step** means the
+      servo integrated to a new resting point. Today's recovery ramped (tau 80 s, 94% explained by
+      the rate integral), so this is genuinely open. Compare `step_us` against `latency_ms` across
+      several seeds — the hypothesis predicts they track.
+    - If confirmed, the fix needs a group reference that does not consume the accounting, and the
+      obvious candidate is blocked: `render_phase_us` is *supposed* to be it but is measured blind
+      (−15.5 ±8.5 µs against +85 µs on the wire, wrong sign, ~12σ) because it consumes
+      `(pushed − played)` — the same term the bad anchor corrupts. The enabling change would be to
+      carry each chunk's server timestamp through to the playout feedback, so the played frame's
+      server time is known directly rather than derived from `pushed`. Validate any such rework
+      against the analyser BEFORE steering on it; the current one failed exactly that check.
 - **The re-baseline anchor plants a fixed offset, reproducibly, and can be studied on demand.** Fire
   `inject_starvation(ms)` (API action in `snapclient-base.yaml`; four lines of `aioesphomeapi`,
   plaintext API, no noise PSK) and the seed arms an 80-chunk `EARLY[n] seed` burst at ~26 ms.
