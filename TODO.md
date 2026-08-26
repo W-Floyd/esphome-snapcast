@@ -297,6 +297,37 @@ defect.
       On reflection the design was wrong from the start: the planted offset should be the *error*
       in `latency`, and a near-constant `latency` says nothing about its error. **A future test
       needs an independent estimate of that error, not the value.**
+    - **THE MECHANISM, measured end to end, and it identifies the −52 ms spike.** `SEEDDRAIN` now
+      measures the anchor's error on-device: the seed asserts the resident audio takes `latency` µs
+      to drain, and the playout feedback (ground truth from the speaker callback, no `pushed` in the
+      path) says how long it really took. Then the RECON line and the repair complete the chain:
+
+          11:48:29  SEEDANCHOR latency=234399 age=25146 frames=10336
+          11:48:29  SEEDDRAIN  anchored=234399 actual=227016 err=-7383
+          11:48:31  RECON drift=-51747   held steady
+          11:48:34  RECON drift=-51747
+          11:48:37  Accounting split repaired: accounted queue ran -51747 us for 3 s; playback late
+          11:49:01  RECON drift=-1       reconciled
+
+      So the seed leaves the accounting **≈51.7 ms short of measured — one DMA buffer (50 ms)** —
+      the split repair catches it after `DRIFT_REPAIR_HOLD_US` (3 s), and **for those 3 s the servo
+      steers real audio against a prediction 52 ms wrong.** The repair then fixes the ACCOUNTING,
+      but the audio has already moved: that is a concrete mechanism for a planted offset that no
+      on-device metric reports afterwards, because once repaired every residual reads 0.
+    - **This is very likely the "−42/−52 ms split spike"** recorded below as structural and
+      unexplained. It is one DMA buffer, it appears immediately after a seed, and it holds steady
+      for exactly the repair hold time. The note below says every occurrence has `xfer=50000` at its
+      maximum, equal to `dma` — consistent with the anchor treating the DMA span as if it held our
+      frames when it holds padding. Worth confirming that every occurrence of the spike follows a
+      re-baseline.
+    - **`SEEDDRAIN` reads err ≈ −7 ms when playback is continuous** (−6778 and −7383 µs on
+      `frames` 11801 and 10336 — consistent), which is a *different and smaller* quantity than the
+      51.7 ms split. Both are real; do not conflate them.
+    - **Known limitation of `SEEDDRAIN`:** on a dry pipeline (`frames = 2205`, one DMA buffer) it
+      read +844 ms and +1017 ms. That is not anchor error — with the pipeline dry the DAC has
+      nothing, so the resident 50 ms genuinely does not render until refill. The instrument
+      conflates "the anchor was wrong" with "playback was stalled", and only answers the intended
+      question when playback runs continuously through the drain.
     - **Two contaminations to avoid next time.** Injections were spaced 22 s while recovery at
       KP = 0.25 takes ~42 s, so every seed but the first landed mid-recovery from the previous one
       — the "before" level was never settled, and fit-and-extrapolate handles a ramp but not
