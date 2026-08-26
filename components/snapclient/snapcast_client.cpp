@@ -206,10 +206,11 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // Do not "fix" the resulting median by rate-limiting or quantising the trim. Both have
 // been tried and both limit-cycle structurally, for the reason in the paragraph above
 // this one: see the REVERTED note below the KI definition.
-// ACQUIRE runs while muted, where the job is to null the error fast enough that the
-// unmute gate (MEDIAN_WINDOW consecutive chunks inside 2x sync_deadband) can be met, and
-// nothing is audible yet so amplified noise costs nothing. RUN takes over once unmuted,
-// where the differential is the only thing that matters. See the switch in the PI block.
+// Two gains, switched on st.converged (see the PI block). ACQUIRE is the historical value
+// and runs while muted, where the error must be nulled fast enough to meet the unmute gate
+// and nothing is audible so amplified noise costs nothing. RUN takes over once unmuted,
+// where the error is mostly differential measurement noise and the gain is the multiplier
+// turning that noise into audible inter-device skew.
 static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
 static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.1f;
 // Authority is derived from the ACQUIRE gain deliberately: the clamp exists so the PI can
@@ -656,7 +657,27 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
   // tracks the stall truthfully and accounting stays exact through recovery.
   const int64_t available_frames = this->pushed_frames_total_ - this->played_frames_total_;
   if (static_cast<int64_t>(frames) > available_frames) {
-    if (available_frames <= 0 && frames > 0 && !this->starved_latched_) {
+    // A re-baseline must not be re-triggered by its OWN aftermath. The seed sets played to 0 and
+    // pushed to the measured in-flight audio, but the sink goes on crediting frames it played from
+    // BEFORE the reset, and those are not in the seed. They drain the accounted queue to zero, and
+    // `available <= 0` is exactly the condition that arms this latch -- so the recovery re-arms it,
+    // a second re-baseline fires, and by then the pipeline has REFILLED, so it anchors to a full
+    // one. The latch's own hysteresis does not help: starved_latched_ clears on the first credit
+    // that fits, which the early post-seed credits do.
+    //
+    // Measured on hardware, and this is the whole 8.5 ms bug: seed 3705 frames (84 ms) at
+    // 19:21:00.7; 3526 frames discarded across 9 clamp events; second re-baseline at 19:21:02.9
+    // anchoring to 253 ms (own=253741, debt=0 -- entirely real audio, nothing drained about it).
+    // The accounting was then permanently 8526 us adrift -- `drift=-8526` on every RECON line for
+    // the next two minutes -- while the servo reported clean medians and steered real audio to that
+    // wrong target. On a logic analyser the pair sat 8.51 ms apart, sd 22 us: a pure static offset.
+    //
+    // Suppressing for twice the measured latency covers the drain of the pre-reset audio, which is
+    // what that latency measures. Masking a genuine second starvation inside the window is the
+    // intended trade: a starvation arriving that soon is part of the same event, and re-baselining
+    // again is precisely the cascade being prevented.
+    const bool starve_suppressed = timestamp_us < this->starve_suppress_until_us_.load(std::memory_order_relaxed);
+    if (available_frames <= 0 && frames > 0 && !this->starved_latched_ && !starve_suppressed) {
       // Complete drain: the framework tears its pipeline down and restarts it with
       // an unpredictable buffer fill level between this feedback point and the DAC
       // -- invisible to the accounting, so playback would settle audibly offset
@@ -2032,27 +2053,50 @@ void SnapcastClient::player_task_() {
       if (st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
         const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
-        // Acquisition and steady state want OPPOSITE gains, so the loop switches.
+        // Acquisition and steady state want OPPOSITE gains, so the loop switches on
+        // st.converged: muted, nothing is audible and the error must be nulled fast enough
+        // to satisfy the unmute gate; unmuted, the differential is all that matters.
         //
-        // Running on the low gain everywhere delayed audio start badly: the unmute gate
-        // needs MEDIAN_WINDOW *consecutive* chunks inside 2x sync_deadband, and the low
-        // gain no longer holds the common-mode error in that band -- measured 54%/57% of
-        // medians in band, so the counter kept resetting and lock took 31-33 s from boot.
-        // The low gain is chosen precisely BECAUSE it stops chasing the common-mode error
-        // (see TRIM_KP_RUN_PPM_PER_US), so it is structurally in tension with a gate that
-        // is defined on that error. Acquisition needs the error nulled fast; steady state
-        // needs the differential noise not amplified. One gain cannot do both.
+        // REVERTED: scheduling the gain on |median error| instead. The motivation was real
+        // -- st.converged cannot see a CONVERGED board recovering from a starvation, which
+        // took minutes on the low gain while the pair separated by ~300 us -- but the cure
+        // was worse. A threshold at 300 us with hysteresis at 150 put a nonlinearity right
+        // where the recovery error lives, and the switching sustained a limit cycle: both
+        // boards oscillated +-300 us with a ~20-25 s period and never settled back under the
+        // lower edge, with the trim stepping (+45.78 -> +122.20 ppm) exactly at the
+        // crossings. Low gain lets the error grow, it crosses, high gain overshoots, repeat.
+        //
+        // Same failure as the reverted slew limit below: a nonlinearity inside the loop at a
+        // threshold the disturbance actually spans. Sizing it from STEADY-STATE spread (sd
+        // ~75 us) was the error -- the case it exists to serve is recovery, which parks the
+        // error on the boundary by definition. Any future attempt needs the threshold placed
+        // from the recovery distribution, and to answer why switching does not simply move
+        // the limit cycle to the new boundary.
+        //
+        // The reverted-to build measured, once fully settled: median +2.01 us, sd 5.73 us,
+        // peak-to-peak inside one frame. The slow starvation recovery is a known, accepted
+        // cost against that.
         const float kp = st.converged ? TRIM_KP_RUN_PPM_PER_US : TRIM_KP_ACQUIRE_PPM_PER_US;
         // Bumpless transfer. The gains differ 5x, so switching would step the output by
-        // (kp_hi - kp_lo) * error -- up to ~100 ppm at the unmute threshold, i.e. a real
-        // rate step on one board at the exact moment it becomes audible, which is the
-        // defect this whole change exists to remove. Move the difference into the
-        // integrator instead so the commanded trim is continuous across the switch.
-        if (st.converged != st.trim_run_gain) {
-          const float from = st.trim_run_gain ? TRIM_KP_RUN_PPM_PER_US : TRIM_KP_ACQUIRE_PPM_PER_US;
-          st.trim_integral_ppm =
-              std::clamp(st.trim_integral_ppm + (from - kp) * static_cast<float>(median_err_us), -clamp_ppm, clamp_ppm);
-          st.trim_run_gain = st.converged;
+        // (kp_hi - kp_lo) * error. At the schedule threshold that is 0.4 * 300 = 120 ppm --
+        // a real rate step on one board, applied while unmuted, which is precisely the
+        // defect this whole line of work exists to remove. Move the difference into the
+        // integrator instead so the COMMANDED TRIM IS CONTINUOUS across the switch: only
+        // its future responsiveness changes, not its present output.
+        //
+        // trim_kp_last starts at 0 meaning "never conditioned", so the first pass only
+        // records the gain -- transferring against a startup error would inject a large
+        // integral term for a switch that never happened.
+        if (st.trim_kp_last != kp) {
+          if (st.trim_kp_last != 0.0f) {
+            st.trim_integral_ppm =
+                std::clamp(st.trim_integral_ppm + (st.trim_kp_last - kp) * static_cast<float>(median_err_us),
+                           -clamp_ppm, clamp_ppm);
+          }
+          // Recorded unconditionally, including on the first pass -- guarding the whole
+          // block on the sentinel would leave it at 0 forever and no switch would ever
+          // transfer.
+          st.trim_kp_last = kp;
         }
         const float p_term = kp * static_cast<float>(median_err_us);
         // Conditional integration (anti-windup): winding the integral while the
@@ -2316,6 +2360,14 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
           (have_fill && have_own && latency.microseconds > own_audio.microseconds)
               ? static_cast<int64_t>(latency.microseconds - own_audio.microseconds) * rec.params.sample_rate / 1000000
               : 0;
+      // Bar this seed's own aftermath from re-arming the latch (see notify_audio_played). The
+      // window is twice the measured latency, which is how long the pre-reset audio downstream can
+      // still be generating credits we did not seed; floored so a near-empty measurement -- the
+      // usual case here, since the pipeline just drained -- still leaves room for the sink's own
+      // in-flight buffer to clear.
+      const int64_t suppress_us =
+          std::max<int64_t>(2 * static_cast<int64_t>(have_fill ? latency.microseconds : 0), 1000000);
+      this->starve_suppress_until_us_.store(now_us() + suppress_us, std::memory_order_relaxed);
       this->playout_mutex_.lock();
       this->playout_valid_ = false;
       this->played_frames_total_ = 0;

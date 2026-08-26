@@ -371,10 +371,12 @@ class SnapcastClient {
     // track what is actually programmed (including the nominal-rate fallback) or the
     // limiter ramps away from a value the clock is not running at.
     float trim_applied_ppm{0.0f};
-    // Which KP the integrator was last conditioned for, so the gain switch can be made
-    // bumpless exactly once per transition rather than every chunk. Starts false to match
-    // st.converged: a fresh servo acquires before it runs.
-    bool trim_run_gain{false};
+    // The KP the integrator was last conditioned for, so the bumpless transfer runs exactly
+    // once per switch rather than every chunk. 0 means "never conditioned": the first pass
+    // must NOT transfer, or it would apply (0 - kp) * error against a startup error that is
+    // large by definition. The gain constants live in the .cpp, so a sentinel is used rather
+    // than duplicating one of them here where it could drift out of step.
+    float trim_kp_last{0.0f};
     bool rate_lock_ok{false};
     uint32_t rate_lock_rate{0};
     // Trim wander over the report window. The trim IS the loop's estimate of the
@@ -650,6 +652,9 @@ class SnapcastClient {
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
   std::atomic<bool> pipeline_starved_{false};
   bool starved_latched_{false};
+  /// Until when a re-baseline's own aftermath is barred from re-arming the starvation latch.
+  /// Written by the player task in rebaseline_after_starvation_, read on the speaker callback.
+  std::atomic<int64_t> starve_suppress_until_us_{0};
   /// TEST HOOK, see inject_starvation(). 0 when not injecting.
   std::atomic<int64_t> starve_until_us_{0};
   // TEMPORARY DIAGNOSTIC: frames the clamp below has silently discarded. A PARTIAL clamp
