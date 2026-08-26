@@ -765,8 +765,7 @@ def tod_to_unix(tod, ref_unix):
 
 
 def write_svg(path, ts, ys, title, ylabel, include_zero=True,
-              xlabel="elapsed (s)", log_axes=False, events=(), panel2=None, stats=None,
-              panel2_label="temperature (\u00b0C)"):
+              xlabel="elapsed (s)", log_axes=False, events=(), panels=(), stats=None):
     """Plot without a plotting dependency -- the rest of scripts/ is stdlib too.
 
     A second panel is drawn only when panel2 has data, so a run without temperature
@@ -775,11 +774,17 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     excursion lines up with a temperature move.
     """
     W, ML, M, MB = 900, 108, 70, 70
-    has2 = bool(panel2) and any(v for v in panel2.values())
-    top_h = 280 if has2 else 280
-    top0, top1 = M, M + top_h
-    bot0, bot1 = (top1 + 62, top1 + 62 + 150) if has2 else (0, 0)
-    H = (bot1 if has2 else top1) + MB
+    # Only panels with something in them take space, so a run without temperature (or
+    # without rate columns, replotting an older CSV) looks exactly as it did before.
+    extra = [(lab, series) for lab, series in panels
+             if series and any(v for v in series.values())]
+    top0, top1 = M, M + 280
+    bands, y = [], top1
+    for _ in extra:
+        y += 62
+        bands.append((y, y + 150))
+        y += 150
+    H = y + MB
 
     pts = [(t, y) for t, y in zip(ts, ys) if math.isfinite(y)]
     if not pts:
@@ -790,9 +795,9 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
         return
     xs = [p[0] for p in pts]
     x0, x1 = min(xs), max(xs)
-    if has2:
-        for series in panel2.values():
-            for x, _ in series:
+    for _, series in extra:
+        for pts_ in series.values():
+            for x, _v in pts_:
                 x0, x1 = min(x0, x), max(x1, x)
     if x1 - x0 < 1e-9:
         x1 = x0 + 1
@@ -848,14 +853,14 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
             o.append(f'<text x="{W/2}" y="{p1+42}" text-anchor="middle" '
                      f'fill="#333">{xlabel}</text>')
 
-    axis(top0, top1, y0, y1, ylabel, py, not has2)
+    axis(top0, top1, y0, y1, ylabel, py, not extra)
     if y0 <= 0 <= y1:
         z = py(0.0)
         o.append(f'<line x1="{ML}" y1="{z:.1f}" x2="{W-40}" y2="{z:.1f}" stroke="#888" '
                  f'stroke-width="1.2" stroke-dasharray="2 3"/>')
         o.append(f'<text x="{W-36}" y="{z+4:.1f}" fill="#888">0</text>')
 
-    bar_bottom = bot1 if has2 else top1
+    bar_bottom = bands[-1][1] if bands else top1
     colours = {"corrected": "#d9534f", "resync": "#8e44ad", "trim": "#e0a800",
                "sync": "#1a7f37", "pipeline": "#0969da", "role": "#000000"}
     for i, (ex, kind, label) in enumerate(sorted(events)):
@@ -907,10 +912,42 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     open(path, "w").write("\n".join(o))
 
 
-SCHEMA = "elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,reason"
+SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
+          "fs_a_hz,fs_b_hz,reason")
 
 
 DUMP_SCHEMA = "elapsed_s,skew_ns"
+
+
+def load_rates(path):
+    """(rate_a, rate_b) from a CSV that carries the fs columns; empty if it does not.
+
+    Older files predate those columns, so replotting one simply shows no rate panels
+    rather than failing.
+    """
+    ra, rb = [], []
+    if not os.path.exists(path):
+        return ra, rb
+    cols = None
+    for line in open(path):
+        if line.startswith("elapsed_s"):
+            cols = line.strip().split(",")
+            continue
+        if line[:1] in "#e" or cols is None:
+            continue
+        f = line.strip().split(",")
+        if "fs_a_hz" not in cols or len(f) < len(cols) - 1:
+            return [], []
+        ia, ib, it = cols.index("fs_a_hz"), cols.index("fs_b_hz"), 0
+        try:
+            t = float(f[it])
+            for idx, dst in ((ia, ra), (ib, rb)):
+                v = float(f[idx])
+                if math.isfinite(v) and v > 0:
+                    dst.append((t, v))
+        except (ValueError, IndexError):
+            pass
+    return ra, rb
 
 
 def load_existing(path):
@@ -973,6 +1010,45 @@ def trim_temps(temps, lo, hi):
         if len(keep) >= 2:
             out[name] = keep
     return out
+
+
+def rate_derivative(series, window):
+    """d(rate)/dt in Hz/s, by least squares over a sliding window.
+
+    Differencing consecutive points would be dominated by measurement noise: each rate
+    comes from a regression over one capture, good to ~0.04 Hz, which across a 16.7 ms
+    block is ~2 Hz/s of noise for a quantity that moves far slower. Fitting a slope over
+    a window of points trades time resolution for a derivative that means something.
+    """
+    if len(series) < 3:
+        return []
+    xs = np.array([x for x, _ in series])
+    ys_ = np.array([v for _, v in series])
+    out = []
+    for i in range(len(series)):
+        lo = np.searchsorted(xs, xs[i] - window / 2.0)
+        hi = np.searchsorted(xs, xs[i] + window / 2.0)
+        if hi - lo < 3 or np.ptp(xs[lo:hi]) <= 0:
+            continue
+        out.append((float(xs[i]), float(np.polyfit(xs[lo:hi], ys_[lo:hi], 1)[0])))
+    return out
+
+
+def build_panels(args, rate_a, rate_b, temps, lo, hi):
+    """Extra plot panels, in order: temperature, absolute I2S rate, its derivative."""
+    panels = []
+    t2 = trim_temps(temps, lo, hi)
+    if t2:
+        panels.append(("temperature (\u00b0C)", t2))
+    win = lambda ser: [(x, v) for x, v in ser if lo <= x <= hi]
+    ra, rb = win(rate_a), win(rate_b)
+    if ra or rb:
+        panels.append(("I2S frame rate (Hz)", {"a rate": ra, "b rate": rb}))
+        da, db = rate_derivative(ra, args.rate_window), rate_derivative(rb, args.rate_window)
+        if da or db:
+            panels.append((f"d(rate)/dt (Hz/s), {args.rate_window:g}s fit",
+                           {"a d/dt": da, "b d/dt": db}))
+    return panels
 
 
 def stats_caption(ts, ys):
@@ -1199,6 +1275,9 @@ def main():
                    help="cap on the whole-frame ambiguity undone per row (0 = no cap). "
                         "The ambiguity is not small -- it was measured wandering over "
                         "+-10 frames -- so a cap mainly re-breaks the series")
+    p.add_argument("--rate-window", type=float, default=1.0,
+                   help="seconds of points fitted for the d(rate)/dt panel; differencing "
+                        "consecutive rates is pure noise at high row rates")
     p.add_argument("--plot-window", type=float, default=0.0,
                    help="plot only the last N seconds (0 = the whole run). A live chart "
                         "wants a bounded window: the cost of a write grows with the "
@@ -1293,6 +1372,7 @@ def main():
             print(f"   {path}: log covers t={lo:+.1f}..{hi:+.1f} s{miss}")
         for x, kind, label in sorted(ev)[:40]:
             print(f"   t={x:8.2f}s  {kind:9s} {label}")
+        ra0, rb0 = load_rates(args.out)
         t2 = trim_temps(TEMPS, ts0[0] - 1, ts0[-1] + 1)
         if args.annotate and not t2:
             print(f"   no temperature found in {', '.join(args.annotate)} within the "
@@ -1305,7 +1385,9 @@ def main():
         write_svg(args.plot, ts0, ys0, "I2S playout skew",
                   "board B - board A (ns)   [+ = B later]",
                   stats=stats_caption(ts0, ys0),
-                  include_zero=not args.y_free, events=ev, panel2=t2)
+                  include_zero=not args.y_free, events=ev,
+                  panels=build_panels(args, ra0, rb0, TEMPS,
+                                      ts0[0] - 1, ts0[-1] + 1))
         print(f"  plot {args.plot}")
         return
 
@@ -1338,6 +1420,7 @@ def main():
     # A window of recent values, long enough to out-vote a run of bad blocks but short
     # enough to follow a real move.
     ncorr = 0
+    rate_a, rate_b = [], []
     dumpf = None
     if args.dump_skew:
         dumpf = open(args.dump_skew, "w", buffering=1 << 20)
@@ -1456,9 +1539,15 @@ def main():
             ys.append(off if math.isfinite(off) else float("nan"))
             if math.isfinite(ppm):
                 ppms.append(ppm)
+            fs_a, fs_b = info.get("fs", (float("nan"), float("nan")))
+            if math.isfinite(fs_a):
+                rate_a.append((elapsed, fs_a))
+            if math.isfinite(fs_b):
+                rate_b.append((elapsed, fs_b))
             log.write(f"{elapsed:.3f},{wall:.3f},{off:.1f},{ppm:.4f},{coef:.4f},"
                       f"{info.get('frame_lag',0)},{info.get('rival',float('nan')):.3f},"
-                      f"{info.get('scatter_ns',float('nan')):.1f},{reason}\n")
+                      f"{info.get('scatter_ns',float('nan')):.1f},"
+                      f"{fs_a:.4f},{fs_b:.4f},{reason}\n")
 
             note = reason
             if info.get("lag_steps"):
@@ -1515,7 +1604,8 @@ def main():
                           "board B - board A (ns)   [+ = B later]",
                           stats=stats_caption(pt, py_),
                           include_zero=not args.y_free, events=events,
-                          panel2=trim_temps(TEMPS, pt[0] - 1, pt[-1] + 1))
+                          panels=build_panels(args, rate_a, rate_b, TEMPS,
+                                              pt[0] - 1, pt[-1] + 1))
             n += 1
             if (args.count == 0 or n < args.count) and args.interval > 0 \
                     and not args.simulate:
@@ -1533,7 +1623,7 @@ def main():
                   "board B - board A (ns)   [+ = B later]",
                   stats=stats_caption(ts, ys),
                   include_zero=not args.y_free, events=events,
-                  panel2=trim_temps(TEMPS, -1, ts[-1] + 1))
+                  panels=build_panels(args, rate_a, rate_b, TEMPS, -1, ts[-1] + 1))
     if ncorr:
         print(f"\n  {ncorr} of {len(ys)} rows had a whole-frame ambiguity "
               f"corrected by continuity with the previous row")

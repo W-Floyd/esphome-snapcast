@@ -36,8 +36,26 @@ the offset filter's tracking lag and is now fed forward (see `OFFSET_RATE_*` in 
 What is left is a static offset planted at every accounting re-anchor — see the first item, which
 is now the largest error in the chain by an order of magnitude.
 
-- **The feedback pivot** advances in 50 ms DMA granules (`inflight=2205`) with each board at a
-  different sub-granule phase. The remaining half of the differential noise; untouched.
+- **DISPROVEN: the feedback pivot is not a differential term.** It was listed here as "the
+  remaining half of the differential noise" on the strength of the granule phase argument, which
+  was an assumption. The pivot's error is derivable in closed form: an EWMA at α lags a ramp by
+  `c = (1−α)/α = 63` steps, and since `S·2205 = 50000 µs` exactly, the bias is
+
+      predicted − ideal = c·(S·2205 − Δt) = c · 50000 · δ      δ = achieved rate vs nominal
+
+  which is ~157 µs at δ = 50 ppm and scales with the smoothing — so it is worth knowing about for
+  ABSOLUTE latency. But δ is the ACHIEVED rate, not the trim: each board's trim cancels its own
+  crystal, so both land on the same achieved rate, and the analyser measures the residual
+  difference at **0.018 ppm** (wire slope over 30 s). Differential bias is therefore
+  `63 × 50000 × 0.018e-6 = 0.06 µs`, against 7.14 µs of differential median noise to explain.
+  Do not smooth the pivot to chase inter-device skew; it cancels.
+- **Find what the 7.14 µs of differential median noise actually is.** Chain confirmed to 1%:
+  differential median sd 7.14 µs × `TRIM_KP_RUN` 0.25 = differential trim sd 1.78 ppm (measured
+  1.78), which integrates into the observed few-µs wire wander at ~20 s period. So this is the
+  input that sets the floor, and the pivot is not it. `tbjit` says the timebase contributes 1–4 µs.
+  The untested remainder is chunk-arrival timing (when the prediction is evaluated) and the
+  accounting. Needs a per-chunk decomposition of one board's own error into deadline / predicted /
+  actual, which the report only shows as a windowed median.
 - **The −42 ms split spike.** Recurs at −42223..−42246 µs on both boards, to within 20 µs, so it
   is structural. Rejected by the median so it is harmless, but unexplained. Suspect a stale or
   partial depth snapshot that `accounted_at_()` then differences against. New clue: every
