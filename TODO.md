@@ -350,6 +350,28 @@ defect.
       `DRIFT_REPAIR_HOLD_US`, saturated by the ±1000 ppm clamp** — which is why an 8× larger split
       yields only 1.5× the step. The ~17% is presumably the ~0.85 s measurement lag plus trim slew
       eating most of the 3 s window.
+    - **FIX 1 LANDED AND MEASURED: hold the trim through the confirmation window.** While
+      `drift_excess_since_us` times a split toward `DRIFT_REPAIR_HOLD_US`, the trim is held instead
+      of recomputed from a median measured against a prediction the code is about to declare wrong.
+      Held rather than zeroed, since the current trim is the converged crystal cancellation.
+
+          +-2500 us split      steps                    mean magnitude
+          before               +329.6 +311.1 -347.4     329 us
+          with trim hold       +187.3 -256.9            222 us     (~33% cut)
+
+      Both after-floors clean (7.60, 5.61 us), and `Trim held`/`Trim released` confirmed engaging
+      for 3.3 s. A 42% figure quoted from the first point alone was optimistic; n=2 gives 33%.
+    - **FIX 2, FLASHED, NOT YET MEASURED: the repair left the median window stale.** The 33% is
+      short of the ~0 the model predicts for a frozen trim, and the residual is the servo chasing
+      the prediction step the REPAIR ITSELF makes: `pushed` steps, so every error still in
+      `st.err_window` was measured against the old prediction, and the servo steers from that stale
+      median for a full window afterwards. The repair already clears the playout histories for
+      exactly this reason — *"the counters just jumped, so anything remembered against them is
+      meaningless"* — and the median window is the same kind of memory, overlooked. Now cleared
+      (with `steer_dir`), which lets the median fall back to the instantaneous error, honest
+      post-repair because it uses the corrected prediction. The integrator is deliberately kept: it
+      holds the crystal offset, which the repair says nothing about.
+      **Prediction: substantially below 187 us. If not, the stale-median account is wrong.**
     - **Consequence, and it is a design tension worth stating:** the 3 s hold exists to avoid acting
       on a spike, but during those 3 s the servo steers real audio against a prediction the code is
       *about to declare wrong*. The damage is done before the correction lands, and it is permanent
