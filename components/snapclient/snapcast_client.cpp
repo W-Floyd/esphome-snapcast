@@ -208,7 +208,23 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // takes over once unmuted, where the error is mostly differential measurement noise and the
 // gain is the multiplier turning that noise into audible inter-device skew.
 static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
-static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.1f;
+static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.25f;
+// 0.1 -> 0.25 buys recovery time at the cost of steady-state skew, and the two are the SAME
+// dial: for this plant the error obeys e'' + KP*e' + KI*e = 0, so the envelope decays as
+// e^(-KP/2 * t) and the sqrt(KI) cancels. Settling depends on KP alone -- raising KI changes
+// only damping and overshoot, which is why the integrator is no help here.
+//
+// Measured at 0.1, recovering from a power cycle on a logic analyser: trough -620 us, back to
+// -50 us over ~86 s, i.e. tau ~34 s and ~135 s to settle. Two minutes of audible drift after
+// every reboot. At 0.25 that scales to tau ~14 s, ~54 s to settle.
+//
+// The cost is differential noise, which scales linearly with KP: measured 45-100 us excursions
+// at KP = 0.5 and ~15 us at 0.1, so ~37 us here -- under two frames, and well inside the
+// 100 us this whole line of work started from.
+//
+// This is a COMFORT SETTING, not a fix. The reason a reboot starts 620 us out at all is the
+// re-baseline anchor planting an offset (see the disproven-hypotheses note in the seed path).
+// Fix that and there is little left to converge from, and KP stops mattering.
 // Authority is derived from the ACQUIRE gain deliberately: the clamp exists so the PI can
 // express its proportional term at the converge_fine handoff, which is an acquisition
 // question. Deriving it from the run gain would shrink the headroom available for a
