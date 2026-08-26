@@ -229,12 +229,34 @@ defect.
   sink's per-descriptor real-frame bookkeeping handles it. `pad` is published through `AudioDepth`
   and printed in RECON, so both stay cheap to re-check.
 - **The −42 ms split spike.** Recurs at −42223..−42246 µs on both boards to within 20 µs, so it is
-  structural; rejected by the median, so harmless, but unexplained. Since the in-flight fix it reads
-  −52245/−49343 — the same spike plus the 10 ms `inflight` those samples carry — and the terms are
-  self-consistent (`sum == meas`, `r_mix == 0`), so it is not a conservation failure. Every
-  occurrence has `xfer=50000` (its maximum, equal to `dma`), `inflight=10000`, `queued=70000`,
-  `dma=50000`, `age≈33 ms`: a full transfer buffer, i.e. the sink briefly not accepting. Start from
-  why `xfer` is railed at exactly one DMA buffer whenever this fires.
+  structural; rejected by the median, so harmless *to the steering servo*, but unexplained. Since
+  the in-flight fix it reads −52245/−49343 — the same spike plus the 10 ms `inflight` those samples
+  carry — and the terms are self-consistent (`sum == meas`, `r_mix == 0`), so it is not a
+  conservation failure. Every occurrence has `xfer=50000` (its maximum, equal to `dma`),
+  `inflight=10000`, `queued=70000`, `dma=50000`, `age≈33 ms`: a full transfer buffer, i.e. the sink
+  briefly not accepting. Still worth knowing why `xfer` is railed at exactly one DMA buffer whenever
+  this fires — but note the "harmless" was doing less work than it looked: the median rejects it for
+  steering, while the hard-resync path tests the RAW instantaneous error, so nothing shielded that
+  path from a ~50 ms single-sample reading against a 50 ms threshold. See the item below.
+- **FIXED, and the lesson generalises: an unbounded correction turned a momentary trigger into a
+  22 s outage.** The late hard-resync path discarded a chunk and `continue`d with no bound across
+  iterations. Dropping a chunk buys exactly one chunk of deadline, so it closes REAL lateness — but
+  when the reading comes from a bad prediction or a bad deadline, every following chunk reports the
+  same excess, the test never clears, and the loop discards the whole ring. Measured on board A:
+    - healthy at 09:46:53.410 (median −38 µs, ring **1724 ms**), `Hard resync 50 ms late` at .688
+    - **pipeline completely dry** 0.7 s later: `queued=0 dma_real=0 written==completed inflight=0`
+    - ring down to **26 ms**, **37 hard resyncs**, median 1.06 s, then
+      `Pipeline drained (source starvation); re-baselining playout`, then **22 s muted**
+    - 66 chunks discarded to chase a 50 ms error that two would have covered
+  Emptying the pipeline makes the prediction *worse*, because the playout feedback the pivot smooths
+  stops arriving — positive feedback into the drain, which is why it ended in a re-baseline rather
+  than settling. Now budgeted per episode (the opening lateness plus one threshold of slack): a
+  genuine backlog still gets what it needs (5 s → 193 chunks allowed, 192 needed) while a spurious
+  reading costs 3 chunks instead of 66, and past the budget the chunk is played late instead. The
+  budget is set once at episode open and deliberately NOT grown with the error, because in the
+  observed failure the error grew from 50 → 490 → 811 ms *as a consequence of the draining*, so a
+  max()-based budget would re-arm the runaway. Refused resyncs are no longer counted toward the
+  storm, which would otherwise mute on the very spike the budget absorbs.
 - **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured, but
   not re-checked since the in-flight fix changed what `meas` contains.
 - **Stale deadline on stream resumption.** With `keepalive_hold: never`, the first chunk after a long
@@ -296,6 +318,22 @@ Earned expensively; ignoring these cost hours.
   pivot term was declared disproven off a differential rate whose MEAN was 0.018 ppm — true, and
   irrelevant, because the bias multiplies the instantaneous value and its sd was 1.64 ppm. Before
   concluding that a term cancels, check which moment of it the mechanism actually multiplies.
+- **Bound every corrective action by what the error could justify, and check the correction can
+  actually reduce its own trigger.** Three separate outages in this project were a correct-looking
+  response applied without a ceiling: the repair cascade (a repair fired on an incomplete depth
+  report, and its own subtraction created the opposite split that a second repair answered), and the
+  late hard-resync drain (66 chunks discarded for a 50 ms error, emptying the ring and forcing a
+  re-baseline). In both, the arithmetic was right for the case it was written for and had no
+  ceiling for the case where its input was wrong. Ask two questions of any correction: *what is the
+  most this error could possibly justify*, and *does applying it reduce the thing that triggered
+  it?* If the second answer is "only when the trigger is real", the first question is mandatory —
+  otherwise a bad reading becomes an unbounded loop. Worse, both had positive feedback: the
+  correction degraded the very measurement that gated it.
+- **A guard on the median does not protect a path that reads the raw error.** The −52 ms split spike
+  was filed as harmless because the median rejects it. It is harmless to the steering servo and was
+  never harmless to the hard-resync path, which deliberately tests the instantaneous error so it can
+  react to genuine steps. When a known artifact is dismissed as "rejected by the median", check
+  which consumers actually go through that median.
 - **Anything derived from the controller's output is inside the loop.** Three attempts to correct the
   pivot bias from the applied trim failed for this reason: a slow mean lags acquisition, an
   instantaneous value carries full loop gain, and the absolute value carries the crystal offset. A
