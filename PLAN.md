@@ -45,17 +45,32 @@ Built, compiled clean, and flashed. Three details that decided whether the numbe
 On its own line (the Sync line is at the 256-byte ceiling) and in every build, not just under
 timing diagnostics.
 
-**Success criterion — now measurable, not yet measured.** `scripts/i2s-skew.py --replot --annotate
-a.log b.log` runs the integral check against both the analyser's `fs` columns and the boards' own
-reported trim, in one table (`0ee9212`). Integrating the differential time-mean trim should explain
-far more than the snapshots' 13–19%. If it does not jump, the aliasing explanation is wrong and
-step 3's design needs rethinking before it is built.
+**Success criterion — MEASURED, and the answer is a split decision (`19bca3f`).** Two runs, 96 and
+127 windows over 231 and 425 s, scored against the analyser's own rate columns:
 
-The same commit makes the **central finding reproducible on demand** rather than remembered: the
-`fs`-column check reproduced it on the first real capture tried (19.5 s, corr −1.000, slope −0.994,
-residual 0.03 µs, 99% explained). Two latent script bugs were fixed to get there (`0239695`): the
-replot path double-counted every `--annotate` log, and `--simulate` had always crashed at the end
-of a run, which had quietly disabled the only no-hardware regression check.
+- **The aliasing was real and the fix works, at the rate level.** Window-mean differential trim
+  tracks the true differential achieved rate at **corr +0.976..+0.979**, against **−0.778** for the
+  end-of-window snapshot. Sampling was throwing away most of the signal.
+- **The trim still cannot be the offset reference, for a more fundamental reason than aliasing: an
+  unknown constant.** The differential trim sits **−5.25 ppm** from the true differential rate
+  (−5.246 and −5.272 on the two runs, so stable rather than scatter). That is the **crystal
+  difference** — each board's trim converges to cancel its *own* crystal error, so the differential
+  carries the difference between two crystals, and nothing on the device knows it. Being a rate it
+  integrates forever: **527 µs per 100 s** against a 13–15 µs floor. The trim offset integral
+  explains **1%** where the `fs` columns explain **96–99%**.
+- **Calibrating the constant away would still not be enough:** residual 0.70–0.75 ppm, ≈70 µs per
+  100 s.
+- **De-meaning is not the fix.** It drops the analyser's own check from 96% to 2%, because the true
+  differential rate has a real nonzero mean (+0.61 ppm on one run = a genuine 177 µs ramp over
+  290 s) and de-meaning deletes exactly the term the offset is made of. The constant must be
+  *known*, not removed. A high correlation with a constant offset is the trap; correlation says
+  nothing about an integral.
+
+The same work makes the **central finding reproducible on demand** rather than remembered: the
+`fs`-column check reproduces it on every replot (measured: 19.5 s → corr −1.000/slope −0.994/0.03 µs;
+425 s → corr −0.999/slope −0.994/0.50 µs, 96%). Two latent script bugs were fixed to get there
+(`0239695`): the replot path double-counted every `--annotate` log, and `--simulate` had always
+crashed at the end of a run, which had quietly disabled the only no-hardware regression check.
 
 ## Step 2 — `TRIM_KP_RUN = 0.1`, measured
 
@@ -70,10 +85,20 @@ a's `split +22 µs` (stale since the in-flight fix changed what `meas` contains)
 
 ## Step 3 — achieved rate against server time, published in the beacon
 
-The keystone. An outside-the-loop rate reference de-trends the prediction (step 4) and, published
-beside `drift_ppm`, lets each device integrate the difference and know its own relative offset
-without an analyser. The three failed corrections all derived the reference from the controller's
-output; this one comes from the plant.
+The keystone, and after step 1's measurement the **only surviving route**, not merely the preferred
+one. An outside-the-loop rate reference de-trends the prediction (step 4) and, published beside
+`drift_ppm`, lets each device integrate the difference and know its own relative offset without an
+analyser. The three failed corrections all derived the reference from the controller's output; this
+one comes from the plant.
+
+**The accuracy spec, derived from step 1 rather than guessed.** The offset is the integral of the
+rate, so a constant error `ε` ppm costs `ε` µs per second of run — the trim's −5.25 ppm constant is
+what makes it useless. To keep the integrated error inside the ~13 µs floor over a 300 s run needs
+the *constant* known to better than **0.04 ppm**, and over 100 s to **0.13 ppm**. That is the number
+the design has to hit, and it is what makes the least-squares fit below mandatory rather than
+tidy: a two-endpoint baseline on ~300 µs-jitter timestamps resolves only ±10 ppm, i.e. 250× too
+coarse. It also rules out any scheme whose zero point is a servo output, since those carry the
+crystal offset by construction.
 
 - **Source:** fit `played_frames_total_` (playout feedback, `notify_audio_played`) against server
   time via the clock_sync mapping. The feedback arrives at ~50 ms cadence — ~600 points per 30 s
