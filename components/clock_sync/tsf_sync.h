@@ -235,6 +235,11 @@ class TsfSync {
   // Low-pass state for shared_server_offset_us(); player-task-only
   double offset_filter_us_{0.0};
   bool offset_filter_valid_{false};
+  /// @brief Whether the offset filter has ever held a value. Distinct from offset_filter_valid_,
+  /// which is cleared whenever the mapping is momentarily unavailable: carrying the filter across
+  /// such a gap is what stops a leadership handover stepping the deadline by the filter's
+  /// accumulated tracking lag. Never cleared once set.
+  bool offset_filter_seeded_{false};
   // Per-device sandwich floor, so the trust threshold is derived rather than assumed
   int64_t sandwich_floor_us_{0};
   int64_t sandwich_block_min_us_{0};

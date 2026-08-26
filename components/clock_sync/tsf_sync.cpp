@@ -821,11 +821,62 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   // beacon, so re-anchoring there would reset the filter every second and filter nothing.
   // Consecutive mappings differ by at most the slew rate times the interval, so anything
   // this large is a leader change or a re-anchor, not slew and not read noise.
-  if (!this->offset_filter_valid_ ||
+  //
+  // "Not valid" is NOT the same as "nothing to carry over". The filter is invalidated whenever the
+  // mapping is momentarily unavailable -- expired, or a failed evaluation -- which happens around a
+  // leadership handover. Snapping then discards a filter that was perfectly good and jumps to raw by
+  // whatever LAG it had accumulated, and that lag is drift * tau: at the measured -50 ppm and a
+  // 6.7 s constant it is ~340 us. So a routine handover between devices that already agreed
+  // produced a ~500 us step in one device's deadline, landing entirely on the wire as differential
+  // skew. Measured with the de-trended tbjit field: 1-4 us in steady state, 525 us at the handover,
+  // alongside that device's median hitting 792 us and its trim +234 ppm.
+  //
+  // It also got worse when the filter was smoothed harder -- 4x the time constant is 4x the lag and
+  // so 4x the step -- which is the sort of coupling that only shows up once the artefact is
+  // measurable.
+  //
+  // So carry the filter across an invalidation and let the size of the disagreement decide. A step
+  // beyond OFFSET_SNAP_US is a genuine re-anchor and still snaps, because smearing a real
+  // correction over seconds is worse. Anything smaller smooths, including across a handover.
+  // seeded_ is the "have we ever had a value" flag, and unlike valid_ it is never cleared.
+  // REVERTED: an alpha-beta tracker here. The diagnosis behind it was right and the cure was
+  // worse.
+  //
+  // The input IS a ramp -- this device's local clock against the server's, -48 to -52 ppm after
+  // evaluate_mapping_ has removed the TSF-vs-server drift -- and an EWMA lags a ramp by
+  // rate * tau. Because each device has its own crystal the lags DIFFER, and the difference is a
+  // static inter-device offset:
+  //
+  //   a -52.4 ppm, b -47.6 ppm -> 4.8 ppm apart
+  //   tau 1.7 s -> 8 us apart      (observed static skew -14.7 us)
+  //   tau 6.7 s -> 32 us apart     (observed static skew -50.3 us)
+  //
+  // Estimating the rate does remove that lag. But an EWMA's lag is DETERMINISTIC, so the
+  // difference between two devices is bounded and predictable; an alpha-beta's steady-state
+  // position depends on each device's own rate ESTIMATE, which converges independently and
+  // noisily, and a small rate error integrated over time is a far larger position error than the
+  // lag it replaced. Measured: static skew went from -50 us to -567 us, stable, with both devices
+  // reporting agreement within ~20 us and tbjit at 1-3 us -- i.e. invisible on-device, which is
+  // the exact failure class this work exists to remove.
+  //
+  // So a bounded predictable error beats an unbounded unpredictable one. If the 32 us is ever
+  // worth removing, the way to do it is to make the two devices' lags EQUAL rather than zero --
+  // they already share the mapping, so a shared rate estimate would cancel in the difference
+  // where two independent ones do not.
+  //
+  // Carrying the filter across an invalidation is kept, and is separate from the above: the filter
+  // is invalidated whenever the mapping is momentarily unavailable, which happens around a
+  // leadership handover, and snapping then discarded a good filter and jumped to raw by its whole
+  // accumulated lag -- measured as tbjit 525 us and a ~500 us wire excursion at a handover.
+  // seeded_ is "have we ever had a value" and is never cleared, so only a genuine re-anchor beyond
+  // OFFSET_SNAP_US still snaps.
+  if (!this->offset_filter_seeded_ ||
       std::abs(static_cast<double>(raw_us) - this->offset_filter_us_) > OFFSET_SNAP_US) {
     this->offset_filter_us_ = static_cast<double>(raw_us);
     this->offset_filter_valid_ = true;
+    this->offset_filter_seeded_ = true;
   } else if (sandwich_us <= trust_us) {
+    this->offset_filter_valid_ = true;
     // Only reads near this device's own floor move the filter. A wider bracket is mostly
     // interrupt latency, and averaging it in spends filter authority on known-bad data.
     this->offset_filter_us_ += OFFSET_EWMA_ALPHA * (static_cast<double>(raw_us) - this->offset_filter_us_);

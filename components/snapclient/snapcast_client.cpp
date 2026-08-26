@@ -1810,14 +1810,18 @@ void SnapcastClient::player_task_() {
       // See dl_off_* in ServoState: isolates the timebase's contribution to the error so it can be
       // told apart from the prediction's.
       const int64_t dl_off = deadline - rec.server_ts_us;
-      if (!st.dl_off_valid) {
-        st.dl_off_valid = true;
-        st.dl_off_min_us = st.dl_off_max_us = dl_off;
-      } else {
-        st.dl_off_min_us = std::min(st.dl_off_min_us, dl_off);
-        st.dl_off_max_us = std::max(st.dl_off_max_us, dl_off);
+      if (st.dl_off_valid) {
+        const int64_t step = dl_off - st.dl_off_prev_us;
+        if (!st.dl_step_valid) {
+          st.dl_step_valid = true;
+          st.dl_step_min_us = st.dl_step_max_us = step;
+        } else {
+          st.dl_step_min_us = std::min(st.dl_step_min_us, step);
+          st.dl_step_max_us = std::max(st.dl_step_max_us, step);
+        }
       }
-      st.dl_off_last_us = dl_off;
+      st.dl_off_valid = true;
+      st.dl_off_prev_us = dl_off;
     }
     const int64_t hard_us = static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000;
     const uint32_t frames = rec.bytes / frame_bytes;
@@ -2768,13 +2772,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         st.drift_excess_since_us = 0;
       }
 
-      char dl_str[64] = "";
-      if (st.dl_off_valid) {
-        // Span only. The absolute value carries this device's local epoch (deadline is local time,
-        // server_ts is server time), so it is not comparable between devices and not interesting on
-        // one -- and the report has a length limit that truncated trim and tsf when it was included.
-        snprintf(dl_str, sizeof(dl_str), ", tbspan %" PRId64, st.dl_off_max_us - st.dl_off_min_us);
-        st.dl_off_valid = false;
+      char dl_str[48] = "";
+      if (st.dl_step_valid) {
+        // Spread of the per-chunk STEP, i.e. the timebase's movement with its drift removed. A
+        // smooth ramp reads ~0; a glitch reads its own size. The absolute offset is deliberately
+        // not reported: it carries this device's local epoch, so it is neither comparable across
+        // devices nor interesting on one, and including it pushed the report past the log line
+        // limit and silently truncated trim and tsf off the end.
+        snprintf(dl_str, sizeof(dl_str), ", tbjit %" PRId64, st.dl_step_max_us - st.dl_step_min_us);
+        st.dl_step_valid = false;
       }
       char drift_str[96] = "";
       if (st.drift_samples > 0) {

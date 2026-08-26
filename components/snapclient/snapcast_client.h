@@ -441,10 +441,19 @@ class SnapcastClient {
     // deadline = server_ts + buffer - shared_offset, and buffer is constant, so (deadline -
     // server_ts) isolates the timebase term exactly. Tracked as a spread across the report window:
     // steady means the timebase is innocent and the pivot is the source.
-    int64_t dl_off_min_us{0};
-    int64_t dl_off_max_us{0};
-    int64_t dl_off_last_us{0};
+    // DE-TRENDED. The raw span of (deadline - server_ts) is dominated by the local-versus-server
+    // crystal drift -- measured -48..-52 ppm, so ~165 us across a 3.3 s report -- which buries the
+    // noise riding on it. It read ~170 us whether the offset filter smoothed 8x or 16x, and so
+    // failed to detect a change the wire showed as a halving of the skew floor.
+    //
+    // Tracking the spread of CONSECUTIVE DIFFERENCES de-trends by construction: a pure ramp has
+    // constant differences and therefore ~zero spread, while a glitch appears at its full size.
+    // Cheap -- one subtraction per sample, no fit, no history.
+    int64_t dl_off_prev_us{0};
+    int64_t dl_step_min_us{0};
+    int64_t dl_step_max_us{0};
     bool dl_off_valid{false};
+    bool dl_step_valid{false};
     // A MEDIAN, not a mean. The wave this was built to average through turned out not to be a
     // wave: measured, 31 samples of a window read ~0 and one reads a fixed large negative spike,
     // so the means came out quantised in exact multiples of spike/32 (-1320, -2640, -3960 for
