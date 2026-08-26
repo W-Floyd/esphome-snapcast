@@ -1828,19 +1828,31 @@ def report_resync_bursts(lo, hi):
             # Ratio of error closed to error the discards should have closed. ~1 means the
             # lateness was real and discarding was the right tool; ~0 or negative means it
             # was not lateness at all.
-            ratio = (closed / expected) if expected > 0 else float("nan")
+            # The ratio only means anything when discards actually happened; with none, the
+            # expected closure is zero and a ratio is a division by zero dressed up as data.
+            print(f"      {board} t={t0:8.1f}s  n={len(b):3d}  err {err0:+9d} -> {errN:+9d} us  "
+                  f"ring {ring0:5d} -> {ringN:5d} ms  drops {dropsN:3d}")
             if dropsN == 0:
-                verdict = "no discards (excursion absorbed without them)"
-            elif ratio > 0.6:
-                verdict = "REAL lateness -- discards closed it ~1:1"
+                print(f"      {'':>{len(board)}}  closed {closed:+9d} us with NO discards"
+                      f"  -> excursion resolved by other means; this path was not the mechanism")
+                continue
+            ratio = closed / expected
+            # Bounded on BOTH sides. An unbounded "ratio > 0.6 means real" called +5.59 a 1:1
+            # closure, which it plainly is not: closing five times more than the discards could
+            # buy means something else did the work, and that is a third answer, not the first.
+            if 0.6 <= ratio <= 1.6:
+                verdict = "REAL lateness -- discards account for the closure"
+            elif ratio > 1.6:
+                verdict = "closed by SOMETHING ELSE -- discards too few to explain it"
+            elif ratio < -0.2:
+                verdict = "RUNAWAY -- error grew while discarding"
             elif ratio < 0.2:
                 verdict = "NOT lateness -- discards did not move it"
             else:
                 verdict = "partial -- inconclusive"
-            print(f"      {board} t={t0:8.1f}s  n={len(b):3d}  err {err0:+9d} -> {errN:+9d} us  "
-                  f"ring {ring0:5d} -> {ringN:5d} ms  drops {dropsN:3d}")
-            print(f"      {'':>{len(board)}}  closed {closed:+9d} us of {expected:9.0f} expected"
-                  f"  ratio {ratio:+.2f}  -> {verdict}")
+            print(f"      {'':>{len(board)}}  closed {closed:+9d} us of {expected:9.0f} the discards"
+                  f" could buy  ratio {ratio:+.2f}")
+            print(f"      {'':>{len(board)}}  -> {verdict}")
     return printed
 
 
