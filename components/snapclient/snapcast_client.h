@@ -395,6 +395,33 @@ class SnapcastClient {
     float trim_max_ppm{0.0f};
     uint32_t trim_samples{0};
     uint32_t trim_railed{0};
+    // TIME-INTEGRAL of the applied trim over the report window, its audio time, and the
+    // audio time actually covered by a programmed trim.
+    //
+    // The wire offset between two devices is the integral of their differential achieved
+    // rate and nothing else (slope -1.0, sub-us residual, 99-100% explained by the
+    // analyser's own rate columns). The trim is this device's best on-board proxy for that
+    // rate, but the END-OF-WINDOW SNAPSHOT above cannot deliver it: one sample per 3.3 s of
+    // a continuously moving quantity is an ALIAS, and integrating those snapshots explained
+    // only 13-19% of the measured offset. The window's time-MEAN is the quantity that has a
+    // chance, and the integral needs the mean and the DURATION together, which is why the
+    // time is published beside it rather than assumed to be one report interval.
+    //
+    // Accumulated in EVERY build, not just under timing diagnostics: the snapshot's
+    // invisibility in a plain build is the same failure the note at the report site
+    // describes, where "(idle)" was printed for a loop steering by tens of ppm. Accumulated
+    // once per chunk AFTER the servo has run, on a path every servo branch reaches, so the
+    // hard-resync and catch-up branches -- which leave the previously programmed trim on the
+    // hardware and never enter the PI -- contribute their audio time instead of silently
+    // dropping out of the integral.
+    //
+    // covered < window means part of the window had no trim programmed at all (rate lock
+    // unavailable); the report prints the ratio rather than folding the hole into the mean,
+    // because a mean over an unknown fraction of the window is exactly the kind of number
+    // that reads as data and is not.
+    double trim_integral_ppm_s{0.0};
+    float trim_covered_s{0.0f};
+    float trim_window_s{0.0f};
 #endif
     uint32_t raw_sample_countdown{1};
     // Smoothed accounted-vs-observed disagreement (us); 0 when the accounting is honest

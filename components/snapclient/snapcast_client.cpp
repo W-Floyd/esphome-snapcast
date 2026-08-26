@@ -2231,6 +2231,27 @@ void SnapcastClient::player_task_() {
       }
     }
 
+#ifdef USE_I2S_RATE_LOCK
+    // Integrate the APPLIED trim over this chunk's audio time. Placed after the whole servo
+    // chain, deliberately: the hard-resync and aggressive-catch-up branches never enter the
+    // PI, yet audio keeps being clocked out under whatever trim was last programmed, so
+    // accumulating inside the PI block would drop that time out of the integral without
+    // saying so. st.trim_applied_ppm is the right term because it is defined to track what
+    // is actually programmed, including the nominal-rate fallback.
+    //
+    // Attribution is off by at most one chunk (~26 ms in a ~3.3 s window): the trim
+    // programmed now governs audio that drains from now on. Second-order against the
+    // aliasing this exists to remove.
+    {
+      const float chunk_s = static_cast<float>(frames) / static_cast<float>(rec.params.sample_rate);
+      st.trim_window_s += chunk_s;
+      if (st.rate_lock_ok) {
+        st.trim_integral_ppm_s += static_cast<double>(st.trim_applied_ppm) * static_cast<double>(chunk_s);
+        st.trim_covered_s += chunk_s;
+      }
+    }
+#endif
+
 #ifdef CLOCK_SYNC_TSF_ACTIVE
     // Report our own tracking quality to the TSF layer: a leader publishes the
     // timebase the whole group follows, so it must hand off while its own playout
@@ -3051,6 +3072,27 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       st.soft_inserted_frames = 0;
       st.hard_resyncs = 0;
   #ifdef USE_I2S_RATE_LOCK
+      // Its OWN line. The sync report above is at the 256-byte formatting ceiling and
+      // silently truncates its last field, so a new diagnostic added there reads as missing
+      // data rather than as a formatting problem.
+      //
+      // Both numbers are needed to form the integral this measures: mean x time. Coverage is
+      // printed unconditionally rather than only when short, because "compared, and it
+      // agreed" and "there was nothing to compare" must not look the same -- the same
+      // distinction the fill/drift branches above are built around.
+      if (st.trim_window_s > 0.0f) {
+        const float covered_pct = 100.0f * st.trim_covered_s / st.trim_window_s;
+        if (st.trim_covered_s > 0.0f) {
+          ESP_LOGD(TAG, "Trim window: mean %+.3f ppm over %.2f s audio (covered %.0f%%)",
+                   static_cast<float>(st.trim_integral_ppm_s / static_cast<double>(st.trim_covered_s)),
+                   st.trim_window_s, covered_pct);
+        } else {
+          ESP_LOGD(TAG, "Trim window: no trim programmed over %.2f s audio", st.trim_window_s);
+        }
+      }
+      st.trim_integral_ppm_s = 0.0;
+      st.trim_covered_s = 0.0f;
+      st.trim_window_s = 0.0f;
       st.trim_samples = 0;
       st.trim_railed = 0;
   #endif
