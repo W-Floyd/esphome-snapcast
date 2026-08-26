@@ -40,6 +40,16 @@
   speaker per-SoC. `rate_lock` pokes the S3's MCLK divider directly and would prefer a
   speaker API, keeping `i2s_rate_lock` as the fallback for older ESPHome.
   Satellite1's forked `I2SAudioSpeaker::sync_play()` is independent evidence of demand.
+- **`mixer` does not yield when the sink stops draining.** The task loop guards the no-data
+  case with `delay(TASK_DELAY_MS)` but not the no-space case: `transfer_data_to_sink()` only
+  blocks while the sink is ACCEPTING, so a stopped sink refuses at once, nothing can be mixed
+  into a full output buffer, and the loop spins. `MIXER_TASK_PRIORITY` is 10 against the
+  ESP-IDF main task at 1, so it can starve the main loop. Fixed on the fork (`74d32d9dd`) as a
+  defensive yield, NOT proposed upstream: the failure it was written to explain turned out to be
+  concurrent log sessions of mine, not starvation, so the spin is visible by inspection but has
+  never been observed to bite. A report needs a test that actually stops a sink and measures
+  CPU.
+
 - **`speaker_source` spins forever on an unmixable announcement.** A format mismatch
   cannot be resolved by retrying, but that is what it does: with an announcement pipeline
   at 48000/mono against a 44100/stereo stream, the mixer sets
@@ -50,7 +60,47 @@
 
 ## Investigate
 
-- **Re-evaluate the starvation re-baseline.** The case against it was that it anchored
+- **RESOLVED: the starvation re-baseline stays, and its residue is now repaired.** Tested by
+  removing it, using `inject_starvation()` to fire the event on one device on demand rather
+  than waiting for a group-wide one. It cannot go: without it the same injected starvation
+  left the accounting at -204 ms with nothing able to fix it, and the pair swung +-20 ms for
+  about twenty seconds before the servo walked it out. With it: re-locked in 9 s, back to
+  within a frame on a logic analyser.
+
+  What it DOES plant is a per-device accounting error, and that was the "silent offset" class
+  all along. Measured against a logic analyser, the offset a device renders at is `-drift`:
+
+  | `drift` | wire |
+  |---|---|
+  | -8526 us | 8.51 ms |
+  | -64672 us | 67 ms |
+  | -68549 us | 73 ms |
+  | -194060 us | 198 ms |
+  | -198435 us | 191 ms |
+
+  Five for five within a few percent, and every one NEGATIVE — which is why they persisted:
+  the self-repair armed on `fill_drift_us >= DRIFT_REPAIR_US`, positive only, so the one sign
+  the anchor plants was unrepairable by construction. Now sign-symmetric and keyed on a
+  windowed median (see the skew section), with the thresholds that follow from a 1 us floor:
+  `DRIFT_REPAIR_US` 20 ms -> 2 ms, hold 10 s -> 3 s, band 10 ms -> 2 ms. The 8.5 ms case was
+  BELOW the old threshold and so invisible even to a sign-symmetric test.
+
+  Five explanations for the planted error were eliminated and are recorded in the source, so
+  they are not worth retrying: divider quantisation (`want` tracks `applied` to 0.24 ppm);
+  the re-baseline cascade alone (fixed, offsets persisted); snapshot staleness (tested with the
+  correct published term — age does not imply drainage, upstream keeps refilling); and seed #2
+  as culprit (it is COMPENSATING for a seed #1 whose anchor expires — refusing it made the pair
+  198 ms apart against 10 ms).
+
+  Still open: the anchor plants the error in the first place. It captures an instant that stops
+  being true — `own=0` when measured, ~244 ms 1.4 s later — and the accounting can only learn
+  that by being re-anchored. Preventing it needs an anchor that stays valid, not another way to
+  suppress a seed.
+
+  The original argument is kept below, because its reasoning about WHERE the harm came from
+  is still the clearest statement of the mechanism.
+
+  The case against it was that it anchored
   `pushed` to a number excluding the mixer ring and I2S DMA, so the clamp in
   `notify_audio_played()` permanently absorbed the shortfall — `drift` stepping to +51 ms
   and staying there while the device played ~43 ms early, both medians reading ~40 µs.
@@ -232,6 +282,96 @@
   will spin and flood the log hard enough to stall an OTA; and when an experiment ages a
   timestamp, age the VALUE it describes too, or it measures a mismatch you invented rather than
   the one you are hunting.
+
+- **A stale-bailout reconnect could leave a speaker permanently silent — fixed, cause of the
+  trigger still open.** Observed once: lateness ran 1504 -> 4544 -> 4893 ms in ~4 s, tripping
+  `STALE_BAILOUT_US`. The network task recovered fully (reconnected, codec negotiated, TSF
+  leadership yielded) and the player task never processed another chunk. The mixer logged
+  `Stopped` once and never started; the media player reported `PLAYING` throughout; the speaker
+  sat at `queued=0 dma_real=0 inflight=0` for 3.5 minutes.
+
+  The re-arm watchdog exists for exactly this and never fired, because it was gated on
+  `get_state() != IDLE` — which assumes IDLE is the only way to end up not routing. Now keyed on
+  the invariant instead: chunks arriving and `output_active()` false, with PAUSED still excluded
+  by state (a pause is a deliberate not-routing). The log line prints the state it fired in, so
+  the next occurrence identifies the stuck state rather than leaving it to be inferred.
+
+  Not addressed: why lateness spiralled to 4.9 s. That run had the accounting left at
+  `drift=-194060` by a since-reverted experiment, so the trigger was probably self-inflicted —
+  but the failure to recover from it was not.
+
+- **Inter-device skew: the floor is now sd 4.6 us, and the chain is characterised.** Measured
+  on a logic analyser decoding both boards' I2S (`scripts/i2s-skew.py`). Started at ~100 us
+  excursions; the dominant chain is:
+
+  ```
+  common-mode disturbance   MAD 122 us   (both boards, corr 0.98)
+        |  each board's servo corrects it
+  differential in response  MAD  12 us
+        |  x KP, integrated over a report
+  wire skew                 sd  4.6 us
+  ```
+
+  Common-mode cancels between boards and is harmless; only the DIFFERENTIAL reaches the wire.
+  That distinction is the single most useful idea here, and it is why several plausible fixes
+  made things worse.
+
+  What was fixed: the rate-lock gain split (`TRIM_KP_ACQUIRE` 0.5 / `TRIM_KP_RUN` 0.25 —
+  recovery ~150 s -> 42 s, measured 3.6x); the shared-offset filter smoothed 4x
+  (`OFFSET_EWMA_ALPHA` 1/64 -> 1/256, sd 9.3 -> 4.6 us, exactly the sqrt(4) predicted); and a
+  leadership handover stepping the offset filter by its accumulated lag (~500 us per handover).
+
+  SIX changes failed, all recorded in the source with their measurements. Do not retry without
+  reading them: a slew limit on the trim (limit-cycled, +-1.5 ms), a gain schedule on |median|
+  (limit-cycled, the threshold sat inside the steady-state distribution), snapshot aging twice,
+  a drained-pipeline guard on the seed, and an alpha-beta offset filter (removed the lag it was
+  designed to remove and made static skew -50 -> -567 us).
+
+  The alpha-beta failure carries the general lesson: for inter-device sync the goal is not for
+  each device's error to be ZERO but for the two to be EQUAL. An EWMA's lag is deterministic so
+  it largely cancels in the difference; two independently converged rate estimates do not.
+
+  Remaining levers, in order:
+
+  0. **`TRIM_KP_RUN` = 0.25 is a comfort setting, not a fix.** It buys recovery speed with
+     steady-state noise (15 us at 0.1, 35 us at 0.25, 45-100 us at 0.5 — the relation is linear
+     and held across all three). A reboot only starts ~790 us out because the anchor plants an
+     offset; fix that and this should go back down.
+  1. **The static ~50 us offset.** About 32 us of it is EWMA lag difference — the boards'
+     local-vs-server drifts differ (-52.4 vs -47.6 ppm) and lag is `rate * tau`, so 4.8 ppm x
+     6.7 s. Predicted and confirmed twice (8 us at tau 1.7 s / observed -14.7; 32 us at tau
+     6.7 s / observed -50.3). The fix is a SHARED rate estimate published in the beacon like
+     `drift_ppm` already is, so it cancels in the difference. Not a tuning change.
+  2. **The feedback pivot**, which advances in 50 ms DMA granules (`inflight=2205`) with each
+     board at a different sub-granule phase. The other half of the differential, and untouched.
+  3. **The -42 ms split spike.** Recurs at -42223..-42246 us on both boards, to within 20 us,
+     so it is structural rather than noise. Rejected by the median, still unexplained. Likely a
+     stale or partial depth snapshot that `accounted_at_()` then differences against.
+  4. **Board a carries a persistent `split +22 us`** where b sits at -1. Constant across every
+     window measured, so real.
+
+- **Instruments, and which ones lie.** Every real gain tonight followed a measurement getting
+  better, and three instruments were actively misleading:
+
+  - **Pipeline DEPTH delta** (`pipeline_us` over TSF) compares buffer OCCUPANCY, which
+    legitimately differs between devices rendering in sync. It read -13.4 ms for a 3.7 ms
+    offset and +206 ms for one the wire put at 191 ms. Fit to raise an alarm, unfit to size
+    anything. `PIPELINE_DIVERGE_US` is now 5 ms (was 100 ms, sized against an artefact that the
+    window-mean fix had already removed) and it caught two self-inflicted regressions within
+    6 s each.
+  - **Render phase** (`render_phase_us`, added then documented as blind) compares WHEN a known
+    frame renders, which is the right quantity — but it consumes `pushed - played`, and the
+    servo steers audio to match that same accounting, so the two errors cancel exactly:
+    `render_phase = true_phase - d`. It read +10 us for a 191 ms offset. Any future instrument
+    must avoid consuming the accounting on both sides.
+  - **`tbspan`** was the raw spread of `deadline - server_ts`, dominated by the -50 ppm drift
+    (~165 us per report). It read ~170 us regardless and could not detect the 4x filter
+    change. De-trended to `tbjit` (spread of consecutive differences) it reads 1-4 us in steady
+    state and found the handover step at 525 us within one report.
+
+  Two statistics lessons: `sd` is the wrong summary for anything here — network events dominate
+  it, and a differential of MAD 12 us reported sd 129 us — and a `mean` over a window carries a
+  rare fixed-size spike straight into the answer where a median rejects it.
 
 - **Stale deadline on stream resumption.** With `keepalive_hold: never` the pipeline is
   held across an idle, and the first chunk afterwards carries a deadline stale by roughly
