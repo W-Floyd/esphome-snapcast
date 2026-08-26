@@ -300,11 +300,24 @@ defect.
       behind, draining IS the recovery and the 22 s re-lock is correct behaviour, not a defect.
       Nothing measured so far distinguishes "spurious 50 ms reading" from "real backlog starting at
       50 ms", and that distinction is the whole question.
-    - **So the next step is evidence, not control code.** What is needed is a per-chunk trace across
-      one of these events showing, at the same instant: `error_us`, the ring occupancy, and whether
-      each discard actually reduced the following chunk's error. If discards reduce it ~1:1 the
-      lateness is real and the existing behaviour is right; if the error is flat or growing across
-      discards, it is a prediction fault and the trigger is what needs gating, not the response.
+    - **ANSWERED by the per-chunk trace, and it refutes the original diagnosis. The empty ring
+      comes FIRST.** Nine bursts captured on hardware, and the split is total:
+        - ring full at burst start (1697–1828 ms): **6 bursts, 0 discards every time**, initial
+          error ~100 ms, all closed without the discard path being the mechanism at all
+        - ring already at **26 ms** — one chunk, i.e. empty — at burst start: **3 bursts, 79 / 32 /
+          4 discards**, initial error +150 ms to +1741 ms
+      So discarding is not what empties the ring: by the time the error crosses the 50 ms
+      threshold the ring is *already* empty in every case where discarding then happens. The
+      causality runs source starvation → late playout → resync → discards, which makes the
+      discards the RECOVERY. That is exactly why capping them made things worse, and it retires
+      the "the correction drained the ring" reading of the 09:46 cascade.
+      **So the trigger, not the response, is what wants attention: why does the ring empty?**
+        - Caveat on the evidence: the burst is armed by the threshold crossing, so it shows the
+          ring at that moment, not before the excursion began. "Already empty" means empty by the
+          crossing. Seeing the drain start needs a rolling pre-trigger history, which is the next
+          instrumentation step if this needs nailing down harder.
+        - Also measured, and useful on its own: an ~100 ms excursion with a healthy ring resolves
+          with no discards and no muting. The path only engages when the ring is gone.
     - **Independently exposed, and worth fixing on its own:** the stale-bailout reconnect can leave
       the speaker STOPPED. B logged `Connected to 192.168.1.2:1704` and `Stream started: 44100 Hz`
       at 10:14:13 and still never wrote another frame — `dma_real=0` says the I2S channel was not
