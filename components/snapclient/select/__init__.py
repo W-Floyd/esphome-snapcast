@@ -13,11 +13,16 @@ CONF_CHANNEL_MODE = "channel_mode"
 CONF_PHASE = "phase"
 CONF_SERVER = "server"
 CONF_PAUSE_BEHAVIOR = "pause_behavior"
+CONF_SYNC_RESILIENCE = "sync_resilience"
 
 # Option orders must match the ChannelMode / PhaseMode / PauseBehavior enums
 CHANNEL_MODE_OPTIONS = ["Stereo", "Left", "Right", "Mono"]
 PHASE_OPTIONS = ["None", "Left", "Right", "Both"]
 PAUSE_BEHAVIOR_OPTIONS = ["Allow", "Resume", "Ignore"]
+# Ascending tolerance of audible artifacts, matching the SyncResilience enum. "Mute on storms"
+# is the historical behaviour and stays the default; the other two trade audible corrections for
+# never going silent. None of them changes the first lock after a start or reconnect.
+SYNC_RESILIENCE_OPTIONS = ["Mute on storms", "Play through storms", "Never mute"]
 # Mono-summing amps (MAX98357A style) analog-mix L+R: inverting one side of
 # duplicated content cancels to silence, so only whole-program inversion is offered;
 # "Stereo" is just an undefined analog (L+R)/2, so the digital Mix stands in for it
@@ -42,6 +47,9 @@ SnapclientServerSelect = snapclient_ns.class_(
 )
 SnapclientPauseBehaviorSelect = snapclient_ns.class_(
     "SnapclientPauseBehaviorSelect", cg.Component, select.Select
+)
+SnapclientSyncResilienceSelect = snapclient_ns.class_(
+    "SnapclientSyncResilienceSelect", cg.Component, select.Select
 )
 
 
@@ -80,6 +88,13 @@ CONFIG_SCHEMA = cv.All(
             CONF_PAUSE_BEHAVIOR: _select_schema(
                 SnapclientPauseBehaviorSelect, "mdi:pause-octagon-outline"
             ),
+            # How much audible disruption to accept rather than mute through a resync
+            # episode. Runtime-selectable because it is a property of what the speaker
+            # carries: music in a group is usually better off silent through a storm,
+            # speech or a lone speaker is better off rough.
+            CONF_SYNC_RESILIENCE: _select_schema(
+                SnapclientSyncResilienceSelect, "mdi:volume-vibrate"
+            ),
         },
     ),
     cv.only_on_esp32,
@@ -90,6 +105,7 @@ _OPTIONS = {
     CONF_PHASE: PHASE_OPTIONS,
     CONF_SERVER: ["Automatic"],
     CONF_PAUSE_BEHAVIOR: PAUSE_BEHAVIOR_OPTIONS,
+    CONF_SYNC_RESILIENCE: SYNC_RESILIENCE_OPTIONS,
 }
 
 

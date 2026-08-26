@@ -2120,7 +2120,16 @@ void SnapcastClient::player_task_() {
         st.storm_resyncs = 0;
       }
       st.storm_resyncs++;
-      mute_now = st.storm_resyncs >= RESYNC_STORM_COUNT || std::abs(error_us) > stale_us;
+      // The mute decision, subject to the room's resilience setting. See SyncResilience: the
+      // storm test is the tunable half, because a storm is an established run of audible
+      // corrections; the stale test is the half that survives every level except NEVER_MUTE,
+      // because past the server's own buffer the DEADLINE is wrong and playing toward it is
+      // meaningless rather than merely rough.
+      const SyncResilience resilience = this->sync_resilience();
+      const bool storm_mutes = resilience == SyncResilience::MUTE_ON_STORM;
+      const bool stale_mutes = resilience != SyncResilience::NEVER_MUTE;
+      mute_now = (storm_mutes && st.storm_resyncs >= RESYNC_STORM_COUNT) ||
+                 (stale_mutes && std::abs(error_us) > stale_us);
       if (std::abs(error_us) > stale_us) {
         // Past the server's own bufferMs the DEADLINE is wrong, not our clock, and it is wrong
         // for the whole group at once -- measured on a pause/resume as a 2111 ms and a 2091 ms

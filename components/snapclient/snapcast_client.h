@@ -113,6 +113,38 @@ enum class PauseBehavior : uint8_t {
   IGNORE = 2,
 };
 
+/// @brief How much AUDIBLE DISRUPTION to accept in exchange for not going silent.
+///
+/// A hard resync is answered two ways: mute until the servo re-locks (silence, clean when it
+/// returns) or correct audibly while playing (skips and inserted silence, but sound never stops).
+/// The current default mutes once a storm is established, because a storm means many corrections
+/// and each one is audible.
+///
+/// That is the right default and the wrong answer for some rooms. The measured trigger is a ~2 s
+/// SUPPLY OUTAGE upstream of this firmware -- during which there is nothing to play anyway -- and
+/// what follows is a re-lock the listener hears as a hole. A speaker carrying speech, or one whose
+/// owner would rather hear a glitch than a gap, wants to ride it out. Hence a runtime setting: the
+/// answer belongs to the room, not the build.
+///
+/// The levels are ordered by increasing tolerance of artifacts. NONE of them changes the FIRST
+/// lock after a start or reconnect: before it there is no established timeline at all, so playing
+/// is not "tolerating an artifact", it is emitting audio at an unknown offset -- which is the boot
+/// warble this codebase has chased twice.
+enum class SyncResilience : uint8_t {
+  // Mute once a storm is established (RESYNC_STORM_COUNT resyncs in the window) or the error
+  // passes the server's own buffer. The historical behaviour, and still the default: a storm is
+  // many audible corrections in a row, and silence is usually the lesser artifact.
+  MUTE_ON_STORM = 0,
+  // Ride out storms; mute only when the error passes the server's buffer, where the DEADLINE is
+  // implausible rather than the clock, and playing toward it is meaningless by definition. Trades
+  // a run of audible skips for never going quiet during an ordinary supply outage.
+  PLAY_THROUGH_STORMS = 1,
+  // Never mute after the first lock, whatever the error. The most tolerant setting and the one
+  // with real teeth: a wrong DEADLINE (a group-wide pause/resume was measured at ~2.1 s) will be
+  // chased audibly rather than in silence. Choose it when a gap is worse than a mess.
+  NEVER_MUTE = 2,
+};
+
 /// @brief Decoded stream format of the current Snapcast stream.
 struct StreamParams {
   uint32_t sample_rate{0};
@@ -257,6 +289,16 @@ class SnapcastClient {
   /// set_channel_mode, safe to change at any time.
   void set_phase_mode(PhaseMode mode) {
     this->phase_mode_.store(static_cast<uint8_t>(mode), std::memory_order_relaxed);
+  }
+
+  /// @brief How much audible disruption to accept rather than mute; see SyncResilience.
+  /// Read by the player task at the mute decision, so a change takes effect on the next
+  /// excursion and never mid-recovery.
+  void set_sync_resilience(SyncResilience level) {
+    this->sync_resilience_.store(static_cast<uint8_t>(level), std::memory_order_relaxed);
+  }
+  SyncResilience sync_resilience() const {
+    return static_cast<SyncResilience>(this->sync_resilience_.load(std::memory_order_relaxed));
   }
 
   /// @brief Reports a local volume/mute change to the server via a ClientInfo message.
@@ -794,6 +836,7 @@ class SnapcastClient {
   std::atomic<bool> output_active_{false};
   std::atomic<int32_t> static_delay_ms_{0};
   std::atomic<uint8_t> channel_mode_{static_cast<uint8_t>(ChannelMode::STEREO)};
+  std::atomic<uint8_t> sync_resilience_{static_cast<uint8_t>(SyncResilience::MUTE_ON_STORM)};
   std::atomic<uint8_t> phase_mode_{static_cast<uint8_t>(PhaseMode::NONE)};
 
   // Server settings shadow used by the tasks (buffer_ms/latency for deadlines).

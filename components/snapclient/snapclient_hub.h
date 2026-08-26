@@ -100,6 +100,11 @@ class SnapclientHub final : public Component,
   void set_phase_mode(PhaseMode mode);
   PhaseMode get_phase_mode() const { return this->phase_mode_; }
 
+  /// @brief How much audible disruption to accept rather than mute during a resync episode.
+  /// Safe at runtime; takes effect on the next excursion. See SyncResilience.
+  void set_sync_resilience(SyncResilience level);
+  SyncResilience sync_resilience() const { return this->sync_resilience_; }
+
   /// @brief Reports a local volume/mute change to the server (ClientInfo message).
   void send_client_volume(uint8_t volume_percent, bool muted);
 
@@ -198,6 +203,7 @@ class SnapclientHub final : public Component,
 
   ChannelMode channel_mode_{ChannelMode::STEREO};
   PhaseMode phase_mode_{PhaseMode::NONE};
+  SyncResilience sync_resilience_{SyncResilience::MUTE_ON_STORM};
 
   // Server override sources (empty host = not set)
   std::string manual_host_;

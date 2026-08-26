@@ -136,6 +136,23 @@ class SnapclientPauseBehaviorSelect final : public SnapclientIndexedSelect {
   uint8_t initial_index_() const override { return static_cast<uint8_t>(this->parent_->pause_behavior()); }
 };
 
+/// @brief How much audible disruption to accept rather than mute during a resync episode.
+///
+/// Runtime-selectable for the same reason as the pause behaviour: the answer is a property of
+/// what the speaker is carrying. A music speaker in a group is usually better off silent through
+/// a storm; one carrying speech, or a lone speaker where a hole is the worst outcome, is better
+/// off rough. Options ascend in tolerance and map straight onto the enum.
+class SnapclientSyncResilienceSelect final : public SnapclientIndexedSelect {
+ public:
+  void dump_config() override;
+
+ protected:
+  void apply_index_(uint8_t index) override {
+    this->parent_->set_sync_resilience(static_cast<SyncResilience>(index));
+  }
+  uint8_t initial_index_() const override { return static_cast<uint8_t>(this->parent_->sync_resilience()); }
+};
+
 /// @brief Picker over mDNS-discovered snapservers ("Automatic" + one option per
 /// server, labeled "name (host:port)").
 ///

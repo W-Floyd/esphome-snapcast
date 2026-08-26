@@ -177,6 +177,12 @@ select:
     snapclient_id: snap
     name: Pause Behavior
   - platform: snapclient
+    # Mute on storms / Play through storms / Never mute. Ascending tolerance of audible
+    # artifacts in exchange for never going silent while the servo re-locks.
+    type: sync_resilience
+    snapclient_id: snap
+    name: Sync Resilience
+  - platform: snapclient
     type: server
     snapclient_id: snap
     name: Server

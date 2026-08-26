@@ -55,6 +55,13 @@ PAUSE_BEHAVIORS = {
     "ignore": PauseBehavior.IGNORE,
 }
 
+SyncResilience = snapclient_ns.enum("SyncResilience", is_class=True)
+SYNC_RESILIENCES = {
+    "mute_on_storm": SyncResilience.MUTE_ON_STORM,
+    "play_through_storms": SyncResilience.PLAY_THROUGH_STORMS,
+    "never_mute": SyncResilience.NEVER_MUTE,
+}
+
 PhaseMode = snapclient_ns.enum("PhaseMode", is_class=True)
 PHASE_MODES = {
     "none": PhaseMode.NONE,
@@ -71,6 +78,7 @@ CONF_TSF_SYNC = "tsf_sync"
 CONF_TIMING_DIAGNOSTICS = "timing_diagnostics"
 CONF_KEEPALIVE_HOLD = "keepalive_hold"
 CONF_PAUSE_BEHAVIOR = "pause_behavior"
+CONF_SYNC_RESILIENCE = "sync_resilience"
 
 
 def _none_to_empty_dict(value):
@@ -247,6 +255,26 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PAUSE_BEHAVIOR, default="allow"): cv.enum(
                 PAUSE_BEHAVIORS, lower=True
             ),
+            # How much AUDIBLE DISRUPTION to accept rather than go silent while the
+            # servo re-locks. The measured trigger for a resync storm is a ~2 s supply
+            # outage upstream of this firmware, and what the listener hears afterwards
+            # is the re-lock, not the outage -- so which artifact is worse depends on
+            # what the speaker carries, not on the build:
+            #
+            #   mute_on_storm        mute once a storm is established, or past the
+            #                        server's buffer. The historical behaviour.
+            #   play_through_storms  ride out storms; mute only past the server's
+            #                        buffer, where the DEADLINE is wrong rather than
+            #                        the clock and playing toward it is meaningless
+            #   never_mute           never mute after the first lock, whatever the
+            #                        error. A gap is the worst outcome; a mess is not.
+            #
+            # None of them changes the FIRST lock after a start or reconnect: before
+            # that there is no established timeline, so playing is not tolerating an
+            # artifact, it is emitting audio at an unknown offset.
+            cv.Optional(CONF_SYNC_RESILIENCE, default="mute_on_storm"): cv.enum(
+                SYNC_RESILIENCES, lower=True
+            ),
             # How long a chunk gap is bridged with keepalive silence before the
             # stream is allowed to end. Ending it tears the audio pipeline down, and
             # rebuilding playout phase costs a mute plus 7-16 s of re-lock -- so an
@@ -335,6 +363,7 @@ async def to_code(config: ConfigType) -> None:
     )
     # 0 is the "never release while connected" sentinel on the C++ side
     cg.add(var.set_pause_behavior(config[CONF_PAUSE_BEHAVIOR]))
+    cg.add(var.set_sync_resilience(config[CONF_SYNC_RESILIENCE]))
     hold = config[CONF_KEEPALIVE_HOLD]
     cg.add(var.set_keepalive_hold(0 if hold == CONF_NEVER else hold.total_milliseconds))
 

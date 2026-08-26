@@ -51,6 +51,8 @@ void SnapclientPhaseSelect::dump_config() { LOG_SELECT("", "Snapclient Phase Sel
 
 void SnapclientPauseBehaviorSelect::dump_config() { LOG_SELECT("", "Snapclient Pause Behavior Select", this); }
 
+void SnapclientSyncResilienceSelect::dump_config() { LOG_SELECT("", "Snapclient Sync Resilience Select", this); }
+
 static const char AUTOMATIC_OPTION[] = "Automatic";
 
 /// Extracts host/port from a "name (host:port)" option; false for anything else
