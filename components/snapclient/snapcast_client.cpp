@@ -208,7 +208,24 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // takes over once unmuted, where the error is mostly differential measurement noise and the
 // gain is the multiplier turning that noise into audible inter-device skew.
 static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
-static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.25f;
+static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.1f;
+// UNDER MEASUREMENT: 0.25 -> 0.1. The straight noise-vs-recovery trade below was priced before
+// the loop around the feedback pivot was understood, and it undersells the change. The loop is
+// median -> trim (KP) -> achieved rate -> pivot bias (3.15 us/ppm) -> median, so its gain is
+// KP * 3.15: 0.79 at 0.25, 0.32 at 0.1. That removes a 1/(1-G) ~ 4.8x amplification as well as
+// the linear factor, so 0.1 should buy considerably more than the 2-3 us the linear estimate
+// predicts. It is also why the residual oscillates smoothly over ~20 s rather than looking like
+// noise -- a gain just under unity.
+//
+// Baseline to beat, measured in steady state with the boards settled and both instruments
+// agreeing (KP = 0.25, 180 s): wire offset sd 6.20 us, differential achieved rate sd 1.515 ppm,
+// on-device differential median MAD 6.00 us. Judge it on those, NOT on sd of the differential
+// median -- network events put that at 209 us against a MAD of 6.
+//
+// The priced cost is recovery: ~42 s at 0.25, and the note below measured ~135 s to settle at
+// 0.1 before the input noise fell 6x. Re-measure it, because that is the number that decides
+// whether this stays.
+//
 // 0.1 -> 0.25 buys recovery time at the cost of steady-state skew, and the two are the SAME
 // dial: for this plant the error obeys e'' + KP*e' + KI*e = 0, so the envelope decays as
 // e^(-KP/2 * t) and the sqrt(KI) cancels. Settling depends on KP alone -- raising KI changes
