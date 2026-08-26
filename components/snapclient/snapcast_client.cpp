@@ -383,18 +383,38 @@ static constexpr int64_t PADDING_DRAINED_US = 5000;
 // servo then walks that back audibly -- measured in the field as corrections of -66 to
 // -220 ms, one per repair, every repair. So this must only fire on a number that is
 // certainly right, and being slow to act is far cheaper than acting on noise.
-static constexpr int32_t DRIFT_REPAIR_US = 20000;
+// 20 ms -> 2 ms. The old value was a noise floor, not a tolerance: with the repair keyed on a
+// single end-of-window sample it had to clear an artefact that reached tens of milliseconds.
+// Keyed on the median that artefact is gone -- measured +0/-1 us per window on both boards in
+// steady state -- so the floor is now ~1 us and 2 ms is three orders of magnitude above it.
+//
+// This matters for real offsets, not just tidiness: the smallest split measured on the wire
+// tonight was 8.5 ms, which sat BELOW the old threshold and was therefore unrepairable however
+// long it persisted. Every offset in the session (8.5, 28, 67, 73, 191, 198 ms) clears 2 ms.
+static constexpr int32_t DRIFT_REPAIR_US = 2000;
+// Chunk divisor for the drift distribution sampling (see the sampler in the player loop).
+static constexpr uint32_t DRIFT_SAMPLE_EVERY_CHUNKS = 4;
 // A real split is STEADY: the original was observed rock-steady at +50.7 ms for 18
 // minutes. Measurement artefacts are not -- with a mixer in the chain, drift sawtooths
 // between ~0 and -100 ms as a source ring fills and drains, and a threshold test alone
 // happily fires on the peaks. Requiring the spread across the hold window to stay inside
 // this band is what distinguishes the two, and it is the property the hold was always
 // meant to test.
-static constexpr int32_t DRIFT_STEADY_BAND_US = 10000;
+// 10 ms -> 2 ms, for the same reason as the threshold: this bounded the artefact's spread
+// through the window, and on a median the spread of a genuine split is microseconds. Kept well
+// above that rather than at the floor, because a split that is still settling should restart
+// the window rather than be repaired mid-move.
+static constexpr int32_t DRIFT_STEADY_BAND_US = 2000;
 // Held this long before acting: a real split is rock-steady (18 minutes at +50.7),
 // while a refill transient is not, and repairing a transient would inject the error
 // it is meant to remove.
-static constexpr int64_t DRIFT_REPAIR_HOLD_US = 10000000;
+// 10 s -> 3 s. The hold had two jobs: out-wait the sampling artefact, and let a post-event
+// transient settle. The median does the first instantly, so only the second remains -- and it
+// is short: measured across an injected starvation, the split was constant to the microsecond
+// (-28527 every report) from ~3 s after unmute, so a 3 s hold would have fired ~7 s earlier
+// while still observing a steady value. The band test below remains the real guard: anything
+// still moving restarts the window regardless of how long it has been open.
+static constexpr int64_t DRIFT_REPAIR_HOLD_US = 3000000;
 
 static constexpr uint32_t RESYNC_STORM_COUNT = 8;
 static constexpr int64_t RESYNC_STORM_WINDOW_US = 2000000;
@@ -2244,6 +2264,51 @@ void SnapcastClient::player_task_() {
     st.depth_accum_frames += this->pushed_frames_total_ - this->played_frames_total_;
     this->playout_mutex_.unlock();
     st.depth_samples++;
+
+    // Sample the ACCOUNTING SPLIT across the window, not once at the end of it.
+    //
+    // The report's fill_drift_us is a single snapshot pair per ~3.3 s, and the quantity
+    // sawtooths as the mixer's source ring fills and drains, so that one sample lands at an
+    // arbitrary phase of the wave. Publishing an instant of a sawtooth is the same mistake the
+    // group depth made -- two devices sampled out of phase differed by up to +-50 ms of pure
+    // artefact -- and it is why the repair needs a 10 s hold and a 20 ms threshold to see past
+    // it. Characterise the wave first: min, max and mean per window say how big it really is,
+    // whether the mean is steady while the instant swings, and therefore whether the mean is a
+    // fit input for a faster, tighter repair.
+    //
+    // Every 4th chunk, ~10/s, so ~32 samples per report: enough to resolve a wave whose period
+    // is seconds, cheap enough not to matter (a seqlock read and a mutex, against the ~38/s the
+    // chunk loop already runs at).
+    //
+    // Differenced AT THE READING'S OWN INSTANT via accounted_at_(), for the same reason the
+    // report's own value is: the reading is a snapshot on the sink's cadence while the accounted
+    // queue moves on ours, and differencing them as-read measures the phase between those
+    // cadences and almost nothing else.
+    if (--st.drift_sample_countdown == 0) {
+      st.drift_sample_countdown = DRIFT_SAMPLE_EVERY_CHUNKS;
+      audio::AudioDepth d_meas;
+      int64_t d_acct_frames = 0;
+      if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
+          this->audio_listener_->on_query_audio(d_meas)) {
+        this->playout_mutex_.lock();
+        const bool ok = this->accounted_at_(d_meas.as_of_us, d_acct_frames);
+        this->playout_mutex_.unlock();
+        if (ok) {
+          const int64_t acct_us = d_acct_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+          const int32_t d = static_cast<int32_t>(acct_us - static_cast<int64_t>(d_meas.microseconds));
+          if (st.drift_samples == 0) {
+            st.drift_min_us = st.drift_max_us = d;
+          } else {
+            st.drift_min_us = std::min(st.drift_min_us, d);
+            st.drift_max_us = std::max(st.drift_max_us, d);
+          }
+          st.drift_window_us[st.drift_window_idx] = d;
+          st.drift_window_idx = (st.drift_window_idx + 1) % ServoState::DRIFT_WINDOW;
+          st.drift_accum_us += d;
+          st.drift_samples++;
+        }
+      }
+    }
   }
   vTaskDelete(nullptr);
 }
@@ -2595,30 +2660,79 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // the steadiness band already measures. A dip of 1 us is inside the band and keeps the window;
       // a collapse to zero blows the band and restarts it, disarmed unless that sample independently
       // warrants arming.
+      // Windowed MEDIAN of the accounting split, used by the repair below and reported after it.
+      // Declared here so both see it: the spikes that pollute a mean are rare and fixed-size, so a
+      // median rejects them outright. INT32_MIN means no samples yet -- nothing to act on.
+      int32_t drift_med_us = INT32_MIN;
+      if (st.drift_samples > 0) {
+        const size_t mn = std::min<size_t>(st.drift_samples, ServoState::DRIFT_WINDOW);
+        int32_t msorted[ServoState::DRIFT_WINDOW];
+        memcpy(msorted, st.drift_window_us, mn * sizeof(int32_t));
+        std::nth_element(msorted, msorted + mn / 2, msorted + mn);
+        drift_med_us = msorted[mn / 2];
+      }
       if (fill_comparable && st.converged) {
-        if (fill_drift_us >= DRIFT_REPAIR_US && st.drift_excess_since_us == 0) {
+        // SIGN-SYMMETRIC. Drift in either direction is the same defect -- the accounted queue
+        // disagrees with the measured chain, so the prediction is wrong by that much and the servo
+        // steers real audio to the wrong time while every on-device metric agrees with itself.
+        //
+        // Negative drift was excluded because, with a mixer in the chain, drift sawtooths between
+        // ~0 and -100 ms as a source ring fills and drains, and a magnitude test alone fires on the
+        // peaks. But the sign was the wrong filter for that: the property that separates artefact
+        // from split is STEADINESS, which the band-and-hold test below already applies. The
+        // sawtooth spans ~100 ms and fails a 10 ms band on its own; a real split does not.
+        //
+        // Measured tonight, against a logic analyser, the offset a board renders at is -drift:
+        //
+        //   drift  -8526 us -> wire   8.51 ms      drift -68549 us -> wire  73 ms
+        //   drift -64672 us -> wire     67 ms      drift -194060 us -> wire 198 ms
+        //   drift -198435 us -> wire   191 ms
+        //
+        // Five for five within a few percent, and every one of them NEGATIVE -- so the excluded
+        // sign is precisely the one the re-baseline anchor plants, and it was unrepairable by
+        // construction. That is why these offsets persisted for as long as the device stayed up.
+        //
+        // A repair of this size is audible (field-measured corrections of -66 to -220 ms), but a
+        // permanent 191 ms offset is worse, and it is the sound of the defect being removed rather
+        // than created.
+        // The MEDIAN is the repair's input, so it is computed before the report that displays it.
+        // INT32_MIN means no samples yet, which the repair treats as "nothing to act on".
+        //
+        // KEYED ON THE WINDOWED MEDIAN, not on the single end-of-window sample. Measured on both
+        // boards in steady state: median +0/-1 us every window, while the mean of the same window
+        // ran -1320 to -5190 and the minimum hit -42246. The split is genuinely ZERO when nothing
+        // is wrong; what polluted it was rare fixed-size spikes, one or two per 32 samples, which a
+        // mean carries in at spike/n and a median rejects outright.
+        //
+        // That is what lets the thresholds below come down. They were sized for a "0 to -100 ms
+        // sawtooth" that no longer exists -- most likely removed when the mixer began reading the
+        // sink and its transfer buffer on the same side of the hand-off -- and a 20 ms floor could
+        // not see the 8.5 ms offset measured on the wire earlier tonight at all.
+        const int32_t drift_for_repair = drift_med_us;
+        if (drift_for_repair != INT32_MIN && std::abs(drift_for_repair) >= DRIFT_REPAIR_US &&
+            st.drift_excess_since_us == 0) {
           st.drift_excess_since_us = now_us();
-          st.drift_excess_min_us = fill_drift_us;
-          st.drift_excess_max_us = fill_drift_us;
+          st.drift_excess_min_us = drift_for_repair;
+          st.drift_excess_max_us = drift_for_repair;
         }
-        if (st.drift_excess_since_us != 0) {
-          st.drift_excess_min_us = std::min(st.drift_excess_min_us, fill_drift_us);
-          st.drift_excess_max_us = std::max(st.drift_excess_max_us, fill_drift_us);
+        if (st.drift_excess_since_us != 0 && drift_for_repair != INT32_MIN) {
+          st.drift_excess_min_us = std::min(st.drift_excess_min_us, drift_for_repair);
+          st.drift_excess_max_us = std::max(st.drift_excess_max_us, drift_for_repair);
           if (st.drift_excess_max_us - st.drift_excess_min_us > DRIFT_STEADY_BAND_US) {
             // Moving, so it is a measurement artefact rather than a split. Restart the window from
             // here rather than abandoning it: a genuine split that begins during a noisy patch should
             // still be caught once the noise passes. Restarting DISARMED unless this sample would
             // have armed it on its own -- otherwise a drift that collapsed to zero would keep a
             // window open on the strength of a magnitude it no longer has.
-            st.drift_excess_since_us = (fill_drift_us >= DRIFT_REPAIR_US) ? now_us() : 0;
-            st.drift_excess_min_us = fill_drift_us;
-            st.drift_excess_max_us = fill_drift_us;
+            st.drift_excess_since_us = (std::abs(drift_for_repair) >= DRIFT_REPAIR_US) ? now_us() : 0;
+            st.drift_excess_min_us = drift_for_repair;
+            st.drift_excess_max_us = drift_for_repair;
           } else if (now_us() - st.drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
             // Trust the measurement: drop the accounted queue by the whole drift. Playback was
             // running that far early, so the prediction moves later and the servo walks the phase
             // back through the proportional band.
             const int64_t excess_frames =
-                static_cast<int64_t>(fill_drift_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000;
+                static_cast<int64_t>(drift_for_repair) * static_cast<int64_t>(rec.params.sample_rate) / 1000000;
             this->playout_mutex_.lock();
             this->pushed_frames_total_ -= excess_frames;
             // The counter just stepped; levels recorded against its old value would make the next
@@ -2630,9 +2744,9 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                                 this->played_frames_total_);
             this->playout_mutex_.unlock();
             ESP_LOGW(TAG,
-                     "Accounting split repaired: accounted queue ran %" PRId32 " us over measured latency "
-                     "for %" PRId64 " s; playback was that far early",
-                     fill_drift_us, DRIFT_REPAIR_HOLD_US / 1000000);
+                     "Accounting split repaired: accounted queue ran %+" PRId32 " us against measured latency "
+                     "for %" PRId64 " s; playback was that far %s",
+                     drift_for_repair, DRIFT_REPAIR_HOLD_US / 1000000, drift_for_repair > 0 ? "early" : "late");
             st.drift_excess_since_us = 0;
           }
         }
@@ -2641,6 +2755,17 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         st.drift_excess_since_us = 0;
       }
 
+      char drift_str[96] = "";
+      if (st.drift_samples > 0) {
+        // Median over the window: the spikes are rare and fixed-size, so a median rejects them
+        // where a mean carries them in at spike/n.
+        snprintf(drift_str, sizeof(drift_str),
+                 ", split med %+" PRId32 " mean %+" PRId64 " (%+" PRId32 "..%+" PRId32 ", n=%" PRIu32 ")",
+                 drift_med_us, st.drift_accum_us / static_cast<int64_t>(st.drift_samples), st.drift_min_us,
+                 st.drift_max_us, st.drift_samples);
+      }
+      st.drift_accum_us = 0;
+      st.drift_samples = 0;
       char fill_str[96] = "";
       if (fill_ms >= 0 && fill_comparable) {
 #ifdef USE_SNAPCLIENT_TIMING_DIAG
@@ -2781,11 +2906,11 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
                " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, feedback %" PRId64
-               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s%s over %" PRIu32
+               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s%s%s over %" PRIu32
                " chunks",
                st.err_accum_us / st.err_count, st.err_peak_us, median_err_us, st.soft_dropped_frames, st.soft_inserted_frames,
-               st.hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, trim_str,
-               tsf_str, st.err_count);
+               st.hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, drift_str,
+               trim_str, tsf_str, st.err_count);
       st.err_accum_us = 0;
       st.err_peak_us = 0;
       st.err_count = 0;

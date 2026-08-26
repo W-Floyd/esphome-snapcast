@@ -426,6 +426,28 @@ class SnapcastClient {
     // +-50 ms of pure phase. Measured across a pair whose depths agreed to 0.3 ms on average, the
     // instantaneous difference spanned 98 ms. That noise floor is why the divergence alarm sits at
     // 100 ms and cannot see the millisecond-scale offsets that actually matter.
+    // Drift sampled ACROSS the window rather than once at its end. fill_drift_us is one
+    // snapshot pair per report, and the quantity sawtooths -- with a mixer in the chain it
+    // swings ~0 to -100 ms as a source ring fills and drains -- so a single sample is an
+    // arbitrary point on that wave. That is the same aliasing that made the published depth
+    // useless until it became a window mean, and it is why the repair needs a 10 s hold to
+    // see through it. Accumulate min/max/mean so the wave can be characterised before
+    // deciding whether the mean is a fit input for the repair.
+    // A MEDIAN, not a mean. The wave this was built to average through turned out not to be a
+    // wave: measured, 31 samples of a window read ~0 and one reads a fixed large negative spike,
+    // so the means came out quantised in exact multiples of spike/32 (-1320, -2640, -3960 for
+    // one, two and three spikes). Averaging carries the artefact straight into the answer; a
+    // median discards it outright and reads the true split. Kept alongside min/max/mean so the
+    // spike stays visible rather than merely rejected -- it is a fixed-size recurring artefact
+    // worth explaining, not just filtering.
+    static constexpr size_t DRIFT_WINDOW = 33;
+    int32_t drift_window_us[DRIFT_WINDOW]{};
+    size_t drift_window_idx{0};
+    int64_t drift_accum_us{0};
+    uint32_t drift_samples{0};
+    int32_t drift_min_us{0};
+    int32_t drift_max_us{0};
+    uint32_t drift_sample_countdown{1};
     int64_t depth_accum_frames{0};
     uint32_t depth_samples{0};
     uint32_t in_band_chunks{0};
