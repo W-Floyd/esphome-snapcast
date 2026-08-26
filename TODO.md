@@ -238,25 +238,45 @@ defect.
   this fires — but note the "harmless" was doing less work than it looked: the median rejects it for
   steering, while the hard-resync path tests the RAW instantaneous error, so nothing shielded that
   path from a ~50 ms single-sample reading against a 50 ms threshold. See the item below.
-- **FIXED, and the lesson generalises: an unbounded correction turned a momentary trigger into a
-  22 s outage.** The late hard-resync path discarded a chunk and `continue`d with no bound across
-  iterations. Dropping a chunk buys exactly one chunk of deadline, so it closes REAL lateness — but
-  when the reading comes from a bad prediction or a bad deadline, every following chunk reports the
-  same excess, the test never clears, and the loop discards the whole ring. Measured on board A:
+- **REVERTED, and the diagnosis is NOT established. Do not re-attempt without the evidence below.**
+  A discard budget on the late hard-resync path was written, flashed, and reverted within minutes
+  because it caused a WORSE failure than the one it targeted: board B refused to discard, its error
+  ran away 666 → 2657 → 8076 ms, the stale bailout forced a reconnect, and the speaker never
+  restarted — `queued=0 dma_real=0 written==completed inflight=0`, frozen for over a minute, where
+  the unbounded behaviour it replaced recovers in ~22 s. Reverted in `4c13250`.
+    - **What the attempt got wrong.** Unbounded discarding is LOAD-BEARING: it is how the client
+      consumes a genuine multi-second backlog. The fallback left behind (the aggressive soft band at
+      frames/32, ~3% catch-up) cannot close seconds of lateness, so capping the discard turned a
+      recoverable backlog into a runaway. The budget was also set once at episode open and never
+      re-armed, so a growing real backlog could never buy the discards it needed.
+    - **The original interpretation is now in doubt.** The 09:46 cascade below was read as
+      self-inflicted — the correction draining the ring. But if the client was genuinely falling
+      behind, draining IS the recovery and the 22 s re-lock is correct behaviour, not a defect.
+      Nothing measured so far distinguishes "spurious 50 ms reading" from "real backlog starting at
+      50 ms", and that distinction is the whole question.
+    - **So the next step is evidence, not control code.** What is needed is a per-chunk trace across
+      one of these events showing, at the same instant: `error_us`, the ring occupancy, and whether
+      each discard actually reduced the following chunk's error. If discards reduce it ~1:1 the
+      lateness is real and the existing behaviour is right; if the error is flat or growing across
+      discards, it is a prediction fault and the trigger is what needs gating, not the response.
+    - **Independently exposed, and worth fixing on its own:** the stale-bailout reconnect can leave
+      the speaker STOPPED. B logged `Connected to 192.168.1.2:1704` and `Stream started: 44100 Hz`
+      at 10:14:13 and still never wrote another frame — `dma_real=0` says the I2S channel was not
+      running, not merely starved. The starvation re-baseline path recovers from the same situation
+      (measured at 09:46:57 → `Sync locked` 18 s later), so this is specific to the reconnect path.
+- **The measured cascade this all started from**, for whoever picks it up. On board A:
     - healthy at 09:46:53.410 (median −38 µs, ring **1724 ms**), `Hard resync 50 ms late` at .688
     - **pipeline completely dry** 0.7 s later: `queued=0 dma_real=0 written==completed inflight=0`
     - ring down to **26 ms**, **37 hard resyncs**, median 1.06 s, then
       `Pipeline drained (source starvation); re-baselining playout`, then **22 s muted**
-    - 66 chunks discarded to chase a 50 ms error that two would have covered
-  Emptying the pipeline makes the prediction *worse*, because the playout feedback the pivot smooths
-  stops arriving — positive feedback into the drain, which is why it ended in a re-baseline rather
-  than settling. Now budgeted per episode (the opening lateness plus one threshold of slack): a
-  genuine backlog still gets what it needs (5 s → 193 chunks allowed, 192 needed) while a spurious
-  reading costs 3 chunks instead of 66, and past the budget the chunk is played late instead. The
-  budget is set once at episode open and deliberately NOT grown with the error, because in the
-  observed failure the error grew from 50 → 490 → 811 ms *as a consequence of the draining*, so a
-  max()-based budget would re-arm the runaway. Refused resyncs are no longer counted toward the
-  storm, which would otherwise mute on the very spike the budget absorbs.
+    - 66 chunks discarded; the error grew 50 → 490 → 811 ms as it went
+  Two readings remain open, and the failed attempt above is what makes the choice matter. Either the
+  drain was self-inflicted (a spurious 50 ms reading, discards that could not close it, and the
+  emptying pipeline degrading the prediction further because the playout feedback the pivot smooths
+  stops arriving), or the client was genuinely falling behind and the drain plus re-lock was the
+  correct recovery. The growing error is consistent with BOTH — self-inflicted or real — which is
+  exactly why capping the response blindly made things worse. Settle it with the per-chunk trace
+  described above before touching this path again.
 - **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured, but
   not re-checked since the in-flight fix changed what `meas` contains.
 - **Stale deadline on stream resumption.** With `keepalive_hold: never`, the first chunk after a long
@@ -318,17 +338,21 @@ Earned expensively; ignoring these cost hours.
   pivot term was declared disproven off a differential rate whose MEAN was 0.018 ppm — true, and
   irrelevant, because the bias multiplies the instantaneous value and its sd was 1.64 ppm. Before
   concluding that a term cancels, check which moment of it the mechanism actually multiplies.
-- **Bound every corrective action by what the error could justify, and check the correction can
-  actually reduce its own trigger.** Three separate outages in this project were a correct-looking
-  response applied without a ceiling: the repair cascade (a repair fired on an incomplete depth
-  report, and its own subtraction created the opposite split that a second repair answered), and the
-  late hard-resync drain (66 chunks discarded for a 50 ms error, emptying the ring and forcing a
-  re-baseline). In both, the arithmetic was right for the case it was written for and had no
-  ceiling for the case where its input was wrong. Ask two questions of any correction: *what is the
-  most this error could possibly justify*, and *does applying it reduce the thing that triggered
-  it?* If the second answer is "only when the trigger is real", the first question is mandatory —
-  otherwise a bad reading becomes an unbounded loop. Worse, both had positive feedback: the
-  correction degraded the very measurement that gated it.
+- **Before capping a correction, prove the correction is the problem — a cap on a load-bearing
+  recovery path is worse than the thing it fixes.** Cost one flash and a minute of dead audio. The
+  late hard-resync discard looked like an unbounded correction chasing a bad reading, so it was
+  budgeted. It is also the ONLY mechanism that consumes a genuine multi-second backlog: capped, a
+  real backlog ran away (666 → 2657 → 8076 ms) into a stale-bailout reconnect that left the speaker
+  stopped indefinitely, where the uncapped version recovers in ~22 s. The tell that should have
+  stopped the attempt: the *same observable* (a growing error during discards) is produced both by
+  a spurious trigger the discards cannot fix AND by a real backlog they are fixing too slowly, so
+  the evidence in hand never distinguished the two. **When one observable is consistent with both
+  the defect and correct operation, no change to the response is justified yet — instrument to
+  separate them first.** Here: does each discard reduce the next chunk's error ~1:1, or not?
+- **The repair cascade remains the real instance of the unbounded-correction pattern:** a repair
+  fired on an incomplete depth report, and its own subtraction created the opposite split that a
+  second repair answered 14 s later. That one was confirmed by `r_mix` matching the split to 1 µs
+  before anything was changed — which is the standard the hard-resync attempt above did not meet.
 - **A guard on the median does not protect a path that reads the raw error.** The −52 ms split spike
   was filed as harmless because the median rejects it. It is harmless to the steering servo and was
   never harmless to the hard-resync path, which deliberately tests the instantaneous error so it can
