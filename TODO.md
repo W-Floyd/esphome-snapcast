@@ -36,26 +36,34 @@ the offset filter's tracking lag and is now fed forward (see `OFFSET_RATE_*` in 
 What is left is a static offset planted at every accounting re-anchor — see the first item, which
 is now the largest error in the chain by an order of magnitude.
 
-- **DISPROVEN: the feedback pivot is not a differential term.** It was listed here as "the
-  remaining half of the differential noise" on the strength of the granule phase argument, which
-  was an assumption. The pivot's error is derivable in closed form: an EWMA at α lags a ramp by
-  `c = (1−α)/α = 63` steps, and since `S·2205 = 50000 µs` exactly, the bias is
+- **The feedback pivot is the dominant differential term, and the loop around it is why the error
+  oscillates.** Closed form: an EWMA at α lags a ramp by `c = (1−α)/α = 63` steps, and
+  `S·2205 = 50000 µs` exactly, so
 
-      predicted − ideal = c·(S·2205 − Δt) = c · 50000 · δ      δ = achieved rate vs nominal
+      predicted − ideal = c·(S·2205 − Δt) = c · 50000 · δ = 3.15 µs per ppm of δ
 
-  which is ~157 µs at δ = 50 ppm and scales with the smoothing — so it is worth knowing about for
-  ABSOLUTE latency. But δ is the ACHIEVED rate, not the trim: each board's trim cancels its own
-  crystal, so both land on the same achieved rate, and the analyser measures the residual
-  difference at **0.018 ppm** (wire slope over 30 s). Differential bias is therefore
-  `63 × 50000 × 0.018e-6 = 0.06 µs`, against 7.14 µs of differential median noise to explain.
-  Do not smooth the pivot to chase inter-device skew; it cancels.
-- **Find what the 7.14 µs of differential median noise actually is.** Chain confirmed to 1%:
-  differential median sd 7.14 µs × `TRIM_KP_RUN` 0.25 = differential trim sd 1.78 ppm (measured
-  1.78), which integrates into the observed few-µs wire wander at ~20 s period. So this is the
-  input that sets the floor, and the pivot is not it. `tbjit` says the timebase contributes 1–4 µs.
-  The untested remainder is chunk-arrival timing (when the prediction is evaluated) and the
-  accounting. Needs a per-chunk decomposition of one board's own error into deadline / predicted /
-  actual, which the report only shows as a windowed median.
+  where δ is the ACHIEVED rate against nominal. Measured directly, with `fs_a_hz`/`fs_b_hz` in the
+  analyser CSV:
+    - δ = **+38 ppm** on both boards → **+120 µs of common absolute latency**, scaling with the
+      pivot's smoothing. Inaudible for imaging, real for lip-sync.
+    - differential rate: mean +0.024 ppm but **sd 1.644 ppm**, p2p 12.3 ppm — the boards' rates
+      agree on AVERAGE and wander instantaneously, because the trim wanders (differential trim
+      sd 1.78 ppm, the same quantity).
+    - so differential pivot bias = 3.15 × 1.644 = **5.18 µs**, against 7.14 µs of differential
+      median noise to explain. About 70% of the floor.
+  **And it closes a loop:** median → trim (`TRIM_KP_RUN` 0.25) → achieved rate → pivot bias
+  (3.15 µs/ppm) → median. Loop gain `0.25 × 3.15 = 0.79`, just under unity, which is why the wire
+  shows a smooth ~20 s oscillation rather than white noise, and why lowering KP helps more than its
+  own factor.
+  **The fix is not to smooth it.** Smoothing scales the bias with `c`, so it makes this worse — as
+  the offset filter did before it was fed forward. The bias is a known deterministic function of
+  values the client already holds: `rate_lock_->applied_ppm()` plus the learned crystal baseline
+  give δ with no new measurement noise, so subtract `c · 50000 · δ` from the prediction and the
+  loop gain goes with it. Same shape as the fix that removed the offset filter's lag.
+  A previous note here claimed the opposite -- that the pivot cancels between devices, on the
+  strength of the 0.018 ppm MEAN differential rate. Wrong quantity: the mean says the rates agree
+  over 30 s, the sd says they do not at any instant, and it is the instantaneous value the pivot
+  multiplies.
 - **The −42 ms split spike.** Recurs at −42223..−42246 µs on both boards, to within 20 µs, so it
   is structural. Rejected by the median so it is harmless, but unexplained. Suspect a stale or
   partial depth snapshot that `accounted_at_()` then differences against. New clue: every
