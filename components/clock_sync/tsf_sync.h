@@ -153,7 +153,7 @@ class TsfSync {
   /// Compares our playout depth against the leader's and warns on sustained
   /// divergence. Diagnostics only: never touches the mapping.
   void check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t local_now_us);
-  void check_render_phase_(int64_t leader_phase_us);
+  void check_render_phase_(int64_t leader_phase_us, int64_t local_now_us);
   /// Sandwiched TSF read: local/tsf/local, midpoint local, retried when an
   /// interrupt widens the sandwich. @return false if TSF is unavailable.
   static bool sample_tsf_(int64_t &tsf_us, int64_t &local_us, int64_t *width_out = nullptr);
@@ -186,6 +186,7 @@ class TsfSync {
   std::atomic<int32_t> render_delta_us_{INT32_MIN};
   int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance
   int64_t last_diverge_log_us_{0};
+  int64_t last_render_log_us_{0};
   int64_t unhealthy_since_us_{0};  // leader only; 0 = healthy
   int64_t healthy_since_us_{0};    // 0 = currently unhealthy
   int64_t no_lead_until_us_{0};    // cooldown after stepping down

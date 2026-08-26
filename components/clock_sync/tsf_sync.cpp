@@ -127,6 +127,8 @@ static constexpr int64_t SANDWICH_TRUST_FACTOR = 2;
 static constexpr uint32_t SANDWICH_FLOOR_BLOCK = 256;
 // Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
+// Beacons arrive once a second; the render phase moves far slower than that.
+static constexpr int64_t RENDER_LOG_INTERVAL_US = 4000000;
 
 // Player-side TSF-vs-local rate, used to DE-TREND the offset filter (see
 // shared_server_offset_us). Endpoints are trusted sandwiches, whose midpoint noise is a few us
@@ -487,15 +489,26 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     this->warned_rejected_ = false;
     this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
     this->check_pipeline_divergence_(pkt.pipeline_us, local_now_us);
-    this->check_render_phase_(pkt.render_phase_us);
+    this->check_render_phase_(pkt.render_phase_us, local_now_us);
   }
 }
 
-void TsfSync::check_render_phase_(int64_t leader_phase_us) {
+void TsfSync::check_render_phase_(int64_t leader_phase_us, int64_t local_now_us) {
   const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
   if (leader_phase_us == RENDER_PHASE_UNKNOWN || mine == RENDER_PHASE_UNKNOWN) {
     this->render_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
     return;
+  }
+  // On its own line, throttled, because this is the ONLY instrument that can see an absolute
+  // inter-device offset -- the sync median compares each device against its own prediction, so an
+  // offset moves prediction and audio together and reads as zero there -- and in the sync report
+  // it sits behind tsf=, which the 256-byte formatting ceiling truncates away exactly when the
+  // report is at its most detailed. Two followers of the same leader can be differenced directly:
+  // delta(b) - delta(a) is what a logic analyser between them should read.
+  if (local_now_us - this->last_render_log_us_ >= RENDER_LOG_INTERVAL_US) {
+    this->last_render_log_us_ = local_now_us;
+    ESP_LOGD(TAG, "Render phase mine %+" PRId64 " leader %+" PRId64 " delta %+" PRId64 " us", mine, leader_phase_us,
+             mine - leader_phase_us);
   }
   // Clamped into int32 for reporting: a delta beyond +-2 s is not a playout offset, it is a
   // device that has not settled, and saturating is more honest than wrapping.

@@ -26,9 +26,10 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-Current floor: sd 5.1 µs steady state, +0.9 µs static offset, p2p 15.7 µs, reboot recovery ~42 s.
-The static term was the offset filter's tracking lag and is now fed forward (see
-`OFFSET_RATE_*` in `tsf_sync.cpp`); what is left is the pivot and the two split artefacts.
+Current floor: MAD 1–3 µs steady state, p2p ~15 µs, reboot recovery ~42 s. The static term was
+the offset filter's tracking lag and is now fed forward (see `OFFSET_RATE_*` in `tsf_sync.cpp`).
+What is left is a static offset planted at every accounting re-anchor — see the first item, which
+is now the largest error in the chain by an order of magnitude.
 
 - **The feedback pivot** advances in 50 ms DMA granules (`inflight=2205`) with each board at a
   different sub-granule phase. The remaining half of the differential noise; untouched.
@@ -40,12 +41,22 @@ The static term was the offset filter's tracking lag and is now fed forward (see
   of never, but not prevented: it captures an instant that stops being true (`own=0` at the
   seed, ~244 ms of audio 1.4 s later). Preventing it needs an anchor that stays valid — not
   another way to suppress the second seed.
-- **Pipeline start leaves 2–4 DMA buffers of the client's audio uncredited.** Instrument
-  `playback_delay_frames_` at the moment it is set rather than reasoning about the ordering.
-- **Retry `TRIM_KP_RUN` at 0.1.** It trades steady-state noise for recovery speed (15 µs at 0.1,
-  35 µs at 0.25, 45–100 µs at 0.5; the relation is linear), and 0.25 was chosen while a 42 µs
-  static offset made the recovery speed worth paying for. At sd 5.1 µs the 35 µs it costs is now
-  the largest term in the budget.
+- **Every accounting re-anchor plants a static wire offset of tens of µs.** Now the dominant
+  term, and only visible on the analyser. Measured in one session at MAD 1–3 µs of noise, so the
+  residual is resolved to 1 part in 40 — far better SNR than the 8.5 ms this was chased at:
+    - three boards restarted together: **+0.9 µs**
+    - board b alone, twice: **+89 µs**, then **+115 µs** (26 µs apart, so not frame-quantised)
+    - both boards together: **+26 µs**, then b's split repair fired and it went to **+85 µs**
+  The chain on that last one is the thing to attack: b came up with its accounted queue −25.5 ms
+  against measured latency (≈ half a 50 ms DMA buffer, not the "2–4 buffers" previously assumed),
+  the repair dropped 1224 frames 3 s later to close it, and the audio settled ~60 µs from where
+  it had been. Prevent the start-time miscount and both the repair and its residual go away.
+  Instrument the seed and the first credits at the instant they happen.
+- **Leave `TRIM_KP_RUN` at 0.25.** Re-measured after the feed-forward and the trade has inverted.
+  KP multiplies the DIFFERENTIAL MEDIAN, and that input has fallen 6× since the gain was chosen
+  (sd 43.0 → 6.7 µs; differential trim sd 20.9 → 1.7 ppm), so the 35 µs the setting was said to
+  cost is now most of a 15.7 µs p2p budget. 0.1 would buy ~2–3 µs of the 5.1 µs sd and cost 3.6×
+  on reboot recovery (42 s → 150 s). Revisit only if the recovery trough goes away.
 - **Stale deadline on stream resumption.** With `keepalive_hold: never`, the first chunk after a
   long idle carries a deadline stale by roughly the idle duration. Self-heals in ~2.5 s and the
   magnitude rule mutes correctly, so it is bounded. Closing it needs the snapserver side.
@@ -95,4 +106,11 @@ Earned expensively; ignoring these cost hours.
   the sync line, which reads as missing data rather than as a formatting problem.
 - **On-device metrics have lied repeatedly** — the depth delta compares occupancy rather than
   timing, and the render phase cancels the very error it measures. The logic analyser
-  (`scripts/i2s-skew.py`) is the only instrument that has not.
+  (`scripts/i2s-skew.py`) is the only instrument that has not. The render phase's blindness is
+  now MEASURED, not just suspected: with both boards following the same leader and their deltas
+  differenced, it read −15.5 ±8.5 µs against +85 µs on the wire. Wrong sign, ~12σ out. It
+  consumes `(pushed − played)`, so an accounting error and the audio offset it causes cancel —
+  which is exactly the class of defect it was built to find. Do not use it for absolute offset.
+- **Two boards following the same leader can be differenced.** `delta(b) − delta(a)` from the
+  `Render phase` line is the cheapest on-device stand-in for the analyser, and the medians need
+  ~70 samples each before they mean anything (single samples carry ±100 µs).
