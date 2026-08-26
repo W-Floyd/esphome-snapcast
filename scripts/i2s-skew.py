@@ -1419,6 +1419,10 @@ def main():
 
     if args.simulate:
         capture, chan, sim = make_simulator(args)
+        # The simulator has no acquisition to drop blocks, but the drop check at the end of
+        # the run reads this unconditionally -- so leaving it unbound crashed every
+        # --simulate run in its final lines, after all the work was done and printed.
+        stream_state = None
         if args.count == 0:
             args.count = 5
     else:
@@ -1465,6 +1469,15 @@ def main():
         ts0, ys0, anchor0 = load_existing(args.out)
         if not ts0:
             sys.exit(f"{args.out} has no rows to plot")
+        # Priming above already read each log once, against a placeholder anchor, and the
+        # call below re-reads all of it from byte zero against the CSV's real anchor. TEMPS
+        # APPENDS per line, so without a reset every point is recorded twice -- harmless
+        # looking on a plot that just draws duplicates, but for a time series the axis then
+        # runs forward, jumps back to the start and runs forward again, which is a gap-split
+        # into two overlapping segments where there is one run. (LOG_COVERAGE is already
+        # cleared after priming for the same reason.) The live path must NOT do this: there,
+        # priming's read is the only copy, since the loop reads only bytes appended after it.
+        TEMPS.clear()
         ev, _ = collect_events(anchor0 or time.time())
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]
         print(f"replot: {len(ts0)} rows spanning {ts0[-1]-ts0[0]:.1f} s, "
