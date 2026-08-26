@@ -669,11 +669,47 @@ TEMPS = {}
 # None marks a window with no trim programmed at all, which is a hole in the integral and
 # not a zero; see integral_fit.
 TRIMS = {}
+# (board, key) -> [(elapsed_s, value)] for what the firmware BELIEVES, so it can be shown
+# against what the wire measures. Sampled at the firmware's own cadence (render phase every
+# ~24 s over these logs), not at the capture rate.
+FIRMWARE = {}
+# board -> (offset_s, jitter_ms, n) from device_anchor: how this board's esp_timer clock maps
+# onto the host axis, and how much host-side delay had to be averaged out to get there.
+DEV_ANCHOR = {}
+# board -> [(elapsed_s, n, err_us, med_us, ring_ms, drops)] from the armed per-chunk burst.
+RSYNCS = {}
 
 SYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?"
     r"corrected -(\d+)/\+(\d+) frames,\s*(\d+) hard resyncs.*?"
     r"trim ([+-][\d.]+) ppm")
+
+# DEVICE TIMESTAMP, esp_timer microseconds since boot, appended to every series line the
+# firmware emits for plotting. Preferred over the "[HH:MM:SS]" prefix for placing points,
+# because that prefix is the HOST's receive time: measured carrying ~200 ms of delay
+# typically and up to 1 s, with truncated and interleaved lines on top. At the 3-8 s
+# cadences these lines used to run at that was a few percent; at 1 s it is 20-100% of the
+# interval. Optional, so a log from older firmware still plots off the prefix.
+DEV_T_RE = re.compile(r"\bt=(\d+)")
+
+# "Rate ref: tsf-local +42.237 ppm (raw +42.100) t=..." -- each board's local clock against
+# the RADIO timebase, so it is measured outside the audio servo loop. Its DIFFERENCE between
+# two boards is their crystal difference: measured at -5.347 ppm, which accounts for the whole
+# of the differential trim's constant offset from the true rate and takes the integrated error
+# from 505 to 17 us per 100 s. Updates every RATE_WINDOW_US (4 s) on the device, so there is
+# nothing to gain by looking for it faster.
+RATEREF_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Rate ref: tsf-local ([+-][\d.]+) ppm")
+
+# "RSYNC[7] t=... err=52123 med=-1914 ring=1697 drops=3" -- the armed per-chunk burst around
+# a resync excursion. The discriminator it exists for: if lateness is real, err falls ~1:1
+# with the audio discarded, so err should drop by about one chunk (~26 ms) per drops++. If err
+# is flat or rising across drops, the trigger is a bad prediction or a bad deadline and
+# discarding cannot close it. Those two want opposite fixes and look identical at report
+# resolution, which is how a discard cap got flashed and reverted.
+RSYNC_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RSYNC\[(\d+)\] t=(\d+) err=(-?\d+) med=(-?\d+) "
+    r"ring=(\d+) drops=(\d+)")
 
 # "Trim window: mean +12.345 ppm over 3.31 s audio (covered 100%)" -- the window's
 # TIME-MEAN applied trim, on its own line because the Sync line above is at the 256-byte
@@ -688,6 +724,23 @@ TRIM_WINDOW_RE = re.compile(
 # marks real audio time the integral cannot account for.
 TRIM_NONE_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Trim window: no trim programmed over ([\d.]+) s audio")
+
+# The firmware's OWN estimate of the quantity this script measures on the wire, so it can
+# be plotted against the measurement rather than trusted. Two independent forms exist and
+# they disagree by orders of magnitude over these logs -- render phase sits at a median of
+# -41 us while playout-depth reports medians of +12 ms and -6.6 ms -- which is exactly the
+# disagreement the wire can arbitrate.
+# The sign class must accept '+': the firmware prints this with %+PRId64, so every POSITIVE
+# delta carries a literal plus. A (-?\d+) here silently dropped 1112 of 2713 real points --
+# 41%, all of one sign -- which does not merely thin the series, it BIASES it: the surviving
+# median is a median of negatives only.
+PHASE_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Render phase .*?delta ([+-]?\d+) us")
+DEPTH_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Playout depth ([+-]?\d+) us vs leader")
+# Comparable to the ppm this script measures per capture from the LRC edges.
+RAMP_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Offset ramp ([+-][\d.]+) ppm")
 
 
 def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=None,
@@ -709,13 +762,20 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     # the moment the run went live, having worked fine on a whole-file --replot.
     state = state if state is not None else {}
     ev, temps, trims = [], [], []
+    # name -> [(time_of_day, value)], for series the caller plots and logs rather than
+    # turning into bars. Keyed by name so more can be added without changing the arity.
+    extras = {}
+    # Per-chunk resync bursts: (tod, n, dev_us, err_us, med_us, ring_ms, drops)
+    rsyncs = []
     last_trim, last_resync = state.get("trim"), state.get("resync")
     last_pipe = state.get("pipe")
     last_role = state.get("role")
     try:
         f = open(path, errors="replace")
     except OSError:
-        return [], start_offset, state, []
+        # Same arity as the normal return: it was short by one, so an unreadable log
+        # would have crashed the caller's unpacking rather than being skipped.
+        return [], start_offset, state, [], [], {}, []
     if start_offset == 0 and tail_bytes:
         try:
             size = os.fstat(f.fileno()).st_size
@@ -743,13 +803,39 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         if tw:
             tod_w = (int(tw.group(1)) * 3600 + int(tw.group(2)) * 60 + int(tw.group(3))
                      + int(tw.group(4)) / (10 ** len(tw.group(4))))
-            trims.append((tod_w, float(tw.group(5)), float(tw.group(6))))
+            dv = DEV_T_RE.search(line)
+            trims.append((tod_w, float(tw.group(5)), float(tw.group(6)),
+                          int(dv.group(1)) if dv else None))
             continue
         tn = TRIM_NONE_RE.match(line)
         if tn:
             tod_w = (int(tn.group(1)) * 3600 + int(tn.group(2)) * 60 + int(tn.group(3))
                      + int(tn.group(4)) / (10 ** len(tn.group(4))))
-            trims.append((tod_w, None, float(tn.group(5))))
+            dv = DEV_T_RE.search(line)
+            trims.append((tod_w, None, float(tn.group(5)),
+                          int(dv.group(1)) if dv else None))
+            continue
+        # The firmware's own view, on its own log lines: matched before SYNC_RE's continue.
+        # Each carries the device timestamp when the firmware is new enough; None falls back
+        # to the host prefix so an older log still plots.
+        for key, rx, scale in (("phase_us", PHASE_RE, 1.0),
+                               ("depth_us", DEPTH_RE, 1.0),
+                               ("ramp_ppm", RAMP_RE, 1.0),
+                               ("tsflocal_ppm", RATEREF_RE, 1.0)):
+            mx = rx.match(line)
+            if mx:
+                tod_x = (int(mx.group(1)) * 3600 + int(mx.group(2)) * 60
+                         + int(mx.group(3)) + int(mx.group(4)) / (10 ** len(mx.group(4))))
+                dv = DEV_T_RE.search(line)
+                extras.setdefault(key, []).append(
+                    (tod_x, int(dv.group(1)) if dv else None, float(mx.group(5)) * scale))
+                break
+        rs = RSYNC_RE.match(line)
+        if rs:
+            tod_r = (int(rs.group(1)) * 3600 + int(rs.group(2)) * 60 + int(rs.group(3))
+                     + int(rs.group(4)) / (10 ** len(rs.group(4))))
+            rsyncs.append((tod_r, int(rs.group(5)), int(rs.group(6)), int(rs.group(7)),
+                           int(rs.group(8)), int(rs.group(9)), int(rs.group(10))))
             continue
         m = SYNC_RE.match(line)
         if not m:
@@ -793,7 +879,29 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     f.close()
     state["trim"], state["resync"], state["pipe"] = last_trim, last_resync, last_pipe
     state["role"] = last_role
-    return ev, end, state, temps, trims
+    return ev, end, state, temps, trims, extras, rsyncs
+
+
+def device_anchor(pairs):
+    """(offset_s, jitter_ms, n) mapping one board's esp_timer clock onto the host axis.
+
+    Each board's device clock counts from its own boot, so it needs an anchor before it can
+    share an axis -- but the anchor should be fitted from MANY lines rather than taken from
+    one, because the host prefix each pair uses is receive time and carries the delay this
+    whole change exists to route around. The median of (host - device) averages that out;
+    the residual MAD is then a direct measurement of the host-side jitter, which is worth
+    printing since it is the number that justifies the device stamp in the first place.
+
+    Drift between the two clocks is ppm-scale, so over a plotted window of minutes it is
+    sub-millisecond and a constant offset is enough. Over hours it would not be, which is
+    why this is fitted from the lines inside the run rather than the whole log.
+    """
+    if not pairs:
+        return None, None, 0
+    diffs = sorted(t - d for t, d in pairs)
+    off = diffs[len(diffs) // 2]
+    mad = sorted(abs(x - off) for x in diffs)[len(diffs) // 2]
+    return off, mad * 1000.0, len(diffs)
 
 
 def tod_to_unix(tod, ref_unix):
@@ -811,7 +919,8 @@ def tod_to_unix(tod, ref_unix):
 
 
 def write_svg(path, ts, ys, title, ylabel, include_zero=True,
-              xlabel="elapsed (s)", log_axes=False, events=(), panels=(), stats=None):
+              xlabel="elapsed (s)", log_axes=False, events=(), panels=(), stats=None,
+              overlays=None):
     """Plot without a plotting dependency -- the rest of scripts/ is stdlib too.
 
     Extra panels are drawn only where they have data, so a run without temperature
@@ -850,6 +959,29 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
 
     vs = [p[1] for p in pts]
     y0, y1 = min(vs), max(vs)
+    # Overlays set the scale too -- confining them to the measured range showed only the
+    # part that happened to fall inside it, which reads as agreement where there may be
+    # none. But follow their ROBUST range, not their extremes: 2 of 1572 render-phase
+    # values sit near -1.8 s against a median of -41 us, and honouring those stretched the
+    # axis a thousandfold and flattened everything real. The outliers are still drawn,
+    # clipped to the panel, and counted in the legend.
+    off_scale = {}
+    for name, pts_ in (overlays or {}).items():
+        vals = [v for _x, v in pts_ if math.isfinite(v)]
+        if not vals:
+            continue
+        # Median +- 6 MAD, not percentiles: a short window may hold only a dozen points,
+        # where p1 is effectively the minimum and a single -1.8 s excursion still stretches
+        # the axis a thousandfold. MAD ignores it however few points there are.
+        arr = np.asarray(vals, dtype=float)
+        med = float(np.median(arr))
+        mad = float(np.median(np.abs(arr - med)))
+        if mad > 0:
+            lo_v, hi_v = med - 6 * 1.4826 * mad, med + 6 * 1.4826 * mad
+        else:
+            lo_v, hi_v = float(arr.min()), float(arr.max())
+        y0, y1 = min(y0, lo_v), max(y1, hi_v)
+        off_scale[name] = int(np.count_nonzero((arr < lo_v) | (arr > hi_v)))
     if log_axes:
         include_zero = False
     if include_zero:
@@ -867,6 +999,8 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
          f'font-family="-apple-system,sans-serif" font-size="12">',
          f'<rect width="{W}" height="{H}" fill="white"/>',
+         f'<defs><clipPath id="toppanel"><rect x="{ML}" y="{top0}" '
+         f'width="{W-40-ML}" height="{top1-top0}"/></clipPath></defs>',
          f'<text x="{ML}" y="26" font-size="15" font-weight="600">{title}</text>']
     if stats:
         o.append(f'<text x="{ML}" y="44" font-size="11" fill="#666">{stats}</text>')
@@ -951,6 +1085,30 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
             continue
         o.append(f'<polyline points="{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in seg)}" '
                  f'fill="none" stroke="#2b6cb0" stroke-width="1.5"/>')
+    # The firmware's own estimates, on the same axis as the measurement. Thin and dashed so
+    # the measured trace stays dominant: these are claims, not observations.
+    if overlays:
+        opal = ["#7c3aed", "#be123c", "#0f766e", "#a16207"]
+        for i, (name, pts_) in enumerate(sorted(overlays.items())):
+            good = [(x, v) for x, v in pts_ if math.isfinite(v)]
+            if len(good) < 2:
+                continue
+            col = opal[i % len(opal)]
+            # Clipped to the panel: an off-scale excursion would otherwise draw straight
+            # across the panels below it.
+            o.append(f'<g clip-path="url(#toppanel)">')
+            for seg in split_gaps(sorted(good)):
+                if len(seg) < 2:
+                    continue
+                o.append(f'<polyline points="'
+                         f'{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in seg)}" '
+                         f'fill="none" stroke="{col}" stroke-width="1" '
+                         f'stroke-dasharray="5 3" opacity="0.85"/>')
+            o.append('</g>')
+            nof = off_scale.get(name, 0)
+            tag = f"{name} ({nof} off-scale)" if nof else name
+            o.append(f'<text x="{W-44}" y="{top0+14+i*13}" text-anchor="end" '
+                     f'font-size="10" fill="{col}">{tag}</text>')
     # Shade what is missing, so a gap reads as absence rather than as an axis break.
     for prev, nxt in zip(segments, segments[1:]):
         gx0, gx1 = px(prev[-1][0]), px(nxt[0][0])
@@ -993,7 +1151,21 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
 
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
-          "fs_a_hz,fs_b_hz,reason")
+          "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
+          "tsflocal_a_ppm,tsflocal_b_ppm,reason")
+# The firmware columns are HELD from that board's most recent log line, not resampled: the
+# firmware emits these far slower than rows arrive, so the same value repeats across many rows
+# and is empty until the first line arrives.
+#
+# tsflocal is here because it is the only OUTSIDE-THE-LOOP rate reference the device has: each
+# board's local clock against the radio timebase, so its DIFFERENCE between two boards is their
+# crystal difference. Measured at -5.347 ppm, which accounts for the whole of the differential
+# trim's constant offset from the true rate -- 505 us per 100 s of integrated error down to 17.
+# Held rather than interpolated for the same reason as the rest: it steps every 4 s on the
+# device (RATE_WINDOW_US) and inventing values between those steps would fabricate resolution
+# the measurement does not have.
+HELD_COLS = (("a", "phase_us"), ("b", "phase_us"), ("a", "ramp_ppm"), ("b", "ramp_ppm"),
+             ("a", "tsflocal_ppm"), ("b", "tsflocal_ppm"))
 
 
 DUMP_SCHEMA = "elapsed_s,skew_ns"
@@ -1147,7 +1319,48 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None):
         dt = win(dtrim)
         if dt:
             panels.append(("differential trim mean (ppm)", {"b - a": dt}))
+    # What each board BELIEVES its offset from the leader is, next to the measured ppm.
+    # Same units, so it goes on one panel and any disagreement is read directly.
+    ramp = {f"{b} ramp": win(FIRMWARE.get((b, "ramp_ppm"), [])) for b in ("a", "b")}
+    ramp = {k: v for k, v in ramp.items() if v}
+    if ramp:
+        panels.append(("firmware offset ramp (ppm)", ramp))
+    # tsf-local: each board's clock against the RADIO timebase, so it is measured outside the
+    # audio servo loop -- the only reference here that is. Its own panel rather than sharing
+    # with the ramp above: these sit around +42 and +37 ppm where the ramp sits near 0, so one
+    # shared axis would flatten the ramp. The useful quantity is the SEPARATION between the two
+    # boards, which is their crystal difference (-5.35 ppm measured), so both are drawn.
+    tsfl = {f"{b} tsf-local": win(FIRMWARE.get((b, "tsflocal_ppm"), [])) for b in ("a", "b")}
+    tsfl = {k: v for k, v in tsfl.items() if v}
+    if tsfl:
+        panels.append(("tsf-local, outside the servo (ppm)", tsfl))
     return panels
+
+
+def firmware_overlays(lo, hi, which=("phase",)):
+    """The firmware's own offset estimates, in ns, for drawing over the measured skew.
+
+    Both are the same quantity this script measures on the wire, which is the whole point:
+    every firmware timing metric is computed against that device's own predicted playout,
+    so a modelling error moves the audio and the metric together and reads as zero. Drawn
+    on the skew panel rather than below it because they are directly comparable -- if
+    belief and measurement diverge, the gap is the blind spot.
+    """
+    # Selectable because the two series live on different scales: render phase sits at a
+    # median of -41 us, comparable with the wire, while depth-vs-leader medians are +12 ms
+    # and -6.6 ms. Since the axis now expands to fit whatever is overlaid, including depth
+    # by default would stretch the range 300x and flatten the measurement to a line.
+    out = {}
+    for board in ("a", "b"):
+        for sel, key, label in (("phase", "phase_us", "render phase"),
+                                ("depth", "depth_us", "depth vs leader")):
+            if sel not in which:
+                continue
+            pts = [(x, v * 1000.0) for x, v in FIRMWARE.get((board, key), [])
+                   if lo <= x <= hi]
+            if pts:
+                out[f"{board} {label}"] = pts
+    return out
 
 
 def split_gaps(pts):
@@ -1492,6 +1705,60 @@ def report_recovery(ts, ys):
               f"(band +-{tol:.1f} us, floor MAD {mad:.2f} us)")
 
 
+def report_resync_bursts(lo, hi):
+    """Per-chunk resync bursts: did discarding actually close the error?
+
+    The one question this trace exists to answer. Dropping a chunk buys exactly one chunk of
+    deadline, so REAL lateness falls ~1:1 with the audio discarded. A bad prediction or a bad
+    deadline reads the same excess on every following chunk, so err stays flat or grows while
+    drops climbs. Those two want opposite fixes -- bound the response, or gate the trigger --
+    and at report resolution they look identical, which is how a discard cap was flashed and
+    reverted. So the verdict is reported per burst, not per event.
+    """
+    printed = False
+    for board, rows in sorted(RSYNCS.items()):
+        win = [r for r in rows if lo <= r[0] <= hi]
+        if len(win) < 4:
+            continue
+        # Split into bursts on the sequence number restarting.
+        bursts, cur = [], []
+        for r in win:
+            if cur and r[1] <= cur[-1][1]:
+                bursts.append(cur)
+                cur = []
+            cur.append(r)
+        if cur:
+            bursts.append(cur)
+        for b in bursts:
+            if len(b) < 4:
+                continue
+            if not printed:
+                print("   resync bursts (did discarding close the error?)")
+                printed = True
+            t0, err0, ring0 = b[0][0], b[0][2], b[0][4]
+            errN, ringN, dropsN = b[-1][2], b[-1][4], b[-1][5]
+            chunk_us = 26100.0
+            closed = err0 - errN
+            expected = dropsN * chunk_us
+            # Ratio of error closed to error the discards should have closed. ~1 means the
+            # lateness was real and discarding was the right tool; ~0 or negative means it
+            # was not lateness at all.
+            ratio = (closed / expected) if expected > 0 else float("nan")
+            if dropsN == 0:
+                verdict = "no discards (excursion absorbed without them)"
+            elif ratio > 0.6:
+                verdict = "REAL lateness -- discards closed it ~1:1"
+            elif ratio < 0.2:
+                verdict = "NOT lateness -- discards did not move it"
+            else:
+                verdict = "partial -- inconclusive"
+            print(f"      {board} t={t0:8.1f}s  n={len(b):3d}  err {err0:+9d} -> {errN:+9d} us  "
+                  f"ring {ring0:5d} -> {ringN:5d} ms  drops {dropsN:3d}")
+            print(f"      {'':>{len(board)}}  closed {closed:+9d} us of {expected:9.0f} expected"
+                  f"  ratio {ratio:+.2f}  -> {verdict}")
+    return printed
+
+
 def report_offset_integral(args, ts, ys, rate_a, rate_b):
     """Does the integral of the differential rate reproduce the measured wire offset?
 
@@ -1509,6 +1776,12 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
     offset_us = [(t, y / 1000.0) for t, y in zip(ts, ys) if math.isfinite(y)]
     if len(offset_us) < MIN_FIT_ROWS:
         return []
+    # Host-side log delay, measured rather than asserted: this is what the device stamp routes
+    # around, and if it ever reads small the stamp has stopped being necessary.
+    for board, (off, jitter_ms, n) in sorted(DEV_ANCHOR.items()):
+        print(f"   {board}: device clock anchored from {n} stamped line(s); "
+              f"host log delay MAD {jitter_ms:.0f} ms")
+    report_resync_bursts(ts[0] - 1 if ts else -1, ts[-1] + 1 if ts else 0)
     report_recovery(ts, ys)
     print("   offset integral (is the offset the integral of the differential rate?)")
     dfs = pair_diff(rate_a, rate_b, to_ppm=lambda a, b: (b - a) / ((a + b) / 2.0) * 1e6)
@@ -1781,6 +2054,10 @@ def main():
     p.add_argument("--dump-skew", default=None,
                    help="write the PER-FRAME skew series (one row per audio frame, "
                         "~44100/s) to this CSV, not just one row per capture")
+    p.add_argument("--overlay", default="phase",
+                   help="firmware offset estimates to draw over the measured skew, comma "
+                        "separated: phase, depth, none. The axis expands to fit whatever "
+                        "is overlaid, and depth-vs-leader is ms-scale, so it is opt-in")
     p.add_argument("--y-free", action="store_true",
                    help="scale the vertical axis to the data instead of always including "
                         "zero; use when the shape of the variation matters more than its "
@@ -1798,6 +2075,8 @@ def main():
     p.add_argument("--sim-frame-rate", type=float, default=44117.647)
     args = p.parse_args()
     primed_offsets = None
+    overlay_sel = tuple(x.strip() for x in args.overlay.split(",")
+                        if x.strip() and x.strip() != "none")
 
     def collect_events(t_start, offsets=None):
         """Log events as (elapsed_seconds, kind, label), relative to the run start."""
@@ -1808,18 +2087,41 @@ def main():
         for path in args.annotate:
             board = os.path.basename(path).split(".")[0]
             span = [None, None]
-            ev, end, st, tp, tw = parse_sync_events(path, board, args.trim_ppm,
-                                                    offsets.get(path, 0), span,
-                                                    LOG_STATE.get(path), args.sync_us,
-                                                    args.peak_us, args.pipeline_ms,
-                                                    args.log_tail_mb * (1 << 20))
+            ev, end, st, tp, tw, xt, rs = parse_sync_events(path, board, args.trim_ppm,
+                                                            offsets.get(path, 0), span,
+                                                            LOG_STATE.get(path), args.sync_us,
+                                                            args.peak_us, args.pipeline_ms,
+                                                            args.log_tail_mb * (1 << 20))
+            # One anchor per board, fitted across every line that carried a device stamp, then
+            # used for all of them. Placing each point by its own host prefix is what the
+            # device stamp exists to avoid; placing them by device time with a median-fitted
+            # offset keeps the SPACING exact and only the common origin approximate.
+            pairs = [(tod_to_unix(tod, t_start) - t_start, dev / 1e6)
+                     for pts in xt.values() for tod, dev, _v in pts if dev is not None]
+            pairs += [(tod_to_unix(tod, t_start) - t_start, dev / 1e6)
+                      for tod, _m, _a, dev in tw if dev is not None]
+            off, jitter_ms, npair = device_anchor(pairs)
+            if off is not None:
+                DEV_ANCHOR[board] = (off, jitter_ms, npair)
+            place = (lambda tod, dev: dev / 1e6 + off) if off is not None else \
+                    (lambda tod, dev: tod_to_unix(tod, t_start) - t_start)
+            for key, pts in xt.items():
+                dst = FIRMWARE.setdefault((board, key), [])
+                for tod, dev, val in pts:
+                    dst.append((place(tod, dev) if dev is not None
+                                else tod_to_unix(tod, t_start) - t_start, val))
             offsets[path], LOG_STATE[path] = end, st
             for tod, name, val in tp:
                 TEMPS.setdefault(name, []).append(
                     (tod_to_unix(tod, t_start) - t_start, val))
-            for tod, mean_ppm, audio_s in tw:
+            for tod, mean_ppm, audio_s, dev in tw:
                 TRIMS.setdefault(board, []).append(
-                    (tod_to_unix(tod, t_start) - t_start, mean_ppm, audio_s))
+                    (place(tod, dev) if dev is not None else tod_to_unix(tod, t_start) - t_start,
+                     mean_ppm, audio_s))
+            for tod, n, dev, err, med, ring, drops in rs:
+                RSYNCS.setdefault(board, []).append(
+                    (place(tod, dev) if dev is not None else tod_to_unix(tod, t_start) - t_start,
+                     n, err, med, ring, drops))
             if span[0] is not None:
                 LOG_COVERAGE[path] = (tod_to_unix(span[0], t_start) - t_start,
                                       tod_to_unix(span[1], t_start) - t_start)
@@ -1889,6 +2191,13 @@ def main():
         # copy, since the loop reads only bytes appended after it.
         TEMPS.clear()
         TRIMS.clear()
+        # Every per-log series needs this, not just the two that had it: priming read each log
+        # once already and the call below re-reads it from byte zero, so anything that APPENDS
+        # records each point twice -- which for a time series splits one run into two
+        # overlapping segments rather than merely duplicating points.
+        FIRMWARE.clear()
+        RSYNCS.clear()
+        DEV_ANCHOR.clear()
         ev, _ = collect_events(anchor0 or time.time())
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]
         print(f"replot: {len(ts0)} rows spanning {ts0[-1]-ts0[0]:.1f} s, "
@@ -1916,6 +2225,7 @@ def main():
                   "board B - board A (ns)   [+ = B later]",
                   stats=stats_caption(ts0, ys0),
                   include_zero=not args.y_free, events=ev,
+                  overlays=firmware_overlays(ts0[0] - 1, ts0[-1] + 1, overlay_sel),
                   panels=build_panels(args, ra0, rb0, TEMPS,
                                       ts0[0] - 1, ts0[-1] + 1, dtrim))
         print(f"  plot {args.plot}")
@@ -2078,10 +2388,16 @@ def main():
                 rate_a.append((elapsed, fs_a))
             if math.isfinite(fs_b):
                 rate_b.append((elapsed, fs_b))
+            # Sample-and-hold of the firmware's own numbers, so belief and measurement sit
+            # on the same row and can be compared offline rather than only by eye.
+            held = []
+            for key in HELD_COLS:
+                pts = FIRMWARE.get(key)
+                held.append(f"{pts[-1][1]:.4g}" if pts else "")
             log.write(f"{elapsed:.3f},{wall:.3f},{off:.1f},{ppm:.4f},{coef:.4f},"
                       f"{info.get('frame_lag',0)},{info.get('rival',float('nan')):.3f},"
                       f"{info.get('scatter_ns',float('nan')):.1f},"
-                      f"{fs_a:.4f},{fs_b:.4f},{reason}\n")
+                      f"{fs_a:.4f},{fs_b:.4f},{','.join(held)},{reason}\n")
 
             note = reason
             if info.get("lag_steps"):
@@ -2143,6 +2459,7 @@ def main():
                                   "board B - board A (ns)   [+ = B later]",
                                   stats=stats_caption(pt, py_),
                                   include_zero=not args.y_free, events=evs,
+                                  overlays=firmware_overlays(pt[0] - 1, pt[-1] + 1, overlay_sel),
                                   panels=build_panels(args, ra, rb, TEMPS,
                                                       pt[0] - 1, pt[-1] + 1))
                     finally:
@@ -2170,6 +2487,7 @@ def main():
                   "board B - board A (ns)   [+ = B later]",
                   stats=stats_caption(ts, ys),
                   include_zero=not args.y_free, events=events,
+                  overlays=firmware_overlays(-1, ts[-1] + 1, overlay_sel),
                   panels=build_panels(args, rate_a, rate_b, TEMPS, -1, ts[-1] + 1, dtrim))
     if ncorr:
         print(f"\n  {ncorr} of {len(ys)} rows had a whole-frame ambiguity "
