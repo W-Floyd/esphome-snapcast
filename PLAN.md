@@ -245,6 +245,9 @@ forward if upstream submission has any calendar pressure.
   a fix aimed only at stop/restart would miss it. Both variants need a replug.
 - **Why the ring empties in the first place.** Upstream of the resync runaway and of the wedge, and
   still unexplained. This is the first defect in the chain; the others are consequences.
+  Instrumented as of 2026-08-26: the `RSYNC` burst now replays an 80-chunk pre-trigger history
+  (`RPRE`) when it arms, and `i2s-skew.py` reads the arrival cadence in it to separate a stalled
+  supply from playout outrunning an intact one. Flashed to all five boards; needs an event.
 - **A silent board is not always a wedge.** Both boards once went quiet together with no audio-task
   lines; the cause was `stream 'Spotify': status='idle'` on the server. Query
   `Server.GetStatus` on `192.168.1.2:1780` before diagnosing firmware — and note the tell: a real

@@ -2116,20 +2116,33 @@ void SnapcastClient::player_task_() {
     // skips dbg_early_recon_ entirely and a storm currently leaves no chunk-resolution trace at
     // all. ring= is here because the other open question is whether the ring drains because the
     // client is behind or because the correction is draining it.
+    // Ring level in ms of audio. Computed every chunk now, because the pre-trigger history
+    // below needs it on chunks where nothing is being logged at all.
+    const uint32_t ring_ms =
+        (frame_bytes > 0 && rec.params.sample_rate > 0)
+          ? static_cast<uint32_t>(static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 /
+                                  (frame_bytes * rec.params.sample_rate))
+          : 0;
+
     if (st.resync_trace_left == 0 && std::abs(error_us) > hard_us &&
         now_us() - st.resync_trace_arm_us >= RESYNC_TRACE_ARM_INTERVAL_US) {
       st.resync_trace_arm_us = now_us();
       st.resync_trace_left = RESYNC_TRACE_CHUNKS;
       st.resync_trace_idx = 0;
       st.resync_drops = 0;
+      // Arm the pre-trigger replay in the same breath. The window ends at the chunk BEFORE this
+      // one -- this chunk is RSYNC[0] -- so the two records abut with no overlap and no gap.
+      this->arm_pre_trace_dump_(st);
     }
     if (st.resync_trace_left > 0) {
       st.resync_trace_left--;
-      const uint32_t ring_ms = static_cast<uint32_t>(static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 /
-                                                     (frame_bytes * rec.params.sample_rate));
       ESP_LOGD(TAG, "RSYNC[%u] t=%" PRId64 " err=%" PRId64 " med=%" PRId64 " ring=%" PRIu32 " drops=%" PRIu32,
                st.resync_trace_idx++, now_us(), error_us, median_err_us, ring_ms, st.resync_drops);
     }
+    // One packed line of history per chunk, then back to recording. Recording is frozen for the
+    // ~14 chunks this takes, which is why it is ordered after the emit and before the record.
+    this->emit_pre_trace_line_(st);
+    this->record_pre_trace_(st, error_us, median_err_us, ring_ms);
     if (error_us <= hard_us && error_us >= -hard_us) {
       st.resync_drops = 0;  // episode closed
     }
@@ -2877,6 +2890,111 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
       this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
     }
+}
+
+// PRE-TRIGGER HISTORY for the resync trace. THREAD CONTEXT: player task, all three.
+//
+// The armed burst answers "did discarding close the error?" and settled it. It cannot answer the
+// question that replaced it -- WHY DOES THE RING EMPTY? -- because it is armed BY the threshold
+// crossing, so RSYNC[0] already reads ring=26 and the drain is over before the first line exists.
+// Every offset-planting event measured so far runs the same chain: ring empties -> late playout
+// -> resync -> repair -> permanent displacement, and only the first link has never been watched.
+//
+// So: record every chunk unconditionally into a ring, and replay it when the burst arms. Same
+// instrument, one buffer. The cost in steady state is five stores per chunk and no log traffic.
+//
+// Three constraints shaped the rest. The samples cannot live in ServoState, which is the player
+// task's 6 KB stack -- hence PreSample and pre_trace_ on the client. The replay cannot be dumped
+// in one go, because 80 lines at once would flood the log queue and the first casualty would be
+// the live burst it is meant to be read against -- hence packing and one line per chunk. And the
+// replay must not race the recorder -- hence the freeze, which is safe precisely because the
+// frozen span is the span the live burst covers line for line.
+static void append_num_(char *buf, size_t cap, size_t &pos, bool first, long long v) {
+  if (pos + 1 >= cap) {
+    return;
+  }
+  const int r = snprintf(buf + pos, cap - pos, first ? "%lld" : ",%lld", v);
+  if (r < 0) {
+    return;
+  }
+  pos = (static_cast<size_t>(r) < cap - pos) ? pos + static_cast<size_t>(r) : cap - 1;
+}
+
+// Saturating narrowing. Real errors run to a few seconds, but a timebase step once read
+// 24888016 ms, and a wrapped int32 in a diagnostic is worse than a pegged one.
+static int32_t clamp_i32_(int64_t v) {
+  return static_cast<int32_t>(std::min<int64_t>(std::max<int64_t>(v, INT32_MIN), INT32_MAX));
+}
+
+void SnapcastClient::record_pre_trace_(ServoState &st, int64_t error_us, int64_t median_err_us, uint32_t ring_ms) {
+  if (st.pre_dump_left > 0) {
+    return;  // frozen while replaying; the live burst covers this span
+  }
+  const int64_t t = now_us();
+  // dt is the gap from the predecessor, so the first sample after a boot or a freeze has no
+  // predecessor to measure against and stores 0.
+  const int64_t dt = st.pre_filled == 0 ? 0 : t - st.pre_last_t_us;
+  PreSample &s = this->pre_trace_[st.pre_idx];
+  s.dt_us = static_cast<uint32_t>(std::min<int64_t>(std::max<int64_t>(dt, 0), UINT32_MAX));
+  s.err_us = clamp_i32_(error_us);
+  s.med_us = clamp_i32_(median_err_us);
+  s.ring_ms = static_cast<uint16_t>(std::min<uint32_t>(ring_ms, UINT16_MAX));
+  s.drops = static_cast<uint16_t>(std::min<uint32_t>(st.resync_drops, UINT16_MAX));
+  st.pre_last_t_us = t;
+  st.pre_idx = (st.pre_idx + 1) % RESYNC_PRE_CHUNKS;
+  if (st.pre_filled < RESYNC_PRE_CHUNKS) {
+    st.pre_filled++;
+  }
+}
+
+void SnapcastClient::arm_pre_trace_dump_(ServoState &st) {
+  if (st.pre_filled == 0 || st.pre_dump_left > 0) {
+    return;
+  }
+  st.pre_dump_left = st.pre_filled;
+  st.pre_dump_pos = static_cast<uint16_t>((st.pre_idx + RESYNC_PRE_CHUNKS - st.pre_filled) % RESYNC_PRE_CHUNKS);
+  st.pre_dump_label = st.pre_filled;  // oldest prints as -pre_filled, newest as -1
+  // Samples store deltas only, so absolute time is reconstructed by walking back from the newest
+  // sample's timestamp: dt of a sample is the gap from its PREDECESSOR, so reaching the oldest of
+  // n samples subtracts n-1 of them.
+  int64_t t = st.pre_last_t_us;
+  uint16_t idx = st.pre_idx == 0 ? static_cast<uint16_t>(RESYNC_PRE_CHUNKS - 1) : static_cast<uint16_t>(st.pre_idx - 1);
+  for (uint16_t k = 1; k < st.pre_filled; k++) {
+    t -= this->pre_trace_[idx].dt_us;
+    idx = idx == 0 ? static_cast<uint16_t>(RESYNC_PRE_CHUNKS - 1) : static_cast<uint16_t>(idx - 1);
+  }
+  st.pre_dump_t_us = t;
+}
+
+void SnapcastClient::emit_pre_trace_line_(ServoState &st) {
+  if (st.pre_dump_left == 0) {
+    return;
+  }
+  const uint16_t n = std::min<uint16_t>(RESYNC_PRE_PER_LINE, st.pre_dump_left);
+  // Field-major packing: one CSV list per quantity, so a reader can eyeball ring= across six
+  // chunks on one line, and a parser can zip the lists. Sized for six saturated values each.
+  char dt[96], err[96], med[96], ring[64], drops[64];
+  size_t p_dt = 0, p_err = 0, p_med = 0, p_ring = 0, p_drops = 0;
+  dt[0] = err[0] = med[0] = ring[0] = drops[0] = '\0';
+  const int64_t t_first = st.pre_dump_t_us;
+  const uint16_t label_first = st.pre_dump_label;
+  for (uint16_t k = 0; k < n; k++) {
+    const PreSample &s = this->pre_trace_[st.pre_dump_pos];
+    append_num_(dt, sizeof(dt), p_dt, k == 0, s.dt_us);
+    append_num_(err, sizeof(err), p_err, k == 0, s.err_us);
+    append_num_(med, sizeof(med), p_med, k == 0, s.med_us);
+    append_num_(ring, sizeof(ring), p_ring, k == 0, s.ring_ms);
+    append_num_(drops, sizeof(drops), p_drops, k == 0, s.drops);
+    st.pre_dump_pos = static_cast<uint16_t>((st.pre_dump_pos + 1) % RESYNC_PRE_CHUNKS);
+    st.pre_dump_label--;
+    st.pre_dump_left--;
+    // pre_dump_t_us tracks the sample now under the cursor, so it advances by THAT sample's dt.
+    if (st.pre_dump_left > 0) {
+      st.pre_dump_t_us += this->pre_trace_[st.pre_dump_pos].dt_us;
+    }
+  }
+  ESP_LOGD(TAG, "RPRE[-%u..-%u] t=%" PRId64 " dt=%s err=%s med=%s ring=%s drops=%s", label_first,
+           static_cast<unsigned>(label_first - n + 1), t_first, dt, err, med, ring, drops);
 }
 
 // THREAD CONTEXT: player task. Emits the periodic report and, on the same cadence,

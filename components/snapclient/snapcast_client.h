@@ -371,6 +371,29 @@ class SnapcastClient {
   // (half-window), keeping phase margin comfortable at KP = 0.5.
   static constexpr size_t MEDIAN_WINDOW = 31;
 
+  /// @brief One chunk of the resync trace's PRE-TRIGGER history.
+  ///
+  /// Deliberately 16 bytes: 80 of these is 1.3 KB, which is affordable as a permanent member
+  /// but would not be on the player task's 6 KB stack. dt_us is the gap from the previous
+  /// recorded chunk -- the cadence of arrivals is itself part of the question ("does the ring
+  /// empty because supply stopped?"), and a delta fits where an absolute timestamp does not.
+  struct PreSample {
+    uint32_t dt_us;
+    int32_t err_us;
+    int32_t med_us;
+    uint16_t ring_ms;
+    uint16_t drops;
+  };
+  // Chunks of history kept before an arm, matched to the 80 the live burst covers after it, so
+  // an episode reads as one continuous ~160-chunk record. ~2.1 s of lead-in at the 26 ms
+  // cadence, and much less during a storm -- which is the case the lead-in is for.
+  static constexpr uint16_t RESYNC_PRE_CHUNKS = 80;
+  // Samples packed into each dumped line. The dump is paced at one line per chunk, so this is
+  // the ratio between the history's log cost and the live burst's: at 6, replaying 80 chunks of
+  // history adds ~25% to a burst that already runs at the documented flood rate. Sized so the
+  // formatted line stays clear of the 256-byte ceiling the Sync line hit.
+  static constexpr uint16_t RESYNC_PRE_PER_LINE = 6;
+
   /// @brief Everything the playout servo carries between chunks.
   ///
   /// These were locals of player_task_(), which is why the loop was ~700 lines: the
@@ -468,6 +491,26 @@ class SnapcastClient {
     uint16_t resync_trace_idx{0};
     int64_t resync_trace_arm_us{0};
     uint32_t resync_drops{0};
+    // PRE-TRIGGER history cursors for that trace. The burst above is armed BY the threshold
+    // crossing, so its first line already shows the ring empty and it structurally cannot show
+    // the emptying. These carry the rolling window of the chunks BEFORE the arm; the samples
+    // themselves live in pre_trace_ on the client object, because this struct is the player
+    // task's stack and that task has 6 KB.
+    //
+    // pre_last_t_us is the timestamp of the newest recorded sample: samples store only the
+    // DELTA from their predecessor (which is the arrival-cadence data the drain question wants,
+    // and fits in 4 bytes), so absolute time is reconstructed backwards from this at dump.
+    uint16_t pre_idx{0};     // write cursor into pre_trace_
+    uint16_t pre_filled{0};  // samples valid, <= RESYNC_PRE_CHUNKS
+    int64_t pre_last_t_us{0};
+    // Dump in progress: paced at one packed line per chunk so the history costs a fraction of
+    // the live burst's line rate rather than doubling it. Recording is frozen while it runs, so
+    // the dump cannot read entries it is racing against; the frozen span is exactly the span the
+    // live burst is covering anyway.
+    uint16_t pre_dump_left{0};   // samples still to emit
+    uint16_t pre_dump_pos{0};    // ring index of the next sample to emit
+    uint16_t pre_dump_label{0};  // printed as -pre_dump_label, so the newest sample is -1
+    int64_t pre_dump_t_us{0};    // reconstructed absolute time of that sample
 #ifdef USE_I2S_RATE_LOCK
 #endif
     uint32_t raw_sample_countdown{1};
@@ -651,6 +694,15 @@ class SnapcastClient {
   int64_t chunk_deadline_us_(const ChunkRecord &rec);
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
+
+  /// Appends one chunk to the resync trace's rolling pre-trigger history. Called on EVERY chunk
+  /// the servo sees; a no-op while a dump is replaying. Costs five stores.
+  void record_pre_trace_(ServoState &st, int64_t error_us, int64_t median_err_us, uint32_t ring_ms);
+  /// Arms the replay of that history, oldest first, and reconstructs the oldest sample's
+  /// absolute timestamp from the stored deltas.
+  void arm_pre_trace_dump_(ServoState &st);
+  /// Emits at most one packed RPRE line, if a dump is armed. Called once per chunk.
+  void emit_pre_trace_line_(ServoState &st);
 
   /// One recorded value of a playout counter and the instant it took effect. See the histories
   /// themselves, below, for why the accounting has to be evaluable at a past instant at all.
@@ -934,6 +986,9 @@ class SnapcastClient {
 #endif
   std::unique_ptr<uint8_t[]> slice_buffer_;
   static constexpr size_t SLICE_BUFFER_SIZE = 4096;
+  // Rolling pre-trigger history for the resync trace; written and read by the player task only.
+  // Here rather than in ServoState because ServoState is that task's stack. See PreSample.
+  PreSample pre_trace_[RESYNC_PRE_CHUNKS]{};
   // Most recent pushed frame, for click-free servo insertion (player task only)
   uint8_t last_frame_[8]{};
   uint32_t last_frame_bytes_{0};

@@ -520,8 +520,20 @@ defect.
       **So the trigger, not the response, is what wants attention: why does the ring empty?**
         - Caveat on the evidence: the burst is armed by the threshold crossing, so it shows the
           ring at that moment, not before the excursion began. "Already empty" means empty by the
-          crossing. Seeing the drain start needs a rolling pre-trigger history, which is the next
-          instrumentation step if this needs nailing down harder.
+          crossing. Seeing the drain start needs a rolling pre-trigger history.
+        - **BUILT AND FLASHED to all five boards (2026-08-26), awaiting an event.** `RPRE` lines:
+          the last 80 chunks before an arm — `dt`, `err`, `med`, `ring`, `drops` per chunk — kept
+          in a 1.3 KB ring on the client, replayed six-per-line and one line per chunk when the
+          burst arms, so the history adds ~25% to a burst that already runs at the flood rate.
+          Recording is frozen during the replay; the frozen span is what the live burst covers.
+          `i2s-skew.py` expands them into the existing per-chunk rows with NEGATIVE sequence
+          numbers, so an episode reads −80…+79 continuously, and reports the drain separately
+          from the discard verdict (which is still computed on the armed chunks only).
+        - **The discriminator to read off it**: `dt` says whether chunks kept ARRIVING while the
+          ring fell. Gaps summing to a quarter of the window → supply stalled (radio, server,
+          decode) and the servo is a victim; cadence intact while `ring` falls → playout outran
+          supply and the rate is wrong. The report prints one of those two verdicts per burst.
+          If `ring` is already flat at its floor at seq −80, raise `RESYNC_PRE_CHUNKS`.
         - Also measured, and useful on its own: an ~100 ms excursion with a healthy ring resolves
           with no discards and no muting. The path only engages when the ring is gone.
     - **THE WEDGE IS A SEPARATE, PRE-EXISTING DEFECT, and NOT caused by the discard cap.** I said it

@@ -771,6 +771,25 @@ RSYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RSYNC\[(\d+)\] t=(\d+) err=(-?\d+) med=(-?\d+) "
     r"ring=(\d+) drops=(\d+)")
 
+# "RPRE[-80..-75] t=... dt=26100,26099,... err=... med=... ring=... drops=..." -- the PRE-TRIGGER
+# history replayed when that burst arms. The burst above is armed BY the threshold crossing, so
+# its first line already reads ring=26 and it structurally cannot show the ring EMPTYING, which is
+# the question that replaced "did discarding close the error?". These lines are the chunks before
+# the arm, six per line, replayed one line per chunk so the replay costs a fraction of the live
+# burst's log rate.
+#
+# Expanded into the SAME per-chunk rows as RSYNC, with NEGATIVE sequence numbers (-80 = 80 chunks
+# before the arm, -1 = the chunk immediately before it), so an episode reads as one continuous
+# record from -80 to +79 and the burst report needs no special case. The replay is emitted AFTER
+# the arm, so rows are sorted by device time before bursts are split.
+#
+# dt is each chunk's gap from its predecessor: the firmware stores deltas (4 bytes, and the
+# arrival cadence is itself part of "why does the ring empty?"), and only the first sample on
+# each line carries an absolute t. The rest are reconstructed by accumulating dt.
+RPRE_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RPRE\[-(\d+)\.\.-(\d+)\] t=(\d+) dt=([\d,]+) "
+    r"err=([-\d,]+) med=([-\d,]+) ring=([\d,]+) drops=([\d,]+)")
+
 # "Trim window: mean +12.345 ppm over 3.31 s audio (covered 100%)" -- the window's
 # TIME-MEAN applied trim, on its own line because the Sync line above is at the 256-byte
 # formatting ceiling. This is the quantity the offset integral needs; the end-of-window
@@ -932,6 +951,23 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
                      + int(rs.group(4)) / (10 ** len(rs.group(4))))
             rsyncs.append((tod_r, int(rs.group(5)), int(rs.group(6)), int(rs.group(7)),
                            int(rs.group(8)), int(rs.group(9)), int(rs.group(10))))
+            continue
+        rp = RPRE_RE.match(line)
+        if rp:
+            tod_p = (int(rp.group(1)) * 3600 + int(rp.group(2)) * 60 + int(rp.group(3))
+                     + int(rp.group(4)) / (10 ** len(rp.group(4))))
+            first_seq, t0 = int(rp.group(5)), int(rp.group(7))
+            cols = [[int(v) for v in rp.group(g).split(",")] for g in (8, 9, 10, 11, 12)]
+            # A truncated line (the formatting ceiling is 256 bytes and six saturated samples
+            # can approach it) would zip short and silently drop the tail; refuse it instead.
+            if len({len(c) for c in cols}) == 1:
+                dts, errs, meds, rings, drops = cols
+                t = t0
+                for i in range(len(dts)):
+                    if i:
+                        t += dts[i]  # dt[0] is the gap to the PREVIOUS line, not within this one
+                    rsyncs.append((tod_p, -(first_seq - i), t, errs[i], meds[i],
+                                   rings[i], drops[i]))
             continue
         m = SYNC_RE.match(line)
         if not m:
@@ -2060,6 +2096,61 @@ def report_seed_steps(ts, ys, settle_s=4.0):
               "\n      anchor's latency error is what plants the offset, anchor_err == step_us.")
 
 
+def report_pre_trigger_drain(board, pre):
+    """Why did the ring empty? The half of the episode the armed burst cannot see.
+
+    Every offset-planting event measured so far runs one chain: ring empties -> late playout ->
+    resync -> repair -> permanent displacement. Links 2-4 are characterised; this is link 1. The
+    armed burst is armed by the threshold crossing, so it opens with the ring already gone.
+
+    Two mechanisms end with an empty ring and want opposite fixes. If chunks STOPPED ARRIVING the
+    drain is a supply gap -- radio, server, decode -- and the servo is a victim. If they kept
+    arriving on cadence while the ring fell, playout outran supply and the rate is wrong. The
+    arrival cadence separates them, which is why dt is recorded at all.
+    """
+    if len(pre) < 8:
+        return
+    pre = sorted(pre, key=lambda r: r[1])
+    rings = [r[4] for r in pre]
+    ring_max = max(rings)
+    # Chunk cadence from the placed timestamps. Degenerate when device time was unavailable and
+    # every sample on a line fell back to the line's own log timestamp; say so rather than
+    # reporting a cadence that is an artefact of the fallback.
+    dts = [(pre[i][0] - pre[i - 1][0]) * 1000.0 for i in range(1, len(pre))]
+    usable = [d for d in dts if d > 0]
+    span_ms = (pre[-1][0] - pre[0][0]) * 1000.0
+    print(f"      {board}  pre-trigger: ring {rings[0]:5d} -> {rings[-1]:5d} ms over "
+          f"{len(pre)} chunks ({span_ms:.0f} ms), peak {ring_max} ms")
+    if ring_max <= 0:
+        print(f"      {'':>{len(board)}}  -> ring was ALREADY empty a full window before the arm;"
+              f" widen RESYNC_PRE_CHUNKS to catch the drain")
+        return
+    # Drain onset: the last chunk at which the ring still held half its peak. Half rather than
+    # the peak itself because the ring breathes by a chunk either way in normal running.
+    onset = max((i for i, v in enumerate(rings) if v >= ring_max / 2), default=0)
+    onset_ms = (pre[-1][0] - pre[onset][0]) * 1000.0
+    print(f"      {'':>{len(board)}}  drain began at seq {pre[onset][1]:+d} "
+          f"({onset_ms:.0f} ms before the arm, from {rings[onset]} ms)")
+    if len(usable) < len(dts) / 2:
+        print(f"      {'':>{len(board)}}  arrival cadence unavailable (no device timestamps)")
+        return
+    usable.sort()
+    med_dt = usable[len(usable) // 2]
+    gaps = [d for d in usable if d > 2 * med_dt]
+    print(f"      {'':>{len(board)}}  arrivals: median {med_dt:.1f} ms, max {max(usable):.1f} ms, "
+          f"{len(gaps)} gap(s) > 2x median")
+    # A stalled supply shows as gaps that add up to real audio time; a rate problem shows as a
+    # ring falling while chunks keep landing on cadence.
+    if gaps and sum(gaps) > 0.25 * span_ms:
+        print(f"      {'':>{len(board)}}  -> SUPPLY STALLED: {sum(gaps):.0f} ms of the "
+              f"{span_ms:.0f} ms window was gap; the ring drained because nothing arrived")
+    elif rings[-1] < ring_max / 2:
+        print(f"      {'':>{len(board)}}  -> SUPPLY INTACT: chunks kept arriving on cadence while"
+              f" the ring fell; playout outran supply")
+    else:
+        print(f"      {'':>{len(board)}}  -> inconclusive: no gaps and no sustained decline")
+
+
 def report_resync_bursts(lo, hi):
     """Per-chunk resync bursts: did discarding actually close the error?
 
@@ -2072,9 +2163,12 @@ def report_resync_bursts(lo, hi):
     """
     printed = False
     for board, rows in sorted(RSYNCS.items()):
-        win = [r for r in rows if lo <= r[0] <= hi]
+        win = sorted((r for r in rows if lo <= r[0] <= hi), key=lambda r: r[0])
         if len(win) < 4:
             continue
+        # Sorted by time above because the pre-trigger rows are LOGGED after the arm (the replay
+        # is paced across the chunks that follow it) while they BELONG before it. Sorted, an
+        # episode runs -80..-1 then 0..79 and the split below still sees one rising sequence.
         # Split into bursts on the sequence number restarting.
         bursts, cur = [], []
         for r in win:
@@ -2090,6 +2184,15 @@ def report_resync_bursts(lo, hi):
             if not printed:
                 print("   resync bursts (did discarding close the error?)")
                 printed = True
+            # The pre-trigger history is a different measurement and must not contaminate this
+            # one: it starts at a healthy err, so folding it in would make every burst look like
+            # a runaway. Verdict on the armed chunks only; the drain gets its own block below.
+            pre = [r for r in b if r[1] < 0]
+            live = [r for r in b if r[1] >= 0]
+            report_pre_trigger_drain(board, pre)
+            if len(live) < 4:
+                continue
+            b = live
             t0, err0, ring0 = b[0][0], b[0][2], b[0][4]
             errN, ringN, dropsN = b[-1][2], b[-1][4], b[-1][5]
             chunk_us = 26100.0
