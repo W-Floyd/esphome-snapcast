@@ -328,6 +328,36 @@ defect.
       accounting, which makes the audio displacement invisible to every on-device metric
       afterwards. That is a candidate mechanism for planted static offsets that fires far more often
       than seeds do, and it does not depend on the seed hypothesis being right.
+    - **QUANTIFIED, n=5, and the size is set by the TRIM DURING THE HOLD — not by the split.**
+      Four provoked points (ramped splits of ±2500 µs) plus the natural one:
+
+          repaired_us   step_us   floor_us   note
+              +2471      +329.6      1.05
+              -2427      -732.9     15.69    floor elevated by the previous point's aftermath
+              +2539      +311.1      5.99
+              -2495      -347.4      2.66
+             +20000      +491.0      0.71    natural
+
+      The two clean positive points agree to 18 µs (+329.6, +311.1) and the clean negative one is
+      −347.4, so **a ±2500 µs split plants ≈330 µs regardless of sign.** The model that explains
+      the sublinearity:
+
+          split   KP*split   clamped@1000   x 3 s hold   measured   ratio
+           2500       625            625         1875       330      0.18
+          20000      5000           1000         3000       491      0.16
+
+      Same efficiency both times. So the step is **the trim the servo applies during
+      `DRIFT_REPAIR_HOLD_US`, saturated by the ±1000 ppm clamp** — which is why an 8× larger split
+      yields only 1.5× the step. The ~17% is presumably the ~0.85 s measurement lag plus trim slew
+      eating most of the 3 s window.
+    - **Consequence, and it is a design tension worth stating:** the 3 s hold exists to avoid acting
+      on a spike, but during those 3 s the servo steers real audio against a prediction the code is
+      *about to declare wrong*. The damage is done before the correction lands, and it is permanent
+      because nothing in the system has position feedback. Shortening the hold, or freezing the trim
+      once a split is suspected, would cut the displacement roughly proportionally.
+    - Note the step scales with KP, so it pulls the opposite way to the landing offset: lower KP
+      shrinks the repair's displacement while *enlarging* the planted offset after a recovery. Any
+      future KP change should be judged on both.
     - **ANSWERED, in quiet conditions: the repair DOES displace real audio.** A natural repair on
       board b, 4 s after a re-lock, with the wire quiet:
 
