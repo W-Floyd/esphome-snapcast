@@ -72,14 +72,26 @@ defect.
       offset floor of **6.96 µs sd**. Hence the offset integral from trim explains **1–6%** where
       the analyser's own rate columns explain **96–99%** (steady state: corr −1.000, slope −1.003,
       residual 0.15 µs).
-    - **Even with the constant calibrated away for free it would not be enough, and this is what
-      closes the route.** After fitting out both the constant AND the slope, the residual is
-      **0.708–0.75 ppm** (0.708 in steady state), which integrates to **~71 µs per 100 s** — more
-      than **10×** the 6.96 µs floor it would have to resolve. So there is no point pursuing a
-      scheme to learn the crystal difference: perfect calibration still leaves the trim an order of
-      magnitude short. (Which also disposes of the obvious "average the differential trim for long
-      enough and its mean IS the crystal difference": besides needing the true differential rate to
-      average to under 0.04 ppm, it buys nothing the residual does not immediately spend.)
+    - **THE CONSTANT IS ALREADY AVAILABLE ON-DEVICE, in `tsf-local`.** The `Offset ramp` line
+      publishes each board's `tsf-local` — the rate of (TSF − local clock), measured against the
+      radio timebase and therefore OUTSIDE the audio servo loop. Its differential is **−5.347 ppm
+      (sd 0.559)**, matching the trim's constant to within the measurement. Subtracting it, scored
+      against the analyser on 119 quiet windows:
+        - trim alone: constant **−5.050 ± 0.163 ppm** → **505 µs per 100 s**
+        - trim − differential `tsf-local`: constant **+0.170 ± 0.165 ppm** → **17 µs per 100 s**
+      So the crystal difference is fully accounted for and the remaining constant is statistically
+      indistinguishable from zero — a 30× cut in the unbounded term, from data the device already
+      has. (Caveat: consecutive 3.3 s windows are autocorrelated, so ±0.165 is optimistic; the
+      constant is "consistent with zero", not "known to 0.165 ppm".)
+    - **What still blocks it is the RESIDUAL, not the constant.** After the constant is removed the
+      per-window residual is **0.708–0.916 ppm**, i.e. **~71–92 µs per 100 s** against a 6.96 µs
+      floor — still **10–13×** too coarse. So `trim − tsf-local` is a much better rate reference than
+      trim alone but is still not good enough on its own, and the remaining work is reducing that
+      residual rather than chasing the offset. This is what the least-squares achieved-rate
+      measurement against server time is for.
+    - Consequence for the beacon: the field to publish is **not** the trim. It is either the
+      achieved rate itself, or trim and `tsf-local` together — the second is nearly free, since
+      `drift_ppm` already travels and `tsf-local` is already computed.
     - **Do not "fix" this by de-meaning.** Tried on the data: subtracting the series mean drops the
       analyser's own fs check from 96% to 2%, because the true differential rate has a real nonzero
       mean (+0.61 ppm on one run, a genuine 177 µs ramp over 290 s) and de-meaning destroys exactly
