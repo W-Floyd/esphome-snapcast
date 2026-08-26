@@ -94,12 +94,27 @@ is now the largest error in the chain by an order of magnitude.
     - **Using the applied trim absolutely** removes the wander but introduces a STATIC differential
       of 3.15 µs/ppm × the boards' ~5 ppm crystal difference ≈ 16 µs, because the residual is then
       `3.15 × crystal_i`, a per-board constant the servo cannot absorb.
-  What would work is a reference that is neither the trim nor an average of it: δ is the achieved
-  rate against nominal, and it is measurable on-device as frames-played against SERVER time (the
-  shared timebase already provides the conversion). That is the same shape as the offset filter's
-  feed-forward — a directly measured rate rather than one inferred from the control output — and it
-  is the next thing to try. Alternatively, make the comparison frames-based rather than
-  time-based, which removes the nominal-rate assumption the bias comes from at its root.
+    - **Measuring the achieved rate from the credit stream (tried, much worse).** This was supposed
+      to be the fix — a rate measured from the plant instead of inferred from the controller, the
+      same shape as the offset filter's feed-forward. Two independent reasons it failed, both worth
+      keeping:
+        1. **The credit timestamps are far too jittery.** Per-window measurements over a 30 s
+           baseline read +66.8, +48.6, +45.6, +55.2, +57.6, +43.7 ppm — a spread of ~±10 ppm, which
+           implies ~300 µs of jitter on the credit instants, not the ~20 µs assumed. Even after a
+           1/4 EWMA the residual is ~3.4 s × 5 ppm ≈ 17 µs, i.e. THREE TIMES the 5.2 µs it removes.
+           A two-endpoint baseline cannot work here; a least-squares fit over all ~600 credits in
+           the window would divide that by √N and is the only version worth trying.
+        2. **A multiplicative scale on the span is unsafe.** It multiplies
+           `pushed − fb_mean_frames`, and a re-baseline resets those two counters at different
+           instants — `r_push` was measured at −7958592 frames, a span of −180 s. At 50 ppm that
+           injects 9 ms. Measured: the pair sat at +5753 µs, then jumped to −6094 µs, each position
+           held with a within-window MAD near 1 µs. Before the change the scale was exactly 1.0, so
+           a corrupt span cost nothing extra; afterwards it costs milliseconds. Any future version
+           must bound the span it trusts, or apply an absolute µs correction computed from a sane
+           span rather than scaling whatever span it is handed.
+  So all three attempts are dead, and the surviving direction is the one that avoids the
+  extrapolation entirely: make the comparison frames-based rather than time-based, which removes the
+  nominal-rate assumption the bias comes from at its root.
   A previous note here claimed the opposite -- that the pivot cancels between devices, on the
   strength of the 0.018 ppm MEAN differential rate. Wrong quantity: the mean says the rates agree
   over 30 s, the sd says they do not at any instant, and it is the instantaneous value the pivot
