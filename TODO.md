@@ -49,10 +49,29 @@ is now the largest error in the chain by an order of magnitude.
   failure. Every occurrence has `xfer=50000`, `inflight=10000`, `queued=70000`, `dma=50000` and
   `age≈33 ms`: a full transfer buffer, i.e. the sink briefly not accepting.
 - **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured.
-- **The re-baseline anchor still plants an accounting error.** Repaired within ~3 s now instead
-  of never, but not prevented: it captures an instant that stops being true (`own=0` at the
-  seed, ~244 ms of audio 1.4 s later). Preventing it needs an anchor that stays valid — not
-  another way to suppress the second seed.
+- **The re-baseline anchor still plants an accounting error**, and the reason is now measured
+  rather than inferred: audio that is in the chain at seed time does not all reach the DAC.
+  Captured end to end on one starvation with every field logged at one instant — seed
+  `latency=280158 own=280158 debt=0`, 12354 frames, snapshot 26 ms old; 150 ms later `meas` read
+  93 ms having played 140 ms of credits plus 754 clamped frames (17 ms):
+
+      280 ms seeded − 157 ms played = 123 ms should remain, 93 ms measured → ~30 ms gone unplayed
+
+  The planted split was `+57075 µs`, held to ±1 µs across five reports, repaired after 3 s, and
+  the settled residual on the wire was **−133 µs**. Staleness cannot explain the SIGN — a 26 ms
+  old snapshot of a refilling pipeline under-reports — so this is not the disproven staleness
+  hypothesis. The next instrument is a count of frames discarded downstream of the source ring:
+  the clamp sees 754 of them, and the gap is ~1300.
+- **Two candidate mechanisms for the per-start offset are now dead**, both recorded at their sites
+  in the fork (`449574cc5`): `playback_delay` was ZERO on all 18 starts measured, and padded
+  silence does not displace (two boards differing by 877 ms of accumulated padding sat 133 µs
+  apart, so the sink's per-descriptor real-frame bookkeeping handles it). `pad` is now published
+  through `AudioDepth` and printed in RECON, so both stay cheap to re-check.
+- **Test prospectively whether an offset only ever appears after a re-baseline or repair.** The
+  boots that needed neither landed at −5, +7.8 and +7.7 µs; the events that planted 30–133 µs all
+  involved one. Not yet conclusive: one lone replug settled at −56 µs with nothing logged, and b's
+  log history before 02:57 was lost when its stream was restarted, so the correlation could not be
+  checked against the earlier samples. Needs a few more events with both logs continuous.
 - **Re-measure the per-boot absolute offset now that the depth report is complete.** It was ±30 µs
   and invisible on-device (differential median −2.0 ±3 µs against +30 µs on the wire) before the
   mixer fix; the boot after it settled at −0.5 to −9 µs with 8–23 µs p2p, which is at or below the

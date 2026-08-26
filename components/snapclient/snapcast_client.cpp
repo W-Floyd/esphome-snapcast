@@ -2665,7 +2665,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                      " xfer=%" PRIu32 " inflight=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " age=%" PRId64
                      " pushed=%" PRId64
                      " played=%" PRId64 " clamped=%" PRId64 " | srcrx=%" PRIu32 " srctx=%" PRIu32 " sinkrx=%" PRIu32
-                     " r_push=%" PRId64 " r_src=%" PRId64 " r_mix=%" PRId64,
+                     " r_push=%" PRId64 " r_src=%" PRId64 " r_mix=%" PRId64 " pad=%" PRIu32,
                      fill_drift_us, accounted_us, measured.microseconds,
                      measured.dbg_own_us + measured.dbg_xfer_us + measured.dbg_inflight_us + measured.dbg_queued_us +
                          measured.dbg_dma_us,
@@ -2678,7 +2678,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                          static_cast<int64_t>(measured.dbg_src_consumed) - own_f,
                      static_cast<int64_t>(measured.dbg_src_consumed) -
                          static_cast<int64_t>(measured.dbg_sink_received) - xfer_f -
-                         static_cast<int64_t>(measured.dbg_inflight_us) * rate_i / 1000000);
+                         static_cast<int64_t>(measured.dbg_inflight_us) * rate_i / 1000000,
+                     // Cumulative silence the SINK has padded in front of our audio. Deliberately not
+                     // folded into any residual: it is not a conservation failure, every frame of it
+                     // was really played. It is here because it DISPLACES our audio and no other field
+                     // can show that -- the accounting counts real frames, so a padded frame moves the
+                     // audio one frame later while every metric still agrees with itself. Two devices
+                     // differing by N frames of padding should sit N * (1e6 / rate) us apart on a
+                     // logic analyser, which is the prediction to test.
+                     measured.dbg_padded_frames);
           }
         }
       }
