@@ -314,12 +314,24 @@ defect.
       steers real audio against a prediction 52 ms wrong.** The repair then fixes the ACCOUNTING,
       but the audio has already moved: that is a concrete mechanism for a planted offset that no
       on-device metric reports afterwards, because once repaired every residual reads 0.
-    - **This is very likely the "−42/−52 ms split spike"** recorded below as structural and
-      unexplained. It is one DMA buffer, it appears immediately after a seed, and it holds steady
-      for exactly the repair hold time. The note below says every occurrence has `xfer=50000` at its
-      maximum, equal to `dma` — consistent with the anchor treating the DMA span as if it held our
-      frames when it holds padding. Worth confirming that every occurrence of the spike follows a
-      re-baseline.
+    - **REFUTED: the spike is NOT caused by seeds.** I guessed the −52 ms split spike WAS this
+      post-seed artifact and checked it. Counted across both logs: **337 spike episodes against 47
+      seeds**, and only **2–6% of episodes have a seed within 60 s**. The converse holds weakly —
+      13/33 and 10/14 seeds *are* followed by a spike — so a seed is one trigger among several, and
+      the post-seed instance I saw was simply one of many. The spike's own cause remains open, and
+      "it appeared right after a seed" was a coincidence of timing in a sample of one.
+    - **BUT the better lead survives, and it is not about seeds at all: the split REPAIR fires 23
+      times** (13 + 10 across the two logs) on sustained splits from **4.7 ms to 57 ms**
+      (−51747 ×2, +57075, +29976, +24671, +9977, +7097, +7096, +4716 …). Every firing means the
+      accounting was that far off **for `DRIFT_REPAIR_HOLD_US` = 3 s**, during which the servo
+      steered real audio against a prediction wrong by that much — and then the repair corrects the
+      accounting, which makes the audio displacement invisible to every on-device metric
+      afterwards. That is a candidate mechanism for planted static offsets that fires far more often
+      than seeds do, and it does not depend on the seed hypothesis being right.
+    - **The test, and it reuses what is already built:** point the step detector at the repair
+      timestamps instead of the seed timestamps. If each repair coincides with a wire offset step,
+      the repair path is displacing audio; if not, the 3 s of wrong prediction is being absorbed
+      somewhere. Not yet done.
     - **`SEEDDRAIN` reads err ≈ −7 ms when playback is continuous** (−6778 and −7383 µs on
       `frames` 11801 and 10336 — consistent), which is a *different and smaller* quantity than the
       51.7 ms split. Both are real; do not conflate them.
