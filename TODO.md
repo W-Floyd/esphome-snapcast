@@ -606,6 +606,26 @@ defect.
       stated reason for not zeroing) while removing exactly the term that displaces audio. Predicted
       step: ~0.17 x 50 ppm x 3 s ≈ 25 µs, i.e. a 4x cut, and it is a three-line change at the hold.
 
+- **MATCHED A/B OF THE FORCED RE-ANCHOR, n=3 per arm: SUGGESTIVE, NOT SIGNIFICANT.** Six lone
+  restarts of board b, flag alternated per trial so the arms interleave (conditions drift here —
+  outages, wedges — and blocking the arms would confound the change with the afternoon). Landing
+  LEVEL is the statistic, not the step: the step depends on where the board happened to sit, and
+  the claim is "it ends up on alignment".
+
+        OFF  |post| = 19.8, 91.3, 513.2 us   median  91.3
+        ON   |post| = 23.3, 32.2, 145.1 us   median  32.2   (48.9 pooled with the earlier -1.8)
+
+  Median 3x lower and the worst case 3.5x lower, **but the ranges overlap and the exact rank-sum
+  gives p = 0.50** — at n=3 vs 3 the best achievable is 0.05, so this cannot reach significance
+  however it comes out. It is evidence the feature does not HURT and a hint that it helps.
+    - **The control arm does plant**, which the first two trials had cast doubt on: 513 µs on one
+      clean OTA restart. So the disturbance is real but highly variable, which is exactly why n=3
+      cannot resolve it.
+    - **To settle it:** ~8 trials per arm (about 2.5 h unattended, the script is written and
+      restores the flag), or a disturbance that plants reliably — an outage-driven reconnect via
+      `inject_starvation`, remembering it puts the wire's fit floor at 162–1291 µs against 0.71 µs
+      quiet, which may swamp the effect being measured.
+
 - **FORCED RE-ANCHOR, FIRST GRADE ON A LONE RESTART (n=1): landed at −1.8 µs.**
   `reanchor_after_reconnect: true`, board b OTA'd alone so the restart was lone rather than
   simultaneous:
