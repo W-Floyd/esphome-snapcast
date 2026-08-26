@@ -750,8 +750,12 @@ CRYSTAL_RE = re.compile(
 # repair can be provoked in QUIET conditions with a KNOWN magnitude. Paired with the repair that
 # follows it, this turns the step-versus-split relationship from one natural data point into a
 # curve.
+# Matches the ramped form, "SPLITINJECT request +2500 us, ramping at 100 us/s (remaining ...)".
+# The `request` word was added when the hook became a ramp and this pattern was not, so every
+# provoked repair silently lost its tag and became indistinguishable from a natural one -- which is
+# the single thing the tag exists to prevent. Kept tolerant of the word being absent.
 SPLITINJECT_RE = re.compile(
-    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SPLITINJECT ([+-]?\d+) us")
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SPLITINJECT (?:request )?([+-]?\d+) us")
 
 REPAIR_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Accounting split repaired: accounted queue ran "
