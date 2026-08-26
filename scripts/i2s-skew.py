@@ -165,7 +165,7 @@ def stream_blocks(args):
             raise RuntimeError("cannot claim the analyser -- is PulseView open?\n  " + err)
 
 
-def stream_reader(args, depth=3):
+def stream_reader(args, depth=16):
     """stream_blocks in a thread, buffered, so slow processing cannot stall sigrok.
 
     Anything that takes longer than a block -- the first log parse reads tens of MB, and
@@ -768,7 +768,7 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
               xlabel="elapsed (s)", log_axes=False, events=(), panels=(), stats=None):
     """Plot without a plotting dependency -- the rest of scripts/ is stdlib too.
 
-    A second panel is drawn only when panel2 has data, so a run without temperature
+    Extra panels are drawn only where they have data, so a run without temperature
     logging looks exactly as before. Both panels share the x axis and the event bars
     span both, which is the point: it should be obvious at a glance whether a skew
     excursion lines up with a temperature move.
@@ -825,6 +825,17 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     if stats:
         o.append(f'<text x="{ML}" y="44" font-size="11" fill="#666">{stats}</text>')
 
+    def tick(vv, span):
+        """Decimals from the axis SPAN, not the value. A rate axis spanning 0.3 Hz around
+        44100 needs three decimals or every label reads the same integer; a derivative
+        axis spanning 1e-6 needs exponent form instead of ten zeros."""
+        if not (span > 0):
+            return f"{vv:.4g}"
+        if span < 1e-3:
+            return f"{vv:.2e}"
+        d = max(0, min(9, int(math.ceil(-math.log10(span / 5.0))) + 1))
+        return f"{vv:,.{d}f}"
+
     def axis(p0, p1, v0, v1, lab, pyf, xticks):
         for k in range(6):
             v = v0 + (v1 - v0) * k / 5
@@ -832,7 +843,7 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
             o.append(f'<line x1="{ML}" y1="{yy:.1f}" x2="{W-40}" y2="{yy:.1f}" '
                      f'stroke="#e5e5e5"/>')
             vv = 10 ** v if log_axes else v
-            t_lbl = f"{vv:,.0f}" if abs(vv) >= 1000 else f"{vv:.3g}"
+            t_lbl = f"{vv:,.0f}" if log_axes else tick(vv, v1 - v0)
             o.append(f'<text x="{ML-8}" y="{yy+4:.1f}" text-anchor="end" '
                      f'fill="#555">{t_lbl}</text>')
         o.append(f'<line x1="{ML}" y1="{p1}" x2="{W-40}" y2="{p1}" stroke="#333"/>')
@@ -890,23 +901,29 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
         for t, v in draw:
             o.append(f'<circle cx="{px(t):.1f}" cy="{py(v):.1f}" r="2.5" fill="#2b6cb0"/>')
 
-    if has2:
-        allv = [v for series in panel2.values() for _, v in series]
-        t0_, t1_ = min(allv), max(allv)
-        tp = (t1_ - t0_) * 0.15 or 1.0
-        t0_, t1_ = t0_ - tp, t1_ + tp
-        py2 = mk_py(bot0, bot1, t0_, t1_)
-        axis(bot0, bot1, t0_, t1_, panel2_label, py2, True)
-        palette = ["#c2410c", "#0f766e", "#7c3aed", "#a16207", "#be123c"]
-        for i, (name, series) in enumerate(sorted(panel2.items())):
-            if not series:
+    palette = ["#c2410c", "#0f766e", "#7c3aed", "#a16207", "#be123c"]
+    for bi, ((lab, series), (p0, p1)) in enumerate(zip(extra, bands)):
+        allv = [v for pts_ in series.values() for _, v in pts_]
+        v0, v1 = min(allv), max(allv)
+        # Rates sit near 44100 with variation of a fraction of a Hz, so the pad has to be
+        # relative to the value, not a fixed 1.0, or the trace flattens to a line.
+        pad_ = (v1 - v0) * 0.15 or (abs(v0) * 1e-6 or 1.0)
+        v0, v1 = v0 - pad_, v1 + pad_
+        pyb = mk_py(p0, p1, v0, v1)
+        axis(p0, p1, v0, v1, lab, pyb, bi == len(extra) - 1)
+        if v0 <= 0 <= v1:
+            zz = pyb(0.0)
+            o.append(f'<line x1="{ML}" y1="{zz:.1f}" x2="{W-40}" y2="{zz:.1f}" '
+                     f'stroke="#bbb" stroke-dasharray="2 3"/>')
+        for i, (name, pts_) in enumerate(sorted(series.items())):
+            if not pts_:
                 continue
             col = palette[i % len(palette)]
-            pl = " ".join(f"{px(x):.1f},{py2(v):.1f}" for x, v in sorted(series))
+            pl = " ".join(f"{px(x):.1f},{pyb(v):.1f}" for x, v in sorted(pts_))
             o.append(f'<polyline points="{pl}" fill="none" stroke="{col}" '
-                     f'stroke-width="1.5"/>')
+                     f'stroke-width="1.4"/>')
             # Left-aligned inside the panel: at the right edge it was easy to miss.
-            o.append(f'<text x="{ML+8}" y="{bot0+14+i*13}" font-size="10" '
+            o.append(f'<text x="{ML+8}" y="{p0+14+i*13}" font-size="10" '
                      f'fill="{col}">{name}</text>')
     o.append("</svg>")
     open(path, "w").write("\n".join(o))
@@ -1021,17 +1038,28 @@ def rate_derivative(series, window):
     a window of points trades time resolution for a derivative that means something.
     """
     if len(series) < 3:
-        return []
+        return [], window
     xs = np.array([x for x, _ in series])
     ys_ = np.array([v for _, v in series])
-    out = []
-    for i in range(len(series)):
-        lo = np.searchsorted(xs, xs[i] - window / 2.0)
-        hi = np.searchsorted(xs, xs[i] + window / 2.0)
-        if hi - lo < 3 or np.ptp(xs[lo:hi]) <= 0:
-            continue
-        out.append((float(xs[i]), float(np.polyfit(xs[lo:hi], ys_[lo:hi], 1)[0])))
-    return out
+    # The window must actually contain points to fit. Asked for 1 s at 1 row/s it held
+    # one, and the panel silently vanished; widen to at least five samples' worth.
+    spacing = float(np.median(np.diff(xs))) if xs.size > 1 else 0.0
+    window = max(window, 5 * spacing)
+    # Least squares over every window at once, from prefix sums: slope is
+    # (n*Sxy - Sx*Sy) / (n*Sxx - Sx^2), and each window's sums are a difference of two
+    # prefixes. Exact for non-uniform spacing, and O(n) instead of n polyfits.
+    lo = np.searchsorted(xs, xs - window / 2.0, side="left")
+    hi = np.searchsorted(xs, xs + window / 2.0, side="right")
+    z = lambda a: np.concatenate(([0.0], np.cumsum(a)))
+    Sx, Sy = z(xs), z(ys_)
+    Sxy, Sxx = z(xs * ys_), z(xs * xs)
+    cnt = (hi - lo).astype(np.float64)
+    sx, sy = Sx[hi] - Sx[lo], Sy[hi] - Sy[lo]
+    sxy, sxx = Sxy[hi] - Sxy[lo], Sxx[hi] - Sxx[lo]
+    den = cnt * sxx - sx * sx
+    ok = (cnt >= 3) & (np.abs(den) > 0)
+    slope = np.where(ok, (cnt * sxy - sx * sy) / np.where(ok, den, 1.0), np.nan)
+    return [(float(x), float(v)) for x, v in zip(xs[ok], slope[ok])], window
 
 
 def build_panels(args, rate_a, rate_b, temps, lo, hi):
@@ -1044,9 +1072,10 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi):
     ra, rb = win(rate_a), win(rate_b)
     if ra or rb:
         panels.append(("I2S frame rate (Hz)", {"a rate": ra, "b rate": rb}))
-        da, db = rate_derivative(ra, args.rate_window), rate_derivative(rb, args.rate_window)
+        da, wa = rate_derivative(ra, args.rate_window)
+        db, wb = rate_derivative(rb, args.rate_window)
         if da or db:
-            panels.append((f"d(rate)/dt (Hz/s), {args.rate_window:g}s fit",
+            panels.append((f"d(rate)/dt (Hz/s), {max(wa, wb):.2g}s fit",
                            {"a d/dt": da, "b d/dt": db}))
     return panels
 
@@ -1267,6 +1296,9 @@ def main():
                    help="read contiguous blocks from one running acquisition instead of "
                         "restarting sigrok per capture: ~99%% duty and no gap between "
                         "blocks, so coverage is continuous")
+    p.add_argument("--stream-buffer", type=int, default=16,
+                   help="blocks held between the reader and the processing loop; absorbs "
+                        "a transient stall instead of dropping blocks")
     p.add_argument("--stream-seconds", type=float, default=60.0,
                    help="--stream: seconds per sigrok acquisition before restarting")
     p.add_argument("--no-prefetch", dest="prefetch", action="store_false",
@@ -1304,33 +1336,8 @@ def main():
     p.add_argument("--sim-ppm", type=float, default=-5.0)
     p.add_argument("--sim-frame-rate", type=float, default=44117.647)
     args = p.parse_args()
+    primed_offsets = None
 
-    if args.simulate:
-        capture, chan, sim = make_simulator(args)
-        if args.count == 0:
-            args.count = 5
-    else:
-        chan = parse_pvs(args.pvs)
-        missing = [k for k in ("DIN_ONE", "BCLK_ONE", "LRC_ONE",
-                               "DIN_TWO", "BCLK_TWO", "LRC_TWO") if k not in chan]
-        if missing:
-            sys.exit(f"{args.pvs} does not name these channels: {', '.join(missing)}")
-        print("channel map: " + "  ".join(
-            f"{k}=D{chan[k]}" for k in ("DIN_ONE", "BCLK_ONE", "LRC_ONE",
-                                        "DIN_TWO", "BCLK_TWO", "LRC_TWO")))
-        if args.stream:
-            capture, stream_state = stream_reader(args)
-            sim = None
-            args.prefetch = False          # the stream is already gapless
-            print(f"  streaming: {args.samples/args_rate_hz(args)*1e3:.0f} ms blocks read "
-                  f"from one acquisition, restarted every {args.stream_seconds:g}s")
-        else:
-            capture, sim, stream_state = (lambda: capture_logic(args)), None, None
-
-    # A run is one continuous acquisition, so the CSV starts fresh by default. Carrying
-    # rows over from a previous invocation fabricates continuity: the elapsed axis
-    # restarts at zero, the gap between runs leaves no trace, and the drift fit is drawn
-    # straight across a discontinuity the boards may well have resynced during.
     def collect_events(t_start, offsets=None):
         """Log events as (elapsed_seconds, kind, label), relative to the run start."""
         out = []
@@ -1356,6 +1363,50 @@ def main():
                 out.append((tod_to_unix(tod, t_start) - t_start, kind, label))
         return out, offsets
 
+    if args.simulate:
+        capture, chan, sim = make_simulator(args)
+        if args.count == 0:
+            args.count = 5
+    else:
+        chan = parse_pvs(args.pvs)
+        missing = [k for k in ("DIN_ONE", "BCLK_ONE", "LRC_ONE",
+                               "DIN_TWO", "BCLK_TWO", "LRC_TWO") if k not in chan]
+        if missing:
+            sys.exit(f"{args.pvs} does not name these channels: {', '.join(missing)}")
+        print("channel map: " + "  ".join(
+            f"{k}=D{chan[k]}" for k in ("DIN_ONE", "BCLK_ONE", "LRC_ONE",
+                                        "DIN_TWO", "BCLK_TWO", "LRC_TWO")))
+        if args.annotate:
+            # Establish trim/resync/pipeline baselines and file offsets before the
+            # acquisition begins. Doing it inside the loop stalled the first block for
+            # ~0.5 s -- reading 4 MB of tail from each log -- which at 17 ms blocks
+            # dropped everything queued behind it. Later polls read only new bytes.
+            #
+            # The returned offsets MUST be carried into the loop. Discarding them meant
+            # the first in-loop poll restarted from byte zero and paid the same 0.5 s all
+            # over again, which is exactly the stall this was meant to remove.
+            t_prime = time.time()
+            _, primed_offsets = collect_events(t_prime)
+            for lp, (_lo, hi) in sorted(LOG_COVERAGE.items()):
+                print(f"  {lp}: log reaches t={hi:+.1f}s; keep it running for the "
+                      f"whole capture")
+            LOG_COVERAGE.clear()
+            print(f"  primed log baselines in {time.time()-t_prime:.2f}s "
+                  f"({sum(primed_offsets.values())/(1<<20):.1f} MB read; "
+                  f"--log-tail-mb {args.log_tail_mb:g})")
+        if args.stream:
+            capture, stream_state = stream_reader(args, depth=args.stream_buffer)
+            sim = None
+            args.prefetch = False          # the stream is already gapless
+            print(f"  streaming: {args.samples/args_rate_hz(args)*1e3:.0f} ms blocks read "
+                  f"from one acquisition, restarted every {args.stream_seconds:g}s")
+        else:
+            capture, sim, stream_state = (lambda: capture_logic(args)), None, None
+
+    # A run is one continuous acquisition, so the CSV starts fresh by default. Carrying
+    # rows over from a previous invocation fabricates continuity: the elapsed axis
+    # restarts at zero, the gap between runs leaves no trace, and the drift fit is drawn
+    # straight across a discontinuity the boards may well have resynced during.
     if args.replot:
         ts0, ys0, anchor0 = load_existing(args.out)
         if not ts0:
@@ -1416,7 +1467,11 @@ def main():
 
     t_start = anchor if (args.append and anchor is not None) else time.time()
     ppms, n, shown_cfg, prefer, pending, last_off = [], 0, False, None, None, None
-    events, log_off, last_plot = [], None, 0.0
+    # Start from the primed offsets so the first in-loop poll reads only new bytes.
+    events, log_off, last_plot = [], primed_offsets, 0.0
+    # A write in flight means this one is skipped, not queued: the chart is cosmetic and
+    # must never hold up the acquisition.
+    plot_busy = threading.Lock()
     # A window of recent values, long enough to out-vote a run of bad blocks but short
     # enough to follow a real move.
     ncorr = 0
@@ -1579,7 +1634,8 @@ def main():
                                 bit(buf, chan["DIN_TWO"]), args.bits, args.bit_delay)
                 write_wavs(f"{args.wav_prefix}-{n:03d}", a_[0], b_[0], info["fs"][0])
 
-            first_poll = log_off is None
+            # Only true when priming was skipped (no --annotate, or the simulator).
+            first_poll = args.annotate and log_off is None
             now = time.time()
             due = (now - last_plot >= args.plot_every) or (n + 1 >= args.count > 0)
             new_ev, log_off = collect_events(t_start, log_off)
@@ -1593,19 +1649,28 @@ def main():
             for e in new_ev:
                 print(f"  event t={e[0]:7.1f}s  {e[1]:9s} {e[2]}")
             events.extend(new_ev)
-            if due:
+            if due and not plot_busy.locked():
                 last_plot = now
-                pt, py_ = ts, ys
+                pt, py_ = list(ts), list(ys)
                 if args.plot_window > 0 and ts:
                     cut = ts[-1] - args.plot_window
                     i0 = bisect.bisect_left(ts, cut)
                     pt, py_ = ts[i0:], ys[i0:]
-                write_svg(args.plot, pt, py_, "I2S playout skew",
-                          "board B - board A (ns)   [+ = B later]",
-                          stats=stats_caption(pt, py_),
-                          include_zero=not args.y_free, events=events,
-                          panels=build_panels(args, rate_a, rate_b, TEMPS,
-                                              pt[0] - 1, pt[-1] + 1))
+                snap = (pt, py_, list(events), list(rate_a), list(rate_b))
+
+                def draw(pt=snap[0], py_=snap[1], evs=snap[2], ra=snap[3], rb=snap[4]):
+                    try:
+                        write_svg(args.plot, pt, py_, "I2S playout skew",
+                                  "board B - board A (ns)   [+ = B later]",
+                                  stats=stats_caption(pt, py_),
+                                  include_zero=not args.y_free, events=evs,
+                                  panels=build_panels(args, ra, rb, TEMPS,
+                                                      pt[0] - 1, pt[-1] + 1))
+                    finally:
+                        plot_busy.release()
+
+                plot_busy.acquire()
+                threading.Thread(target=draw, daemon=True).start()
             n += 1
             if (args.count == 0 or n < args.count) and args.interval > 0 \
                     and not args.simulate:
