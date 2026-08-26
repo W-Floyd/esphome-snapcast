@@ -18,6 +18,13 @@ section; most of the obvious approaches have already failed on hardware.
 - **`speaker::set_rate_adjustment(float ppm)`**, default no-op, per-SoC in the i2s speaker.
   `i2s_rate_lock` stays as the fallback for older ESPHome, and this is the only way rate
   steering reaches a non-S3 target.
+- **`mixer` under-reports what it holds.** Its depth report's `xfer` is not everything in it: the
+  conservation residual `src_consumed − sink_received − xfer` reached **1125 frames** and stayed
+  there for 14 s before returning to zero, so the audio was held rather than lost and the reading
+  was simply incomplete. Downstream that read as a 25.5 ms accounting split, which is enough to
+  trigger the client's repair — now gated on this residual (`MIX_RESIDUAL_MATCH_US`), which is a
+  guard, not a fix. The fix is in the fork's `speaker_mixer` depth reporting: include what the
+  mixer is holding, so `r_mix` means "lost" and nothing else.
 - **`mixer` does not yield when the sink stops draining.** Fixed on the fork (`74d32d9dd`) as a
   defensive yield; not proposed upstream. Needs a reproduction that actually stops a sink and
   measures CPU before it is worth filing.
@@ -35,7 +42,10 @@ is now the largest error in the chain by an order of magnitude.
   different sub-granule phase. The remaining half of the differential noise; untouched.
 - **The −42 ms split spike.** Recurs at −42223..−42246 µs on both boards, to within 20 µs, so it
   is structural. Rejected by the median so it is harmless, but unexplained. Suspect a stale or
-  partial depth snapshot that `accounted_at_()` then differences against.
+  partial depth snapshot that `accounted_at_()` then differences against. New clue: every
+  occurrence caught with the residuals logged had `xfer=50000` — its maximum, equal to `dma` — and
+  `r_mix=441` frames (10 ms), which is nowhere near the 42 ms and so does not explain it. Start
+  from why `xfer` is railed at exactly one DMA buffer whenever this fires.
 - **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured.
 - **The re-baseline anchor still plants an accounting error.** Repaired within ~3 s now instead
   of never, but not prevented: it captures an instant that stops being true (`own=0` at the
