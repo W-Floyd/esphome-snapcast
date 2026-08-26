@@ -582,6 +582,59 @@ defect.
           arrivals at `emit_pcm_` would split those, and is the same shape of change as this one.
         - Also measured, and useful on its own: an ~100 ms excursion with a healthy ring resolves
           with no discards and no muting. The path only engages when the ring is gone.
+- **CLEAN INJECTION UNDER THE KP SCHEDULE (2026-08-26, n=1), AND IT GRADES THE MODEL, NOT THE
+  SCHEDULE.** `inject_split(+2500)` on a settled baseline (pre −16.2 µs, MAD 5.98):
+
+        trim at the hold  +199 ppm
+        wire step         −101.5 µs   (relaxing at +4 µs/min at age 185 s, so ~ −100 landing)
+        model prediction  199 ppm x 3 s x 0.17 = 101 µs
+
+    - The recorded model reproduces the step to 0.5 µs. So this is NOT evidence that the schedule
+      shrank the repair's displacement: it is the same model with a SMALLER TRIM AT THE HOLD than
+      the baseline pair (+187.3 / −256.9 µs, which imply ~625 ppm, i.e. the servo had reached the
+      full 2500 µs error before the hold latched). Comparing steps without comparing the trim at
+      the hold compares two different disturbances.
+    - **STRUCTURAL FINDING, and it says the KP schedule CANNOT help here.** The displacement is
+      generated DURING the 3 s hold, from the trim already commanded when the hold latched. The
+      schedule re-arms KP *at the repair* — after the damage is done. It can only affect the
+      post-repair settling, so no KP schedule of any shape reduces this term.
+    - **What would: hold the INTEGRAL, not the whole trim.** `trim = p_term + integral`, and the
+      p_term is the servo's response to an error the code is about to declare bogus, while the
+      integral is the converged crystal cancellation the hold exists to preserve. Freezing the sum
+      preserves the suspect term for 3 s at full size — 199 of the 199 ppm here is p_term, since a
+      converged integral runs ~40–50 ppm. Holding I-only keeps the clock at the right rate (the
+      stated reason for not zeroing) while removing exactly the term that displaces audio. Predicted
+      step: ~0.17 x 50 ppm x 3 s ≈ 25 µs, i.e. a 4x cut, and it is a three-line change at the hold.
+
+- **NEW LEAD, 2026-08-26: A FORCED REPAIR UNDID AN OUTAGE-PLANTED OFFSET, EXACTLY.** Measured on
+  board b, n=1, and it points the opposite way to everything recorded above about repairs.
+    - 13:51:53 a natural supply outage (`RPRE` supply ratio 0.17, no OTA running) ran the full
+      chain: 39 drops → `Stream 4823 ms late for 3 s: reconnecting` → disconnect → `speaker_mixer:
+      Stopped` → reconnect with a fresh ring buffer and mixer restart → `Sync locked (median
+      249 µs)`. The wire went from **+180 µs to −1307 µs and stayed there**.
+    - Unmuted, the on-device median then walked **811 → 1090 → 755 → 440 → 304 → 224 → 181 µs**
+      over ~30 s. That is the servo steering REAL AUDIO against the fresh anchor, audibly and
+      permanently, while every on-device field reads like a healthy convergence. `Playout depth
+      −5419 µs vs leader` at reconnect and `−11905 µs` 30 s later is the same thing seen from the
+      other side. **The unmute gate let it out at 249 µs and the error then GREW to 1090 µs** —
+      the mixer had only just restarted and its depth was still moving.
+    - 13:54:36 `inject_split(+2500)`; repair fired 13:55:00. The wire stepped **+1329.8 µs** and
+      landed at **+23.2 µs against the +24.6 µs baseline measured before the replug** — 1.4 µs from
+      where it started, i.e. the repair UNDID the whole planted offset.
+    - **The mechanism is NOT established and the recorded model does not fit.** The repair measured
+      `+2562 us`, essentially just the injection, so the 1.3 ms was *not* in the split it saw. And
+      step = trim × hold × 0.16–0.18 predicts ~80 µs here (trim was +148 ppm), not 1330. Landing
+      within 1.4 µs of the old baseline is not what random displacement looks like, but n=1 and one
+      clean point establishes existence, not size.
+    - **Why it matters:** if a forced repair can recover an outage-planted offset, that is a lever
+      on the single largest term measured — an outage plants ~1.3 ms where the steady-state floor is
+      7 µs. The obvious follow-up is whether a repair provoked deliberately after a RECONNECT does
+      this reliably, which is testable with the same hook.
+    - **Do not generalise from this to natural repairs yet.** The recorded 23-per-session repairs
+      plant 222 µs; this one recovered 1330 µs. Both cannot be the same mechanism, and the
+      difference may be that this device was carrying a bad anchor from a pipeline restart while the
+      earlier measurements were of repairs on a healthy one.
+
     - **THE WEDGE IS A SEPARATE, PRE-EXISTING DEFECT, and NOT caused by the discard cap.** I said it
       was and reverted on that basis. The revert was still right — the cap removed the recovery path
       — but the wedge fires without it: `speaker_mixer: Stopped` followed by permanent silence
