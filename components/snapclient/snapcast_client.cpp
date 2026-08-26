@@ -2772,11 +2772,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             drift_for_repair != INT32_MIN && std::abs(mix_residual_us) >= DRIFT_REPAIR_US / 2 &&
             std::abs(drift_for_repair - mix_residual_us) <= MIX_RESIDUAL_MATCH_US;
         if (residual_explains) {
-          if (st.drift_excess_since_us != 0) {
+          // Logged whenever the split is big enough that the repair WOULD have looked at it, not
+          // only when a window was already open. The gate disarms before the arming branch below,
+          // so without this a phantom that shows up while unarmed leaves no trace and the gate
+          // cannot be told from a gate that never fires.
+          if (std::abs(drift_for_repair) >= DRIFT_REPAIR_US) {
             ESP_LOGW(TAG,
                      "Accounting split %+" PRId32 " us left alone: the mixer's conservation residual is "
-                     "%+" PRId32 " us, so the depth reading is not describing the whole pipeline",
-                     drift_for_repair, mix_residual_us);
+                     "%+" PRId32 " us, so the depth reading is not describing the whole pipeline%s",
+                     drift_for_repair, mix_residual_us, st.drift_excess_since_us != 0 ? " (window dropped)" : "");
           }
           st.drift_excess_since_us = 0;
         } else if (drift_for_repair != INT32_MIN && std::abs(drift_for_repair) >= DRIFT_REPAIR_US &&
