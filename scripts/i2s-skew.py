@@ -1437,6 +1437,61 @@ def report_rate_reference(label, paired):
     return True
 
 
+def report_recovery(ts, ys):
+    """Time for the offset to settle after a boot or a re-lock, per contiguous segment.
+
+    The servo gain trades steady-state skew against exactly this, so it is half of every
+    TRIM_KP decision -- and it was being read off plots by eye, which is how "~42 s" and
+    "~135 s" entered the notes without a method attached.
+
+    A recovery is a segment that STARTS far out and decays, which is what a boot looks like:
+    ~25 s of no audio to correlate, then playout resuming with an offset planted by the
+    re-baseline anchor. Segments that merely continue at the floor are not recoveries and are
+    skipped, so this prints nothing on an ordinary quiet capture rather than inventing an
+    event.
+
+    Both numbers are reported against the segment's OWN settled level, not against zero: the
+    absolute offset carries whatever the anchor planted, and the question here is how fast the
+    loop converges, not where it converges to.
+    """
+    pts = [(t, y / 1000.0) for t, y in zip(ts, ys) if math.isfinite(y)]
+    if len(pts) < 40:
+        return
+    printed = False
+    for seg in split_gaps(pts):
+        if len(seg) < 40:
+            continue
+        tail = [v for _t, v in seg[int(len(seg) * 0.8):]]
+        settled = float(np.median(tail))
+        # Tolerance from the tail's own scatter, so a quieter floor demands a tighter
+        # settle rather than being graded against a constant from another era. MAD, not sd:
+        # network events dominate sd here by ~30x.
+        mad = float(np.median([abs(v - settled) for v in tail]))
+        tol = max(4.0 * mad, 5.0)
+        start_err = abs(seg[0][1] - settled)
+        # Not a recovery unless it began meaningfully outside the band it ends in.
+        if start_err < 4.0 * tol:
+            continue
+        t0 = seg[0][0]
+        # Settled = the first instant after which it never leaves the band again. "First
+        # entry" would report the first overshoot crossing, which on a decaying oscillation
+        # is far too optimistic.
+        settle_t = None
+        for i in range(len(seg)):
+            if all(abs(v - settled) <= tol for _t, v in seg[i:]):
+                settle_t = seg[i][0] - t0
+                break
+        # 1/e of the initial excursion: comparable to the tau values already in the notes.
+        tau = next((t - t0 for t, v in seg if abs(v - settled) <= start_err / math.e), None)
+        if not printed:
+            print("   recovery (offset settling after a boot or re-lock)")
+            printed = True
+        print(f"      t={t0:8.1f}s  from {seg[0][1] - settled:+8.1f} us  "
+              f"tau {('%.0f s' % tau) if tau is not None else '   --':>6s}  "
+              f"settled {('%.0f s' % settle_t) if settle_t is not None else 'not yet':>8s}  "
+              f"(band +-{tol:.1f} us, floor MAD {mad:.2f} us)")
+
+
 def report_offset_integral(args, ts, ys, rate_a, rate_b):
     """Does the integral of the differential rate reproduce the measured wire offset?
 
@@ -1454,6 +1509,7 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
     offset_us = [(t, y / 1000.0) for t, y in zip(ts, ys) if math.isfinite(y)]
     if len(offset_us) < MIN_FIT_ROWS:
         return []
+    report_recovery(ts, ys)
     print("   offset integral (is the offset the integral of the differential rate?)")
     dfs = pair_diff(rate_a, rate_b, to_ppm=lambda a, b: (b - a) / ((a + b) / 2.0) * 1e6)
     report_integral(
