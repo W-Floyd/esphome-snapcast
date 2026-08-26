@@ -472,6 +472,15 @@ defect.
       So the reconnect succeeds and the media player reports PLAYING while the mixer task stays
       deallocated and the player task blocks writing into it. `dma_real=0` confirms the I2S channel
       is not running rather than merely starved.
+      **A SECOND VARIANT, observed 12:19–12:22: the pipeline never STARTS after a boot.** Same end
+      state, different entry. b's last `I2SDBG` was at 12:19:25 before the OTA reboot; it then
+      booted, connected at 12:19:46, reported `State changed to PLAYING`, logged `Boot seems
+      successful`, and from 12:20 produced **zero** lines from `snap_player`, `snap_net`,
+      `speaker_task` or `mixer` — only `wifi_diag` from the main loop. So the main loop is alive
+      while every audio task is dead from boot, and no `Stopped` appears anywhere in it. That
+      points AWAY from the STOPPED handler below and toward task startup, or a lock taken before
+      the tasks run. A fix aimed only at the stop/restart path would miss this variant entirely.
+      Both need a replug.
       **Suspect, not confirmed:** `mixer_speaker.cpp:466-471` handles `MIXER_TASK_STATE_STOPPED` by
       calling `task_.deallocate()` and then `xEventGroupClearBits(event_group_,
       MIXER_TASK_ALL_BITS)` — clearing *all* bits, which would discard a pending
