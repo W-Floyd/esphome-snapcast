@@ -1384,15 +1384,20 @@ def window_means(dfs, windows):
     why the firmware publishes it. Windows without enough coverage are dropped rather than
     compared against a partial average.
     """
-    out = []
+    out, thin = [], 0
     for t, val, audio_s in windows:
         if val is None:
             continue
         seg = [v for ts_, v in dfs if t - audio_s <= ts_ <= t]
-        if len(seg) < 20:
+        # Three is the floor at which a mean is a mean rather than a sample. The analyser
+        # normally supplies ~40 per window, so this only bites on a sparse capture -- and it
+        # is counted rather than dropped quietly, because "no windows compared" and "windows
+        # compared and they agreed" must not look the same.
+        if len(seg) < 3:
+            thin += 1
             continue
         out.append((t, val, float(np.mean(seg))))
-    return out
+    return out, thin
 
 
 def report_rate_reference(label, paired):
@@ -1408,25 +1413,28 @@ def report_rate_reference(label, paired):
     crystal error, so the differential trim carries the crystal DIFFERENCE. That constant is
     unobservable on-device and integrates without bound.
     """
+    paired, thin = paired
+    thin_note = f", {thin} window(s) had too few analyser samples to average" if thin else ""
     if len(paired) < MIN_FIT_ROWS:
-        print(f"   {label}: {len(paired)} paired window(s), need {MIN_FIT_ROWS}")
-        return
+        print(f"   {label}: {len(paired)} paired window(s), need {MIN_FIT_ROWS}{thin_note}")
+        return False
     x = np.array([p[1] for p in paired])      # candidate reference
     y = np.array([p[2] for p in paired])      # analyser's own differential rate
     bias = float(np.mean(x) - np.mean(y))
     if np.ptp(x) < 1e-12 or np.ptp(y) < 1e-12:
         print(f"   {label}: reference or rate is constant, nothing to fit")
-        return
+        return False
     corr = float(np.corrcoef(x, y)[0, 1])
     slope, icept = np.polyfit(x, y, 1)
     resid_sd = float(np.std(y - (slope * x + icept)))
-    print(f"   {label}: {len(paired)} window(s)")
+    print(f"   {label}: {len(paired)} window(s){thin_note}")
     print(f"      corr {corr:+.3f}   slope {slope:+.3f}   "
           f"constant offset {bias:+.3f} ppm   residual {resid_sd:.3f} ppm")
     # What each error term costs the OFFSET, which is the only thing that matters. The
     # constant is the killer: it is a rate, so it integrates linearly and forever.
     print(f"      integrated over 100 s: constant {abs(bias) * 100:.0f} us, "
           f"residual {resid_sd * 100:.0f} us")
+    return True
 
 
 def report_offset_integral(args, ts, ys, rate_a, rate_b):
@@ -1475,16 +1483,17 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
         # audio duration is the interval the analyser's rates must be averaged over.
         dur = {t: audio_s for t, _m, audio_s in TRIMS[na]}
         windows = [(t, dv, dur[t]) for t, dv in dtrim if t in dur]
-        report_rate_reference("trim mean   (vs analyser rate)", window_means(dfs, windows))
-        print(f"      a constant offset here is the CRYSTAL DIFFERENCE: each board's trim "
-              f"cancels its own\n      crystal error, so the differential trim carries "
-              f"their difference. Nothing on the\n      device knows it, and it integrates "
-              f"without bound -- which is why the offset\n      integral below fails even "
-              f"where the correlation above is high.")
+        if report_rate_reference("trim mean   (vs analyser rate)",
+                                 window_means(dfs, windows)):
+            print(f"      the constant offset is the CRYSTAL DIFFERENCE: each board's trim "
+                  f"cancels its own\n      crystal error, so the differential trim carries "
+                  f"their difference, and nothing on\n      the device knows it. Being a "
+                  f"rate it integrates without bound, which is why a\n      high correlation "
+                  f"here still leaves the offset integral below at ~1%.")
     report_integral(
         f"trim mean   (offset integral, {nb} - {na})", dtrim, offset_us, breaks,
-        expect=("expected to FAIL while the constant above is unknown; it is recorded so a "
-                "change in it is visible"))
+        expect=("fails while the constant above is unknown -- recorded so a change is "
+                "visible, not because\n              it is expected to work"))
     return dtrim
 
 
