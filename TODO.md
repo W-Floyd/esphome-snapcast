@@ -318,11 +318,32 @@ defect.
           instrumentation step if this needs nailing down harder.
         - Also measured, and useful on its own: an ~100 ms excursion with a healthy ring resolves
           with no discards and no muting. The path only engages when the ring is gone.
-    - **Independently exposed, and worth fixing on its own:** the stale-bailout reconnect can leave
-      the speaker STOPPED. B logged `Connected to 192.168.1.2:1704` and `Stream started: 44100 Hz`
-      at 10:14:13 and still never wrote another frame — `dma_real=0` says the I2S channel was not
-      running, not merely starved. The starvation re-baseline path recovers from the same situation
-      (measured at 09:46:57 → `Sync locked` 18 s later), so this is specific to the reconnect path.
+    - **THE WEDGE IS A SEPARATE, PRE-EXISTING DEFECT, and NOT caused by the discard cap.** I said it
+      was and reverted on that basis. The revert was still right — the cap removed the recovery path
+      — but the wedge fires without it: `speaker_mixer: Stopped` followed by permanent silence
+      occurred **five times** on one board (10:14:10, 10:32:55, 10:36:15, 10:49:56, 11:06:02), and
+      **three of those were after the cap was reverted at ~10:15**. Requires a replug to clear.
+      Sequence, captured per-chunk:
+
+          11:06:00  RSYNC[22..26] err 2873342 -> 3606874 us, ring=26, drops=22..26   runaway
+          11:06:01  mixer DEPTH own=0 down_audio=0 total_audio=0                     all empty
+          11:06:01  Stream ended / Disconnected from server
+          11:06:02  speaker_mixer: Stopped        <- speaker stopped, `written` freezes here
+          11:06:04  Connected / Stream started / State changed to PLAYING
+                    ... no mixer "Starting", no further player-task line, ever
+
+      So the reconnect succeeds and the media player reports PLAYING while the mixer task stays
+      deallocated and the player task blocks writing into it. `dma_real=0` confirms the I2S channel
+      is not running rather than merely starved.
+      **Suspect, not confirmed:** `mixer_speaker.cpp:466-471` handles `MIXER_TASK_STATE_STOPPED` by
+      calling `task_.deallocate()` and then `xEventGroupClearBits(event_group_,
+      MIXER_TASK_ALL_BITS)` — clearing *all* bits, which would discard a pending
+      `MIXER_TASK_COMMAND_START`. That would explain a start request being lost across a stop. What
+      is not yet established is whether a START was issued and lost, or never issued because the
+      player task was already blocked; the two are distinguishable and no "Starting" line appears
+      either way. **Do not fix on this inference alone** — instrument which of the two it is first.
+      Note the runaway itself is upstream of the wedge and is the empty-ring trigger below, so this
+      is the second defect in the chain, not the first.
 - **The measured cascade this all started from**, for whoever picks it up. On board A:
     - healthy at 09:46:53.410 (median −38 µs, ring **1724 ms**), `Hard resync 50 ms late` at .688
     - **pipeline completely dry** 0.7 s later: `queued=0 dma_real=0 written==completed inflight=0`
