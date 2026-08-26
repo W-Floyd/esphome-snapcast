@@ -2716,6 +2716,12 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
         this->seed_drain_from_us_ = now_us();
         this->seed_drain_latency_us_ = latency.microseconds;
         this->seed_drain_prev_frames_ = this->played_frames_total_;
+        // Reset the interpolation base too. Without this it still holds a PRE-SEED feedback
+        // timestamp, so if the target is crossed on the first batch after the seed the batch
+        // interval spans the whole starvation and the interpolation is nonsense. That is not a
+        // corner case: a dry pipeline anchors at one DMA buffer, and one buffer IS one batch --
+        // exactly the case this measurement was armed for.
+        this->played_prev_ts_us_ = now_us();
       }
       this->playout_mutex_.unlock();
       if (have_fill) {
