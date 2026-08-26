@@ -2508,7 +2508,12 @@ void SnapcastClient::player_task_() {
           // is what the trim beside it was produced with.
           ESP_LOGD(TAG, "Trim window: mean %+.3f ppm over %.2f s audio (covered %.0f%%) t=%" PRId64 " kp=%.3f",
                    static_cast<float>(st.trim_integral_ppm_s / static_cast<double>(st.trim_covered_s)),
-                   st.trim_window_s, covered_pct, now_us(), st.kp_active);
+                   st.trim_window_s, covered_pct, now_us(),
+                   // 0 means the PI has not run since boot -- the split-hold path programs a trim
+                   // without going through the gain. Printing that 0 reads as "the loop is running
+                   // at zero gain", which is the same class of lie as the "(idle)" trim snapshot.
+                   // Fall back to what the schedule WOULD hand it on this chunk.
+                   st.kp_active > 0.0f ? st.kp_active : this->trim_kp_(st));
         } else {
           ESP_LOGD(TAG, "Trim window: no trim programmed over %.2f s audio t=%" PRId64, st.trim_window_s,
                    now_us());
