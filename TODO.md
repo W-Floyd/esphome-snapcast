@@ -18,13 +18,11 @@ section; most of the obvious approaches have already failed on hardware.
 - **`speaker::set_rate_adjustment(float ppm)`**, default no-op, per-SoC in the i2s speaker.
   `i2s_rate_lock` stays as the fallback for older ESPHome, and this is the only way rate
   steering reaches a non-S3 target.
-- **`mixer` under-reports what it holds.** Its depth report's `xfer` is not everything in it: the
-  conservation residual `src_consumed − sink_received − xfer` reached **1125 frames** and stayed
-  there for 14 s before returning to zero, so the audio was held rather than lost and the reading
-  was simply incomplete. Downstream that read as a 25.5 ms accounting split, which is enough to
-  trigger the client's repair — now gated on this residual (`MIX_RESIDUAL_MATCH_US`), which is a
-  guard, not a fix. The fix is in the fork's `speaker_mixer` depth reporting: include what the
-  mixer is holding, so `r_mix` means "lost" and nothing else.
+- **Carry the mixer's in-flight fix to the `render-latency` branch** before upstream submission.
+  Landed on `speaker-render-latency` as `07f80de5e` (`dbg_inflight_us`: the mixer counts frames
+  handed to the sink, the sink already publishes frames accepted, and the difference is the audio
+  between them — the term the composite depth omitted, worth up to one sink publish interval).
+  That branch is the flashing one; `render-latency` is the submission one and does not have it.
 - **`mixer` does not yield when the sink stops draining.** Fixed on the fork (`74d32d9dd`) as a
   defensive yield; not proposed upstream. Needs a reproduction that actually stops a sink and
   measures CPU before it is worth filing.
@@ -45,19 +43,21 @@ is now the largest error in the chain by an order of magnitude.
   partial depth snapshot that `accounted_at_()` then differences against. New clue: every
   occurrence caught with the residuals logged had `xfer=50000` — its maximum, equal to `dma` — and
   `r_mix=441` frames (10 ms), which is nowhere near the 42 ms and so does not explain it. Start
-  from why `xfer` is railed at exactly one DMA buffer whenever this fires.
+  from why `xfer` is railed at exactly one DMA buffer whenever this fires. Since the in-flight fix
+  it reads −52245/−49343 — the same spike plus the 10 ms `inflight` those samples carry — and the
+  terms are self-consistent there (`sum == meas`, `r_mix == 0`), so it is not a conservation
+  failure. Every occurrence has `xfer=50000`, `inflight=10000`, `queued=70000`, `dma=50000` and
+  `age≈33 ms`: a full transfer buffer, i.e. the sink briefly not accepting.
 - **Board a carries `split +22 µs`** where b sits at −1. Constant across every window measured.
 - **The re-baseline anchor still plants an accounting error.** Repaired within ~3 s now instead
   of never, but not prevented: it captures an instant that stops being true (`own=0` at the
   seed, ~244 ms of audio 1.4 s later). Preventing it needs an anchor that stays valid — not
   another way to suppress the second seed.
-- **A per-boot absolute offset of ±30 µs survives, and no on-device metric sees it.** Measured
-  with both boards settled and no repair anywhere in the trace: differential median −2.0 ±3 µs
-  against +30 µs on the wire. Both boards agree with each other and with themselves; only the
-  analyser disagrees. Not frame-quantised (samples: +0.9, −15, +30 µs post-gate; +89, +115, +85
-  before it), so it is a continuous start-phase term, not a whole-frame miscount. The route to it
-  is the mixer depth fix below — with `r_mix` provably non-zero, the accounting cannot be verified
-  to a frame, and until it can, this term has no instrument.
+- **Re-measure the per-boot absolute offset now that the depth report is complete.** It was ±30 µs
+  and invisible on-device (differential median −2.0 ±3 µs against +30 µs on the wire) before the
+  mixer fix; the boot after it settled at −0.5 to −9 µs with 8–23 µs p2p, which is at or below the
+  analyser's own floor. One boot is not a distribution: reboot one board 4–5 times and record where
+  each lands before deciding whether anything is left here.
 - **Every accounting re-anchor plants a static wire offset of tens of µs.** Now the dominant
   term, and only visible on the analyser. Measured in one session at MAD 1–3 µs of noise, so the
   residual is resolved to 1 part in 40 — far better SNR than the 8.5 ms this was chased at:

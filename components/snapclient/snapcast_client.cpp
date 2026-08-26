@@ -2363,6 +2363,9 @@ void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase)
   // these are exact rather than differences of separately-sampled counters.
   //   r_push : what we think we handed over, against what the source ring says it took
   //   r_src  : the source ring -- taken in, minus given to the mixer, minus what it still holds
+  //   r_mix  : the mixer -- taken from the source ring, minus handed to the sink, minus its transfer
+  //            buffer and what is in flight to the sink. Omitting that last stage is what made this
+  //            residual equal the stage itself, and downstream that read as an accounting split.
   //   r_sink : the sink ring -- taken in, minus written to DMA, minus what it still holds
   const int64_t own_frames = static_cast<int64_t>(m.dbg_own_us) * rate / 1000000;
   const int64_t queued_frames = static_cast<int64_t>(m.dbg_queued_us) * rate / 1000000;
@@ -2370,8 +2373,9 @@ void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase)
   const int64_t r_push = p_now - static_cast<int64_t>(m.dbg_src_received);
   const int64_t r_src = static_cast<int64_t>(m.dbg_src_received) - static_cast<int64_t>(m.dbg_src_consumed) -
                         own_frames;
+  const int64_t inflight_frames = static_cast<int64_t>(m.dbg_inflight_us) * rate / 1000000;
   const int64_t r_mix = static_cast<int64_t>(m.dbg_src_consumed) - static_cast<int64_t>(m.dbg_sink_received) -
-                        xfer_frames;
+                        xfer_frames - inflight_frames;
   const int64_t r_sink = static_cast<int64_t>(m.dbg_sink_received) - queued_frames;
   ESP_LOGD(TAG,
            "EARLY[%" PRIu32 "] %s ok=%d acct=%" PRId64 " live=%" PRId64 " meas=%" PRIu32 " own=%" PRIu32
@@ -2623,8 +2627,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             {
               const int64_t rate_r = static_cast<int64_t>(rec.params.sample_rate);
               const int64_t xfer_f = static_cast<int64_t>(measured.dbg_xfer_us) * rate_r / 1000000;
+              const int64_t inflight_f = static_cast<int64_t>(measured.dbg_inflight_us) * rate_r / 1000000;
+              // Subtracting the in-flight stage is what makes this a conservation check again rather
+              // than a restatement of it. src_consumed = written_to_sink + xfer, so before the mixer
+              // reported the in-flight term this residual was ALGEBRAICALLY EQUAL to it --
+              // written_to_sink - sink_received -- which is why it matched the observed split to 1 us
+              // and why the split existed at all. With the term reported and included here the
+              // residual is zero by construction, so the gate below is now a regression guard rather
+              // than a live defence: it fires only if some stage goes missing from the chain again.
               const int64_t resid_f = static_cast<int64_t>(measured.dbg_src_consumed) -
-                                      static_cast<int64_t>(measured.dbg_sink_received) - xfer_f;
+                                      static_cast<int64_t>(measured.dbg_sink_received) - xfer_f - inflight_f;
               mix_residual_us = static_cast<int32_t>(
                   std::clamp<int64_t>(resid_f * 1000000 / rate_r, INT32_MIN / 2, INT32_MAX / 2));
             }
@@ -2648,23 +2660,25 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int64_t rate_i = static_cast<int64_t>(rec.params.sample_rate);
             const int64_t own_f = static_cast<int64_t>(measured.dbg_own_us) * rate_i / 1000000;
             const int64_t xfer_f = static_cast<int64_t>(measured.dbg_xfer_us) * rate_i / 1000000;
-            const int64_t queued_f = static_cast<int64_t>(measured.dbg_queued_us) * rate_i / 1000000;
             ESP_LOGD(TAG,
                      "RECON drift=%" PRId32 " acct=%" PRId64 " meas=%" PRIu32 " sum=%" PRIu32 " own=%" PRIu32
-                     " xfer=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " age=%" PRId64 " pushed=%" PRId64
+                     " xfer=%" PRIu32 " inflight=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " age=%" PRId64
+                     " pushed=%" PRId64
                      " played=%" PRId64 " clamped=%" PRId64 " | srcrx=%" PRIu32 " srctx=%" PRIu32 " sinkrx=%" PRIu32
-                     " r_push=%" PRId64 " r_src=%" PRId64 " r_mix=%" PRId64 " r_sink=%" PRId64,
+                     " r_push=%" PRId64 " r_src=%" PRId64 " r_mix=%" PRId64,
                      fill_drift_us, accounted_us, measured.microseconds,
-                     measured.dbg_own_us + measured.dbg_xfer_us + measured.dbg_queued_us + measured.dbg_dma_us,
-                     measured.dbg_own_us, measured.dbg_xfer_us, measured.dbg_queued_us, measured.dbg_dma_us,
+                     measured.dbg_own_us + measured.dbg_xfer_us + measured.dbg_inflight_us + measured.dbg_queued_us +
+                         measured.dbg_dma_us,
+                     measured.dbg_own_us, measured.dbg_xfer_us, measured.dbg_inflight_us, measured.dbg_queued_us,
+                     measured.dbg_dma_us,
                      now_us() - measured.as_of_us, dbg_pushed, dbg_played, this->dbg_clamped_frames_,
                      measured.dbg_src_received, measured.dbg_src_consumed, measured.dbg_sink_received,
                      dbg_pushed - static_cast<int64_t>(measured.dbg_src_received),
                      static_cast<int64_t>(measured.dbg_src_received) -
                          static_cast<int64_t>(measured.dbg_src_consumed) - own_f,
                      static_cast<int64_t>(measured.dbg_src_consumed) -
-                         static_cast<int64_t>(measured.dbg_sink_received) - xfer_f,
-                     static_cast<int64_t>(measured.dbg_sink_received) - queued_f);
+                         static_cast<int64_t>(measured.dbg_sink_received) - xfer_f -
+                         static_cast<int64_t>(measured.dbg_inflight_us) * rate_i / 1000000);
           }
         }
       }
