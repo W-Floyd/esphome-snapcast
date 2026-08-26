@@ -303,8 +303,24 @@ class SnapcastClient {
   /// the audio stays where the servo put it. That is the sequence a natural split follows; the only
   /// difference is that the size is known, which is what makes a step-versus-split curve possible.
   ///
-  /// A first quiet natural repair measured +491 us of permanent wire step for a +20 ms split, so
-  /// keep the magnitudes near that: a few ms to a few tens of ms. THREAD CONTEXT: any (atomic).
+  /// DESIGN FLAW, MEASURED: this STEPS the accounting, and nature RAMPS it. The distinction is
+  /// the whole experiment.
+  ///
+  /// A natural split develops over seconds. The servo's error is computed against the prediction
+  /// `pushed` feeds, so a slowly-biased `pushed` simply holds the audio at a biased position while
+  /// the error reads ~0 -- no disturbance, just a static offset -- and the only step is at the
+  /// REPAIR, when `pushed` is corrected. That is the +491 us measured on a natural repair against a
+  /// 0.71 us floor.
+  ///
+  /// Stepping `pushed` instead hands the servo a large INSTANTANEOUS error, which it corrects
+  /// violently: an injected +10 ms produced a -3.9 ms offset excursion and left the fit floor at
+  /// 822-1204 us, swamping the very step being measured. So the injection contributes two steps
+  /// where nature contributes one, and the injection's is the bigger. No magnitude fixes this --
+  /// DRIFT_REPAIR_US is 2000, so even a minimal 2 ms step disturbs by ~2 ms against a sub-us floor.
+  ///
+  /// To be useful this must ramp the split in over several seconds rather than applying it at once.
+  /// Left as-is and unused pending that change, because a step injection measures its own
+  /// disturbance rather than the repair's. THREAD CONTEXT: any (atomic).
   void inject_split(int32_t us) { this->inject_split_us_.store(us, std::memory_order_relaxed); }
   static int64_t now_us_public();
 
