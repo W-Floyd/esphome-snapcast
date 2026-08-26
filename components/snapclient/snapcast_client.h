@@ -303,8 +303,7 @@ class SnapcastClient {
   /// the audio stays where the servo put it. That is the sequence a natural split follows; the only
   /// difference is that the size is known, which is what makes a step-versus-split curve possible.
   ///
-  /// DESIGN FLAW, MEASURED: this STEPS the accounting, and nature RAMPS it. The distinction is
-  /// the whole experiment.
+  /// RAMPED, not stepped, and that distinction is the whole experiment.
   ///
   /// A natural split develops over seconds. The servo's error is computed against the prediction
   /// `pushed` feeds, so a slowly-biased `pushed` simply holds the audio at a biased position while
@@ -318,9 +317,10 @@ class SnapcastClient {
   /// where nature contributes one, and the injection's is the bigger. No magnitude fixes this --
   /// DRIFT_REPAIR_US is 2000, so even a minimal 2 ms step disturbs by ~2 ms against a sub-us floor.
   ///
-  /// To be useful this must ramp the split in over several seconds rather than applying it at once.
-  /// Left as-is and unused pending that change, because a step injection measures its own
-  /// disturbance rather than the repair's. THREAD CONTEXT: any (atomic).
+  /// So the request is a TARGET, applied a little per chunk at SPLIT_RAMP_US_PER_S -- slow enough
+  /// that the servo tracks it as ordinary drift, which is what makes the audio arrive at the biased
+  /// position smoothly and leaves the repair as the only step on the wire. THREAD CONTEXT: any
+  /// (atomic); the ramp itself is player-task-only.
   void inject_split(int32_t us) { this->inject_split_us_.store(us, std::memory_order_relaxed); }
   static int64_t now_us_public();
 
@@ -782,10 +782,12 @@ class SnapcastClient {
   /// Until when a re-baseline's own aftermath is barred from re-arming the starvation latch.
   /// Written by the player task in rebaseline_after_starvation_, read on the speaker callback.
   std::atomic<int64_t> starve_suppress_until_us_{0};
-  /// TEST HOOK, see inject_split(). Pending accounting perturbation in us; 0 when none. Applied
-  /// and cleared by the player task at a chunk boundary, so it lands at a defined point rather
-  /// than mid-update.
+  /// TEST HOOK, see inject_split(). REQUEST in us, consumed once by the player task; 0 when none.
   std::atomic<int32_t> inject_split_us_{0};
+  /// @brief Remaining split still to be ramped in, us. Player task only. Signed: a negative target
+  /// ramps down. Accumulates, so a second request while one is in flight adds to it rather than
+  /// discarding it.
+  int64_t split_ramp_remaining_us_{0};
   /// TEST HOOK, see inject_starvation(). 0 when not injecting.
   std::atomic<int64_t> starve_until_us_{0};
   /// @brief ANCHOR ERROR measurement, armed by a re-baseline. Player task only.

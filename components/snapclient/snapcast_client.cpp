@@ -458,6 +458,12 @@ static constexpr int32_t MIX_RESIDUAL_MATCH_US = 2000;
 // while still observing a steady value. The band test below remains the real guard: anything
 // still moving restarts the window regardless of how long it has been open.
 static constexpr int64_t DRIFT_REPAIR_HOLD_US = 3000000;
+// TEST HOOK ramp rate, see inject_split(). 100 us/s is chosen to sit at or under the disturbance
+// the servo already tracks unaided -- the clock-offset estimate wanders ~100 us/s on wifi jitter --
+// so the injected bias arrives as ordinary drift rather than as a transient the servo fights. At
+// this rate the 2 ms minimum that can arm a repair (DRIFT_REPAIR_US) takes ~20 s to build, plus
+// DRIFT_REPAIR_HOLD_US to fire, which is the price of not swamping the measurement.
+static constexpr double SPLIT_RAMP_US_PER_S = 100.0;
 
 static constexpr uint32_t RESYNC_STORM_COUNT = 8;
 static constexpr int64_t RESYNC_STORM_WINDOW_US = 2000000;
@@ -2460,20 +2466,42 @@ void SnapcastClient::player_task_() {
     // Accumulate the accounted queue per chunk so the group cross-check can be handed a MEAN rather
     // than a single sample of a sawtooth. One extra lock per chunk (~38/s) buys an order of
     // magnitude on that comparison's noise floor.
-    // TEST HOOK, see inject_split(): shift the accounting by a known amount, audio untouched.
-    // Applied here because it is a defined point -- inside the playout mutex, at a chunk boundary,
-    // after the servo has run -- rather than asynchronously mid-update. Consumed once.
+    // TEST HOOK, see inject_split(): bias the accounting by a known amount, audio untouched, RAMPED
+    // IN so the servo tracks it as ordinary drift instead of reacting to a step.
+    //
+    // Stepping it was tried and measured its own disturbance rather than the repair's: an injected
+    // +10 ms produced a -3.9 ms excursion and left the wire's fit floor at 822-1204 us, against the
+    // few hundred us being looked for. Ramping at a rate the servo already absorbs (the clock-offset
+    // estimate wanders ~100 us/s on wifi jitter unaided) reproduces what a natural accounting drift
+    // does: the audio arrives at the biased position smoothly, and the REPAIR is the only step on
+    // the wire -- which is the thing being measured.
     const int32_t split_req = this->inject_split_us_.exchange(0, std::memory_order_relaxed);
-    this->playout_mutex_.lock();
     if (split_req != 0) {
-      const int64_t shift = static_cast<int64_t>(split_req) * rec.params.sample_rate / 1000000;
-      this->pushed_frames_total_ += shift;
-      // The counters just jumped, so anything remembered against them describes a level that no
-      // longer exists -- the same reason the re-baseline clears these.
-      this->clear_playout_history_();
-      this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(), this->pushed_frames_total_);
-      this->mark_playout_(this->played_history_, this->played_history_next_, now_us(), this->played_frames_total_);
-      ESP_LOGW(TAG, "SPLITINJECT %+" PRId32 " us (%+" PRId64 " frames) t=%" PRId64, split_req, shift, now_us());
+      // Accumulate rather than replace: a second request while one is in flight should add.
+      this->split_ramp_remaining_us_ += split_req;
+      ESP_LOGW(TAG, "SPLITINJECT request %+" PRId32 " us, ramping at %d us/s (remaining %+" PRId64 ") t=%" PRId64,
+               split_req, static_cast<int>(SPLIT_RAMP_US_PER_S), this->split_ramp_remaining_us_, now_us());
+    }
+    this->playout_mutex_.lock();
+    if (this->split_ramp_remaining_us_ != 0) {
+      const double chunk_s = static_cast<double>(frames) / rec.params.sample_rate;
+      const int64_t budget = static_cast<int64_t>(SPLIT_RAMP_US_PER_S * chunk_s + 0.5);
+      const int64_t inc = std::clamp<int64_t>(this->split_ramp_remaining_us_, -budget, budget);
+      const int64_t shift = inc * rec.params.sample_rate / 1000000;
+      if (shift != 0) {
+        this->pushed_frames_total_ += shift;
+        this->split_ramp_remaining_us_ -= inc;
+        // Histories describe levels against the old counter, so they are re-marked rather than
+        // cleared: cleared every chunk would leave the split-vs-measured comparison no history at
+        // all, which is the very quantity this experiment needs intact.
+        this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(),
+                            this->pushed_frames_total_);
+        if (this->split_ramp_remaining_us_ == 0) {
+          ESP_LOGW(TAG, "SPLITINJECT ramp complete t=%" PRId64, now_us());
+        }
+      }
+      // If the budget rounded to zero frames this chunk, nothing is applied and nothing is
+      // consumed, so the remainder carries to the next chunk rather than being silently dropped.
     }
     st.depth_accum_frames += this->pushed_frames_total_ - this->played_frames_total_;
     this->playout_mutex_.unlock();
