@@ -75,6 +75,10 @@ struct SnapcastClientConfig {
   // corrections become clock trims instead of frame splices where supported)
   uint8_t rate_lock_i2s_port{0};
 #endif
+  // Force one accounting repair cycle after each session start. OFF by default: the effect is
+  // measured (n=12) but its mechanism is not, so this is opt-in until a lone reconnect has been
+  // graded with it. See reanchor_after_session_() and REANCHOR_BIAS_US.
+  bool reanchor_after_reconnect{false};
 };
 
 /// @brief Output channel routing, matching esp32 snapclient's dsp_channel_mode_t.
@@ -533,6 +537,10 @@ class SnapcastClient {
     uint16_t resync_trace_idx{0};
     int64_t resync_trace_arm_us{0};
     uint32_t resync_drops{0};
+    // Re-anchor after a session start: the epoch already handled, and the instant the settle
+    // delay expires. See reanchor_after_session_().
+    uint32_t reanchor_epoch{0};
+    int64_t reanchor_due_us{0};
     // Gain schedule: the instant of the last DISTURBANCE EVENT, from which KP decays ACQUIRE ->
     // RUN. Not the instant of the last error -- see TRIM_KP_DECAY_TAU_S for why that distinction
     // is the whole safety argument. Set to the player task's start so a boot counts as an event.
@@ -753,6 +761,10 @@ class SnapcastClient {
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
 
+  /// Forces one repair cycle after a session start, if configured; a no-op otherwise. Called
+  /// once per chunk from the player loop, after the convergence gate.
+  void reanchor_after_session_(ServoState &st);
+
   /// The PI's proportional gain for this chunk: ACQUIRE while unconverged, otherwise decaying
   /// ACQUIRE -> RUN with time since the last disturbance event. Open-loop in the error by
   /// construction; see TRIM_KP_DECAY_TAU_S.
@@ -837,6 +849,10 @@ class SnapcastClient {
   std::atomic<int32_t> static_delay_ms_{0};
   std::atomic<uint8_t> channel_mode_{static_cast<uint8_t>(ChannelMode::STEREO)};
   std::atomic<uint8_t> sync_resilience_{static_cast<uint8_t>(SyncResilience::MUTE_ON_STORM)};
+  /// Bumped by the network task when a stream starts, so the player task can tell "this is a new
+  /// session" from "the same session re-locked after an excursion" -- which the servo state alone
+  /// cannot, since both clear st.converged.
+  std::atomic<uint32_t> session_epoch_{0};
   std::atomic<uint8_t> phase_mode_{static_cast<uint8_t>(PhaseMode::NONE)};
 
   // Server settings shadow used by the tasks (buffer_ms/latency for deadlines).

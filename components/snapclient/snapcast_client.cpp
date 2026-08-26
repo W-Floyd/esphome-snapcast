@@ -490,6 +490,34 @@ static constexpr int32_t MIX_RESIDUAL_MATCH_US = 2000;
 // while still observing a steady value. The band test below remains the real guard: anything
 // still moving restarts the window regardless of how long it has been open.
 static constexpr int64_t DRIFT_REPAIR_HOLD_US = 3000000;
+// RE-ANCHOR AFTER A SESSION START, opt-in (config_.reanchor_after_reconnect).
+//
+// A reconnect rebuilds the pipeline and re-anchors the playout accounting, and the per-device error
+// in that anchor becomes a permanent static offset which no on-device field can see -- measured
+// twice on 2026-08-26 as ~1.3 and ~1.4 ms of wire offset planted by an outage's reconnect, with
+// every on-device metric reading healthy either side of it.
+//
+// What is measured (n=12, quiet-gated, injected splits on one board): a repair removes about TWO
+// THIRDS of whatever standing offset the device carries, per firing -- post = +0.33 x pre - 6.4 --
+// and two of them took a board from -1377 us back to -35 us. Its own displacement, seen where the
+// device is already aligned, is +-50 us. So the repair is corrective, and forcing one after a
+// session start is the cheapest way to spend it on the offset a reconnect just planted.
+//
+// What is NOT established is WHY, and the honest version of that matters here: the standing offset
+// does not show up in `drift` (a fully-accounted device reads ~7 us, and the injection that
+// recovered 1.3 ms measured +2562 us, i.e. only the injection). So this forces the repair by
+// biasing the accounting, exactly as the test hook does, rather than by any principled re-derivation
+// -- which is why it is OFF by default and gated on a config flag until a lone reconnect has been
+// graded with it. If the effect does not reproduce for naturally planted offsets, the cost is one
+// hold and its +-50 us per reconnect, and this comes straight back out.
+//
+// The bias must exceed DRIFT_REPAIR_US to be detected at all; 2500 us is what every measured point
+// used. It is ramped by the same machinery as the test hook, so nothing is stepped.
+static constexpr int32_t REANCHOR_BIAS_US = 2500;
+// How long after the unmute to wait before perturbing. Long enough that the servo has finished the
+// fine settling the re-lock ends with -- perturbing into that would measure the settling, not the
+// anchor -- and short enough to be over before a listener has settled in.
+static constexpr int64_t REANCHOR_SETTLE_US = 10000000;
 // TEST HOOK ramp rate, see inject_split(). 100 us/s is chosen to sit at or under the disturbance
 // the servo already tracks unaided -- the clock-offset estimate wanders ~100 us/s on wifi jitter --
 // so the injected bias arrives as ordinary drift rather than as a transient the servo fights. At
@@ -1655,6 +1683,9 @@ void SnapcastClient::handle_wire_chunk_(const uint8_t *payload, size_t len) {
 
   this->last_chunk_us_.store(now_us(), std::memory_order_relaxed);
   if (!this->stream_active_) {
+    // A new session, which the player task cannot infer from its own state: a reconnect and a
+    // mid-session excursion both clear st.converged, and only the first rebuilt the pipeline.
+    this->session_epoch_.fetch_add(1, std::memory_order_relaxed);
     this->set_stream_active_(true);
   }
 
@@ -2602,6 +2633,8 @@ void SnapcastClient::player_task_() {
       st.in_band_chunks = 0;
     }
 
+    this->reanchor_after_session_(st);
+
     this->push_chunk_(rec, drop_frames, !st.converged);
 
     // TEMPORARY DIAGNOSTIC: see dbg_early_recon_ -- this is the post-startup half.
@@ -2986,6 +3019,39 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
       this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
     }
+}
+
+// THREAD CONTEXT: player task. See REANCHOR_BIAS_US for what this is for and what is unproven
+// about it.
+void SnapcastClient::reanchor_after_session_(ServoState &st) {
+  if (!this->config_.reanchor_after_reconnect) {
+    return;
+  }
+  const uint32_t epoch = this->session_epoch_.load(std::memory_order_relaxed);
+  if (st.reanchor_epoch == epoch) {
+    return;  // this session has had its cycle
+  }
+  if (!st.converged) {
+    // Not locked yet, or knocked out of lock again. Restart the settle from the next unmute: a
+    // perturbation applied mid-recovery measures the recovery.
+    st.reanchor_due_us = 0;
+    return;
+  }
+  if (st.reanchor_due_us == 0) {
+    st.reanchor_due_us = now_us() + REANCHOR_SETTLE_US;
+    return;
+  }
+  if (now_us() < st.reanchor_due_us) {
+    return;
+  }
+  st.reanchor_epoch = epoch;
+  st.reanchor_due_us = 0;
+  // Biases the ACCOUNTING only, leaving the audio alone, and is ramped -- the same path the test
+  // hook uses, so a forced cycle and a manual one are the same experiment. Logged at INFO with its
+  // own wording so the two are never confused in a log.
+  this->inject_split_us_.store(REANCHOR_BIAS_US, std::memory_order_relaxed);
+  ESP_LOGI(TAG, "Re-anchoring after session start: forcing one repair cycle (%+" PRId32 " us bias) t=%" PRId64,
+           REANCHOR_BIAS_US, now_us());
 }
 
 // THREAD CONTEXT: player task. The gain schedule; see TRIM_KP_DECAY_TAU_S for the argument.

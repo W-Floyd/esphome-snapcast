@@ -67,6 +67,8 @@ class SnapclientHub final : public Component,
   void set_stream_idle_timeout(uint32_t timeout_ms) { this->stream_idle_timeout_ms_ = timeout_ms; }
   /// @brief 0 = never release the pipeline while connected
   void set_keepalive_hold(uint32_t hold_ms) { this->keepalive_hold_ms_ = hold_ms; }
+  /// @brief Force one accounting repair cycle after each session start; see REANCHOR_BIAS_US.
+  void set_reanchor_after_reconnect(bool enable) { this->reanchor_after_reconnect_ = enable; }
   void set_pause_behavior(PauseBehavior behavior) { this->pause_behavior_ = behavior; }
   PauseBehavior pause_behavior() const { return this->pause_behavior_; }
   /// @brief True while wire chunks are actually arriving (not merely stream_active)
@@ -190,6 +192,7 @@ class SnapclientHub final : public Component,
   uint32_t hard_resync_threshold_ms_{50};
   uint32_t stream_idle_timeout_ms_{3000};
   uint32_t keepalive_hold_ms_{0};
+  bool reanchor_after_reconnect_{false};
   PauseBehavior pause_behavior_{PauseBehavior::ALLOW};
   uint32_t sync_deadband_us_{128};
   uint32_t converge_fine_us_{2000};
