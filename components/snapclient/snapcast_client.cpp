@@ -2684,7 +2684,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
 #endif
       }
   #endif
-      char tsf_str[64] = "";
+      char tsf_str[128] = "";
   #ifdef CLOCK_SYNC_TSF_ACTIVE
       if (this->tsf_sync_ != nullptr) {
         // Publish our depth so the group can cross-check it (see TsfSync)
@@ -2699,9 +2699,50 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         st.depth_samples = 0;
         this->tsf_sync_->set_pipeline_us(
             static_cast<int32_t>(depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate)));
+
+        // RENDER PHASE: the TSF instant at which this device renders server audio time zero.
+        //
+        // The depth published above compares buffer OCCUPANCY, and two devices rendering in
+        // perfect sync legitimately hold different amounts -- which is why that delta reads
+        // -13.4 ms for an offset a logic analyser measures at 3.7 ms. This compares WHEN A
+        // KNOWN FRAME RENDERS instead, which must be identical across devices playing the same
+        // stream, so a difference is real skew rather than a difference of buffering.
+        //
+        // Built from direct observations only, the same terms the offline RAW line uses:
+        //   (played, played_ts) is ground truth -- that many frames HAD rendered at that local
+        //   time; (s_ts, pushed) anchors the frame count to server audio time, the same number
+        //   on every device for the same audio; (tsf, tsf_local) converts to the one clock the
+        //   devices provably share. No servo state and no predicted playout: every wrong
+        //   diagnosis in this area came from trusting a model of when audio renders.
+        //
+        // Once per report, not per chunk: a TSF read costs 45-81 us and this needs one, which
+        // is nothing at 3.3 s intervals and would not be at 38/s.
+        //
+        // NOTE it consumes (pushed - played), so it inherits any accounting error. That is a
+        // real limit: it cannot say WHY two devices disagree, only that they do and by how
+        // much. Which is the measurement four failed hypotheses lacked.
+        int64_t phase_tsf = 0, phase_local = 0, phase_width = 0;
+        if (TsfSync::raw_tsf_sample(phase_tsf, phase_local, phase_width)) {
+          this->playout_mutex_.lock();
+          const int64_t p_played = this->played_frames_total_;
+          const int64_t p_pushed = this->pushed_frames_total_;
+          const int64_t p_played_ts = this->played_last_ts_us_;
+          const bool p_valid = this->playout_valid_;
+          this->playout_mutex_.unlock();
+          if (p_valid && p_played_ts > 0) {
+            const int64_t render_tsf = p_played_ts + (phase_tsf - phase_local);
+            const int64_t render_server = rec.server_ts_us - (p_pushed - p_played) * 1000000 /
+                                                                 static_cast<int64_t>(rec.params.sample_rate);
+            this->tsf_sync_->set_render_phase_us(render_tsf - render_server);
+          } else {
+            this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
+          }
+        }
         const TsfSync::Role role = this->tsf_sync_->role();
+        const int64_t own_phase = this->tsf_sync_->render_phase_us();
         if (role == TsfSync::Role::LEADER) {
-          snprintf(tsf_str, sizeof(tsf_str), ", tsf=leader(peers %u)", this->tsf_sync_->peer_count());
+          snprintf(tsf_str, sizeof(tsf_str), ", tsf=leader(peers %u, phase %s)", this->tsf_sync_->peer_count(),
+                   own_phase == TsfSync::RENDER_PHASE_UNKNOWN ? "unknown" : "set");
         } else if (role == TsfSync::Role::FOLLOWER) {
           // depth delta vs the leader: the only visibility we have into an absolute
           // playout offset, which the median above cannot show by construction
@@ -2709,8 +2750,19 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           if (depth_delta == INT32_MIN) {
             snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs)", this->tsf_sync_->mapping_age_s(now_us()));
           } else {
-            snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " us)",
-                     this->tsf_sync_->mapping_age_s(now_us()), depth_delta);
+            const int32_t render_delta = this->tsf_sync_->render_delta_us();
+            if (render_delta == INT32_MIN) {
+              // Say WHICH side is missing: "mine" means this device has not computed a phase,
+              // "leader" means the beacon carried none. Without that the absence is mute.
+              snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " us, render none/%s)",
+                       this->tsf_sync_->mapping_age_s(now_us()), depth_delta,
+                       own_phase == TsfSync::RENDER_PHASE_UNKNOWN ? "mine" : "leader");
+            } else {
+              // render= is the one to trust of the two; depth= is kept alongside it precisely so
+              // the two can be compared against the analyser before anything acts on either.
+              snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " render %+" PRId32 " us)",
+                       this->tsf_sync_->mapping_age_s(now_us()), depth_delta, render_delta);
+            }
           }
         } else {
           // Roleless does NOT imply no shared timebase: a leader that handed off keeps

@@ -95,6 +95,23 @@ class TsfSync {
   /// leader mapping, leader too old to report it, or we are the leader). Diagnostics.
   int32_t pipeline_delta_us() const { return this->pipeline_delta_us_.load(std::memory_order_relaxed); }
 
+  /// @brief Publish this device's RENDER PHASE: the TSF instant at which it renders server
+  /// audio time zero. See TsfPacket::render_phase_us for the derivation. Pass
+  /// RENDER_PHASE_UNKNOWN before anything has rendered.
+  void set_render_phase_us(int64_t phase_us) { this->render_phase_us_.store(phase_us, std::memory_order_relaxed); }
+  /// @brief This device's render phase minus the leader's, us; INT32_MIN when either side has
+  /// not published one. THE true relative playout offset: two devices playing the same stream
+  /// must map a given server frame to the same TSF instant, so a non-zero difference is real
+  /// skew, measured without the servo, the prediction model or the pipeline depth in the path.
+  int32_t render_delta_us() const { return this->render_delta_us_.load(std::memory_order_relaxed); }
+  /// @brief This device's own render phase, or RENDER_PHASE_UNKNOWN. Diagnostics: a delta is
+  /// only absent because one SIDE is unknown, and without seeing both there is no way to tell
+  /// which -- a leader publishes a phase but reports no delta, so its own value is otherwise
+  /// invisible.
+  int64_t render_phase_us() const { return this->render_phase_us_.load(std::memory_order_relaxed); }
+
+  static constexpr int64_t RENDER_PHASE_UNKNOWN = INT64_MIN;
+
   /// @brief Unicast peer roster (sockaddr s_addr values, network byte order), from
   /// the snapserver's Server.GetStatus client list. The leader unicasts its beacon
   /// to every peer in addition to the multicast group: client-to-client multicast
@@ -136,6 +153,7 @@ class TsfSync {
   /// Compares our playout depth against the leader's and warns on sustained
   /// divergence. Diagnostics only: never touches the mapping.
   void check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t local_now_us);
+  void check_render_phase_(int64_t leader_phase_us);
   /// Sandwiched TSF read: local/tsf/local, midpoint local, retried when an
   /// interrupt widens the sandwich. @return false if TSF is unavailable.
   static bool sample_tsf_(int64_t &tsf_us, int64_t &local_us, int64_t *width_out = nullptr);
@@ -161,6 +179,8 @@ class TsfSync {
   std::atomic<bool> deadline_implausible_{false};
   std::atomic<int32_t> pipeline_us_{INT32_MIN};
   std::atomic<int32_t> pipeline_delta_us_{INT32_MIN};
+  std::atomic<int64_t> render_phase_us_{INT64_MIN};
+  std::atomic<int32_t> render_delta_us_{INT32_MIN};
   int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance
   int64_t last_diverge_log_us_{0};
   int64_t unhealthy_since_us_{0};  // leader only; 0 = healthy

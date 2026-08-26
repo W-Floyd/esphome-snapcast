@@ -174,6 +174,22 @@ struct __attribute__((packed)) TsfPacket {
   // Sender's playout pipeline depth (pushed-but-unplayed), us; PIPELINE_UNKNOWN
   // before it has played anything. Diagnostics only -- never feeds the timebase.
   int32_t pipeline_us;
+  // RENDER PHASE: the TSF instant at which this sender renders server audio time zero.
+  //
+  //   render_phase = (played_ts + (tsf - tsf_local)) - (s_ts - (pushed - played) * 1e6 / rate)
+  //                   \________ when the last frame rendered, in TSF ______/   \__ its server time __/
+  //
+  // Two devices playing the same stream MUST map a given server frame to the same TSF
+  // instant, so differencing this between them is the true relative playout offset -- with
+  // the servo, the prediction model and the pipeline depth all outside the measurement.
+  // That is the distinction from pipeline_us above, which compares buffer OCCUPANCY: depths
+  // legitimately differ between devices that are rendering in perfect sync, which is why it
+  // reads -13.4 ms for an offset a logic analyser measures at 3.7 ms.
+  //
+  // Absolute value is meaningless (TSF and server epochs are unrelated and it is a large
+  // number); only differences between devices mean anything. RENDER_PHASE_UNKNOWN before
+  // anything has rendered. Diagnostics only -- never feeds the timebase.
+  int64_t render_phase_us;
 };
 
 TsfSync::~TsfSync() {
@@ -428,7 +444,21 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     this->warned_rejected_ = false;
     this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
     this->check_pipeline_divergence_(pkt.pipeline_us, local_now_us);
+    this->check_render_phase_(pkt.render_phase_us);
   }
+}
+
+void TsfSync::check_render_phase_(int64_t leader_phase_us) {
+  const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
+  if (leader_phase_us == RENDER_PHASE_UNKNOWN || mine == RENDER_PHASE_UNKNOWN) {
+    this->render_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
+    return;
+  }
+  // Clamped into int32 for reporting: a delta beyond +-2 s is not a playout offset, it is a
+  // device that has not settled, and saturating is more honest than wrapping.
+  const int64_t delta = mine - leader_phase_us;
+  this->render_delta_us_.store(static_cast<int32_t>(std::clamp<int64_t>(delta, -2000000, 2000000)),
+                               std::memory_order_relaxed);
 }
 
 void TsfSync::check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t local_now_us) {
@@ -541,6 +571,7 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     // logic analyser with both reporting themselves perfect.
     const int32_t depth = this->pipeline_us_.load(std::memory_order_relaxed);
     pkt.pipeline_us = depth;  // PIPELINE_UNKNOWN is INT32_MIN, which passes through unchanged
+    pkt.render_phase_us = this->render_phase_us_.load(std::memory_order_relaxed);
   }
   struct sockaddr_in dest = {};
   dest.sin_family = AF_INET;
