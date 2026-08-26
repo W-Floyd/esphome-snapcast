@@ -353,11 +353,6 @@ static constexpr int64_t RESYNC_LOG_INTERVAL_US = 2000000;
 // in well under a second), short enough that the silent spiral is bounded.
 static constexpr int64_t STALE_BAILOUT_US = 3000000;
 
-// Padding counts as drained below this. Not zero: the DMA holds a fractional buffer of silence
-// almost always, and waiting for exactly zero would leave the debt outstanding indefinitely. Half a
-// DMA buffer at the rates in use, so the residue left behind is under the servo's own deadband.
-static constexpr int64_t PADDING_DRAINED_US = 5000;
-
 // Re-mute policy for hard resyncs. Mute-until-synced exists because CONVERGENCE
 // splices repeatedly for seconds, which is audible as a correction storm -- not
 // because any single splice is. A one-shot catch-up is a |error| ms skip; muting for
@@ -1747,54 +1742,70 @@ void SnapcastClient::player_task_() {
     // Repay the re-baseline's padding debt as soon as the padding it was seeded with has drained.
     // Checked only while a debt is outstanding, which is a handful of chunks after a starvation, so
     // the listener walk costs nothing in steady state.
-    if (st.padding_debt_frames > 0) {
+    if (st.padding_debt_frames > 0 && now_us() >= st.padding_repay_at_us) {
       audio::AudioDepth lat_now, own_now;
       if (this->audio_listener_ != nullptr && this->audio_listener_->on_query_latency(lat_now) &&
           this->audio_listener_->on_query_audio(own_now)) {
         const int64_t pad_now_us =
             lat_now.microseconds > own_now.microseconds ? lat_now.microseconds - own_now.microseconds : 0;
-        if (pad_now_us <= PADDING_DRAINED_US) {
-          const int64_t pad_now_frames = pad_now_us * rec.params.sample_rate / 1000000;
-          this->playout_mutex_.lock();
-          // NEVER below `played`. The debt is a frame count recorded at seed time, but by the time
-          // it is repaid the DAC may already have consumed everything the seed covered -- and then
-          // subtracting it whole drives pushed under played, which is not merely untidy: it makes
-          // available_frames NEGATIVE, so the clamp in notify_audio_played() discards EVERY
-          // subsequent credit, `played` stops advancing, and the starvation latch re-fires forever.
-          // Observed on hardware as acct_after=-10000 us, then "available -441" on the very next
-          // credit, then a reconnect and seven minutes of silence with the sink idle
-          // (written == completed, nothing in flight) until the device was power-cycled.
-          const int64_t repay =
-              std::min(st.padding_debt_frames - pad_now_frames, this->pushed_frames_total_ - this->played_frames_total_);
-          if (repay > 0) {
-            this->pushed_frames_total_ -= repay;
-            // The counter stepped; levels recorded against the old value would read as a split.
-            this->clear_playout_history_();
-            this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(),
-                                this->pushed_frames_total_);
-            this->mark_playout_(this->played_history_, this->played_history_next_, now_us(),
-                                this->played_frames_total_);
-          }
-          const int64_t dbg_pushed_after = this->pushed_frames_total_;
-          const int64_t dbg_played_after = this->played_frames_total_;
-          this->playout_mutex_.unlock();
-          if (repay > 0) {
-            // Everything needed to see whether the residual exists BEFORE this repayment or is
-            // created BY it: the accounting either side, and the chain reading it is compared to.
-            const int64_t acct_after =
-                (dbg_pushed_after - dbg_played_after) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
-            ESP_LOGD(TAG,
-                     "PAYDBG debt=%" PRId64 " pad_now=%" PRId64 " repay=%" PRId64 " pushed=%" PRId64 " played=%" PRId64
-                     " acct_after=%" PRId64 " lat=%" PRIu32 " own=%" PRIu32 " resid=%" PRId64,
-                     st.padding_debt_frames, pad_now_us, repay, dbg_pushed_after, dbg_played_after, acct_after,
-                     lat_now.microseconds, own_now.microseconds,
-                     acct_after - static_cast<int64_t>(own_now.microseconds));
-            ESP_LOGD(TAG, "Repaid re-baseline padding debt: %" PRId64 " frames (%" PRId64 " us), %s",
-                     repay, repay * 1000000 / static_cast<int64_t>(rec.params.sample_rate),
-                     st.converged ? "AUDIBLE (already unmuted)" : "silent (still muted)");
-          }
-          st.padding_debt_frames = 0;
+        // REPAY THE WHOLE DEBT, and on a deadline set at the seed rather than when the CURRENT
+        // padding reads empty. The old trigger was `pad_now <= PADDING_DRAINED_US`, minus
+        // pad_now's own frames, and it was wrong in both directions: the DMA is a rolling window,
+        // so pad_now falls to zero as soon as one full buffer of real audio is queued -- while the
+        // silence the seed was actually given may still be resident -- and equally it can stay
+        // high on NEW padding long after the seeded silence has gone, which then repays a
+        // fraction of the debt and leaves the rest planted forever.
+        //
+        // Measured with an injected starvation: repaying 2205 frames on that trigger left the
+        // accounting 60 ms BELOW the chain where not repaying at all would have left it 10 ms
+        // below -- the repayment contributed 50 ms of shortfall, because by the time pad_now read
+        // zero the real audio behind the seeded silence had already arrived and been credited.
+        //
+        // The deadline needs no query to be right. The seeded silence sits behind the real audio
+        // inside each resident descriptor, so all of it has played once the DAC has worked through
+        // the span that was resident at the seed -- `latency` at that instant -- and the DAC plays
+        // at real time. pad_now is still read, for the diagnostic only.
+
+        this->playout_mutex_.lock();
+        // NEVER below `played`. The debt is a frame count recorded at seed time, but by the time
+        // it is repaid the DAC may already have consumed everything the seed covered -- and then
+        // subtracting it whole drives pushed under played, which is not merely untidy: it makes
+        // available_frames NEGATIVE, so the clamp in notify_audio_played() discards EVERY
+        // subsequent credit, `played` stops advancing, and the starvation latch re-fires forever.
+        // Observed on hardware as acct_after=-10000 us, then "available -441" on the very next
+        // credit, then a reconnect and seven minutes of silence with the sink idle
+        // (written == completed, nothing in flight) until the device was power-cycled.
+        const int64_t repay =
+            std::min(st.padding_debt_frames, this->pushed_frames_total_ - this->played_frames_total_);
+        if (repay > 0) {
+          this->pushed_frames_total_ -= repay;
+          // The counter stepped; levels recorded against the old value would read as a split.
+          this->clear_playout_history_();
+          this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(),
+                              this->pushed_frames_total_);
+          this->mark_playout_(this->played_history_, this->played_history_next_, now_us(),
+                              this->played_frames_total_);
         }
+        const int64_t dbg_pushed_after = this->pushed_frames_total_;
+        const int64_t dbg_played_after = this->played_frames_total_;
+        this->playout_mutex_.unlock();
+        if (repay > 0) {
+          // Everything needed to see whether the residual exists BEFORE this repayment or is
+          // created BY it: the accounting either side, and the chain reading it is compared to.
+          const int64_t acct_after =
+              (dbg_pushed_after - dbg_played_after) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+          ESP_LOGD(TAG,
+                   "PAYDBG debt=%" PRId64 " pad_now=%" PRId64 " repay=%" PRId64 " pushed=%" PRId64 " played=%" PRId64
+                   " acct_after=%" PRId64 " lat=%" PRIu32 " own=%" PRIu32 " resid=%" PRId64,
+                   st.padding_debt_frames, pad_now_us, repay, dbg_pushed_after, dbg_played_after, acct_after,
+                   lat_now.microseconds, own_now.microseconds,
+                   acct_after - static_cast<int64_t>(own_now.microseconds));
+          ESP_LOGD(TAG, "Repaid re-baseline padding debt: %" PRId64 " frames (%" PRId64 " us), %s",
+                   repay, repay * 1000000 / static_cast<int64_t>(rec.params.sample_rate),
+                   st.converged ? "AUDIBLE (already unmuted)" : "silent (still muted)");
+        }
+        st.padding_debt_frames = 0;
+        st.padding_repay_at_us = 0;
       }
     }
 
@@ -2509,6 +2520,9 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
           (have_fill && have_own && latency.microseconds > own_audio.microseconds)
               ? static_cast<int64_t>(latency.microseconds - own_audio.microseconds) * rec.params.sample_rate / 1000000
               : 0;
+      // When the debt comes off, decided here rather than by a later query. See the repayment site.
+      st.padding_repay_at_us =
+          st.padding_debt_frames > 0 ? now_us() + static_cast<int64_t>(latency.microseconds) : 0;
       // Bar this seed's own aftermath from re-arming the latch (see notify_audio_played). The
       // window is twice the measured latency, which is how long the pre-reset audio downstream can
       // still be generating credits we did not seed; floored so a near-empty measurement -- the

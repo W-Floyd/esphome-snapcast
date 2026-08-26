@@ -420,6 +420,11 @@ class SnapcastClient {
     // warble heard on every boot. Repaying the debt as soon as the padding actually drains -- while
     // the device is still muted and re-locking -- makes the same correction inaudible.
     int64_t padding_debt_frames{0};
+    /// @brief Local instant at which the padding the seed was given has certainly drained: the seed
+    /// instant plus the whole span that was resident then. The silence sits BEHIND the real audio
+    /// inside each DMA descriptor, so waiting for the span is what guarantees it, and the DAC plays
+    /// at real time so the deadline needs no query to confirm. 0 = no debt outstanding.
+    int64_t padding_repay_at_us{0};
     // Running mean of the accounted queue over the report window, for the TSF group cross-check.
     // The instantaneous depth is useless there: it sawtooths by a chunk as the source ring fills in
     // 26 ms steps and drains continuously, so two devices sampled out of phase differ by up to

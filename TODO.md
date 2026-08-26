@@ -53,21 +53,36 @@ is now the largest error in the chain by an order of magnitude.
   `inject_starvation(ms)` (an API action in `snapclient-base.yaml`; there is a helper at
   `scripts/`-adjacent scratch or four lines of `aioesphomeapi`, plaintext API, no noise PSK) and the
   seed arms an 80-chunk `EARLY[n] seed` burst at ~26 ms. Two injections, 900 ms and 2500 ms:
-    - **The residual is exact and constant.** `acct − meas` sat at **−51747 µs = 2282.0 frames** from
-      the first sample after the seed and never moved by more than 1 µs across 3.3 s. That is
-      **one DMA buffer (2205 frames, 50000 µs) plus exactly 77 frames (1747 µs)**. Both integers.
-      Unexplained, and the interesting part: `debt` was 0 for that seed and every conservation
-      residual was 0, so it is neither the padding path nor a stage losing audio.
+    - **The residual is constant WITHIN an event and varies BETWEEN events.** Measured −51747 µs
+      (2282 frames) on one injection and −201225 µs (8874 frames) on another, each held to ±1 µs
+      across the whole 3.3 s burst. An earlier note here claimed the first value decomposed as
+      exactly one DMA buffer plus exactly 77 frames and called that structural; with a second
+      sample it is plainly a coincidence of one event, and the claim is withdrawn. What survives is
+      the shape: the seed plants a fixed offset, instantly, and it does not drift afterwards.
+      `debt` was 0 and every conservation residual was 0 in both, so it is neither the padding path
+      nor a stage losing audio.
     - **The seed can anchor audio that does not exist.** `latency=50000 own=0 dma=0 debt=2205
       seed=2205` — no real audio anywhere in the chain, 2205 frames anchored. That is the padding
       path working as designed (seed on `latency`, repay `debt` once the padding drains), but see
-      the next point for when it repays.
+      the next point for when it repays. Not reproducible on demand: it needs the DMA to be dry of
+      real audio at the instant the seed runs, and four injections since all produced `debt=0`
+      because audio had refilled the DMA by then. The one that produced it was a three-seed cascade.
     - **The repayment lands while the pipeline is still refilling.** `PAYDBG debt=2205 repay=2205
       acct_after=66530 lat=126530 own=126530 resid=-60000`: after repaying, the accounting is 60 ms
       below the chain where it would have been 10 ms below without repaying. `pad_now` reaching 0
       is not sufficient evidence that the seeded padding is what drained — by then the real audio
       behind it has arrived. A repayment keyed on the seeded padding having been *credited* rather
       than on the current padding being empty would not have this problem.
+  **The repayment trigger has been changed but NOT exercised.** It now repays the whole debt on a
+  deadline set at the seed (`seed instant + latency then`), the point being that the seeded silence
+  sits behind the real audio in the resident descriptors and the DAC plays at real time, so the
+  deadline needs no query. The old trigger — current padding reading empty, minus its own frames —
+  could fire early (the DMA is a rolling window, so `pad_now` hits zero as soon as one full buffer
+  of real audio is queued) or repay only a fraction and leave the rest planted. The "never below
+  played" clamp is retained, so the catastrophic mode recorded there is still guarded. It has not
+  run once: every seed since has had `debt=0`. Exercise it on the next natural starvation that
+  leaves the DMA dry before trusting it.
+
   Ruled out along the way, with the sign as the argument: `own` and `latency` are computed
   correctly by the sink (`queued + dma_real` vs `queued + dma_span`), and `held` is the DMA SPAN,
   not silence — so there is no field inconsistency, and `debt=0` really does mean the DMA held real
