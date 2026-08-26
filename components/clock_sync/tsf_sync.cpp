@@ -46,10 +46,26 @@ static constexpr uint8_t TSF_VERSION = 1;
 // Observed: one device sat at 72-118 ms of pipeline against a fleet norm of ~250 ms
 // and was audibly ~150 ms behind its pair, with textbook-clean sync reports on every
 // device. The group is the only available reference, so followers compare their own
-// depth against the leader's and shout when it diverges. Threshold sits above the
-// normal spread (224-282 ms measured across four identical boards = 58 ms) so
-// healthy variation stays quiet.
-static constexpr int32_t PIPELINE_DIVERGE_US = 100000;
+// depth against the leader's and shout when it diverges.
+//
+// 100 ms -> 5 ms. The old value was sized against the spread of the INSTANTANEOUS depth
+// (224-282 ms across four boards = 58 ms), which was almost entirely sampling phase: the
+// accounted queue sawtooths by about a chunk, so two devices sampled out of phase differed
+// by up to +-50 ms of pure artefact. Publishing the window MEAN removed that, and the
+// residual spread has since been characterised over a full session: |delta| median 318 us,
+// p95 ~1 ms. 5 ms is an order of magnitude above that floor.
+//
+// The old threshold left the alarm blind to everything under 100 ms, which is where this
+// defect actually lives. Three real offsets were found on a logic analyser hours after the
+// fact -- 8.5 ms, 10 ms and 13.4 ms, every one sustained, every one silent here. Each was
+// planted by a re-baseline anchoring to a per-device instantaneous measurement, and each
+// was invisible to every other metric on the device by construction.
+//
+// This is a WARN and nothing else: no control action is taken on it, and none should be
+// without a far better instrument. The delta is directionally right but biased -- it read
+// -13.4 ms for an offset a logic analyser measured at 3.7 ms -- so it is fit to raise an
+// alarm and unfit to size a correction.
+static constexpr int32_t PIPELINE_DIVERGE_US = 5000;
 static constexpr int64_t PIPELINE_DIVERGE_MIN_US = 5000000;
 static constexpr int64_t PIPELINE_DIVERGE_LOG_US = 30000000;
 static constexpr int32_t PIPELINE_UNKNOWN = INT32_MIN;

@@ -136,28 +136,25 @@ static constexpr float FILL_EWMA_ALPHA = 0.25f;
 // Bound, symmetric: past this the reading is bad, not a real disagreement
 static constexpr int64_t FILL_CORR_MAX_US = 400000;
 
-// Unmute gate width, in multiples of sync_deadband (128 us default -> ~1 ms).
+// Unmute gate width, in multiples of sync_deadband (128 us default -> 256 us).
 //
-// Was 2x. That was calibrated against a loop running KP = 0.5 everywhere, which held the
-// common-mode error to sd ~74 us so 256 us was a comfortable fit. The run gain is now 0.1
-// (see TRIM_KP_RUN_PPM_PER_US), deliberately chosen to STOP tracking the common-mode
-// error, which then wanders to sd 649 us and peaks near 2.8 ms. A gate an order of
-// magnitude tighter than the error the loop is designed to permit cannot be met: measured
-// with only 54-57% of medians in band, and unmute needs MEDIAN_WINDOW *consecutive* in
-// band, so the counter kept resetting and audio took 31-35 s to start.
+// REVERTED from 8x. The widening was justified by a measurement taken with KP = 0.1
+// running EVERYWHERE (only 54-57% of medians in band, lock 31-35 s), before acquisition
+// was given its own gain. Acquisition now runs at KP = 0.5 -- the historical value, which
+// held the error inside 256 us for as long as this project has existed -- so the problem
+// the widening solved had already been solved by the gain split, and was never
+// re-measured after it.
 //
-// Widening is sound on the gate's own stated justification -- "corrections inside the
-// band are trim-only and inaudible". That holds all the way to converge_fine (2 ms), not
-// just to 2x deadband: while muted and inside converge_fine the PI is engaged, trim_holds
-// is true, and the splice path is suppressed entirely. So nothing audible happens anywhere
-// inside 1 ms; the old value was simply tighter than it needed to be.
+// The cost was real. A wider gate lets a board unmute up to ~1 ms from its target, and
+// after independent re-baselines two boards cross it at very different errors (measured
+// 845 us and 85 us). That error then has to be nulled at the low run gain: from a cold
+// start the pair peaked 1.198 ms apart at 21 s and was still 290 us apart at 75 s. Four
+// times further out than 2x allows, then five times slower to correct.
 //
-// The obvious worry -- two boards unmuting at opposite edges of a wider band, i.e. 2 ms of
-// differential at start -- does not apply. The gate tests each board's own median, and
-// those are 0.84-0.98 correlated between boards with a differential sd of ~30 us. They
-// unmute at nearly the same error, which is the same reason the common-mode wander is
-// inaudible in the first place.
-static constexpr int64_t UNMUTE_BAND_DEADBANDS = 8;
+// The reasoning for widening was also wrong where it mattered: it argued both boards
+// unmute at correlated errors, which holds in steady state (differential sd ~30 us) but
+// demonstrably not after a re-baseline -- which is the case the gate exists for.
+static constexpr int64_t UNMUTE_BAND_DEADBANDS = 2;
 
 // Median error below which our playout counts as tracking the timebase, reported
 // to the TSF layer for leader eligibility. Generous: this gates "am I fit to
@@ -207,10 +204,9 @@ static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
 // been tried and both limit-cycle structurally, for the reason in the paragraph above
 // this one: see the REVERTED note below the KI definition.
 // Two gains, switched on st.converged (see the PI block). ACQUIRE is the historical value
-// and runs while muted, where the error must be nulled fast enough to meet the unmute gate
-// and nothing is audible so amplified noise costs nothing. RUN takes over once unmuted,
-// where the error is mostly differential measurement noise and the gain is the multiplier
-// turning that noise into audible inter-device skew.
+// and runs while muted, where nothing is audible so amplified noise costs nothing. RUN
+// takes over once unmuted, where the error is mostly differential measurement noise and the
+// gain is the multiplier turning that noise into audible inter-device skew.
 static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
 static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.1f;
 // Authority is derived from the ACQUIRE gain deliberately: the clamp exists so the PI can
@@ -2053,29 +2049,16 @@ void SnapcastClient::player_task_() {
       if (st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
         const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
-        // Acquisition and steady state want OPPOSITE gains, so the loop switches on
-        // st.converged: muted, nothing is audible and the error must be nulled fast enough
-        // to satisfy the unmute gate; unmuted, the differential is all that matters.
+        // Acquisition and steady state want opposite gains, switched on st.converged:
+        // muted, nothing is audible and the error must be nulled fast enough to satisfy the
+        // unmute gate; unmuted, the differential is the only thing that matters.
         //
-        // REVERTED: scheduling the gain on |median error| instead. The motivation was real
-        // -- st.converged cannot see a CONVERGED board recovering from a starvation, which
-        // took minutes on the low gain while the pair separated by ~300 us -- but the cure
-        // was worse. A threshold at 300 us with hysteresis at 150 put a nonlinearity right
-        // where the recovery error lives, and the switching sustained a limit cycle: both
-        // boards oscillated +-300 us with a ~20-25 s period and never settled back under the
-        // lower edge, with the trim stepping (+45.78 -> +122.20 ppm) exactly at the
-        // crossings. Low gain lets the error grow, it crosses, high gain overshoots, repeat.
-        //
-        // Same failure as the reverted slew limit below: a nonlinearity inside the loop at a
-        // threshold the disturbance actually spans. Sizing it from STEADY-STATE spread (sd
-        // ~75 us) was the error -- the case it exists to serve is recovery, which parks the
-        // error on the boundary by definition. Any future attempt needs the threshold placed
-        // from the recovery distribution, and to answer why switching does not simply move
-        // the limit cycle to the new boundary.
-        //
-        // The reverted-to build measured, once fully settled: median +2.01 us, sd 5.73 us,
-        // peak-to-peak inside one frame. The slow starvation recovery is a known, accepted
-        // cost against that.
+        // Two richer schemes were tried on hardware and both are recorded as failures below
+        // and at TRIM_KP_ACQUIRE_PPM_PER_US: scheduling the gain on |median error| with
+        // hysteresis (limit-cycled), and a one-way latch on sustained smallness (did not
+        // cycle, but was history-dependent, did not address the starvation-recovery case it
+        // was justified by, and existed only to correct the error let through by a widened
+        // unmute gate that should not have been widened). Keep this switch boring.
         const float kp = st.converged ? TRIM_KP_RUN_PPM_PER_US : TRIM_KP_ACQUIRE_PPM_PER_US;
         // Bumpless transfer. The gains differ 5x, so switching would step the output by
         // (kp_hi - kp_lo) * error. At the schedule threshold that is 0.4 * 300 = 120 ppm --
@@ -2352,6 +2335,26 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
                              this->audio_listener_->on_query_latency(latency);
       const bool have_own = this->audio_listener_ != nullptr && frame_bytes > 0 &&
                             this->audio_listener_->on_query_audio(own_audio);
+      // REVERTED: aging the snapshot before anchoring. The idea was sound and the arithmetic was
+      // not. Snapshot ages here are 15-39 ms and the offsets this seed plants are 3.7-13 ms -- the
+      // same order -- so an unaged anchor over-anchors by whatever drained in between. Aging the
+      // WHOLE latency is known-fatal (the i2s DMA span is held permanently full by the always-fill
+      // model, so it does not decay; subtracting elapsed time from it caused hard resyncs at 350,
+      // 2297 and 3581 ms in four seconds). The attempt was therefore to age only the queue ahead of
+      // the DMA, which the note below already concedes "would be fair".
+      //
+      // It used AudioDepth::dbg_dma_us as the non-draining term. That field is "real audio resident
+      // in the sink's DMA descriptors" -- the part that DOES drain -- not the always-full span. So
+      // it aged off the queue and kept the draining part, i.e. exactly inverted. Measured with an
+      // injected starvation: seed latency=50000 own=22653 dma=22653 -> anchor 22801, under-anchoring
+      // by the padding, leaving drift=-64672 and the pair 67 ms apart against 10 ms before. 6.7x
+      // worse.
+      //
+      // AudioDepth exposes no term for the always-full span, so this cannot be written correctly
+      // from what the listener reports today. Doing it properly needs the sink to publish the span
+      // separately (the I2SDBG line already knows it: dma_real=2205, 50000 us). Note also that the
+      // draining premise itself needs re-checking per stage -- the DMA refills with silence while a
+      // queue does not, so "aged by elapsed time" is only right for the stages upstream of it.
       const int64_t in_flight_frames =
           have_fill ? static_cast<int64_t>(latency.microseconds) * rec.params.sample_rate / 1000000 : 0;
       // The padding is the difference between the two queries, by definition: latency counts the
@@ -2382,10 +2385,10 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       if (have_fill) {
         // The snapshot's age is logged but NOT applied -- see above. It is here because it is the
         // number that would have to be wrong for this anchor to be wrong.
-        ESP_LOGD(TAG, "SEEDDBG latency=%" PRIu32 " own=%" PRIu32 " debt=%" PRId64 " seed=%" PRId64
-                      " played_was=%" PRId64,
-                 latency.microseconds, have_own ? own_audio.microseconds : 0, st.padding_debt_frames,
-                 in_flight_frames, this->played_frames_total_);
+        ESP_LOGD(TAG, "SEEDDBG latency=%" PRIu32 " own=%" PRIu32 " dma=%" PRIu32 " debt=%" PRId64
+                      " seed=%" PRId64 " played_was=%" PRId64,
+                 latency.microseconds, have_own ? own_audio.microseconds : 0, latency.dbg_dma_us,
+                 st.padding_debt_frames, in_flight_frames, this->played_frames_total_);
         ESP_LOGD(TAG, "Re-baseline anchored to measured latency: %" PRIu32 " ms (%" PRId64
                       " frames), snapshot %" PRId64 " ms old",
                  latency.microseconds / 1000, in_flight_frames, (now_us() - latency.as_of_us) / 1000);
