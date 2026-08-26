@@ -280,13 +280,31 @@ defect.
       **+0.9 µs**, both together at −5/+7.7/+26 µs, but **board b alone** at +89/+115/−56/+127 µs.
       Simultaneous restarts have correlated pipeline states so their latency errors cancel; a lone
       restart's does not.
-    - **The test, now instrumented.** `SEEDANCHOR` logs the anchored latency, the snapshot age and
-      `t=` at each seed; `i2s-skew.py` reports the wire offset step at each seed, extrapolating
-      both sides to the seed instant so a ramp cannot masquerade as a step. Two outcomes, wanting
-      different fixes: a **step** means the anchor plants it; a **ramp with no step** means the
-      servo integrated to a new resting point. Today's recovery ramped (tau 80 s, 94% explained by
-      the rate integral), so this is genuinely open. Compare `step_us` against `latency_ms` across
-      several seeds — the hypothesis predicts they track.
+    - **FIRST RESULT: seeds DO step the wire, but the step is not explained by the anchored
+      latency.** Eight seeds fired with `inject_starvation`, three measurable on the wire:
+
+          latency_ms  age_ms   step_us   floor_us
+             220.0     17.0     +17.6      0.05
+             230.0     13.1     -13.1      0.05
+             233.2     17.9    +222.3      0.11
+
+      Every step is >100× the noise floor, so the anchor plants a real discontinuity — that half
+      of the hypothesis holds, and it is the half that distinguishes it from "the servo integrated
+      to a new resting point".
+    - **But the correlation test as designed was worthless, and that is my error.** `latency` is
+      near-constant across all three seeds (220–233 ms) while the step swings +17.6 → −13.1 →
+      +222.3 µs, so it *could not* have tracked. Snapshot `age` is near-constant too (13–18 ms).
+      On reflection the design was wrong from the start: the planted offset should be the *error*
+      in `latency`, and a near-constant `latency` says nothing about its error. **A future test
+      needs an independent estimate of that error, not the value.**
+    - **Two contaminations to avoid next time.** Injections were spaced 22 s while recovery at
+      KP = 0.25 takes ~42 s, so every seed but the first landed mid-recovery from the previous one
+      — the "before" level was never settled, and fit-and-extrapolate handles a ramp but not
+      curvature. Space them beyond 90 s. And there is a **selection effect that removes the most
+      extreme cases**: the five seeds with `latency = 50000` (one DMA buffer, i.e. the pipeline
+      fully dry) produced no wire measurement at all, because with the audio stopped the analyser
+      loses PCM lock and the offset goes NaN either side of the seed. The deepest starvations are
+      exactly the ones the wire cannot see.
     - If confirmed, the fix needs a group reference that does not consume the accounting, and the
       obvious candidate is blocked: `render_phase_us` is *supposed* to be it but is measured blind
       (−15.5 ±8.5 µs against +85 µs on the wire, wrong sign, ~12σ) because it consumes
