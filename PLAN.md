@@ -98,6 +98,18 @@ longer → **the planted offset is larger.** KP trades steady-state noise agains
 *and* against the size of the static offset every event leaves — which is the problem this whole
 plan exists to solve. Revisit only once the anchor stops planting an offset.
 
+## Step 2c — dynamic KP — ⏳ BUILT AND FLASHED (`5b751f9`), NOT YET MEASURED
+
+The decay form from `TODO.md`, built: KP decays ACQUIRE → RUN with time since the last disturbance
+event (boot, hard resync, re-baseline, split repair, role change), τ = 20 s. Keyed on a timer, never
+on the error, which is what makes it structurally incapable of the limit cycle the two earlier
+schedules produced. Endpoints unchanged so the first measurement grades the schedule alone.
+
+Grade it in this order: (1) the null test — steady state must be unchanged against the 180 s
+baseline, since the schedule only differs after an event; (2) the landing offset after a lone
+restart, previously ±130 µs, which is the term it exists to reduce. Only then consider moving the
+RUN endpoint toward 0.1, which is the change this is supposed to make affordable.
+
 ## Step 2b — THE OFFSET-PLANTING MECHANISM (new, and now the live thread)
 
 Everything above converges here: a static offset is planted by an event and then persists because

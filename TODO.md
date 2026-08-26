@@ -234,6 +234,25 @@ defect.
       that a large excursion recovers under `TRIM_KP_ACQUIRE` while muted, so coarse re-lock speed is
       governed by the acquire gain and `KP_RUN` governs only the fine settling after unmute. The
       quoted 42 s / 150 s figures do not say which they measured.
+- **BUILT 2026-08-26 (`5b751f9`): the decay schedule is in.** KP = RUN + (ACQUIRE − RUN)·e^(−age/τ)
+  once converged, τ = 20 s, snapped to RUN at 3τ; ACQUIRE unchanged while muted. `age` is time since
+  the last disturbance event, and the events are boot, hard resync (late and early), re-baseline,
+  split repair, and a TSF role change (checked per chunk, not at report cadence — a 3.3 s delay
+  would spend most of the decay before the schedule noticed). `kp=` is published on the `Trim
+  window` line, appended at the end so the existing parser still matches.
+    - **Endpoints deliberately unchanged (0.5 → 0.25)** so the first measurement grades the
+      *schedule* alone. Lowering the RUN endpoint toward 0.1 is the follow-up this is meant to make
+      affordable — separate change, separate measurement, and it is the one with the real upside.
+    - **How to grade it.** Null test first: steady state must be UNCHANGED, because the schedule
+      differs from the old fixed switch only after an event — wire offset sd 6.20 µs, differential
+      achieved rate sd 1.515 ppm, on-device differential median MAD 6.00 µs at KP = 0.25 over 180 s.
+      Then the target: the LANDING OFFSET after a lone restart, previously ±130 µs, plus tau and
+      time-to-settle from `i2s-skew.py`'s per-recovery report. Judge on the wire and the MAD, never
+      on sd of the differential median.
+    - **The residual feedback path, so it is checked rather than assumed:** a hard resync is an
+      event and resyncs are error-triggered. The separation is 50 ms against single-digit-µs
+      steady-state error, and the measured triggers are supply outages. If resync RATE ever starts
+      tracking KP, this schedule is the first suspect.
 - **Dynamic KP is the right answer, but ONLY scheduled on something outside the loop.** The
   0.25-vs-0.1 bake-off is choosing a compromise between two things a schedule would give you both
   of, so it is worth less than fixing the schedule. Two forms have already failed on hardware
