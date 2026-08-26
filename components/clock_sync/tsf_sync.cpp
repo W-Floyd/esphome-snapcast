@@ -13,7 +13,9 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <cstddef>
 #include <cstring>
+#include <limits>
 
 namespace esphome::clock_sync {
 
@@ -235,7 +237,34 @@ struct __attribute__((packed)) TsfPacket {
   // number); only differences between devices mean anything. RENDER_PHASE_UNKNOWN before
   // anything has rendered. Diagnostics only -- never feeds the timebase.
   int64_t render_phase_us;
+  // CRYSTAL RATE: this sender's d(tsf − local)/dt in ppm, i.e. its own clock measured against
+  // the RADIO timebase. NaN before it has been measured.
+  //
+  // Here because its DIFFERENCE between two devices is their crystal difference, and that is
+  // the one term standing between the trim and a usable rate reference. Measured with a logic
+  // analyser: the differential trim sits -5.25..-5.40 ppm from the true differential achieved
+  // rate, stable across runs, and subtracting this difference removes essentially all of it --
+  // integrated error from 505 us per 100 s down to 17. Publishing it lets each device compute
+  // that correction for itself, which is the whole point: an analyser on the bench cannot ship
+  // inside a speaker.
+  //
+  // Sourced from offset_rate_ppm_, NOT tsf_rate_ppm_. They are the same physical quantity but
+  // the latter is measured on the network task and only while leading, so a follower's copy is
+  // stale and a device that has never led has none. offset_rate_ppm_ comes from the samples the
+  // offset filter already takes on the player task, in every role.
+  //
+  // Diagnostics only -- never feeds the timebase. Appended at the END and the version is NOT
+  // bumped, per the note at TSF_VERSION: a bump makes a half-flashed fleet lose the shared
+  // timebase in BOTH directions, which is expensive, and an appended field cannot be misread by
+  // an older receiver -- it simply is not there. The receiver accepts both lengths.
+  float crystal_ppm;
 };
+
+// Fields from render_phase_us onward are the newest additions, so an older sender's packet is
+// SHORTER. Accept it and default what is missing rather than dropping it on the length check:
+// dropping would make a mixed fleet lose the timebase in the direction the version note was
+// careful to keep working.
+static constexpr size_t TSF_PACKET_MIN_BYTES = offsetof(TsfPacket, crystal_ppm);
 
 TsfSync::~TsfSync() {
   if (this->sock_ >= 0) {
@@ -393,11 +422,18 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     socklen_t from_len = sizeof(from);
     const ssize_t n =
         recvfrom(this->sock_, &pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&from), &from_len);
-    if (n < static_cast<ssize_t>(sizeof(pkt))) {
+    if (n < static_cast<ssize_t>(TSF_PACKET_MIN_BYTES)) {
       if (n < 0) {
         break;  // drained (EWOULDBLOCK) or error; retried next tick either way
       }
-      continue;  // runt packet
+      continue;  // runt packet: too short even for the timebase core
+    }
+    if (n < static_cast<ssize_t>(sizeof(pkt))) {
+      // Older sender, before crystal_ppm was appended. Default it rather than reject the
+      // packet: its timebase fields are all at their original offsets and perfectly usable.
+      // MUST be reset every iteration, since pkt is reused and would otherwise carry the
+      // previous sender's value.
+      pkt.crystal_ppm = NAN;
     }
     if (pkt.magic != TSF_MAGIC || pkt.version != TSF_VERSION) {
       continue;
@@ -497,6 +533,7 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
     this->check_pipeline_divergence_(pkt.pipeline_us, local_now_us);
     this->check_render_phase_(pkt.render_phase_us, local_now_us);
+    this->check_crystal_delta_(pkt.crystal_ppm, local_now_us);
   }
 }
 
@@ -533,6 +570,37 @@ void TsfSync::check_render_phase_(int64_t leader_phase_us, int64_t local_now_us)
   const int64_t delta = mine - leader_phase_us;
   this->render_delta_us_.store(static_cast<int32_t>(std::clamp<int64_t>(delta, -2000000, 2000000)),
                                std::memory_order_relaxed);
+}
+
+void TsfSync::check_crystal_delta_(float leader_crystal_ppm, int64_t local_now_us) {
+  // Our clock against the radio timebase, minus the leader's. Both sides measure themselves
+  // against the SAME AP TSF, so the AP's own crystal cancels and what is left is the difference
+  // between the two devices' crystals -- a hardware property, measured entirely outside the
+  // audio servo loop.
+  //
+  // This is the term that stands between the differential trim and a usable rate reference.
+  // With a logic analyser the differential trim sits -5.25..-5.40 ppm from the true
+  // differential achieved rate, stable across three runs and two builds, and that offset is
+  // exactly this quantity: subtracting it took the integrated error from 505 us per 100 s to 17.
+  // Published so a device can compute the correction without an analyser on the bench.
+  //
+  // NaN either side means unknown, not zero: a leader that predates the field, or either device
+  // before its first measurement. Storing zero would read as "the crystals match", which is the
+  // one answer that is never true.
+  const float mine = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
+  if (std::isnan(mine) || std::isnan(leader_crystal_ppm)) {
+    this->crystal_delta_ppm_.store(std::numeric_limits<float>::quiet_NaN(), std::memory_order_relaxed);
+    return;
+  }
+  const float delta = mine - leader_crystal_ppm;
+  this->crystal_delta_ppm_.store(delta, std::memory_order_relaxed);
+  // Throttled to the render-phase cadence: it moves only with temperature, so this is already
+  // far faster than the quantity changes. t= is esp_timer us, matching the other series lines.
+  if (local_now_us - this->last_crystal_log_us_ >= RENDER_LOG_INTERVAL_US) {
+    this->last_crystal_log_us_ = local_now_us;
+    ESP_LOGD(TAG, "Crystal: mine %+.3f leader %+.3f delta %+.3f ppm t=%" PRId64, mine, leader_crystal_ppm,
+             delta, local_now_us);
+  }
 }
 
 void TsfSync::check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t local_now_us) {
@@ -589,27 +657,6 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     if (std::fabs(measured_ppm) < 100.0f) {
       this->tsf_rate_ppm_ = this->tsf_rate_valid_ ? 0.5f * this->tsf_rate_ppm_ + 0.5f * measured_ppm : measured_ppm;
       this->tsf_rate_valid_ = true;
-      // Logged HERE, at its own update, rather than only inside the Offset ramp line below.
-      // That line is gated by the OFFSET_RATE_WINDOW_US baseline (8 s) while this quantity
-      // refreshes every RATE_WINDOW_US (4 s), so half of it was being discarded.
-      //
-      // Worth the line on its own account: the DIFFERENCE of this field between two boards is
-      // their crystal difference, measured against the radio timebase and therefore outside
-      // the audio servo loop. Measured at -5.347 ppm differential, which accounts for the
-      // whole of the differential trim's constant offset from the true rate and takes the
-      // integrated error from 505 to 17 us per 100 s. It is the only outside-the-loop rate
-      // reference the device currently has.
-      //
-      // Do NOT try to make this faster by shortening RATE_WINDOW_US: it is a two-endpoint
-      // rate measurement, so a shorter window divides the same TSF sampling jitter by less
-      // time. That is the mistake already recorded against measuring achieved rate from the
-      // credit stream. 4 s is the information rate; logging faster would repeat a stale value.
-      //
-      // t= is esp_timer microseconds since boot, matching the snapclient diagnostics. See the
-      // render-phase log for what this is actually worth: the host prefix measures good to
-      // ~30 ms worst case here, so this is insurance rather than a correction.
-      ESP_LOGD(TAG, "Rate ref: tsf-local %+.3f ppm (raw %+.3f) t=%" PRId64, this->tsf_rate_ppm_,
-               measured_ppm, local_mid);
     }
     this->rate_ref_tsf_us_ = tsf_now;
     this->rate_ref_local_us_ = local_mid;
@@ -652,6 +699,9 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   pkt.tsf_base_us = tsf_now;
   pkt.tsf_minus_server_us = tms_pub;
   pkt.drift_ppm = drift_ppm;
+  // From the player task's mirror: offset_rate_ppm_ is measured there, in every role, and
+  // must not be read directly from this task.
+  pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
   {
     // Only the sentinel is out of range. The bound used to be INT16's, and the cast used to be to
     // int16_t, because v1 carried this field as int16 MILLISECONDS -- +-32 s, which no real depth
@@ -924,6 +974,10 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
                                      ? this->offset_rate_ppm_ + OFFSET_RATE_ALPHA * (measured_ppm - this->offset_rate_ppm_)
                                      : measured_ppm;
         this->offset_rate_valid_ = true;
+        // Mirror for the network task to beacon. Stored here rather than computed there
+        // because this is the all-roles measurement; see TsfPacket::crystal_ppm.
+        this->pub_crystal_ppm_.store(static_cast<float>(this->offset_rate_ppm_),
+                                     std::memory_order_relaxed);
         // Once per baseline (~8 s), i.e. slower than the sync report, and it cannot go in that
         // report: that line is already at the 256-byte formatting ceiling and silently truncates
         // its last field. Both terms are printed because the DIFFERENCE is what the filter

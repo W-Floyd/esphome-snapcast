@@ -703,8 +703,16 @@ DEV_T_RE = re.compile(r"\bt=(\d+)")
 # of the differential trim's constant offset from the true rate and takes the integrated error
 # from 505 to 17 us per 100 s. Updates every RATE_WINDOW_US (4 s) on the device, so there is
 # nothing to gain by looking for it faster.
-RATEREF_RE = re.compile(
-    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Rate ref: tsf-local ([+-][\d.]+) ppm")
+# "Crystal: mine +42.169 leader +37.001 delta +5.168 ppm t=..." -- the DEVICE's own answer to
+# the question this script needed an analyser for. Both sides measure themselves against the
+# same AP TSF, so the AP's crystal cancels and the delta is the two devices' crystal difference,
+# measured outside the audio servo loop. That difference is the whole of the differential trim's
+# constant offset from the true achieved rate (-5.25..-5.40 ppm measured on the wire), so this
+# line is what lets a speaker compute the correction with no analyser present. Followers only:
+# a leader has no leader to difference against.
+CRYSTAL_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Crystal: mine ([+-][\d.]+) leader ([+-][\d.]+) "
+    r"delta ([+-][\d.]+) ppm")
 
 # "RSYNC[7] t=... err=52123 med=-1914 ring=1697 drops=3" -- the armed per-chunk burst around
 # a resync excursion. The discriminator it exists for: if lateness is real, err falls ~1:1
@@ -823,17 +831,19 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         # The firmware's own view, on its own log lines: matched before SYNC_RE's continue.
         # Each carries the device timestamp when the firmware is new enough; None falls back
         # to the host prefix so an older log still plots.
-        for key, rx, scale in (("phase_us", PHASE_RE, 1.0),
-                               ("depth_us", DEPTH_RE, 1.0),
-                               ("ramp_ppm", RAMP_RE, 1.0),
-                               ("tsflocal_ppm", RATEREF_RE, 1.0)):
+        # The value's capture group is carried per pattern rather than assumed to be 5: the
+        # Crystal line reports mine, leader AND the delta, and the delta is the useful one.
+        for key, rx, grp in (("phase_us", PHASE_RE, 5),
+                             ("depth_us", DEPTH_RE, 5),
+                             ("ramp_ppm", RAMP_RE, 5),
+                             ("crystal_ppm", CRYSTAL_RE, 7)):
             mx = rx.match(line)
             if mx:
                 tod_x = (int(mx.group(1)) * 3600 + int(mx.group(2)) * 60
                          + int(mx.group(3)) + int(mx.group(4)) / (10 ** len(mx.group(4))))
                 dv = DEV_T_RE.search(line)
                 extras.setdefault(key, []).append(
-                    (tod_x, int(dv.group(1)) if dv else None, float(mx.group(5)) * scale))
+                    (tod_x, int(dv.group(1)) if dv else None, float(mx.group(grp))))
                 break
         rs = RSYNC_RE.match(line)
         if rs:
@@ -925,7 +935,7 @@ def tod_to_unix(tod, ref_unix):
 
 def write_svg(path, ts, ys, title, ylabel, include_zero=True,
               xlabel="elapsed (s)", log_axes=False, events=(), panels=(), stats=None,
-              overlays=None):
+              overlays=None, expand_for_overlays=False):
     """Plot without a plotting dependency -- the rest of scripts/ is stdlib too.
 
     Extra panels are drawn only where they have data, so a run without temperature
@@ -970,23 +980,27 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     # values sit near -1.8 s against a median of -41 us, and honouring those stretched the
     # axis a thousandfold and flattened everything real. The outliers are still drawn,
     # clipped to the panel, and counted in the legend.
-    off_scale = {}
-    for name, pts_ in (overlays or {}).items():
-        vals = [v for _x, v in pts_ if math.isfinite(v)]
-        if not vals:
-            continue
-        # Median +- 6 MAD, not percentiles: a short window may hold only a dozen points,
-        # where p1 is effectively the minimum and a single -1.8 s excursion still stretches
-        # the axis a thousandfold. MAD ignores it however few points there are.
-        arr = np.asarray(vals, dtype=float)
-        med = float(np.median(arr))
-        mad = float(np.median(np.abs(arr - med)))
-        if mad > 0:
-            lo_v, hi_v = med - 6 * 1.4826 * mad, med + 6 * 1.4826 * mad
-        else:
-            lo_v, hi_v = float(arr.min()), float(arr.max())
-        y0, y1 = min(y0, lo_v), max(y1, hi_v)
-        off_scale[name] = int(np.count_nonzero((arr < lo_v) | (arr > hi_v)))
+    # The axis follows the MEASUREMENT, not the overlays. Scaling to fit the firmware's
+    # estimates -- even robustly -- costs an order of magnitude of range, and the thing
+    # actually being read on this panel is the measured trace converging, which then
+    # collapses to a flat line. Overlays are still drawn, clipped to the panel, with the
+    # off-scale count in the legend so nothing looks like agreement by omission.
+    # --overlay-expand restores the fit-everything behaviour.
+    if expand_for_overlays:
+        for pts_ in (overlays or {}).values():
+            vals = [v for _x, v in pts_ if math.isfinite(v)]
+            if not vals:
+                continue
+            # Median +- 6 MAD, not min/max: a single -1.8 s excursion against a -41 us
+            # median would stretch the axis a thousandfold.
+            arr = np.asarray(vals, dtype=float)
+            med = float(np.median(arr))
+            mad = float(np.median(np.abs(arr - med)))
+            if mad > 0:
+                y0 = min(y0, med - 6 * 1.4826 * mad)
+                y1 = max(y1, med + 6 * 1.4826 * mad)
+            else:
+                y0, y1 = min(y0, float(arr.min())), max(y1, float(arr.max()))
     if log_axes:
         include_zero = False
     if include_zero:
@@ -1099,6 +1113,9 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
             if len(good) < 2:
                 continue
             col = opal[i % len(opal)]
+            # Counted against the FINAL axis, so the legend states how much of the overlay
+            # the reader cannot see.
+            nof = sum(1 for _x, v in good if v < y0 or v > y1)
             # Clipped to the panel: an off-scale excursion would otherwise draw straight
             # across the panels below it.
             o.append(f'<g clip-path="url(#toppanel)">')
@@ -1110,8 +1127,7 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
                          f'fill="none" stroke="{col}" stroke-width="1" '
                          f'stroke-dasharray="5 3" opacity="0.85"/>')
             o.append('</g>')
-            nof = off_scale.get(name, 0)
-            tag = f"{name} ({nof} off-scale)" if nof else name
+            tag = f"{name} ({nof}/{len(good)} off-scale)" if nof else name
             o.append(f'<text x="{W-44}" y="{top0+14+i*13}" text-anchor="end" '
                      f'font-size="10" fill="{col}">{tag}</text>')
     # Shade what is missing, so a gap reads as absence rather than as an axis break.
@@ -1157,7 +1173,7 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
           "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
-          "tsflocal_a_ppm,tsflocal_b_ppm,reason")
+          "crystal_a_ppm,crystal_b_ppm,reason")
 # The firmware columns are HELD from that board's most recent log line, not resampled: the
 # firmware emits these far slower than rows arrive, so the same value repeats across many rows
 # and is empty until the first line arrives.
@@ -1170,10 +1186,35 @@ SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
 # device (RATE_WINDOW_US) and inventing values between those steps would fabricate resolution
 # the measurement does not have.
 HELD_COLS = (("a", "phase_us"), ("b", "phase_us"), ("a", "ramp_ppm"), ("b", "ramp_ppm"),
-             ("a", "tsflocal_ppm"), ("b", "tsflocal_ppm"))
+             ("a", "crystal_ppm"), ("b", "crystal_ppm"))
 
 
 DUMP_SCHEMA = "elapsed_s,skew_ns"
+
+
+def load_column(path, name):
+    """[(elapsed_s, value)] for one named CSV column; empty if the file lacks it.
+
+    Older CSVs predate some columns, so a replot of one simply omits that trace rather
+    than failing.
+    """
+    out, cols = [], None
+    if not os.path.exists(path):
+        return out
+    for line in open(path):
+        if line.startswith("elapsed_s"):
+            cols = line.strip().split(",")
+            continue
+        if line[:1] in "#e" or cols is None or name not in cols:
+            continue
+        f = line.strip().split(",")
+        try:
+            v = float(f[cols.index(name)])
+            if math.isfinite(v):
+                out.append((float(f[0]), v))
+        except (ValueError, IndexError):
+            pass
+    return out
 
 
 def load_rates(path):
@@ -1364,10 +1405,10 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None,
     # with the ramp above: these sit around +42 and +37 ppm where the ramp sits near 0, so one
     # shared axis would flatten the ramp. The useful quantity is the SEPARATION between the two
     # boards, which is their crystal difference (-5.35 ppm measured), so both are drawn.
-    tsfl = {f"{b} tsf-local": win(FIRMWARE.get((b, "tsflocal_ppm"), [])) for b in ("a", "b")}
+    tsfl = {f"{b} crystal delta": win(FIRMWARE.get((b, "crystal_ppm"), [])) for b in ("a", "b")}
     tsfl = {k: v for k, v in tsfl.items() if v}
     if tsfl:
-        panels.append(("tsf-local, outside the servo (ppm)", tsfl))
+        panels.append(("crystal delta vs leader (ppm)", tsfl))
     return panels
 
 
@@ -2098,6 +2139,10 @@ def main():
     p.add_argument("--dump-skew", default=None,
                    help="write the PER-FRAME skew series (one row per audio frame, "
                         "~44100/s) to this CSV, not just one row per capture")
+    p.add_argument("--overlay-expand", action="store_true",
+                   help="let the overlays widen the skew axis. Off by default: fitting the "
+                        "firmware estimates costs an order of magnitude of range and the "
+                        "convergence being read on that panel flattens to a line")
     p.add_argument("--overlay", default="phase",
                    help="firmware offset estimates to draw over the measured skew, comma "
                         "separated: phase, depth, none. The axis expands to fit whatever "
@@ -2255,6 +2300,7 @@ def main():
         for x, kind, label in sorted(ev)[:40]:
             print(f"   t={x:8.2f}s  {kind:9s} {label}")
         ra0, rb0 = load_rates(args.out)
+        ppm0 = load_column(args.out, "ppm")
         t2 = trim_temps(TEMPS, ts0[0] - 1, ts0[-1] + 1)
         if args.annotate and not t2:
             print(f"   no temperature found in {', '.join(args.annotate)} within the "
@@ -2270,8 +2316,10 @@ def main():
                   stats=stats_caption(ts0, ys0),
                   include_zero=not args.y_free, events=ev,
                   overlays=firmware_overlays(ts0[0] - 1, ts0[-1] + 1, overlay_sel),
+                  expand_for_overlays=args.overlay_expand,
                   panels=build_panels(args, ra0, rb0, TEMPS,
-                                      ts0[0] - 1, ts0[-1] + 1, dtrim))
+                                      ts0[0] - 1, ts0[-1] + 1, dtrim,
+                                      skew=list(zip(ts0, ys0)), ppm_series=ppm0))
         print(f"  plot {args.plot}")
         return
 
@@ -2300,6 +2348,7 @@ def main():
 
     t_start = anchor if (args.append and anchor is not None) else time.time()
     ppms, n, shown_cfg, prefer, pending, last_off = [], 0, False, None, None, None
+    ppm_series = []          # (elapsed, ppm) so the per-capture slope can be plotted
     # Start from the primed offsets so the first in-loop poll reads only new bytes.
     events, log_off, last_plot = [], primed_offsets, 0.0
     # A write in flight means this one is skipped, not queued: the chart is cosmetic and
@@ -2427,6 +2476,7 @@ def main():
             ys.append(off if math.isfinite(off) else float("nan"))
             if math.isfinite(ppm):
                 ppms.append(ppm)
+                ppm_series.append((elapsed, ppm))
             fs_a, fs_b = info.get("fs", (float("nan"), float("nan")))
             if math.isfinite(fs_a):
                 rate_a.append((elapsed, fs_a))
@@ -2495,17 +2545,22 @@ def main():
                     cut = ts[-1] - args.plot_window
                     i0 = bisect.bisect_left(ts, cut)
                     pt, py_ = ts[i0:], ys[i0:]
-                snap = (pt, py_, list(events), list(rate_a), list(rate_b))
+                snap = (pt, py_, list(events), list(rate_a), list(rate_b),
+                        list(ppm_series))
 
-                def draw(pt=snap[0], py_=snap[1], evs=snap[2], ra=snap[3], rb=snap[4]):
+                def draw(pt=snap[0], py_=snap[1], evs=snap[2], ra=snap[3], rb=snap[4],
+                         ps=snap[5]):
                     try:
                         write_svg(args.plot, pt, py_, "I2S playout skew",
                                   "board B - board A (ns)   [+ = B later]",
                                   stats=stats_caption(pt, py_),
                                   include_zero=not args.y_free, events=evs,
                                   overlays=firmware_overlays(pt[0] - 1, pt[-1] + 1, overlay_sel),
+                                  expand_for_overlays=args.overlay_expand,
                                   panels=build_panels(args, ra, rb, TEMPS,
-                                                      pt[0] - 1, pt[-1] + 1))
+                                                      pt[0] - 1, pt[-1] + 1,
+                                                      skew=list(zip(pt, py_)),
+                                                      ppm_series=ps))
                     finally:
                         plot_busy.release()
 
@@ -2532,7 +2587,9 @@ def main():
                   stats=stats_caption(ts, ys),
                   include_zero=not args.y_free, events=events,
                   overlays=firmware_overlays(-1, ts[-1] + 1, overlay_sel),
-                  panels=build_panels(args, rate_a, rate_b, TEMPS, -1, ts[-1] + 1, dtrim))
+                  expand_for_overlays=args.overlay_expand,
+                  panels=build_panels(args, rate_a, rate_b, TEMPS, -1, ts[-1] + 1, dtrim,
+                                      skew=list(zip(ts, ys)), ppm_series=ppm_series))
     if ncorr:
         print(f"\n  {ncorr} of {len(ys)} rows had a whole-frame ambiguity "
               f"corrected by continuity with the previous row")

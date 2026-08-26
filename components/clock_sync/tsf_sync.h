@@ -11,6 +11,7 @@
 #include "esphome/core/helpers.h"
 
 #include <atomic>
+#include <limits>
 #include <cstdint>
 #include <vector>
 
@@ -104,6 +105,19 @@ class TsfSync {
   /// must map a given server frame to the same TSF instant, so a non-zero difference is real
   /// skew, measured without the servo, the prediction model or the pipeline depth in the path.
   int32_t render_delta_us() const { return this->render_delta_us_.load(std::memory_order_relaxed); }
+
+  /// @brief Our crystal rate minus the leader's, in ppm, or NaN when either side is unknown.
+  ///
+  /// Each device measures its own clock against the RADIO timebase, so this difference is a
+  /// hardware property measured entirely outside the audio servo loop. It is the term that
+  /// stands between the differential trim and a usable rate reference: with a logic analyser
+  /// the differential trim sits -5.25..-5.40 ppm from the true differential achieved rate,
+  /// stable across runs, and that offset is this quantity. Subtracting it took the integrated
+  /// error from 505 us per 100 s to 17.
+  ///
+  /// Diagnostics only. Nothing steers on it, and it should not until the residual after
+  /// correction (0.708 ppm, ~71 us per 100 s against a ~7 us floor) is understood.
+  float crystal_delta_ppm() const { return this->crystal_delta_ppm_.load(std::memory_order_relaxed); }
   /// @brief This device's own render phase, or RENDER_PHASE_UNKNOWN. Diagnostics: a delta is
   /// only absent because one SIDE is unknown, and without seeing both there is no way to tell
   /// which -- a leader publishes a phase but reports no delta, so its own value is otherwise
@@ -152,6 +166,7 @@ class TsfSync {
   void seed_published_from_mapping_();
   /// Compares our playout depth against the leader's and warns on sustained
   /// divergence. Diagnostics only: never touches the mapping.
+  void check_crystal_delta_(float leader_crystal_ppm, int64_t local_now_us);
   void check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t local_now_us);
   void check_render_phase_(int64_t leader_phase_us, int64_t local_now_us);
   /// Sandwiched TSF read: local/tsf/local, midpoint local, retried when an
@@ -258,6 +273,16 @@ class TsfSync {
   bool offset_rate_valid_{false};
   int64_t offset_rate_ref_tsf_us_{0};
   int64_t offset_rate_ref_local_us_{0};
+  /// @brief Cross-thread mirror of offset_rate_ppm_, for the network task to publish in the
+  /// beacon. offset_rate_ppm_ itself is player-task-only, and broadcast_ runs on the network
+  /// task, so it must not read it directly. NaN until the first measurement.
+  std::atomic<float> pub_crystal_ppm_{std::numeric_limits<float>::quiet_NaN()};
+  /// @brief Our crystal rate minus the leader's, ppm, or NaN when either side is unknown. This
+  /// is the term that stands between the differential trim and a usable rate reference: the
+  /// trim sits -5.25..-5.40 ppm from the true differential achieved rate, and that offset IS
+  /// this quantity. Diagnostics only; nothing steers on it yet.
+  std::atomic<float> crystal_delta_ppm_{std::numeric_limits<float>::quiet_NaN()};
+  int64_t last_crystal_log_us_{0};
   // Per-device sandwich floor, so the trust threshold is derived rather than assumed
   int64_t sandwich_floor_us_{0};
   int64_t sandwich_block_min_us_{0};

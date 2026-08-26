@@ -92,28 +92,28 @@ defect.
     - Consequence for the beacon: the field to publish is **not** the trim. It is either the
       achieved rate itself, or trim and `tsf-local` together — the second is nearly free, since
       `drift_ppm` already travels and `tsf-local` is already computed.
-    - **BLOCKER on that plan, found while raising the log rate: `tsf_rate_ppm_` is only updated
-      inside `broadcast_`, and all three of its call sites are leader-only.** So the one
-      outside-the-loop rate reference on the device is maintained ONLY WHILE LEADING; a follower
-      carries whatever value it held when it last led, and a board that has never led has
-      `tsf_rate_valid_ == false`. Directly observed: with the new per-update log line, the leader
-      emitted 79 `Rate ref` lines while the follower emitted 0 over the same period, across 124
-      role samples all reading follower.
-        - This does not invalidate the −5.347 ppm differential measured earlier, because a
-          crystal offset is a hardware property and a stale value is still approximately right.
-          It does mean the reference cannot track temperature, and cannot be relied on at all on
-          a board that has not led.
-        - Also note an inference that did NOT survive checking: within apparent follower stints
-          the value looked like it was still moving (50–90 distinct values, 2.5 ppm spread),
-          which suggested followers do update it. The likely explanation is undetected brief
-          leader stints — the Sync line's `tsf=` field is one of the fields the 256-byte ceiling
-          truncates, so a role change can go unseen. Treat role attribution from that field as
-          unreliable, and prefer counting the `Rate ref` lines themselves.
-        - **So step 3 needs the TSF-vs-local rate tracking moved out of `broadcast_` into a path
-          every device runs.** Not done here: `tsf_rate_ppm_` feeds `drift_ppm`, which is
-          published in beacons and used by the shared timebase, so this is control-adjacent and
-          wants its own change with its own measurement rather than riding along with a
-          diagnostics commit.
+    - **WITHDRAWN: a "blocker" recorded here claiming the reference is only maintained while
+      leading.** That was wrong, and the error is instructive. There are TWO fields for the same
+      physical quantity: `tsf_rate_ppm_`, measured on the network task inside `broadcast_` and so
+      genuinely leader-only, and `offset_rate_ppm_`, measured on the player task from the samples
+      the offset filter already takes, in every role. The header says so explicitly at
+      `offset_rate_ppm_`. The log line labelled `tsf-local` prints `offset_rate_ppm_`, so every
+      measurement taken from those logs — including the −5.347 ppm differential — was always the
+      all-roles field and was never stale.
+      What actually happened: a new log line was added for `tsf_rate_ppm_`, the wrong field of
+      the two, and its leader-only behaviour was then read as a property of the reference rather
+      than of the line. Two boards' log counts (79 vs 0) confirmed the line's behaviour and were
+      taken as confirming a claim about the quantity. **Before concluding a quantity is
+      unavailable, check which of the same-named fields the evidence came from.**
+    - **DONE: the crystal difference is now computed on-device.** `crystal_ppm` is appended to
+      `TsfPacket` (no version bump — appending cannot be misread, and a bump costs a half-flashed
+      fleet its shared timebase in both directions; the receiver accepts both lengths), sourced
+      from `offset_rate_ppm_` via a cross-thread mirror. A follower differences it against the
+      leader's and logs `Crystal: mine … leader … delta … ppm`, exposed as
+      `TsfSync::crystal_delta_ppm()`. Both sides measure against the same AP TSF, so the AP's own
+      crystal cancels. **Diagnostics only — nothing steers on it**, and nothing should until the
+      0.708 ppm residual after correction (~71 µs per 100 s against a ~7 µs floor) is understood.
+      Expected first reading: ≈ −5.35 ppm on the follower, matching the wire.
     - **Do not "fix" this by de-meaning.** Tried on the data: subtracting the series mean drops the
       analyser's own fs check from 96% to 2%, because the true differential rate has a real nonzero
       mean (+0.61 ppm on one run, a genuine 177 µs ramp over 290 s) and de-meaning destroys exactly
