@@ -361,7 +361,25 @@ defect.
 
       Both after-floors clean (7.60, 5.61 us), and `Trim held`/`Trim released` confirmed engaging
       for 3.3 s. A 42% figure quoted from the first point alone was optimistic; n=2 gives 33%.
-    - **FIX 2, FLASHED, NOT YET MEASURED: the repair left the median window stale.** The 33% is
+    - **FIX 2 MEASURED AND REVERTED: clearing the median window made it WORSE.** n=2, both floors
+      clean:
+
+          stage                steps                    mean magnitude
+          baseline             +329.6 +311.1 -347.4     329 us
+          + trim hold          +187.3 -256.9            222 us    <- best
+          + median clear       +375.0 -357.7            366 us    <- worse than baseline
+
+      **Why, and it is a rule already written in this file.** With `err_window_filled = 0` the
+      median falls back to `error_us`, a SINGLE RAW SAMPLE. I argued that was "honest because it
+      uses the corrected prediction" — honest about the prediction, and terrible as a measurement.
+      The raw error carries hundreds of µs of network noise where the median carries tens (see
+      *"sd is the wrong summary here… a differential of MAD 12 µs reported sd 129 µs"* in the method
+      notes), and at KP = 0.25 a single 1000 µs noise sample commands 250 ppm of trim. So the servo
+      stopped steering on stale-but-smooth data and started steering hard on one noisy sample, right
+      at the moment it is most sensitive. The median window exists to prevent exactly that.
+      Reverted; the stale-median account of the residual is unsupported and the residual's cause is
+      open.
+    - **SUPERSEDED, kept for the reasoning: the repair left the median window stale.** The 33% is
       short of the ~0 the model predicts for a frozen trim, and the residual is the servo chasing
       the prediction step the REPAIR ITSELF makes: `pushed` steps, so every error still in
       `st.err_window` was measured against the old prediction, and the servo steers from that stale
