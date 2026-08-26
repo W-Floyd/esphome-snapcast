@@ -75,6 +75,10 @@ struct SnapcastClientConfig {
   // corrections become clock trims instead of frame splices where supported)
   uint8_t rate_lock_i2s_port{0};
 #endif
+  // Engage threshold (us) for fast POSITION correction while converged; 0 disables it.
+  // See FAST_SPLICE_RELEASE_US and fast_splice_(). Off by default: the splice path has a
+  // limit-cycle history and this puts it back in the loop while unmuted.
+  uint32_t fast_splice_threshold_us{0};
   // Force one accounting repair cycle after each session start. OFF by default: the effect is
   // measured (n=12) but its mechanism is not, so this is opt-in until a lone reconnect has been
   // graded with it. See reanchor_after_session_() and REANCHOR_BIAS_US.
@@ -537,6 +541,18 @@ class SnapcastClient {
     uint16_t resync_trace_idx{0};
     int64_t resync_trace_arm_us{0};
     uint32_t resync_drops{0};
+    // FAST POSITION CORRECTION. splice_hist is a ring of the frames spliced on each of the last
+    // MEDIAN_WINDOW/2 chunks, with splice_sum its total: a splice changes the error immediately
+    // but reaches the MEDIAN only after about half its window, so without subtracting what is
+    // already in flight the loop would keep correcting an error it has already fixed and
+    // overshoot -- which is the limit cycle this path is on record for.
+    static constexpr size_t SPLICE_HIST = MEDIAN_WINDOW / 2;
+    int8_t splice_hist[SPLICE_HIST]{};
+    size_t splice_hist_idx{0};
+    int32_t splice_sum{0};
+    bool fast_splice_active{false};
+    uint32_t fast_splice_frames{0};  // frames spliced in the current episode, for the log
+
     // Re-anchor after a RE-LOCK: armed by whatever dropped convergence (a session start, a mute,
     // a starvation re-baseline), fired once convergence returns and settles. See
     // reanchor_after_relock_().
@@ -763,6 +779,11 @@ class SnapcastClient {
   int64_t chunk_deadline_us_(const ChunkRecord &rec);
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
+
+  /// Fast POSITION correction while converged: one frame per chunk against a standing offset the
+  /// rate loop would take ~40 s to integrate away. Returns the frames to splice this chunk
+  /// (>0 drop, <0 insert, 0 none). See fast_splice_threshold_us.
+  int32_t fast_splice_(ServoState &st, int64_t median_err_us, uint32_t sample_rate, bool split_pending);
 
   /// Forces one repair cycle after a re-lock, if configured; a no-op otherwise. Called once per
   /// chunk from the player loop, after the convergence gate.

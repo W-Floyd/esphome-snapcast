@@ -67,6 +67,9 @@ class SnapclientHub final : public Component,
   void set_stream_idle_timeout(uint32_t timeout_ms) { this->stream_idle_timeout_ms_ = timeout_ms; }
   /// @brief 0 = never release the pipeline while connected
   void set_keepalive_hold(uint32_t hold_ms) { this->keepalive_hold_ms_ = hold_ms; }
+  /// @brief Standing offset (us) at which fast POSITION correction engages; 0 disables.
+  void set_fast_splice_threshold(uint32_t us) { this->fast_splice_threshold_us_ = us; }
+
   /// @brief Force one accounting repair cycle after each session start; see REANCHOR_BIAS_US.
   void set_reanchor_after_reconnect(bool enable) { this->reanchor_after_reconnect_ = enable; }
   void set_pause_behavior(PauseBehavior behavior) { this->pause_behavior_ = behavior; }
@@ -193,6 +196,7 @@ class SnapclientHub final : public Component,
   uint32_t stream_idle_timeout_ms_{3000};
   uint32_t keepalive_hold_ms_{0};
   bool reanchor_after_reconnect_{false};
+  uint32_t fast_splice_threshold_us_{0};
   PauseBehavior pause_behavior_{PauseBehavior::ALLOW};
   uint32_t sync_deadband_us_{128};
   uint32_t converge_fine_us_{2000};

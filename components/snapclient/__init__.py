@@ -80,6 +80,7 @@ CONF_KEEPALIVE_HOLD = "keepalive_hold"
 CONF_PAUSE_BEHAVIOR = "pause_behavior"
 CONF_SYNC_RESILIENCE = "sync_resilience"
 CONF_REANCHOR_AFTER_RECONNECT = "reanchor_after_reconnect"
+CONF_FAST_SPLICE_THRESHOLD = "fast_splice_threshold"
 
 
 def _none_to_empty_dict(value):
@@ -291,6 +292,24 @@ CONFIG_SCHEMA = cv.All(
             # on to grade it against a lone reconnect; if it does not reproduce, the cost is
             # one trim hold and its +-50 us per reconnect.
             cv.Optional(CONF_REANCHOR_AFTER_RECONNECT, default=False): cv.boolean,
+            # Standing offset at which POSITION correction engages while converged. 0 disables.
+            #
+            # The servo steers rate only, so an offset is integrated away over ~40 s (tau ~14 s at
+            # KP = 0.25), and the gain cannot be raised: the feedback pivot puts loop gain at
+            # KP x 3.15 = 0.79 already, and trim noise -- audible skew -- scales linearly with KP.
+            # Authority is not the limit, though: a single-frame splice is ~23 us and inaudible, so
+            # a 1 ms offset is ~43 frames, about a second at one per chunk. The splice path is
+            # simply off whenever the rate lock is programming.
+            #
+            # Engages only WELL ABOVE the band (the PI owns everything below, and splices
+            # limit-cycle around the deadband -- that is on record), one frame per chunk, with the
+            # corrections already in flight subtracted from the median so it cannot overshoot an
+            # error it has already fixed. 1ms is 8x converge_fine and above every steady-state
+            # excursion measured. Off by default: this puts the splice path back in the loop while
+            # unmuted, which wants measuring per install.
+            cv.Optional(CONF_FAST_SPLICE_THRESHOLD, default="0ms"): cv.All(
+                cv.positive_time_period_microseconds
+            ),
             # How long a chunk gap is bridged with keepalive silence before the
             # stream is allowed to end. Ending it tears the audio pipeline down, and
             # rebuilding playout phase costs a mute plus 7-16 s of re-lock -- so an
@@ -381,6 +400,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_pause_behavior(config[CONF_PAUSE_BEHAVIOR]))
     cg.add(var.set_sync_resilience(config[CONF_SYNC_RESILIENCE]))
     cg.add(var.set_reanchor_after_reconnect(config[CONF_REANCHOR_AFTER_RECONNECT]))
+    cg.add(var.set_fast_splice_threshold(config[CONF_FAST_SPLICE_THRESHOLD].total_microseconds))
     hold = config[CONF_KEEPALIVE_HOLD]
     cg.add(var.set_keepalive_hold(0 if hold == CONF_NEVER else hold.total_milliseconds))
 

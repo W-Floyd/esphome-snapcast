@@ -34,6 +34,7 @@ void SnapclientHub::setup() {
   config.stream_idle_timeout_ms = this->stream_idle_timeout_ms_;
   config.keepalive_hold_ms = this->keepalive_hold_ms_;
   config.reanchor_after_reconnect = this->reanchor_after_reconnect_;
+  config.fast_splice_threshold_us = this->fast_splice_threshold_us_;
   config.sync_deadband_us = this->sync_deadband_us_;
   config.converge_fine_us = this->converge_fine_us_;
 #ifdef USE_I2S_RATE_LOCK

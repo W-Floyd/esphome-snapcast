@@ -99,6 +99,10 @@ snapclient:
   # effect is measured (n=12), the mechanism is not, so watch a lone reconnect and check the
   # planted offset collapses to the ±50 µs residual rather than staying at milliseconds.
   reanchor_after_reconnect: true
+  # Position correction for a standing offset, engaging well above the band. The rate loop
+  # needs ~40 s to integrate a millisecond away; 43 single-frame splices (~23 µs each,
+  # inaudible) do it in about a second. 0ms disables. On here to measure it.
+  fast_splice_threshold: 1ms
   timing_diagnostics: false     # ~38 log lines/s/device; on to measure, off to listen
 
 media_source:

@@ -522,6 +522,32 @@ static constexpr int64_t REANCHOR_SETTLE_US = 10000000;
 // cycle costs a ramp, a hold and its +-50 us; since a repair removes a FRACTION of the standing
 // error rather than all of it, skipping one loses nothing the next event's cycle cannot pick up.
 static constexpr int64_t REANCHOR_MIN_INTERVAL_US = 60000000;
+
+// FAST POSITION CORRECTION, opt-in (config_.fast_splice_threshold_us; 0 disables).
+//
+// The servo can only steer RATE, so every standing offset has to be integrated away: the envelope
+// decays as e^(-KP/2 t), which measures tau ~14 s and ~42 s to settle at KP = 0.25. The gain cannot
+// simply be raised -- the feedback pivot means the loop measures its own output at 3.15 us/ppm, so
+// loop gain is KP x 3.15 = 0.79 already, and differential trim noise (audible skew) scales linearly
+// with KP. That is the whole 0.5/0.25/0.1 argument and it has been had three times.
+//
+// But AUTHORITY is not the constraint. A single-frame splice is ~23 us and is documented inaudible;
+// the trim clamp is +-1000 ppm = 1 ms/s. A 1 ms offset is 43 frames -- about a second at one frame
+// per chunk -- against ~40 s of integrating it away. The reason it never happens while playing is
+// that the splice path sits behind `if (!trim_holds)`, so whenever the rate lock is programming,
+// splices are off entirely. That is deliberate (splices limit-cycle around the deadband, which is
+// why the PI owns the end-game) and it leaves a converged device with a millisecond of standing
+// offset no fast way to spend it -- while the events that plant milliseconds happen several times
+// an hour.
+//
+// So: splice ONLY well above the band, one frame per chunk, and hand back to the PI inside it.
+// Engaging at 1 ms rather than at the deadband is what keeps this away from the limit cycle: the
+// PI still owns everything below, and 1 ms is 8x converge_fine.
+static constexpr int64_t FAST_SPLICE_RELEASE_US = 300;
+// Bound on one episode, so a mis-measurement cannot walk the audio indefinitely: 128 frames is
+// ~2.9 ms at 44.1 kHz, comfortably more than any planted offset measured (1.4 ms) and far less
+// than the server's buffer. An episode that hits this is a bug report, not a correction.
+static constexpr uint32_t FAST_SPLICE_MAX_FRAMES = 128;
 // TEST HOOK ramp rate, see inject_split(). 100 us/s is chosen to sit at or under the disturbance
 // the servo already tracks unaided -- the clock-offset estimate wanders ~100 us/s on wifi jitter --
 // so the injected bias arrives as ordinary drift rather than as a transient the servo fights. At
@@ -2511,6 +2537,21 @@ void SnapcastClient::player_task_() {
             this->push_silence_(steer_frames, rec.params);
           }
         }
+      } else {
+        // The rate lock is steering, so the block above is off. A standing offset therefore has
+        // only the rate loop to remove it, at ~40 s -- see FAST_SPLICE_RELEASE_US. Position
+        // correction runs here instead, well above the band, one frame at a time.
+        // Re-read rather than reusing the PI block's local: that one is scoped to the rate-lock
+        // branch, and this must be correct whether or not the PI ran this chunk. Same expression.
+        const int32_t fast =
+            this->fast_splice_(st, median_err_us, rec.params.sample_rate, st.drift_excess_since_us != 0);
+        if (fast > 0) {
+          drop_frames = static_cast<uint32_t>(fast);
+          st.soft_dropped_frames += static_cast<uint32_t>(fast);
+        } else if (fast < 0) {
+          st.soft_inserted_frames += static_cast<uint32_t>(-fast);
+          this->push_repeat_frame_(rec.params);
+        }
       }
     }
 
@@ -3029,6 +3070,56 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
       this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
     }
+}
+
+// THREAD CONTEXT: player task. See FAST_SPLICE_RELEASE_US for the argument.
+int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t median_err_us, uint32_t sample_rate,
+                                     bool split_pending) {
+  const int64_t threshold = static_cast<int64_t>(this->config_.fast_splice_threshold_us);
+  const int64_t frame_us = sample_rate > 0 ? 1000000 / static_cast<int64_t>(sample_rate) : 0;
+  // Retire the oldest in-flight splice whether or not one is applied this chunk: the ring is a
+  // window on recent HISTORY, and freezing it while disabled would leave a stale debt behind.
+  const int8_t retired = st.splice_hist[st.splice_hist_idx];
+  int32_t applied = 0;
+
+  if (threshold > 0 && frame_us > 0 && st.converged && !split_pending) {
+    // What the median has NOT yet seen. A splice moves the error immediately, but the median is
+    // an average over 31 chunks, so about half a window of corrections are still invisible to it.
+    const int64_t in_flight_us = static_cast<int64_t>(st.splice_sum) * frame_us;
+    const int64_t effective_us = median_err_us - in_flight_us;
+    if (st.fast_splice_active) {
+      if (std::abs(effective_us) <= FAST_SPLICE_RELEASE_US || st.fast_splice_frames >= FAST_SPLICE_MAX_FRAMES) {
+        if (st.fast_splice_frames >= FAST_SPLICE_MAX_FRAMES) {
+          ESP_LOGW(TAG, "Fast splice hit its %" PRIu32 "-frame bound with %" PRId64
+                        " us still standing -- treating as a measurement fault, handing back to the PI",
+                   FAST_SPLICE_MAX_FRAMES, effective_us);
+        } else {
+          ESP_LOGD(TAG, "Fast splice done: %" PRIu32 " frames, %" PRId64 " us left for the PI t=%" PRId64,
+                   st.fast_splice_frames, effective_us, now_us());
+        }
+        st.fast_splice_active = false;
+      } else {
+        applied = effective_us > 0 ? 1 : -1;
+      }
+    } else if (std::abs(effective_us) >= threshold) {
+      st.fast_splice_active = true;
+      st.fast_splice_frames = 0;
+      applied = effective_us > 0 ? 1 : -1;
+      ESP_LOGI(TAG, "Fast splice engaged: %" PRId64 " us standing, correcting by position at one frame "
+                    "(%" PRId64 " us) per chunk t=%" PRId64,
+               effective_us, frame_us, now_us());
+    }
+  } else {
+    st.fast_splice_active = false;
+  }
+
+  st.splice_hist[st.splice_hist_idx] = static_cast<int8_t>(applied);
+  st.splice_hist_idx = (st.splice_hist_idx + 1) % ServoState::SPLICE_HIST;
+  st.splice_sum += applied - retired;
+  if (applied != 0) {
+    st.fast_splice_frames++;
+  }
+  return applied;
 }
 
 // THREAD CONTEXT: player task. See REANCHOR_BIAS_US for what this is for and what is unproven
