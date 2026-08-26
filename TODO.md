@@ -53,11 +53,35 @@ defect.
 - **THE ONE MISSING MEASUREMENT: achieved rate, referenced outside the servo loop.** It would do two
   jobs — de-trend the prediction (see the pivot item) and, published in the beacon beside
   `drift_ppm`, let each device integrate the difference and know its own relative offset without an
-  analyser. Differential TRIM already predicts differential rate at corr −0.778, so the information
-  exists; integrating those snapshots explains only 13–19% because the report samples one value per
-  3.3 s of a continuously moving quantity. That is aliasing, not physics. **The cheap first step is
-  to log the time-MEAN applied trim per report window instead of the end-of-window snapshot.**
-  Measuring it from the credit stream was tried and failed on jitter — see the pivot item.
+  analyser. **The trim cannot do this job, and that is now measured rather than assumed.** The cheap
+  first step is done: the report publishes the time-MEAN applied trim per window (`Trim window:`,
+  with the window's audio time and its covered fraction), and `i2s-skew.py --replot --annotate a.log
+  b.log` scores any candidate rate reference against the analyser's own rate columns.
+    - **The aliasing was real and the fix works — at the RATE level.** Window-mean differential trim
+      tracks the analyser's differential achieved rate at **corr +0.976..+0.979**, against the
+      **−0.778** recorded for end-of-window snapshots. Measured twice, 96 and 127 windows over
+      231 and 425 s. Sampling was genuinely throwing away most of the signal.
+    - **It still fails as an OFFSET reference, for a different and more fundamental reason: an
+      unknown constant.** The differential trim sits **−5.25 ppm** from the true differential rate
+      (−5.246 and −5.272 ppm on the two runs). That is the CRYSTAL DIFFERENCE: each board's trim
+      cancels its own crystal error, so the differential trim carries their difference, and nothing
+      on the device knows it. It is a rate, so it integrates linearly and forever — **527 µs per
+      100 s**, against an offset floor of ~13–15 µs sd. Hence the offset integral from trim explains
+      **1%** where the analyser's own rate columns explain **96–99%**.
+    - **Even with the constant calibrated away it would not be enough.** After fitting out both the
+      constant and the slope, the residual is **0.70–0.75 ppm**, which integrates to **~70 µs per
+      100 s** — still several times the floor.
+    - **Do not "fix" this by de-meaning.** Tried on the data: subtracting the series mean drops the
+      analyser's own fs check from 96% to 2%, because the true differential rate has a real nonzero
+      mean (+0.61 ppm on one run, a genuine 177 µs ramp over 290 s) and de-meaning destroys exactly
+      the term the offset is made of. The constant has to be *known*, not removed.
+    - Also measured in passing: the trim moves ~1.30× further than the realised differential rate
+      (fit slope +0.771), and the realised trim differs from the PI's demand by sd 0.5–0.65 ppm with
+      a 4 ppm p2p — more than the documented 0.15 ppm quantisation step, though common-mode enough
+      that the differential barely notices (sd 5.89 realised vs 5.74 demanded).
+    - **So the reference must be measured against SERVER TIME from the plant.** That is the next
+      item and it is now the only surviving route, not merely the preferred one. Measuring it from
+      the credit stream was tried and failed on jitter — see the pivot item.
 - **The feedback pivot is the dominant differential term, and the loop around it is why the residual
   oscillates rather than looking like noise.** Closed form: an EWMA at α lags a ramp by
   `c = (1−α)/α = 63` steps, and `S·2205 = 50000 µs` exactly, so

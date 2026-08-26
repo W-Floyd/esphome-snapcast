@@ -1375,6 +1375,60 @@ def report_integral(label, dppm, offset_us, breaks=(), expect=None):
     return True
 
 
+def window_means(dfs, windows):
+    """Mean of a dense differential-rate series over each report window.
+
+    The analyser measures a rate per capture (tens of Hz); a board reports one time-mean per
+    ~3.3 s window. Comparing them needs the dense series averaged over the SAME interval the
+    board averaged, which is [t - audio_s, t] -- the window's own audio duration, which is
+    why the firmware publishes it. Windows without enough coverage are dropped rather than
+    compared against a partial average.
+    """
+    out = []
+    for t, val, audio_s in windows:
+        if val is None:
+            continue
+        seg = [v for ts_, v in dfs if t - audio_s <= ts_ <= t]
+        if len(seg) < 20:
+            continue
+        out.append((t, val, float(np.mean(seg))))
+    return out
+
+
+def report_rate_reference(label, paired):
+    """How good is a candidate rate reference, measured against the analyser's own rates?
+
+    This is the question that decides whether a device can know its own offset. The offset is
+    the integral of the differential rate, so a reference is only usable to the extent that
+    (a) its CONSTANT offset from the true rate is known, and (b) what is left over is small.
+    Both are reported in the units that matter -- ppm, and what that ppm integrates to.
+
+    A high correlation is NOT sufficient and is the trap here: the trim tracks the true rate
+    closely while sitting a few ppm away from it, because each board's trim cancels its OWN
+    crystal error, so the differential trim carries the crystal DIFFERENCE. That constant is
+    unobservable on-device and integrates without bound.
+    """
+    if len(paired) < MIN_FIT_ROWS:
+        print(f"   {label}: {len(paired)} paired window(s), need {MIN_FIT_ROWS}")
+        return
+    x = np.array([p[1] for p in paired])      # candidate reference
+    y = np.array([p[2] for p in paired])      # analyser's own differential rate
+    bias = float(np.mean(x) - np.mean(y))
+    if np.ptp(x) < 1e-12 or np.ptp(y) < 1e-12:
+        print(f"   {label}: reference or rate is constant, nothing to fit")
+        return
+    corr = float(np.corrcoef(x, y)[0, 1])
+    slope, icept = np.polyfit(x, y, 1)
+    resid_sd = float(np.std(y - (slope * x + icept)))
+    print(f"   {label}: {len(paired)} window(s)")
+    print(f"      corr {corr:+.3f}   slope {slope:+.3f}   "
+          f"constant offset {bias:+.3f} ppm   residual {resid_sd:.3f} ppm")
+    # What each error term costs the OFFSET, which is the only thing that matters. The
+    # constant is the killer: it is a rate, so it integrates linearly and forever.
+    print(f"      integrated over 100 s: constant {abs(bias) * 100:.0f} us, "
+          f"residual {resid_sd * 100:.0f} us")
+
+
 def report_offset_integral(args, ts, ys, rate_a, rate_b):
     """Does the integral of the differential rate reproduce the measured wire offset?
 
@@ -1393,10 +1447,9 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
     if len(offset_us) < MIN_FIT_ROWS:
         return []
     print("   offset integral (is the offset the integral of the differential rate?)")
+    dfs = pair_diff(rate_a, rate_b, to_ppm=lambda a, b: (b - a) / ((a + b) / 2.0) * 1e6)
     report_integral(
-        "fs columns  (analyser)",
-        pair_diff(rate_a, rate_b, to_ppm=lambda a, b: (b - a) / ((a + b) / 2.0) * 1e6),
-        offset_us,
+        "fs columns  (analyser)", dfs, offset_us,
         expect="established: corr -0.997..-1.000, slope -1.0, resid sd 0.14-0.38 us")
 
     names = [os.path.basename(p).split(".")[0] for p in (args.annotate or [])]
@@ -1411,13 +1464,27 @@ def report_offset_integral(args, ts, ys, rate_a, rate_b):
     na, nb = have[0], have[1]
     dtrim, breaks = trim_diff(TRIMS[na], TRIMS[nb])
     # --annotate order decides which log is A: the analyser's A/B comes from the probe
-    # wiring and nothing in the logs can confirm it. A swap shows up as slope +1 rather
-    # than -1, so say so here instead of leaving a sign to be puzzled over.
+    # wiring and nothing in the logs can confirm it, so a swap shows as a flipped sign.
+    print(f"\n   rate reference (can a board see its own differential rate?  {nb} - {na})")
+    if dfs:
+        # Compared against the analyser's own rates rather than against the offset. The
+        # integral fit cannot separate a bad reference from a good one with a constant
+        # error, and a constant error is exactly what the trim has -- so measure the
+        # reference directly and price its two error terms separately.
+        # Each differential point is timestamped by board A's window, so A's own reported
+        # audio duration is the interval the analyser's rates must be averaged over.
+        dur = {t: audio_s for t, _m, audio_s in TRIMS[na]}
+        windows = [(t, dv, dur[t]) for t, dv in dtrim if t in dur]
+        report_rate_reference("trim mean   (vs analyser rate)", window_means(dfs, windows))
+        print(f"      a constant offset here is the CRYSTAL DIFFERENCE: each board's trim "
+              f"cancels its own\n      crystal error, so the differential trim carries "
+              f"their difference. Nothing on the\n      device knows it, and it integrates "
+              f"without bound -- which is why the offset\n      integral below fails even "
+              f"where the correlation above is high.")
     report_integral(
-        f"trim mean   (on-device, {nb} - {na})", dtrim, offset_us, breaks,
-        expect=("snapshots managed 13-19% explained; if the time-mean does not clear that "
-                "decisively the aliasing\n              explanation is wrong. A slope near "
-                f"+1 means {na}/{nb} are swapped against the analyser's probes."))
+        f"trim mean   (offset integral, {nb} - {na})", dtrim, offset_us, breaks,
+        expect=("expected to FAIL while the constant above is unknown; it is recorded so a "
+                "change in it is visible"))
     return dtrim
 
 

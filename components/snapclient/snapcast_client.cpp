@@ -2232,12 +2232,18 @@ void SnapcastClient::player_task_() {
     }
 
 #ifdef USE_I2S_RATE_LOCK
-    // Integrate the APPLIED trim over this chunk's audio time. Placed after the whole servo
+    // Integrate the REALISED trim over this chunk's audio time. Placed after the whole servo
     // chain, deliberately: the hard-resync and aggressive-catch-up branches never enter the
     // PI, yet audio keeps being clocked out under whatever trim was last programmed, so
     // accumulating inside the PI block would drop that time out of the integral without
-    // saying so. st.trim_applied_ppm is the right term because it is defined to track what
-    // is actually programmed, including the nominal-rate fallback.
+    // saying so.
+    //
+    // applied_ppm(), not st.trim_applied_ppm: the first is what the divider actually
+    // achieved after rational quantisation, the second is what the PI asked for. An integral
+    // of achieved RATE has to use the achieved value -- the clock does not run at the demand.
+    // Measured on hardware they sit sd 0.5-0.65 ppm apart with a 4 ppm peak-to-peak, so this
+    // is not the 0.15 ppm quantisation step alone, though it is common-mode enough that the
+    // DIFFERENTIAL between two boards barely moves (sd 5.89 realised against 5.74 demanded).
     //
     // Attribution is off by at most one chunk (~26 ms in a ~3.3 s window): the trim
     // programmed now governs audio that drains from now on. Second-order against the
@@ -2246,7 +2252,8 @@ void SnapcastClient::player_task_() {
       const float chunk_s = static_cast<float>(frames) / static_cast<float>(rec.params.sample_rate);
       st.trim_window_s += chunk_s;
       if (st.rate_lock_ok) {
-        st.trim_integral_ppm_s += static_cast<double>(st.trim_applied_ppm) * static_cast<double>(chunk_s);
+        st.trim_integral_ppm_s +=
+            static_cast<double>(this->rate_lock_->applied_ppm()) * static_cast<double>(chunk_s);
         st.trim_covered_s += chunk_s;
       }
     }
