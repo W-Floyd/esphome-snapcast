@@ -110,6 +110,8 @@ class SnapclientHub final : public Component,
   /// @brief TEST HOOK: forwards to SnapcastClient::inject_starvation(); see there for why it exists
   /// and why it drains through the real path rather than setting the latch directly.
   void inject_starvation(uint32_t ms);
+  /// @brief TEST HOOK: forwards to SnapcastClient::inject_split(); see there.
+  void inject_split(int32_t us);
 
   template<typename F> void add_connection_callback(F &&callback) {
     this->connection_callbacks_.add(std::forward<F>(callback));

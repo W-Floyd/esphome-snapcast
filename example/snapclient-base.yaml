@@ -40,6 +40,15 @@ api:
         ms: int
       then:
         - lambda: 'id(snap)->inject_starvation(ms);'
+    # TEST HOOK: perturb only the playout ACCOUNTING, leaving the audio alone, so the self-repair
+    # can be provoked without the chaos an injected starvation brings. The wire's fit floor is
+    # 0.71 us when quiet against 162-1291 us during a starvation, and the step being measured is a
+    # few hundred us -- so the measurement needs the split without the wreckage.
+    - action: inject_split
+      variables:
+        us: int
+      then:
+        - lambda: 'id(snap)->inject_split(us);'
 
 ota:
   - platform: esphome

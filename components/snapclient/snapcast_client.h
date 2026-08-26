@@ -287,6 +287,25 @@ class SnapcastClient {
   void inject_starvation(uint32_t ms) {
     this->starve_until_us_.store(now_us_public() + static_cast<int64_t>(ms) * 1000, std::memory_order_relaxed);
   }
+  /// @brief TEST HOOK: perturb ONLY the playout accounting, by `us` of audio, leaving the real
+  /// audio untouched.
+  ///
+  /// Exists because the interesting event -- an accounted-vs-measured split that holds long enough
+  /// for the self-repair to fire -- cannot be waited for (it arrives on its own schedule) and
+  /// cannot be provoked with inject_starvation, which reproduces it only by wrecking everything
+  /// else: an injected starvation puts the wire's fit floor at 162-1291 us, against 0.71 us when
+  /// quiet, and the step being measured is a few hundred us. The measurement needs the split
+  /// WITHOUT the chaos.
+  ///
+  /// This reproduces the real mechanism faithfully rather than simulating it: shifting `pushed`
+  /// makes the prediction wrong by exactly that much, the servo immediately begins steering real
+  /// audio against it, and DRIFT_REPAIR_HOLD_US later the repair reconciles the accounting while
+  /// the audio stays where the servo put it. That is the sequence a natural split follows; the only
+  /// difference is that the size is known, which is what makes a step-versus-split curve possible.
+  ///
+  /// A first quiet natural repair measured +491 us of permanent wire step for a +20 ms split, so
+  /// keep the magnitudes near that: a few ms to a few tens of ms. THREAD CONTEXT: any (atomic).
+  void inject_split(int32_t us) { this->inject_split_us_.store(us, std::memory_order_relaxed); }
   static int64_t now_us_public();
 
   // --- Diagnostics (main loop) ---
@@ -747,6 +766,10 @@ class SnapcastClient {
   /// Until when a re-baseline's own aftermath is barred from re-arming the starvation latch.
   /// Written by the player task in rebaseline_after_starvation_, read on the speaker callback.
   std::atomic<int64_t> starve_suppress_until_us_{0};
+  /// TEST HOOK, see inject_split(). Pending accounting perturbation in us; 0 when none. Applied
+  /// and cleared by the player task at a chunk boundary, so it lands at a defined point rather
+  /// than mid-update.
+  std::atomic<int32_t> inject_split_us_{0};
   /// TEST HOOK, see inject_starvation(). 0 when not injecting.
   std::atomic<int64_t> starve_until_us_{0};
   /// @brief ANCHOR ERROR measurement, armed by a re-baseline. Player task only.

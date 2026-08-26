@@ -682,6 +682,8 @@ RSYNCS = {}
 SEEDS = {}
 # board -> [(elapsed_s, repaired_us)] from each accounting-split repair.
 REPAIRS = {}
+# board -> [(elapsed_s, injected_us)] from each deliberate accounting-split injection.
+INJECTS = {}
 
 SYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?"
@@ -744,6 +746,13 @@ CRYSTAL_RE = re.compile(
 # steered real audio against a prediction wrong by the same amount, and then the repair fixes the
 # ACCOUNTING, which makes any resulting audio displacement invisible to every on-device metric.
 # Measured 23 times across two logs on splits from 4.7 to 57 ms, i.e. far more often than seeds.
+# "SPLITINJECT +20000 us (+882 frames) t=..." -- a deliberately injected accounting split, so a
+# repair can be provoked in QUIET conditions with a KNOWN magnitude. Paired with the repair that
+# follows it, this turns the step-versus-split relationship from one natural data point into a
+# curve.
+SPLITINJECT_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SPLITINJECT ([+-]?\d+) us")
+
 REPAIR_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Accounting split repaired: accounted queue ran "
     r"([+-]?\d+) us")
@@ -818,6 +827,8 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     seeds = []
     # (tod, dev_us, repaired_us) per accounting-split repair; dev_us is None (no t= on that line)
     repairs = []
+    # (tod, dev_us, injected_us) per deliberate accounting-split injection
+    injects = []
     last_trim, last_resync = state.get("trim"), state.get("resync")
     last_pipe = state.get("pipe")
     last_role = state.get("role")
@@ -826,7 +837,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     except OSError:
         # Same arity as the normal return: it was short by one, so an unreadable log
         # would have crashed the caller's unpacking rather than being skipped.
-        return [], start_offset, state, [], [], {}, [], [], []
+        return [], start_offset, state, [], [], {}, [], [], [], []
     if start_offset == 0 and tail_bytes:
         try:
             size = os.fstat(f.fileno()).st_size
@@ -883,6 +894,13 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
                 extras.setdefault(key, []).append(
                     (tod_x, int(dv.group(1)) if dv else None, float(mx.group(grp))))
                 break
+        si = SPLITINJECT_RE.match(line)
+        if si:
+            tod_i = (int(si.group(1)) * 3600 + int(si.group(2)) * 60 + int(si.group(3))
+                     + int(si.group(4)) / (10 ** len(si.group(4))))
+            dv = DEV_T_RE.search(line)
+            injects.append((tod_i, int(dv.group(1)) if dv else None, int(si.group(5))))
+            continue
         rp = REPAIR_RE.match(line)
         if rp:
             tod_p = (int(rp.group(1)) * 3600 + int(rp.group(2)) * 60 + int(rp.group(3))
@@ -953,7 +971,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     f.close()
     state["trim"], state["resync"], state["pipe"] = last_trim, last_resync, last_pipe
     state["role"] = last_role
-    return ev, end, state, temps, trims, extras, rsyncs, seeds, repairs
+    return ev, end, state, temps, trims, extras, rsyncs, seeds, repairs, injects
 
 
 def place_device_times(rows, host_of, dev_of):
@@ -1951,7 +1969,11 @@ def report_repair_steps(ts, ys):
                       f" {'floor':>7s}")
                 printed = True
             verdict = "STEP" if abs(step) > max(6.0 * floor, 5.0) else "no step"
-            print(f"      {board:>5s} {t0:8.1f} {us:+12d} {step:+9.1f} {floor:7.2f}  {verdict}")
+            # Tag repairs that a deliberate injection caused, so a provoked point is never mistaken
+            # for a natural one and the two are never averaged together.
+            inj = [u for t, u in INJECTS.get(board, []) if 0 <= t0 - t <= 12.0]
+            tag = f"  <- injected {inj[-1]:+d} us" if inj else ""
+            print(f"      {board:>5s} {t0:8.1f} {us:+12d} {step:+9.1f} {floor:7.2f}  {verdict}{tag}")
     if printed:
         print("      a STEP means the repair path displaced real audio, which no on-device metric"
               "\n      reports once the accounting is reconciled. Compare step_us against"
@@ -2433,7 +2455,7 @@ def main():
         for path in args.annotate:
             board = os.path.basename(path).split(".")[0]
             span = [None, None]
-            ev, end, st, tp, tw, xt, rs, sd, rpr = parse_sync_events(path, board, args.trim_ppm,
+            ev, end, st, tp, tw, xt, rs, sd, rpr, inj = parse_sync_events(path, board, args.trim_ppm,
                                                                 offsets.get(path, 0), span,
                                                                 LOG_STATE.get(path), args.sync_us,
                                                                 args.peak_us, args.pipeline_ms,
@@ -2471,6 +2493,9 @@ def main():
                     (p if p is not None else host(tod), lat, age, frames, aerr))
             for tod, _dev, us in rpr:
                 REPAIRS.setdefault(board, []).append((host(tod), us))
+            placed, _j, _n = place_device_times(inj, lambda r: host(r[0]), lambda r: r[1])
+            for (tod, _dev, us), pp in zip(inj, placed):
+                INJECTS.setdefault(board, []).append((pp if pp is not None else host(tod), us))
             if n_all:
                 DEV_ANCHOR[board] = (0.0, max(jit_all), n_all)
             if span[0] is not None:
@@ -2550,6 +2575,7 @@ def main():
         RSYNCS.clear()
         SEEDS.clear()
         REPAIRS.clear()
+        INJECTS.clear()
         DEV_ANCHOR.clear()
         ev, _ = collect_events(anchor0 or time.time())
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]

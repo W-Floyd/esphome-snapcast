@@ -165,6 +165,13 @@ void SnapclientHub::inject_starvation(uint32_t ms) {
   }
 }
 
+void SnapclientHub::inject_split(int32_t us) {
+  if (this->client_ != nullptr) {
+    ESP_LOGW(TAG, "Injecting accounting split: %+" PRId32 " us (audio untouched)", us);
+    this->client_->inject_split(us);
+  }
+}
+
 void SnapclientHub::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
   if (this->client_ != nullptr) {
     this->client_->notify_audio_played(frames, timestamp_us);

@@ -2460,7 +2460,21 @@ void SnapcastClient::player_task_() {
     // Accumulate the accounted queue per chunk so the group cross-check can be handed a MEAN rather
     // than a single sample of a sawtooth. One extra lock per chunk (~38/s) buys an order of
     // magnitude on that comparison's noise floor.
+    // TEST HOOK, see inject_split(): shift the accounting by a known amount, audio untouched.
+    // Applied here because it is a defined point -- inside the playout mutex, at a chunk boundary,
+    // after the servo has run -- rather than asynchronously mid-update. Consumed once.
+    const int32_t split_req = this->inject_split_us_.exchange(0, std::memory_order_relaxed);
     this->playout_mutex_.lock();
+    if (split_req != 0) {
+      const int64_t shift = static_cast<int64_t>(split_req) * rec.params.sample_rate / 1000000;
+      this->pushed_frames_total_ += shift;
+      // The counters just jumped, so anything remembered against them describes a level that no
+      // longer exists -- the same reason the re-baseline clears these.
+      this->clear_playout_history_();
+      this->mark_playout_(this->pushed_history_, this->pushed_history_next_, now_us(), this->pushed_frames_total_);
+      this->mark_playout_(this->played_history_, this->played_history_next_, now_us(), this->played_frames_total_);
+      ESP_LOGW(TAG, "SPLITINJECT %+" PRId32 " us (%+" PRId64 " frames) t=%" PRId64, split_req, shift, now_us());
+    }
     st.depth_accum_frames += this->pushed_frames_total_ - this->played_frames_total_;
     this->playout_mutex_.unlock();
     st.depth_samples++;
