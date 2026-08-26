@@ -2258,45 +2258,86 @@ void SnapcastClient::player_task_() {
           // transfer.
           st.trim_kp_last = kp;
         }
-        const float p_term = kp * static_cast<float>(median_err_us);
-        // Conditional integration (anti-windup): winding the integral while the
-        // output rails just schedules a rail-to-rail relaxation oscillation
-        // (observed post-boot: trim flipping +-500 ppm with +-5 ms medians for
-        // ~90 s, with audible correction bursts). Freeze the integral whenever the
-        // output is saturated in the error's own direction.
-        const float unclamped = p_term + st.trim_integral_ppm;
-        if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (median_err_us > 0)) {
-          // KI tracks the ACTIVE gain: the critical-damping relationship is KI = KP^2/4,
-          // so a switched KP with a fixed KI would change the damping at the switch --
-          // the exact silent-failure mode the KI note near the gain definitions warns about.
-          st.trim_integral_ppm = std::clamp(
-              st.trim_integral_ppm + (kp * kp / 4.0f) * static_cast<float>(median_err_us) * dt_s, -clamp_ppm,
-              clamp_ppm);
-        }
-        const float trim_ppm = std::clamp(p_term + st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
-        // What the PI asked for, kept so the report can show it next to what the divider
-        // actually realised. Measured on hardware they agree to ~0.2 ppm, which is how
-        // divider quantisation was ruled out as a source of the inter-device excursions.
-        st.trim_applied_ppm = trim_ppm;
-#ifdef USE_SNAPCLIENT_TIMING_DIAG
-        // Report-only: span shows whether the loop tracks a slow offset or chases
-        // something it cannot, and railed counts saturation.
-        if (st.trim_samples == 0) {
-          st.trim_min_ppm = st.trim_max_ppm = trim_ppm;
+        // SPLIT PENDING: hold the trim instead of steering on a prediction we already suspect.
+        //
+        // drift_excess_since_us is non-zero exactly while a sustained accounted-vs-measured split
+        // is being timed toward DRIFT_REPAIR_HOLD_US. Through that window the median error is
+        // measured against a prediction the code is ABOUT TO DECLARE WRONG, and steering on it
+        // moves real audio that nothing will ever move back -- the servo has no position feedback,
+        // so a displacement here is permanent.
+        //
+        // Measured before this: each repair planted a step of +329.6, +311.1, -347.4 us for a
+        // +-2500 us split (two clean positives agreeing to 18 us) and +491 us for a natural
+        // +20000 us one. The size tracks the TRIM applied during the hold, saturated by the clamp
+        // -- 0.18 and 0.16 of trim x hold respectively -- which is what identifies the trim, rather
+        // than the split, as the thing doing the damage. Roughly 23 repairs fired in one session,
+        // so this is a larger contributor to inter-device skew than anything else measured.
+        //
+        // Holding rather than zeroing: the current trim is the converged crystal-offset
+        // cancellation, so the clock keeps running at the right rate. Zeroing would itself be a
+        // rate step of tens of ppm. The 3 s of not steering costs little -- the loop exists to
+        // track disturbances that move over minutes -- and the hold is what buys the confirmation
+        // that stops a spike triggering a spurious repair, so it is kept.
+        const bool split_pending = st.drift_excess_since_us != 0;
+        if (split_pending) {
+          if (!st.trim_split_held) {
+            st.trim_split_held = true;
+            ESP_LOGD(TAG, "Trim held: accounting split pending confirmation, not steering on a "
+                          "suspect prediction (trim %+.2f ppm) t=%" PRId64,
+                     st.trim_applied_ppm, now_us());
+          }
+          // Re-assert the same trim so the slew limiter and the hardware stay in step with
+          // st.trim_applied_ppm rather than drifting away from what is programmed.
+          trim_holds = this->rate_lock_->set_trim_ppm(st.trim_applied_ppm);
+          if (!trim_holds) {
+            st.rate_lock_ok = false;
+            ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
+          }
         } else {
-          st.trim_min_ppm = std::min(st.trim_min_ppm, trim_ppm);
-          st.trim_max_ppm = std::max(st.trim_max_ppm, trim_ppm);
-        }
-        st.trim_samples++;
-        if (std::abs(trim_ppm) >= clamp_ppm - 0.5f) {
-          st.trim_railed++;
-        }
-#endif
-        trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
-        if (!trim_holds) {
-          st.rate_lock_ok = false;
-          ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
-        }
+          if (st.trim_split_held) {
+            st.trim_split_held = false;
+            ESP_LOGD(TAG, "Trim released: split resolved t=%" PRId64, now_us());
+          }
+          const float p_term = kp * static_cast<float>(median_err_us);
+          // Conditional integration (anti-windup): winding the integral while the
+          // output rails just schedules a rail-to-rail relaxation oscillation
+          // (observed post-boot: trim flipping +-500 ppm with +-5 ms medians for
+          // ~90 s, with audible correction bursts). Freeze the integral whenever the
+          // output is saturated in the error's own direction.
+          const float unclamped = p_term + st.trim_integral_ppm;
+          if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (median_err_us > 0)) {
+            // KI tracks the ACTIVE gain: the critical-damping relationship is KI = KP^2/4,
+            // so a switched KP with a fixed KI would change the damping at the switch --
+            // the exact silent-failure mode the KI note near the gain definitions warns about.
+            st.trim_integral_ppm = std::clamp(
+                st.trim_integral_ppm + (kp * kp / 4.0f) * static_cast<float>(median_err_us) * dt_s, -clamp_ppm,
+                clamp_ppm);
+          }
+          const float trim_ppm = std::clamp(p_term + st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
+          // What the PI asked for, kept so the report can show it next to what the divider
+          // actually realised. Measured on hardware they agree to ~0.2 ppm, which is how
+          // divider quantisation was ruled out as a source of the inter-device excursions.
+          st.trim_applied_ppm = trim_ppm;
+  #ifdef USE_SNAPCLIENT_TIMING_DIAG
+          // Report-only: span shows whether the loop tracks a slow offset or chases
+          // something it cannot, and railed counts saturation.
+          if (st.trim_samples == 0) {
+            st.trim_min_ppm = st.trim_max_ppm = trim_ppm;
+          } else {
+            st.trim_min_ppm = std::min(st.trim_min_ppm, trim_ppm);
+            st.trim_max_ppm = std::max(st.trim_max_ppm, trim_ppm);
+          }
+          st.trim_samples++;
+          if (std::abs(trim_ppm) >= clamp_ppm - 0.5f) {
+            st.trim_railed++;
+          }
+  #endif
+          trim_holds = this->rate_lock_->set_trim_ppm(trim_ppm);
+          if (!trim_holds) {
+            st.rate_lock_ok = false;
+            ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
+          }
+        }  // end !split_pending
       } else if (st.rate_lock_ok) {
         // Outside the fine band the PI does not run, which previously left the LAST
         // trim applied to the hardware for the whole excursion. That is an

@@ -562,6 +562,9 @@ class SnapcastClient {
     int32_t drift_excess_min_us{0};
     int32_t drift_excess_max_us{0};
     int64_t drift_excess_since_us{0};
+    /// @brief Whether the trim is currently held because a split is pending confirmation, so the
+    /// enter/leave transitions log once rather than every chunk.
+    bool trim_split_held{false};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};
   };
