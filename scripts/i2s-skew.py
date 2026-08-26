@@ -895,8 +895,22 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
         step = len(pts) / MAX_PLOT_POINTS
         draw = [pts[min(int(i * step), len(pts) - 1)] for i in range(MAX_PLOT_POINTS)]
         draw.append(pts[-1])
-    o.append(f'<polyline points="{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in draw)}" '
-             f'fill="none" stroke="#2b6cb0" stroke-width="1.5"/>')
+    # Decimate first, then segment: decimation can only widen a gap, never invent one, and
+    # segmenting the drawn points keeps the breaks where the eye sees them.
+    segments = split_gaps(draw)
+    for seg in segments:
+        if len(seg) == 1:
+            t, v = seg[0]
+            o.append(f'<circle cx="{px(t):.1f}" cy="{py(v):.1f}" r="2" fill="#2b6cb0"/>')
+            continue
+        o.append(f'<polyline points="{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in seg)}" '
+                 f'fill="none" stroke="#2b6cb0" stroke-width="1.5"/>')
+    # Shade what is missing, so a gap reads as absence rather than as an axis break.
+    for prev, nxt in zip(segments, segments[1:]):
+        gx0, gx1 = px(prev[-1][0]), px(nxt[0][0])
+        if gx1 - gx0 >= 1.0:
+            o.append(f'<rect x="{gx0:.1f}" y="{top0}" width="{gx1-gx0:.1f}" '
+                     f'height="{top1-top0}" fill="#000" opacity="0.05"/>')
     if len(draw) <= 800:
         for t, v in draw:
             o.append(f'<circle cx="{px(t):.1f}" cy="{py(v):.1f}" r="2.5" fill="#2b6cb0"/>')
@@ -919,9 +933,12 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
             if not pts_:
                 continue
             col = palette[i % len(palette)]
-            pl = " ".join(f"{px(x):.1f},{pyb(v):.1f}" for x, v in sorted(pts_))
-            o.append(f'<polyline points="{pl}" fill="none" stroke="{col}" '
-                     f'stroke-width="1.4"/>')
+            for seg in split_gaps(sorted(pts_)):
+                if len(seg) < 2:
+                    continue
+                pl = " ".join(f"{px(x):.1f},{pyb(v):.1f}" for x, v in seg)
+                o.append(f'<polyline points="{pl}" fill="none" stroke="{col}" '
+                         f'stroke-width="1.4"/>')
             # Left-aligned inside the panel: at the right edge it was easy to miss.
             o.append(f'<text x="{ML+8}" y="{p0+14+i*13}" font-size="10" '
                      f'fill="{col}">{name}</text>')
@@ -1080,6 +1097,35 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi):
     return panels
 
 
+def split_gaps(pts):
+    """Splits a series at gaps, so a polyline is never drawn across missing data.
+
+    A dropout is not a measurement of zero drift, but a single polyline through the
+    surviving points says exactly that: the line from the last sample before a gap to the
+    first one after it looks like a smooth glide at whatever slope the endpoints imply. A
+    boot does this every time -- ~25 s with no audio to correlate, so ``pcm_coef`` is 0 and
+    the offset is NaN -- and it was read off the plot as a real 40 ppm ramp before anyone
+    checked the CSV. Breaking the line makes a gap look like a gap.
+
+    The threshold is derived from the data rather than fixed, because the sample cadence
+    depends on --samples: ten times the median spacing, floored at half a second so ordinary
+    scheduling jitter never splits a run.
+    """
+    if len(pts) < 3:
+        return [pts] if pts else []
+    gaps = sorted(pts[i + 1][0] - pts[i][0] for i in range(len(pts) - 1))
+    med = gaps[len(gaps) // 2]
+    limit = max(10 * med, 0.5) if med > 0 else 0.5
+    segs, cur = [], [pts[0]]
+    for prev, nxt in zip(pts, pts[1:]):
+        if nxt[0] - prev[0] > limit:
+            segs.append(cur)
+            cur = []
+        cur.append(nxt)
+    segs.append(cur)
+    return [sg for sg in segs if sg]
+
+
 def stats_caption(ts, ys):
     """One-line summary for the plot header: spread first, slope last."""
     v = [y for y in ys if math.isfinite(y)]
@@ -1088,9 +1134,17 @@ def stats_caption(ts, ys):
     parts = [f"n={len(v)}", f"mean {np.mean(v)/1000:+.3f} us",
              f"sd {np.std(v)/1000:.3f} us",
              f"p2p {(max(v)-min(v))/1000:.3f} us"]
-    f = fit_slope(ts, ys)
-    if f:
-        parts.append(f"slope {f[0]:+,.1f} ns/s ({f[0]/1000:+.4f} ppm)")
+    # Slope over the LONGEST CONTIGUOUS SEGMENT, never across a gap. Fitted across one it
+    # measures the interpolation: a boot with -6 ms before it and -14 us after reads as a
+    # tidy +40 ppm that nothing in the audio did.
+    segs = split_gaps([(t, y) for t, y in zip(ts, ys) if math.isfinite(y)])
+    if segs:
+        seg = max(segs, key=len)
+        f = fit_slope([t for t, _ in seg], [y for _, y in seg])
+        if f:
+            span = seg[-1][0] - seg[0][0]
+            note = "" if len(segs) == 1 else f" over {span:.0f}s of {len(segs)} runs"
+            parts.append(f"slope {f[0]:+,.1f} ns/s ({f[0]/1000:+.4f} ppm){note}")
     return "   ".join(parts)
 
 
