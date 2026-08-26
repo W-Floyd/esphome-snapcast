@@ -224,6 +224,11 @@ class SnapcastClient {
   /// @brief Enables/disables audio output. While disabled, the player task discards
   /// chunks at their deadline so playback resumes in sync when re-enabled.
   void set_output_active(bool active);
+  /// @brief Whether the player is currently routing audio rather than discarding it at the
+  /// deadline. The re-arm watchdog keys on this instead of on the media source's state enum:
+  /// "not routing while chunks are arriving" is the condition that is actually wrong, and it
+  /// stays true however the source got there.
+  bool output_active() const { return this->output_active_.load(std::memory_order_relaxed); }
 
   /// @brief Per-device latency trim, subtracted from every chunk deadline.
   void set_static_delay_ms(int32_t delay_ms) { this->static_delay_ms_.store(delay_ms, std::memory_order_relaxed); }

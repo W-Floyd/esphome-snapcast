@@ -47,16 +47,31 @@ void SnapclientMediaSource::setup() {
     // across a chunk gap, so stream_live_ alone stays true through hours of silence.
     // Keying on real chunks is what makes RESUME sane -- a halt taken while the music
     // is stopped is honoured until the music actually comes back.
-    if (!this->stream_live_ || !this->parent_->audio_flowing() || this->pending_start_ ||
-        this->get_state() != media_source::MediaSourceState::IDLE) {
+    // Keyed on ROUTING, not on the state enum. The gate used to be `state != IDLE`, which
+    // assumes IDLE is the only way to end up not routing -- and a device that reached any
+    // other non-routing state was then stuck forever, because the one mechanism that could
+    // rescue it refused to look. Observed after a stale-bailout reconnect: the network task
+    // recovered fully (reconnected, codec negotiated, TSF leadership yielded) while the
+    // player discarded every chunk for minutes, the mixer stayed stopped, and this watchdog
+    // never once logged. The invariant that was actually violated is "chunks are arriving
+    // and nothing is routing them", so test exactly that.
+    if (!this->stream_live_ || !this->parent_->audio_flowing() || this->pending_start_) {
+      return;
+    }
+    // PAUSED is excluded by state, not by routing: a pause is a deliberate not-routing and
+    // re-arming it would fight the person who asked for silence. Every other state is fair
+    // game -- if audio is flowing and we are not routing it, something is wrong regardless
+    // of what the enum says.
+    if (this->get_state() == media_source::MediaSourceState::PAUSED || this->parent_->output_active()) {
       return;
     }
     if (this->user_halted_ && this->parent_->pause_behavior() != PauseBehavior::RESUME) {
       return;  // someone asked for silence and the stream is not authoritative
     }
-    ESP_LOGW(TAG, "%s; re-requesting playback",
+    ESP_LOGW(TAG, "%s; re-requesting playback (state %d)",
              this->user_halted_ ? "Audio flowing again, overriding the local halt (pause_behavior: resume)"
-                                : "Audio is flowing but nothing is routing it");
+                                : "Audio is flowing but nothing is routing it",
+             static_cast<int>(this->get_state()));
     this->pending_start_ = true;
     this->start_requested_ms_ = millis();
     this->request_play_uri_(URI_CURRENT);

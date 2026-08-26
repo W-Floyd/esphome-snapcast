@@ -125,6 +125,10 @@ void SnapclientHub::set_output_active(bool active) {
   }
 }
 
+bool SnapclientHub::output_active() const {
+  return this->client_ != nullptr && this->client_->output_active();
+}
+
 void SnapclientHub::set_static_delay_ms(int32_t delay_ms) {
   this->pending_static_delay_ms_ = delay_ms;
   if (this->client_ != nullptr) {

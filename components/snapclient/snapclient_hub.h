@@ -85,6 +85,9 @@ class SnapclientHub final : public Component,
   /// @brief Enables/disables synchronized audio output. While disabled, chunks are
   /// discarded at their deadline so playback resumes in sync when re-enabled.
   void set_output_active(bool active);
+  /// @brief Whether the player is routing audio rather than discarding it at the deadline.
+  /// False before the client exists, which is the honest answer: nothing is routing yet.
+  bool output_active() const;
 
   /// @brief Per-device latency trim applied to every chunk deadline.
   void set_static_delay_ms(int32_t delay_ms);
