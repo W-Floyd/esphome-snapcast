@@ -2343,23 +2343,40 @@ void SnapcastClient::player_task_() {
         // than the split, as the thing doing the damage. Roughly 23 repairs fired in one session,
         // so this is a larger contributor to inter-device skew than anything else measured.
         //
-        // Holding rather than zeroing: the current trim is the converged crystal-offset
+        // Holding rather than zeroing: the trim's INTEGRAL is the converged crystal-offset
         // cancellation, so the clock keeps running at the right rate. Zeroing would itself be a
         // rate step of tens of ppm. The 3 s of not steering costs little -- the loop exists to
         // track disturbances that move over minutes -- and the hold is what buys the confirmation
         // that stops a spike triggering a spurious repair, so it is kept.
+        //
+        // HOLD THE INTEGRAL, NOT THE WHOLE TRIM. Freezing p_term + integral preserved the SUSPECT
+        // term at full size for the whole 3 s: p_term is the servo's response to an error the code
+        // is about to declare wrong, which is the exact thing this branch exists not to act on,
+        // while the integral is the part worth preserving. Measured on a clean +2500 us injection
+        // under the previous behaviour: trim +199 ppm at the hold, wire step -101.5 us, against
+        // the model's 199 x 3 x 0.17 = 101 -- so essentially ALL of that displacement was p_term,
+        // a converged integral running ~40-50 ppm. Same model with the integral alone predicts
+        // ~25 us.
+        //
+        // Note this is not rate-LIMITING the output, which is measured and reverted (see the
+        // 2 ppm/s note near the clamp): the trim steps to the integral at once and steps back on
+        // release. A rate step is not a displacement -- displacement is the integral of rate over
+        // time, and this branch is about not accumulating any.
         const bool split_pending = st.drift_excess_since_us != 0;
         if (split_pending) {
+          const float held_ppm = std::clamp(st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
           if (!st.trim_split_held) {
             st.trim_split_held = true;
             ESP_LOGD(TAG, "Trim held: accounting split pending confirmation, not steering on a "
-                          "suspect prediction (trim %+.2f ppm) t=%" PRId64,
-                     st.trim_applied_ppm, now_us());
+                          "suspect prediction (trim %+.2f -> integral %+.2f ppm) t=%" PRId64,
+                     st.trim_applied_ppm, held_ppm, now_us());
           }
-          // Re-assert the same trim so the slew limiter and the hardware stay in step with
-          // st.trim_applied_ppm rather than drifting away from what is programmed.
-          trim_holds = this->rate_lock_->set_trim_ppm(st.trim_applied_ppm);
-          if (!trim_holds) {
+          trim_holds = this->rate_lock_->set_trim_ppm(held_ppm);
+          if (trim_holds) {
+            // What is PROGRAMMED, so the report's trim integral and the nominal-hold path below
+            // both start from the value the hardware actually has.
+            st.trim_applied_ppm = held_ppm;
+          } else {
             st.rate_lock_ok = false;
             ESP_LOGW(TAG, "Rate lock unavailable, falling back to frame-splice corrections");
           }
