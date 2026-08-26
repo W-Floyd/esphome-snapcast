@@ -105,15 +105,39 @@ defect.
       than of the line. Two boards' log counts (79 vs 0) confirmed the line's behaviour and were
       taken as confirming a claim about the quantity. **Before concluding a quantity is
       unavailable, check which of the same-named fields the evidence came from.**
-    - **DONE: the crystal difference is now computed on-device.** `crystal_ppm` is appended to
-      `TsfPacket` (no version bump — appending cannot be misread, and a bump costs a half-flashed
-      fleet its shared timebase in both directions; the receiver accepts both lengths), sourced
-      from `offset_rate_ppm_` via a cross-thread mirror. A follower differences it against the
-      leader's and logs `Crystal: mine … leader … delta … ppm`, exposed as
-      `TsfSync::crystal_delta_ppm()`. Both sides measure against the same AP TSF, so the AP's own
-      crystal cancels. **Diagnostics only — nothing steers on it**, and nothing should until the
-      0.708 ppm residual after correction (~71 µs per 100 s against a ~7 µs floor) is understood.
-      Expected first reading: ≈ −5.35 ppm on the follower, matching the wire.
+    - **BUILT AND RUNNING, NUMBER NOT YET VALIDATED: the crystal difference is computed
+      on-device.** `crystal_ppm` is appended to `TsfPacket` (no version bump — appending cannot be
+      misread, and a bump costs a half-flashed fleet its shared timebase in both directions; the
+      receiver accepts both lengths), sourced from `offset_rate_ppm_` via a cross-thread mirror.
+      A follower differences it against the leader's and logs `Crystal: mine … leader … delta …
+      ppm`, exposed as `TsfSync::crystal_delta_ppm()`. Both sides measure against the same AP TSF,
+      so the AP's own crystal cancels. **Diagnostics only — nothing steers on it**, and nothing
+      should until the 0.708 ppm residual after correction (~71 µs per 100 s against a ~7 µs
+      floor) is understood.
+        - First hardware reading: `mine +36.543 leader -7.835 delta +44.379 ppm`, arithmetic
+          self-consistent, stable across samples. The mechanism works end to end.
+        - **The prediction of ≈ −5.35 ppm FAILED, for a reason that was an assumption not a
+          measurement:** −5.35 is the *a↔b* difference, and b's leader is not a. It is one of the
+          unprobed boards, whose crystal reads −7.835 ppm. So nothing here contradicts the wire —
+          but nothing here confirms it either, and it must not be written up as confirmation.
+        - **VALIDATION STILL OWED.** It needs the two analyser-probed boards in a leader/follower
+          relationship *with each other*. Leadership goes to the lowest MAC, so in a fleet of five
+          that pair may never form: run only the two probed boards, or difference their raw
+          published values rather than their deltas.
+    - **TOPOLOGY LIMITATION, and it bites the actual use case: followers never beacon.** All three
+      `broadcast_` call sites are leader-gated (`role == Role::LEADER`, the leader cadence block,
+      and the moment of assuming leadership). So a follower only ever sees the LEADER's
+      `crystal_ppm`, and **two followers cannot see each other's** — which is the normal case for a
+      stereo pair in a group of five. `mine − leader` is the pair difference only when the leader
+      happens to be the partner.
+        - Publishing the raw rate rather than only the delta was the right call for this reason:
+          the raw value is the composable primitive, and any two peers' raw values difference to
+          their crystal difference. The delta-vs-leader is a convenience, not the quantity a
+          stereo pair needs.
+        - The natural fix is to let a follower publish `crystal_ppm` too, very infrequently —
+          it is a slowly-varying hardware constant, so once per 30 s is ample and the airtime is
+          negligible. Not attempted yet; it changes who transmits, which is a topology change and
+          wants its own measurement.
     - **Do not "fix" this by de-meaning.** Tried on the data: subtracting the series mean drops the
       analyser's own fs check from 96% to 2%, because the true differential rate has a real nonzero
       mean (+0.61 ppm on one run, a genuine 177 µs ramp over 290 s) and de-meaning destroys exactly
