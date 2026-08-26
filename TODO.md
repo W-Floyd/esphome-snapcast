@@ -51,16 +51,25 @@ is now the largest error in the chain by an order of magnitude.
   of never, but not prevented: it captures an instant that stops being true (`own=0` at the
   seed, ~244 ms of audio 1.4 s later). Preventing it needs an anchor that stays valid — not
   another way to suppress the second seed.
+- **A per-boot absolute offset of ±30 µs survives, and no on-device metric sees it.** Measured
+  with both boards settled and no repair anywhere in the trace: differential median −2.0 ±3 µs
+  against +30 µs on the wire. Both boards agree with each other and with themselves; only the
+  analyser disagrees. Not frame-quantised (samples: +0.9, −15, +30 µs post-gate; +89, +115, +85
+  before it), so it is a continuous start-phase term, not a whole-frame miscount. The route to it
+  is the mixer depth fix below — with `r_mix` provably non-zero, the accounting cannot be verified
+  to a frame, and until it can, this term has no instrument.
 - **Every accounting re-anchor plants a static wire offset of tens of µs.** Now the dominant
   term, and only visible on the analyser. Measured in one session at MAD 1–3 µs of noise, so the
   residual is resolved to 1 part in 40 — far better SNR than the 8.5 ms this was chased at:
     - three boards restarted together: **+0.9 µs**
     - board b alone, twice: **+89 µs**, then **+115 µs** (26 µs apart, so not frame-quantised)
     - both boards together: **+26 µs**, then b's split repair fired and it went to **+85 µs**
-  The chain on that last one is the thing to attack: b came up with its accounted queue −25.5 ms
-  against measured latency (≈ half a 50 ms DMA buffer, not the "2–4 buffers" previously assumed),
-  the repair dropped 1224 frames 3 s later to close it, and the audio settled ~60 µs from where
-  it had been. Prevent the start-time miscount and both the repair and its residual go away.
+  The chain on that last one is now understood and was a CASCADE: the mixer's incomplete depth
+  report showed +25509 µs, the repair fired on it at 02:24:46, and subtracting those 1125 frames
+  from `pushed` is what created the −25488 µs split that the second repair answered 14 s later.
+  Two repairs, the second undoing the first, neither needed — the frames were only in flight.
+  `MIX_RESIDUAL_MATCH_US` stops it at the head; the two gate-era boots landed at −15 and +30 µs
+  against +85 to +115 µs before it.
   Instrument the seed and the first credits at the instant they happen.
 - **Leave `TRIM_KP_RUN` at 0.25.** Re-measured after the feed-forward and the trade has inverted.
   KP multiplies the DIFFERENTIAL MEDIAN, and that input has fallen 6× since the gain was chosen
