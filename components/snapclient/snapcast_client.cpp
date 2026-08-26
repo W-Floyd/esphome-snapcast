@@ -518,6 +518,10 @@ static constexpr int32_t REANCHOR_BIAS_US = 2500;
 // fine settling the re-lock ends with -- perturbing into that would measure the settling, not the
 // anchor -- and short enough to be over before a listener has settled in.
 static constexpr int64_t REANCHOR_SETTLE_US = 10000000;
+// Floor on the gap between forced cycles. A storm can plant several re-locks in a minute and each
+// cycle costs a ramp, a hold and its +-50 us; since a repair removes a FRACTION of the standing
+// error rather than all of it, skipping one loses nothing the next event's cycle cannot pick up.
+static constexpr int64_t REANCHOR_MIN_INTERVAL_US = 60000000;
 // TEST HOOK ramp rate, see inject_split(). 100 us/s is chosen to sit at or under the disturbance
 // the servo already tracks unaided -- the clock-offset estimate wanders ~100 us/s on wifi jitter --
 // so the injected bias arrives as ordinary drift rather than as a transient the servo fights. At
@@ -2260,6 +2264,8 @@ void SnapcastClient::player_task_() {
       // is INFO) made a dropout look like a spontaneous "Sync locked" with no cause,
       // since the resync line above is DEBUG and throttled. One line per gap.
       if (st.converged && mute_now) {
+        // The re-lock that follows re-derives the anchor, so arm the forced repair for it.
+        st.reanchor_armed = true;
         ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms late (%" PRIu32
                       " in %" PRId64 " s) -- audible gap until re-lock",
                  error_us / 1000, st.storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
@@ -2285,6 +2291,7 @@ void SnapcastClient::player_task_() {
       st.err_window_filled = 0;
       st.steer_dir = 0;
       if (st.converged && mute_now) {
+        st.reanchor_armed = true;
         ESP_LOGI(TAG, "Muting: hard resync, %" PRId64 " ms early (%" PRIu32
                       " in %" PRId64 " s) -- audible gap until re-lock",
                  -error_us / 1000, st.storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
@@ -2633,7 +2640,7 @@ void SnapcastClient::player_task_() {
       st.in_band_chunks = 0;
     }
 
-    this->reanchor_after_session_(st);
+    this->reanchor_after_relock_(st);
 
     this->push_chunk_(rec, drop_frames, !st.converged);
 
@@ -3008,6 +3015,9 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       st.err_window_filled = 0;
       st.steer_dir = 0;
       st.converged = false;
+      // A seed re-derives the anchor from this device's own measured latency, which is the error
+      // the forced cycle exists to spend a repair on.
+      st.reanchor_armed = true;
   #ifdef USE_I2S_RATE_LOCK
       if (this->rate_lock_ != nullptr) {
         this->rate_lock_->invalidate_baseline();
@@ -3023,13 +3033,24 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
 
 // THREAD CONTEXT: player task. See REANCHOR_BIAS_US for what this is for and what is unproven
 // about it.
-void SnapcastClient::reanchor_after_session_(ServoState &st) {
+void SnapcastClient::reanchor_after_relock_(ServoState &st) {
   if (!this->config_.reanchor_after_reconnect) {
     return;
   }
+  // ARMED BY THE RE-LOCK, NOT BY THE RECONNECT. The first version keyed on the session epoch, and
+  // the very first natural event after it shipped walked past it: board a took a supply outage,
+  // stormed, muted and re-locked at median 163 us WITHOUT a disconnect or a stream restart, so no
+  // epoch changed and no cycle ran. That is the offset-planting event -- the anchor is re-derived
+  // at every re-lock, not only when the session is rebuilt. The epoch is still one of the arming
+  // reasons, because a boot or a reconnect is also a re-lock.
   const uint32_t epoch = this->session_epoch_.load(std::memory_order_relaxed);
-  if (st.reanchor_epoch == epoch) {
-    return;  // this session has had its cycle
+  if (st.reanchor_epoch != epoch) {
+    st.reanchor_epoch = epoch;
+    st.reanchor_armed = true;
+    st.reanchor_due_us = 0;
+  }
+  if (!st.reanchor_armed) {
+    return;
   }
   if (!st.converged) {
     // Not locked yet, or knocked out of lock again. Restart the settle from the next unmute: a
@@ -3044,13 +3065,22 @@ void SnapcastClient::reanchor_after_session_(ServoState &st) {
   if (now_us() < st.reanchor_due_us) {
     return;
   }
-  st.reanchor_epoch = epoch;
+  st.reanchor_armed = false;
   st.reanchor_due_us = 0;
+  // A storm can plant several re-locks inside a minute, and each cycle costs a ramp, a hold and
+  // its +-50 us. One per interval is enough: the repair removes a FRACTION of the standing error,
+  // so the next event's cycle picks up whatever this one left.
+  if (st.reanchor_last_us != 0 && now_us() - st.reanchor_last_us < REANCHOR_MIN_INTERVAL_US) {
+    ESP_LOGD(TAG, "Re-anchor skipped: one fired %" PRId64 " s ago t=%" PRId64,
+             (now_us() - st.reanchor_last_us) / 1000000, now_us());
+    return;
+  }
+  st.reanchor_last_us = now_us();
   // Biases the ACCOUNTING only, leaving the audio alone, and is ramped -- the same path the test
   // hook uses, so a forced cycle and a manual one are the same experiment. Logged at INFO with its
   // own wording so the two are never confused in a log.
   this->inject_split_us_.store(REANCHOR_BIAS_US, std::memory_order_relaxed);
-  ESP_LOGI(TAG, "Re-anchoring after session start: forcing one repair cycle (%+" PRId32 " us bias) t=%" PRId64,
+  ESP_LOGI(TAG, "Re-anchoring after re-lock: forcing one repair cycle (%+" PRId32 " us bias) t=%" PRId64,
            REANCHOR_BIAS_US, now_us());
 }
 

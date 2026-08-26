@@ -78,7 +78,7 @@ struct SnapcastClientConfig {
   // Force one accounting repair cycle after each session start. OFF by default: the effect is
   // measured (n=12) but its mechanism is not, so this is opt-in until a lone reconnect has been
   // graded with it. See reanchor_after_session_() and REANCHOR_BIAS_US.
-  bool reanchor_after_reconnect{false};
+  bool reanchor_after_reconnect{false};  // named for the config key; arms on any re-lock
 };
 
 /// @brief Output channel routing, matching esp32 snapclient's dsp_channel_mode_t.
@@ -537,10 +537,13 @@ class SnapcastClient {
     uint16_t resync_trace_idx{0};
     int64_t resync_trace_arm_us{0};
     uint32_t resync_drops{0};
-    // Re-anchor after a session start: the epoch already handled, and the instant the settle
-    // delay expires. See reanchor_after_session_().
+    // Re-anchor after a RE-LOCK: armed by whatever dropped convergence (a session start, a mute,
+    // a starvation re-baseline), fired once convergence returns and settles. See
+    // reanchor_after_relock_().
     uint32_t reanchor_epoch{0};
+    bool reanchor_armed{false};
     int64_t reanchor_due_us{0};
+    int64_t reanchor_last_us{0};
     // Gain schedule: the instant of the last DISTURBANCE EVENT, from which KP decays ACQUIRE ->
     // RUN. Not the instant of the last error -- see TRIM_KP_DECAY_TAU_S for why that distinction
     // is the whole safety argument. Set to the player task's start so a boot counts as an event.
@@ -761,9 +764,9 @@ class SnapcastClient {
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
 
-  /// Forces one repair cycle after a session start, if configured; a no-op otherwise. Called
-  /// once per chunk from the player loop, after the convergence gate.
-  void reanchor_after_session_(ServoState &st);
+  /// Forces one repair cycle after a re-lock, if configured; a no-op otherwise. Called once per
+  /// chunk from the player loop, after the convergence gate.
+  void reanchor_after_relock_(ServoState &st);
 
   /// The PI's proportional gain for this chunk: ACQUIRE while unconverged, otherwise decaying
   /// ACQUIRE -> RUN with time since the last disturbance event. Open-loop in the error by
