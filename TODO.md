@@ -529,11 +529,37 @@ defect.
           `i2s-skew.py` expands them into the existing per-chunk rows with NEGATIVE sequence
           numbers, so an episode reads −80…+79 continuously, and reports the drain separately
           from the discard verdict (which is still computed on the armed chunks only).
-        - **The discriminator to read off it**: `dt` says whether chunks kept ARRIVING while the
-          ring fell. Gaps summing to a quarter of the window → supply stalled (radio, server,
-          decode) and the servo is a victim; cadence intact while `ring` falls → playout outran
-          supply and the rate is wrong. The report prints one of those two verdicts per burst.
-          If `ring` is already flat at its floor at seq −80, raise `RESYNC_PRE_CHUNKS`.
+        - **FIRST RESULTS, 13:19–13:23 on board a — THE SUPPLY STOPS.** Three arms captured, and
+          the two that drained read the same way:
+
+              t= 68.7s  ring 1697 -> 26 ms over 80 chunks (2044 ms)  supply ratio 0.18
+              t=279.2s  ring 1671 -> 26 ms over 74 chunks (1939 ms)  supply ratio 0.15
+              t=298.9s  ring 1776 -> 1750 ms, no drain at all        supply ratio 0.99
+
+          In both drains `err` stayed inside ±9 µs and `med` inside ±9 µs the whole way down —
+          the servo was perfect until the moment the ring ran out — and the ring fell by almost
+          exactly one chunk per chunk. The third arm is the already-known case: a ~180 ms
+          excursion with the ring FULL and supply at real time, i.e. a prediction/deadline
+          excursion with no starvation in it.
+        - **CAVEAT ON THESE TWO: they are not a quiet-period sample.** Both landed minutes after
+          `reflash.sh` OTA'd five boards over the same radio, so contention is a live explanation
+          for a 2 s supply outage. Needs a capture with nothing else on the channel before
+          "the network stops for 2 s" is a property of normal running.
+        - **`dt` DOES NOT MEASURE ARRIVALS — do not read it that way.** It is the servo loop's
+          cadence, and the loop runs off the backlog: through a total supply outage it kept a
+          textbook ~26 ms cadence with no gaps, because it was working through ~65 buffered
+          chunks. The first version of the analyser called that "supply intact" off a total
+          outage. The discriminator that works is the ring's SLOPE — playout is real time, so
+          `supplied = span + (ring_end − ring_start)`, and the ratio against `span` is the
+          supply rate with the loop's own pacing cancelled out.
+        - **Reading the verdict**: ratio &lt; 0.35 → supply stalled and the servo is a victim;
+          0.35–0.85 → arriving below real time; ≈1 with the ring falling → the loss is DOWNSTREAM
+          of the ring, which would point at the mixer/speaker path rather than the network. If
+          `ring` is already flat at its floor at seq −80, raise `RESYNC_PRE_CHUNKS`.
+        - **Next question, now that the trigger is located:** why does the network task deliver
+          nothing for ~2 s? Nothing here says whether that is the radio, the server, the socket
+          read, or decode — the trace stops at the ring. Instrumenting arrivals at `emit_pcm_`
+          would say which, and is the same shape of change as this one.
         - Also measured, and useful on its own: an ~100 ms excursion with a healthy ring resolves
           with no discards and no muting. The path only engages when the ring is gone.
     - **THE WEDGE IS A SEPARATE, PRE-EXISTING DEFECT, and NOT caused by the discard cap.** I said it

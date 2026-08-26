@@ -2105,8 +2105,22 @@ def report_pre_trigger_drain(board, pre):
 
     Two mechanisms end with an empty ring and want opposite fixes. If chunks STOPPED ARRIVING the
     drain is a supply gap -- radio, server, decode -- and the servo is a victim. If they kept
-    arriving on cadence while the ring fell, playout outran supply and the rate is wrong. The
-    arrival cadence separates them, which is why dt is recorded at all.
+    arriving while the ring fell, consumption outran an intact supply and the fault is downstream.
+
+    THE DISCRIMINATOR IS THE RING'S SLOPE, NOT THE CADENCE. dt is the servo LOOP's cadence, and
+    the loop is fed from a backlog: with a second of audio buffered, it keeps iterating at exactly
+    playout rate long after the network has gone silent, so a starved device shows a textbook
+    26 ms cadence and no gaps at all. The first capture (13:19:18 on board a) is exactly that --
+    perfect cadence, err inside +-9 us, and the ring falling by one chunk per chunk. Believing dt
+    there would have read "supply intact" off a total supply outage.
+
+    Playout is real time, so over a window of `span` the sink consumed `span` of audio. Whatever
+    the ring gained on top of what it lost is what arrived:
+
+        supplied = span + (ring_end - ring_start)
+
+    A ratio near 1 is an intact supply; near 0 is an outage. Both terms come off the same trace,
+    neither depends on the chunk period, and the loop's own pacing cancels out.
     """
     if len(pre) < 8:
         return
@@ -2131,24 +2145,31 @@ def report_pre_trigger_drain(board, pre):
     onset_ms = (pre[-1][0] - pre[onset][0]) * 1000.0
     print(f"      {'':>{len(board)}}  drain began at seq {pre[onset][1]:+d} "
           f"({onset_ms:.0f} ms before the arm, from {rings[onset]} ms)")
-    if len(usable) < len(dts) / 2:
-        print(f"      {'':>{len(board)}}  arrival cadence unavailable (no device timestamps)")
+    if span_ms <= 0:
+        print(f"      {'':>{len(board)}}  window has no device time; supply ratio unavailable")
         return
-    usable.sort()
-    med_dt = usable[len(usable) // 2]
-    gaps = [d for d in usable if d > 2 * med_dt]
-    print(f"      {'':>{len(board)}}  arrivals: median {med_dt:.1f} ms, max {max(usable):.1f} ms, "
-          f"{len(gaps)} gap(s) > 2x median")
-    # A stalled supply shows as gaps that add up to real audio time; a rate problem shows as a
-    # ring falling while chunks keep landing on cadence.
-    if gaps and sum(gaps) > 0.25 * span_ms:
-        print(f"      {'':>{len(board)}}  -> SUPPLY STALLED: {sum(gaps):.0f} ms of the "
-              f"{span_ms:.0f} ms window was gap; the ring drained because nothing arrived")
+    supplied_ms = span_ms + (rings[-1] - rings[0])
+    ratio = supplied_ms / span_ms
+    print(f"      {'':>{len(board)}}  supply: {supplied_ms:.0f} ms of audio arrived during "
+          f"{span_ms:.0f} ms of playout  ratio {ratio:.2f}")
+    if ratio < 0.35:
+        print(f"      {'':>{len(board)}}  -> SUPPLY STALLED: the ring drained because nothing was"
+              f" arriving; the servo is a victim here, not the cause")
+    elif ratio < 0.85:
+        print(f"      {'':>{len(board)}}  -> SUPPLY SLOW: arriving, but below real time")
     elif rings[-1] < ring_max / 2:
-        print(f"      {'':>{len(board)}}  -> SUPPLY INTACT: chunks kept arriving on cadence while"
-              f" the ring fell; playout outran supply")
+        print(f"      {'':>{len(board)}}  -> SUPPLY INTACT: audio kept arriving at ~real time"
+              f" while the ring fell; the loss is DOWNSTREAM of the ring")
     else:
-        print(f"      {'':>{len(board)}}  -> inconclusive: no gaps and no sustained decline")
+        print(f"      {'':>{len(board)}}  -> inconclusive: supply intact and no sustained decline")
+    # Cadence second, and only as colour: it is the loop's pacing, which tracks the backlog rather
+    # than the network. Reported because a REAL stall of the loop itself still shows here.
+    if usable:
+        usable.sort()
+        med_dt = usable[len(usable) // 2]
+        gaps = [d for d in usable if d > 2 * med_dt]
+        print(f"      {'':>{len(board)}}  loop cadence: median {med_dt:.1f} ms, max "
+              f"{max(usable):.1f} ms, {len(gaps)} pause(s) > 2x median")
 
 
 def report_resync_bursts(lo, hi):
