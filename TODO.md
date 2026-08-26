@@ -556,10 +556,11 @@ defect.
           0.35–0.85 → arriving below real time; ≈1 with the ring falling → the loss is DOWNSTREAM
           of the ring, which would point at the mixer/speaker path rather than the network. If
           `ring` is already flat at its floor at seq −80, raise `RESYNC_PRE_CHUNKS`.
-        - **Next question, now that the trigger is located:** why does the network task deliver
-          nothing for ~2 s? Nothing here says whether that is the radio, the server, the socket
-          read, or decode — the trace stops at the ring. Instrumenting arrivals at `emit_pcm_`
-          would say which, and is the same shape of change as this one.
+        - **PARKED (2026-08-26): the ~2 s supply outage is most likely snapserver, not us.**
+          The chain's trigger is now located and it is upstream of this firmware, so chasing it
+          further is not the next slot's work. If it is ever picked back up, the trace stops at
+          the ring and says nothing about radio vs server vs socket vs decode; instrumenting
+          arrivals at `emit_pcm_` would split those, and is the same shape of change as this one.
         - Also measured, and useful on its own: an ~100 ms excursion with a healthy ring resolves
           with no discards and no muting. The path only engages when the ring is gone.
     - **THE WEDGE IS A SEPARATE, PRE-EXISTING DEFECT, and NOT caused by the discard cap.** I said it
