@@ -2335,26 +2335,54 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
                              this->audio_listener_->on_query_latency(latency);
       const bool have_own = this->audio_listener_ != nullptr && frame_bytes > 0 &&
                             this->audio_listener_->on_query_audio(own_audio);
-      // REVERTED: aging the snapshot before anchoring. The idea was sound and the arithmetic was
-      // not. Snapshot ages here are 15-39 ms and the offsets this seed plants are 3.7-13 ms -- the
-      // same order -- so an unaged anchor over-anchors by whatever drained in between. Aging the
-      // WHOLE latency is known-fatal (the i2s DMA span is held permanently full by the always-fill
-      // model, so it does not decay; subtracting elapsed time from it caused hard resyncs at 350,
-      // 2297 and 3581 ms in four seconds). The attempt was therefore to age only the queue ahead of
-      // the DMA, which the note below already concedes "would be fair".
+      // DISPROVEN: ageing the snapshot before anchoring. Kept as a warning, because the reasoning
+      // looks compelling and is wrong.
       //
-      // It used AudioDepth::dbg_dma_us as the non-draining term. That field is "real audio resident
-      // in the sink's DMA descriptors" -- the part that DOES drain -- not the always-full span. So
-      // it aged off the queue and kept the draining part, i.e. exactly inverted. Measured with an
-      // injected starvation: seed latency=50000 own=22653 dma=22653 -> anchor 22801, under-anchoring
-      // by the padding, leaving drift=-64672 and the pair 67 ms apart against 10 ms before. 6.7x
-      // worse.
+      // The snapshot is 15-39 ms old here and the offsets this seed plants are 3.7-13 ms, so ageing
+      // it looks like the obvious correction. Two attempts, both measured with an injected starvation:
       //
-      // AudioDepth exposes no term for the always-full span, so this cannot be written correctly
-      // from what the listener reports today. Doing it properly needs the sink to publish the span
-      // separately (the I2SDBG line already knows it: dma_real=2205, 50000 us). Note also that the
-      // draining premise itself needs re-checking per stage -- the DMA refills with silence while a
-      // queue does not, so "aged by elapsed time" is only right for the stages upstream of it.
+      //   ageing the whole latency        -> hard resyncs at 350, 2297, 3581 ms, then a reconnect
+      //   ageing all but dbg_dma_us       -> that field is real-audio-in-DMA, not the span, so the
+      //                                      split was inverted: pair 67 ms apart (was 10)
+      //   ageing all but the PUBLISHED span (AudioDepth::render_nondraining_us, added for this)
+      //                                   -> pair 73 ms apart, drift -68549 then -88549 and growing
+      //
+      // The third attempt used exactly the right term -- the seed line showed dma=25034 against
+      // held=50000, so the two are genuinely distinct and the value propagated correctly -- and it
+      // was still worse. That rules out the implementation and leaves the premise:
+      //
+      //   SNAPSHOT AGE DOES NOT IMPLY DRAINAGE.
+      //
+      // Ageing assumes the queue drained by the elapsed time. It did not: upstream keeps pushing into
+      // it, so over 37 ms of staleness the net change is near zero. Measured on the seed that did the
+      // damage: own=234399, i.e. 234 ms of real audio present and being replenished, from which 36.8
+      // ms was subtracted for nothing. The premise only holds during a true drain with no refill --
+      // and there the queue term is already zero, so ageing correctly does nothing (observed:
+      // aged_off=0, anchor unchanged, harmless).
+      //
+      // So the anchor error is NOT staleness. Whatever plants the 3.7-13 ms is still unexplained, and
+      // the next attempt needs a different hypothesis rather than a better subtraction. held= is still
+      // logged below: it is the instrument that settled this, and it is worth keeping visible.
+      // DISPROVEN: refusing a seed onto a pipeline that is not drained.
+      //
+      // A starvation produces TWO seeds ~1.4 s apart: the first while the pipeline is genuinely empty
+      // (own=0), the second once it has refilled (own=234399..244400). The second looks indefensible
+      // -- a pipeline holding 244 ms of our own audio plainly did not drain -- and refusing it looked
+      // like the clean semantic fix for the multi-millisecond offsets this path plants.
+      //
+      // Measured with an injected starvation, the guard fired exactly as designed and made things far
+      // worse: pair 198 ms apart, drift -194060, against 10 ms before.
+      //
+      // The second seed is COMPENSATING, not damaging. The first anchors to a truth that expires: at
+      // that instant the pipeline really is empty, but 1.4 s later it holds ~244 ms, and the accounting
+      // pinned to the drained-state anchor is then short by exactly that. The second seed re-anchors to
+      // the refilled pipeline and brings it back. The 8.5-13 ms offset is the RESIDUAL of that
+      // correction, not the correction itself -- so removing the correction leaves the whole error.
+      //
+      // Any future attempt has to explain that residual, or anchor at an instant that stays true,
+      // rather than suppressing the second seed. Three other hypotheses are also dead: divider
+      // quantisation (want tracks applied to 0.24 ppm), the cascade alone (fixed, offsets persisted),
+      // and snapshot staleness (see the note above).
       const int64_t in_flight_frames =
           have_fill ? static_cast<int64_t>(latency.microseconds) * rec.params.sample_rate / 1000000 : 0;
       // The padding is the difference between the two queries, by definition: latency counts the
@@ -2385,10 +2413,11 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       if (have_fill) {
         // The snapshot's age is logged but NOT applied -- see above. It is here because it is the
         // number that would have to be wrong for this anchor to be wrong.
-        ESP_LOGD(TAG, "SEEDDBG latency=%" PRIu32 " own=%" PRIu32 " dma=%" PRIu32 " debt=%" PRId64
-                      " seed=%" PRId64 " played_was=%" PRId64,
+        ESP_LOGD(TAG, "SEEDDBG latency=%" PRIu32 " own=%" PRIu32 " dma=%" PRIu32 " held=%" PRIu32
+                      " debt=%" PRId64 " seed=%" PRId64 " played_was=%" PRId64,
                  latency.microseconds, have_own ? own_audio.microseconds : 0, latency.dbg_dma_us,
-                 st.padding_debt_frames, in_flight_frames, this->played_frames_total_);
+                 latency.render_nondraining_us, st.padding_debt_frames, in_flight_frames,
+                 this->played_frames_total_);
         ESP_LOGD(TAG, "Re-baseline anchored to measured latency: %" PRIu32 " ms (%" PRId64
                       " frames), snapshot %" PRId64 " ms old",
                  latency.microseconds / 1000, in_flight_frames, (now_us() - latency.as_of_us) / 1000);

@@ -60,6 +60,10 @@ class VirtualSpeaker final : public Component, public speaker::Speaker {
     depth.as_of_us = esp_timer_get_time();
     depth.microseconds = static_cast<uint32_t>(static_cast<uint64_t>(this->ring_->available() / frame_bytes) *
                                                1000000 / this->sample_rate_);
+    // render_nondraining_us stays 0, and that is correct rather than merely unset: there is no DMA
+    // and nothing pads here, so every microsecond reported drains at the sample rate and all of it is
+    // fair to age. A hardware sink must report its always-full span instead -- see
+    // AudioDepth::render_nondraining_us.
     return true;
   }
 
