@@ -563,6 +563,34 @@ static constexpr uint32_t FAST_SPLICE_MAX_FRAMES = 128;
 // each other. The PI keeps the repair's step, which is what every landing-offset measurement so
 // far was taken with.
 static constexpr int64_t FAST_SPLICE_REPAIR_HOLDOFF_US = 30000000;
+
+// UNMUTE ALSO NEEDS THE ANCHOR TO AGREE, not just the median error.
+//
+// The median error is a SELF-CONSISTENT test: it compares audio against this device's own
+// prediction, so it reads ~0 while the prediction itself is displaced, and every other on-device
+// field agrees with it. That is the whole invisibility problem, and the unmute gate was built out
+// of exactly that quantity.
+//
+// What it costs, measured 2026-08-26 21:26: an outage's re-lock unmuted at median 230 us, and FIVE
+// SECONDS LATER a repair fired reading +39977 us. The board had been placing real audio against an
+// anchor 40 ms wrong for those seconds, and the pair settled 173 us apart -- permanently, with
+// every metric healthy. The wire offset between two devices is the DIFFERENCE OF THEIR ANCHOR
+// ERRORS, so an anchor that wrong at unmute is a planted offset by construction.
+//
+// The anchor error is not invisible: it is the accounting split the repair already measures, whose
+// own floor is ~7 us on a fully-accounted device, and its samples are collected whether or not the
+// device is converged. So gate the unmute on it -- do not start placing audio until the anchor
+// agrees with the measured pipeline.
+//
+// Set to DRIFT_REPAIR_US, i.e. "do not unmute carrying a split the repair would immediately act
+// on". Tighter is where a <10 us goal has to go, but not before a repair costs less than the
+// +-50 us it currently displaces.
+static constexpr int32_t UNMUTE_ANCHOR_US = DRIFT_REPAIR_US;
+// A bound on that wait. Silence is also a defect: if the anchor never settles -- a mixer reporting
+// a depth that does not describe the whole pipeline, say -- unmuting late but audible beats staying
+// quiet, and the log line says which happened. Long enough for the ~3.3 s drift window to fill
+// several times over.
+static constexpr int64_t UNMUTE_ANCHOR_MAX_WAIT_US = 15000000;
 // TEST HOOK ramp rate, see inject_split(). 100 us/s is chosen to sit at or under the disturbance
 // the servo already tracks unaided -- the clock-offset estimate wanders ~100 us/s on wifi jitter --
 // so the injected bias arrives as ordinary drift rather than as a transient the servo fights. At
@@ -2687,13 +2715,39 @@ void SnapcastClient::player_task_() {
       const bool timebase_settled = true;
 #endif
       if (!st.converged && st.err_window_filled == MEDIAN_WINDOW && timebase_settled && ++st.in_band_chunks >= MEDIAN_WINDOW) {
-        st.converged = true;
-        // Recovery is over, so the leader-side hold is released with it.
-        st.deadline_implausible = false;
-        ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us), unmuting", median_err_us);
+        // The anchor has to agree too, or the audio about to be unmuted is placed against a
+        // prediction that is already wrong -- see UNMUTE_ANCHOR_US. INT32_MIN means the drift
+        // window has no samples yet, which is not evidence of agreement.
+        const bool anchor_known = st.drift_med_last_us != INT32_MIN;
+        const bool anchor_ok = anchor_known && std::abs(st.drift_med_last_us) <= UNMUTE_ANCHOR_US;
+        if (!anchor_ok && st.unmute_anchor_wait_us == 0) {
+          st.unmute_anchor_wait_us = now_us();
+          ESP_LOGD(TAG, "Unmute held: median %" PRId64 " us is in band but the anchor reads %" PRId32
+                        " us; waiting for the accounting to agree t=%" PRId64,
+                   median_err_us, st.drift_med_last_us, now_us());
+        }
+        const bool waited_out =
+            !anchor_ok && st.unmute_anchor_wait_us != 0 &&
+            now_us() - st.unmute_anchor_wait_us >= UNMUTE_ANCHOR_MAX_WAIT_US;
+        if (anchor_ok || waited_out) {
+          st.converged = true;
+          // Recovery is over, so the leader-side hold is released with it.
+          st.deadline_implausible = false;
+          st.unmute_anchor_wait_us = 0;
+          if (waited_out) {
+            ESP_LOGW(TAG, "Sync locked (median %" PRId64 " us) but the anchor still reads %" PRId32
+                          " us after %" PRId64 " s -- unmuting anyway; expect a planted offset of "
+                          "about the difference against the other devices",
+                     median_err_us, st.drift_med_last_us, UNMUTE_ANCHOR_MAX_WAIT_US / 1000000);
+          } else {
+            ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us, anchor %" PRId32 " us), unmuting", median_err_us,
+                     st.drift_med_last_us);
+          }
+        }
       }
     } else {
       st.in_band_chunks = 0;
+      st.unmute_anchor_wait_us = 0;
     }
 
     this->reanchor_after_relock_(st);
@@ -3509,6 +3563,8 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         std::nth_element(msorted, msorted + mn / 2, msorted + mn);
         drift_med_us = msorted[mn / 2];
       }
+      // Carried for the unmute gate at the top of the loop; see UNMUTE_ANCHOR_US.
+      st.drift_med_last_us = drift_med_us;
       if (fill_comparable && st.converged) {
         // SIGN-SYMMETRIC. Drift in either direction is the same defect -- the accounted queue
         // disagrees with the measured chain, so the prediction is wrong by that much and the servo

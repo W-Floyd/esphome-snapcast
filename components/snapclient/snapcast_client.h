@@ -552,6 +552,13 @@ class SnapcastClient {
     int32_t splice_sum{0};
     bool fast_splice_active{false};
     uint32_t fast_splice_frames{0};  // frames spliced in the current episode, for the log
+    // Last computed median of the accounting split, carried so the UNMUTE GATE can see it: the
+    // median is computed further down the loop than the gate, and one chunk of staleness (26 ms)
+    // is nothing against a window that spans ~3.3 s.
+    int32_t drift_med_last_us{INT32_MIN};
+    // When the median-error gate first came good while the anchor test was still failing, so the
+    // wait can be bounded. 0 = not waiting.
+    int64_t unmute_anchor_wait_us{0};
     // Instant of the last accounting repair. A repair STEPS the prediction, so the median error
     // jumps by the size of the split with no audio having moved -- see FAST_SPLICE_REPAIR_HOLDOFF_US.
     int64_t last_repair_us{0};
