@@ -726,6 +726,13 @@ void SnapcastClient::loop() {
       this->player_progress_seen_ = progress;
       this->player_progress_at_us_ = now;
     } else if (this->stream_active_ && this->player_progress_seen_ > 0 &&
+               // AND CHUNKS MUST ACTUALLY BE ARRIVING. Without this the watchdog fires forever
+               // whenever the server's stream goes idle -- a paused Spotify stream had it logging
+               // "no chunk completed for 751 s" at ERROR every 5 s, which is not a wedge, it is
+               // nothing to play. The wedge always has a producer still delivering (the ring was
+               // filling when it was caught), so requiring recent arrivals keeps the real case and
+               // drops the idle one. Same trap PLAN records for diagnosing a silent board.
+               now - this->last_chunk_us_.load(std::memory_order_relaxed) < PLAYER_STALL_US &&
                now - this->player_progress_at_us_ >= PLAYER_STALL_US &&
                now - this->player_stall_log_us_ >= PLAYER_STALL_US) {
       // progress_seen_ > 0 keeps startup quiet: the stream goes active before the pipeline is
