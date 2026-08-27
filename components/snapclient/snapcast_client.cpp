@@ -744,14 +744,21 @@ void SnapcastClient::loop() {
       ESP_LOGE(TAG,
                "PLAYER STALLED: no chunk completed for %" PRId64 " s, phase=%s, ring=%zu bytes, "
                "output_active=%d, heap free=%" PRIu32 " largest=%" PRIu32 " min_ever=%" PRIu32
-               " -- audio is not being written",
+               " records=%u -- audio is not being written",
                (now - this->player_progress_at_us_) / 1000000,
                phase < (sizeof(PHASE_NAMES) / sizeof(PHASE_NAMES[0])) ? PHASE_NAMES[phase] : "?",
                this->pcm_ring_ != nullptr ? this->pcm_ring_->available() : 0,
                this->output_active_.load(std::memory_order_relaxed) ? 1 : 0,
                static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
                static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
-               static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)));
+               static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
+               // THE decisive field. A full ring with an EMPTY queue means PCM nobody has a record
+               // for; a full ring with records waiting means the player is not consuming them, and
+               // those are opposite bugs. Everything so far has been inferred from which of the two
+               // is true, and it was never actually measured.
+               this->record_queue_ != nullptr
+                   ? static_cast<unsigned>(uxQueueMessagesWaiting(this->record_queue_))
+                   : 0u);
     }
   }
 
@@ -2047,6 +2054,10 @@ void SnapcastClient::player_task_() {
       // tens of seconds and any cap short of that reintroduces the teardown.
       if (st.keepalive_params.valid() && this->output_active_.load(std::memory_order_relaxed) &&
           this->is_connected()) {
+        // Stamped separately from the queue wait above it: both are "idle" to a reader, but one is
+        // waiting for work and the other is pushing silence into the pipeline, and a wedge in the
+        // second looks exactly like patience in the first.
+        this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::KEEPALIVE), std::memory_order_relaxed);
         const uint32_t frames = st.keepalive_params.sample_rate / (1000000 / KEEPALIVE_SLICE_US);
         this->push_silence_(frames, st.keepalive_params);
       }
