@@ -47,7 +47,14 @@ metrics (2026-08-27, MLS stimulus, analyser at sd 5.8 µs):
 - **Within a fixed disturbance, nothing measured predicts the displacement.** It is 73 ± 45 µs
   and apparently random.
 
-The leading untested candidate is PADDING, and the prediction is already written in the code at
+**PADDING: TESTED AND REFUTED (2026-08-27).** n=4 forced resyncs, MLS stimulus. Board B accrued
+18369 frames (417 ms) of padding while the net skew moved 18.6 µs; slope +0.0008 against a
+predicted +1.0, r = +0.11. Padding does not displace the output because the repayment path
+(`padding_debt_frames` / `padding_repay_at_us`) already takes it back out — the prediction in
+the code was written as though padding were unaccounted, and that accounting sits a few hundred
+lines above it. `pad=` is a diagnostic, not a displacement term. Recorded at the call site.
+
+The candidate WAS padding, and the prediction was already written in the code at
 `dbg_padded_frames`: "Two devices differing by N frames of padding should sit N * (1e6 / rate)
 µs apart on a logic analyser, which is the prediction to test." 130 µs is 5.7 frames. Padding is
 the only mechanism that moves the output while leaving every internal metric self-consistent,

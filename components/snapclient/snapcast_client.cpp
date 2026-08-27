@@ -3871,6 +3871,24 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                      // audio one frame later while every metric still agrees with itself. Two devices
                      // differing by N frames of padding should sit N * (1e6 / rate) us apart on a
                      // logic analyser, which is the prediction to test.
+                     //
+                     // TESTED 2026-08-27, AND REFUTED. n=4 forced resyncs on one board of a probed
+                     // pair, MLS stimulus, analyser at sd 5.8 us:
+                     //
+                     //     d_pad +3547 frames -> predicted +80432 us, measured   +11.7 us
+                     //     d_pad +5192        -> predicted +117734 us, measured +120.8 us
+                     //     d_pad +4781        -> predicted +108414 us, measured  +45.8 us
+                     //     d_pad +4849        -> predicted +109956 us, measured -159.7 us
+                     //     slope +0.0008 against a predicted +1.0, r = +0.11
+                     //
+                     // Board B accrued 18369 frames (417 ms) of padding across the four; the net
+                     // skew moved +18.6 us. Padding does NOT displace the output, because the
+                     // repayment above (padding_debt_frames / padding_repay_at_us) already takes
+                     // it back out -- the prediction was written as though padding were
+                     // unaccounted, and that accounting exists a few hundred lines up.
+                     //
+                     // So pad= is a diagnostic, not a displacement term. Whatever plants the
+                     // hundreds-of-us offsets, it is not this.
                      measured.dbg_padded_frames);
             // THE SAME COUNTERS ON A LINE SHORT ENOUGH TO SURVIVE. pad= is the last field of the
             // RECON line above, which is long enough that the logger truncates it mid-number --
