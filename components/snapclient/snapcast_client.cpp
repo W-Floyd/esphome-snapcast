@@ -3211,7 +3211,16 @@ static constexpr double RATE_MIN_SAMPLES = 200.0;
 // Reject a window whose residual says it fitted a discontinuity rather than a rate. A clean window
 // sits at ~25 frames; the window that straddled a stream resume read 424. Publishing that as a rate
 // is the "reads as data and is not" failure this file keeps warning about.
-static constexpr double RATE_MAX_SD_FRAMES = 60.0;
+// TIGHTENED from 60 on the first night's windows, which showed the residual is an almost perfect
+// predictor of whether a window can be believed:
+//
+//     sd 3.57 .. 4.68 frames  ->  srv_ppm  -0.27 .. +0.37   (physics: a locked device renders
+//     sd 24.2 .. 28.8 frames  ->  srv_ppm  -8.24 .. -4.70    exactly nominal in SERVER time)
+//
+// A window at sd ~25 is not a noisier estimate of the same quantity, it is 5-8 ppm wrong -- two
+// orders past the 0.04 ppm this reference has to hit. 8 frames sits well above the clean cluster
+// and an order below the dirty one.
+static constexpr double RATE_MAX_SD_FRAMES = 8.0;
 
 void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord &rec) {
   if (rec.params.sample_rate == 0) {
