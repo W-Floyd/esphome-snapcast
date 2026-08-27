@@ -551,6 +551,9 @@ class SnapcastClient {
     int8_t splice_hist[SPLICE_HIST]{};
     size_t splice_hist_idx{0};
     int32_t splice_sum{0};
+    // First instant the standing error was seen above the engage threshold, so a TRANSIENT cannot
+    // arm position correction. See FAST_SPLICE_PERSIST_US. 0 = not currently above it.
+    int64_t fast_splice_seen_us{0};
     bool fast_splice_active{false};
     uint32_t fast_splice_frames{0};  // frames spliced in the current episode, for the log
     // ACHIEVED RATE against server time: incremental least-squares of played_frames_total_ on

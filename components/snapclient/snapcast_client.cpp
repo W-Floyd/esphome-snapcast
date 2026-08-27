@@ -563,6 +563,21 @@ static constexpr uint32_t FAST_SPLICE_MAX_FRAMES = 128;
 // each other. The PI keeps the repair's step, which is what every landing-offset measurement so
 // far was taken with.
 static constexpr int64_t FAST_SPLICE_REPAIR_HOLDOFF_US = 30000000;
+// AND THE ERROR HAS TO PERSIST. Position correction spends real frames, so it must not answer a
+// transient -- and the first thing it did in the field was answer one.
+//
+// Measured 2026-08-27 00:02:33: BOTH boards engaged within 100 ms of each other, at +2733 and
+// +2738 us. Two devices do not independently acquire the same 2.7 ms displacement; that is a
+// COMMON-MODE step, the whole group's deadline moving together, and common-mode error cancels
+// between devices -- it is not skew and needs no correction. Each board spent ~75 frames of real
+// audio on it, and one of them re-engaged 5 s later at -1001 us, which is what the old splice
+// servo's limit cycle looked like.
+//
+// A device cannot tell common-mode from its own displacement (that is the whole invisibility
+// problem), but it can tell TRANSIENT from STANDING, and that is enough: a group deadline step
+// relaxes, while an offset planted by a re-lock does not. Same shape as the repair's
+// DRIFT_REPAIR_HOLD_US, and for the same reason -- act on evidence that held still.
+static constexpr int64_t FAST_SPLICE_PERSIST_US = 4000000;
 
 // UNMUTE ALSO NEEDS THE ANCHOR TO AGREE, not just the median error.
 //
@@ -3164,8 +3179,29 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
 //
 // Diagnostics only, and deliberately so for now: it is logged to be SCORED against the analyser's
 // own rate columns before anything is allowed to steer on it or before it goes in the beacon.
-static constexpr int64_t RATE_WINDOW_US = 30000000;
+// WINDOW LENGTH, MEASURED RATHER THAN CHOSEN. 300 s of raw feedback pairs off board b, refitted
+// offline at several window lengths:
+//
+//     whole capture (312 s)   +49.27 ppm    sd 24.7 frames
+//      30 s windows           sd 41.98 ppm  range  -47.3 .. +109.7
+//      60 s windows           sd  4.35 ppm  range  +51.0 ..  +62.6
+//     120 s windows           sd  2.43 ppm  range  +43.5 ..  +48.4
+//
+// The whole-capture value IS that board's programmed trim (+49..51 ppm on its Trim window lines),
+// so the fit recovers the right answer; the +-100 ppm swings the first version logged were the
+// 30 s window beating against a disturbance of period tens of seconds -- the depth wave this file
+// already documents -- together with the feedback's quantisation (dframes are multiples of 441,
+// one DMA buffer; dt of ~10 ms).
+//
+// 120 s is where it is stable enough to mean something. Note what that costs and what it does not
+// buy: 2.43 ppm is still ~60x the 0.04 ppm the offset integral needs, so this is a usable rate
+// signal and NOT yet an offset reference. Do not publish it as one on the strength of this.
+static constexpr int64_t RATE_WINDOW_US = 120000000;
 static constexpr double RATE_MIN_SAMPLES = 200.0;
+// Reject a window whose residual says it fitted a discontinuity rather than a rate. A clean window
+// sits at ~25 frames; the window that straddled a stream resume read 424. Publishing that as a rate
+// is the "reads as data and is not" failure this file keeps warning about.
+static constexpr double RATE_MAX_SD_FRAMES = 60.0;
 
 void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord &rec) {
   if (rec.params.sample_rate == 0) {
@@ -3226,8 +3262,9 @@ void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord
     const double hz_s = st.rate_server.slope(sd_s) * 1000000.0;
     const double hz_l = st.rate_local.slope(sd_l) * 1000000.0;
     ESP_LOGD(TAG,
-             "ARATE srv_ppm=%+.4f loc_ppm=%+.4f srv_hz=%.4f loc_hz=%.4f n=%.0f span=%.1f s "
+             "ARATE%s srv_ppm=%+.4f loc_ppm=%+.4f srv_hz=%.4f loc_hz=%.4f n=%.0f span=%.1f s "
              "sd_srv=%.2f sd_loc=%.2f frames t=%" PRId64,
+             (sd_s > RATE_MAX_SD_FRAMES || sd_l > RATE_MAX_SD_FRAMES) ? " REJECTED" : "",
              (hz_s / nominal - 1.0) * 1000000.0, (hz_l / nominal - 1.0) * 1000000.0, hz_s, hz_l,
              st.rate_server.n, static_cast<double>(now_us() - st.rate_window_start_us) / 1e6, sd_s, sd_l,
              now_us());
@@ -3267,17 +3304,27 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t median_err_us, uint
         st.fast_splice_active = false;
       } else {
         applied = effective_us > 0 ? 1 : -1;
+        st.fast_splice_seen_us = 0;  // an episode owns the timer; the next arm starts fresh
       }
     } else if (std::abs(effective_us) >= threshold) {
-      st.fast_splice_active = true;
-      st.fast_splice_frames = 0;
-      applied = effective_us > 0 ? 1 : -1;
-      ESP_LOGI(TAG, "Fast splice engaged: %" PRId64 " us standing, correcting by position at one frame "
-                    "(%" PRId64 " us) per chunk t=%" PRId64,
-               effective_us, frame_us, now_us());
+      // Above the threshold, but only ARM once it has stayed there. The timer is cleared the
+      // moment the error drops back, so a transient never accumulates credit toward engaging.
+      if (st.fast_splice_seen_us == 0) {
+        st.fast_splice_seen_us = now_us();
+      } else if (now_us() - st.fast_splice_seen_us >= FAST_SPLICE_PERSIST_US) {
+        st.fast_splice_active = true;
+        st.fast_splice_frames = 0;
+        applied = effective_us > 0 ? 1 : -1;
+        ESP_LOGI(TAG, "Fast splice engaged: %" PRId64 " us standing for %" PRId64
+                      " s, correcting by position at one frame (%" PRId64 " us) per chunk t=%" PRId64,
+                 effective_us, FAST_SPLICE_PERSIST_US / 1000000, frame_us, now_us());
+      }
+    } else {
+      st.fast_splice_seen_us = 0;
     }
   } else {
     st.fast_splice_active = false;
+    st.fast_splice_seen_us = 0;
   }
 
   st.splice_hist[st.splice_hist_idx] = static_cast<int8_t>(applied);
