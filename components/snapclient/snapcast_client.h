@@ -556,6 +556,8 @@ class SnapcastClient {
     int64_t fast_splice_seen_us{0};
     bool fast_splice_active{false};
     uint32_t fast_splice_frames{0};  // frames spliced in the current episode, for the log
+    // How long the record queue has been empty; see the no-record branch in player_task_.
+    int64_t no_record_since_us{0};
     // r_push VALIDITY, counted per report window. r_push = pushed - src_received is the term a
     // frames-based pivot would rest on, and measured over one session it is OUT OF RANGE 31-35% of
     // the time -- stably so (-55817720 frames, i.e. -1265 s, repeating), which is the dangerous

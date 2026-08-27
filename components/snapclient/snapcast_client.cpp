@@ -463,6 +463,11 @@ static constexpr int64_t STALE_BAILOUT_US = 3000000;
 // tonight was 8.5 ms, which sat BELOW the old threshold and was therefore unrepairable however
 // long it persisted. Every offset in the session (8.5, 28, 67, 73, 191, 198 ms) clears 2 ms.
 static constexpr int32_t DRIFT_REPAIR_US = 2000;
+// How long a player-task stall runs before it says so, and how often it repeats. The stalls are
+// legitimate waits -- the record's PCM is guaranteed to arrive, so giving up would be wrong -- but
+// a silent unbounded wait is indistinguishable from a dead task, which is exactly how three wedges
+// today read in the logs. Long enough that ordinary inter-chunk gaps never trip it.
+static constexpr int64_t PUSH_STALL_LOG_US = 3000000;
 // Bound on a believable r_push (pushed - src_received): what is genuinely in flight between our
 // push point and the mixer's source queue is the slice buffer plus a chunk or two. 10000 frames is
 // ~227 ms at 44.1 kHz, several times that, so this refuses only the counter pairs that were
@@ -1943,6 +1948,19 @@ void SnapcastClient::player_task_() {
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
+      // No record. Normal between chunks; a WEDGE if it lasts, and this branch logged nothing at
+      // all, which is why a wedged player task looked identical to a dead one. Throttled, and it
+      // reports the ring so a "no records but a full ring" deadlock -- emit_pcm_ blocked writing
+      // PCM it has not posted a record for, while the player can only drain via records -- is
+      // visible as itself rather than as silence.
+      if (st.no_record_since_us == 0) {
+        st.no_record_since_us = now_us();
+      } else if (now_us() - st.no_record_since_us >= PUSH_STALL_LOG_US) {
+        st.no_record_since_us = now_us();
+        ESP_LOGW(TAG, "player: no chunk records for %" PRId64 " s, ring holds %zu bytes, output_active=%d",
+                 PUSH_STALL_LOG_US / 1000000, this->pcm_ring_->available(),
+                 this->output_active_.load(std::memory_order_relaxed) ? 1 : 0);
+      }
       // No chunk available: keep the downstream pipeline FED rather than idle.
       // The speaker and mixer stop themselves after `timeout` (500 ms default)
       // without data, which tears down and rebuilds their ring buffers -- turning
@@ -4156,10 +4174,24 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
 }
 
 void SnapcastClient::discard_ring_bytes_(size_t bytes) {
+  int64_t starve_since = 0;
   while (bytes > 0 && !this->shutdown_.load(std::memory_order_relaxed)) {
     size_t n = this->pcm_ring_->read(this->slice_buffer_.get(), std::min(bytes, SLICE_BUFFER_SIZE),
                                      pdMS_TO_TICKS(100));
     bytes -= n;
+    // Same silent-unbounded-wait problem as push_chunk_'s read, and the same fix: this is the other
+    // place the player task can disappear into without a word.
+    if (n == 0) {
+      if (starve_since == 0) {
+        starve_since = now_us();
+      } else if (now_us() - starve_since >= PUSH_STALL_LOG_US) {
+        starve_since = now_us();
+        ESP_LOGW(TAG, "discard_ring_bytes_ starved: %zu bytes still to drop, ring holds %zu", bytes,
+                 this->pcm_ring_->available());
+      }
+    } else {
+      starve_since = 0;
+    }
   }
 }
 
@@ -4283,8 +4315,29 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
   while (remaining > 0 && !this->shutdown_.load(std::memory_order_relaxed)) {
     const size_t want = std::min(remaining, SLICE_BUFFER_SIZE);
     size_t got = 0;
+    // UNBOUNDED BY DESIGN -- emit_pcm_ writes a chunk's PCM before posting its record, so a popped
+    // record's bytes are guaranteed present and this loop must not give up on them. But "must not
+    // give up" and "must not say anything" are different things: three wedges today ended with the
+    // player task silent from the disconnect onward, and a silent unbounded wait cannot be told
+    // from a dead task. Say where it is stuck.
+    int64_t starve_since = 0;
     while (got < want && !this->shutdown_.load(std::memory_order_relaxed)) {
-      got += this->pcm_ring_->read(this->slice_buffer_.get() + got, want - got, pdMS_TO_TICKS(100));
+      const size_t n = this->pcm_ring_->read(this->slice_buffer_.get() + got, want - got, pdMS_TO_TICKS(100));
+      got += n;
+      if (n == 0) {
+        if (starve_since == 0) {
+          starve_since = now_us();
+        } else if (now_us() - starve_since >= PUSH_STALL_LOG_US) {
+          starve_since = now_us();
+          ESP_LOGW(TAG,
+                   "push_chunk_ starved: %zu of %zu bytes for this chunk, ring holds %zu, output_active=%d "
+                   "-- the record was posted so the PCM should be here",
+                   got, want, this->pcm_ring_->available(),
+                   this->output_active_.load(std::memory_order_relaxed) ? 1 : 0);
+        }
+      } else {
+        starve_since = 0;
+      }
     }
     remaining -= got;
 
