@@ -725,6 +725,7 @@ void SnapcastClient::set_output_active(bool active) {
     this->played_frames_total_ = 0;
     this->pushed_frames_total_ = 0;
     this->fb_samples_ = 0;
+    this->playout_epoch_.fetch_add(1, std::memory_order_relaxed);
     this->clear_playout_history_();
     this->playout_mutex_.unlock();
   }
@@ -851,6 +852,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // sound premise.
       this->pushed_frames_total_ = this->played_frames_total_ + frames;
       this->fb_samples_ = 0;
+      this->playout_epoch_.fetch_add(1, std::memory_order_relaxed);
       rebaselined = true;
       this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
 #ifdef USE_I2S_RATE_LOCK
@@ -2750,6 +2752,7 @@ void SnapcastClient::player_task_() {
       st.unmute_anchor_wait_us = 0;
     }
 
+    this->accumulate_achieved_rate_(st, rec);
     this->reanchor_after_relock_(st);
 
     this->push_chunk_(rec, drop_frames, !st.converged);
@@ -3139,6 +3142,100 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       ESP_LOGI(TAG, "Pipeline drained (source starvation); re-baselining playout");
       this->dbg_seed_trace_arm_.store(true, std::memory_order_relaxed);
     }
+}
+
+// ACHIEVED RATE AGAINST SERVER TIME. THREAD CONTEXT: player task.
+//
+// The one measurement this whole line of work is missing: a rate reference taken from the PLANT
+// rather than from the controller's own output. Every failed attempt at a rate reference derived it
+// from the servo -- and the trim carries each board's own crystal error, an unknown constant that
+// integrates forever (~540 us per 100 s against a ~7 us floor).
+//
+// The source here is the playout FEEDBACK (frames the speaker says it has rendered, and when),
+// fitted against SERVER time via the shared mapping. Server time is what makes two devices'
+// values comparable: they share it, so differencing their rates gives the term that integrates
+// into wire offset, with no servo state anywhere in the path.
+//
+// Least squares over the whole window, incrementally. Never a two-endpoint baseline: the
+// credit-adjacent timestamps carry ~300 us of jitter, so a 30 s baseline resolves ~+-10 ppm where
+// the spec is 0.04 ppm -- 250x too coarse. The spec comes from the organising fact rather than
+// taste: the offset is the integral of the rate, so a constant error of e ppm costs e us per
+// second, and 0.04 ppm is what keeps a 300 s run inside a ~13 us floor.
+//
+// Diagnostics only, and deliberately so for now: it is logged to be SCORED against the analyser's
+// own rate columns before anything is allowed to steer on it or before it goes in the beacon.
+static constexpr int64_t RATE_WINDOW_US = 30000000;
+static constexpr double RATE_MIN_SAMPLES = 200.0;
+
+void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord &rec) {
+  if (rec.params.sample_rate == 0) {
+    return;
+  }
+  // A seed or a session restart steps the counters, and a fit across that discontinuity is
+  // milliseconds of nonsense the moment anything scales it. Start again rather than straddle it.
+  const uint32_t epoch = this->playout_epoch_.load(std::memory_order_relaxed);
+  if (epoch != st.rate_epoch) {
+    st.rate_epoch = epoch;
+    st.rate_n = st.rate_sx = st.rate_sy = st.rate_sxx = st.rate_sxy = 0.0;
+    st.rate_last_fb_ts = 0;
+    st.rate_window_start_us = 0;
+  }
+
+  this->playout_mutex_.lock();
+  const int64_t played = this->played_frames_total_;
+  const int64_t played_ts = this->played_last_ts_us_;
+  const bool valid = this->playout_valid_;
+  this->playout_mutex_.unlock();
+  if (!valid || played_ts == 0 || played_ts == st.rate_last_fb_ts) {
+    return;  // no feedback yet, or no NEW feedback since the last chunk
+  }
+  st.rate_last_fb_ts = played_ts;
+
+  // Local -> server, through the same shared mapping the deadline uses, so this measures against
+  // the timebase the group actually shares rather than against our own clock.
+  int64_t server_ts = 0;
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+  int64_t shared_offset_us = 0;
+  if (this->tsf_sync_ == nullptr || !this->tsf_sync_->shared_server_offset_us(now_us(), shared_offset_us)) {
+    return;  // no shared mapping: a fit against a provisional timebase measures the timebase
+  }
+  server_ts = played_ts + shared_offset_us;
+#else
+  return;
+#endif
+
+  if (st.rate_n == 0.0) {
+    st.rate_x0 = server_ts;
+    st.rate_y0 = played;
+    st.rate_window_start_us = now_us();
+  }
+  const double x = static_cast<double>(server_ts - st.rate_x0);
+  const double y = static_cast<double>(played - st.rate_y0);
+  st.rate_n += 1.0;
+  st.rate_sx += x;
+  st.rate_sy += y;
+  st.rate_sxx += x * x;
+  st.rate_sxy += x * y;
+
+  if (now_us() - st.rate_window_start_us < RATE_WINDOW_US) {
+    return;
+  }
+  const double denom = st.rate_n * st.rate_sxx - st.rate_sx * st.rate_sx;
+  if (st.rate_n >= RATE_MIN_SAMPLES && denom > 0.0) {
+    // frames per us -> Hz -> ppm against the stream's nominal rate.
+    const double slope = (st.rate_n * st.rate_sxy - st.rate_sx * st.rate_sy) / denom;
+    const double hz = slope * 1000000.0;
+    const double ppm = (hz / static_cast<double>(rec.params.sample_rate) - 1.0) * 1000000.0;
+    // Residual sd of the fit, in frames: the honest error bar. A fit whose residual is large is
+    // reporting the feedback's jitter, not the rate, and saying so is the difference between a
+    // number and data.
+    const double mean_y = st.rate_sy / st.rate_n;
+    const double ss = st.rate_sxx > 0.0 ? (st.rate_sxy - st.rate_sx * mean_y) : 0.0;
+    ESP_LOGD(TAG, "ARATE ppm=%+.4f hz=%.4f n=%.0f span=%.1f s ss=%.3g t=%" PRId64, ppm, hz, st.rate_n,
+             static_cast<double>(now_us() - st.rate_window_start_us) / 1e6, ss, now_us());
+  }
+  st.rate_n = st.rate_sx = st.rate_sy = st.rate_sxx = st.rate_sxy = 0.0;
+  st.rate_window_start_us = now_us();
 }
 
 // THREAD CONTEXT: player task. See FAST_SPLICE_RELEASE_US for the argument.

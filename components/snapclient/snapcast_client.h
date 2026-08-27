@@ -552,6 +552,20 @@ class SnapcastClient {
     int32_t splice_sum{0};
     bool fast_splice_active{false};
     uint32_t fast_splice_frames{0};  // frames spliced in the current episode, for the log
+    // ACHIEVED RATE against server time: incremental least-squares of played_frames_total_ on
+    // server time, in non-overlapping windows. See accumulate_achieved_rate_().
+    //
+    // Least squares over the WHOLE window, never a two-endpoint baseline: credit-adjacent
+    // timestamps carry ~300 us of jitter, so 30 s of baseline resolves only ~+-10 ppm, and the
+    // spec this has to hit is 0.04 ppm (the offset is the integral of the rate, so a constant
+    // error of e ppm costs e us per second of run).
+    double rate_n{0.0}, rate_sx{0.0}, rate_sy{0.0}, rate_sxx{0.0}, rate_sxy{0.0};
+    int64_t rate_x0{0};  // first sample's server time, subtracted to keep the sums conditioned
+    int64_t rate_y0{0};  // first sample's frame count, same reason
+    int64_t rate_last_fb_ts{0};  // feedback timestamp already accumulated; skips duplicates
+    int64_t rate_window_start_us{0};
+    uint32_t rate_epoch{0};  // playout epoch the fit belongs to; a seed invalidates it
+
     // Last computed median of the accounting split, carried so the UNMUTE GATE can see it: the
     // median is computed further down the loop than the gate, and one chunk of staleness (26 ms)
     // is nothing against a window that spans ~3.3 s.
@@ -790,6 +804,10 @@ class SnapcastClient {
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
 
+  /// Accumulates one sample into the achieved-rate fit and reports a completed window.
+  /// THREAD CONTEXT: player task.
+  void accumulate_achieved_rate_(ServoState &st, const ChunkRecord &rec);
+
   /// Fast POSITION correction while converged: one frame per chunk against a standing offset the
   /// rate loop would take ~40 s to integrate away. Returns the frames to splice this chunk
   /// (>0 drop, <0 insert, 0 none). See fast_splice_threshold_us.
@@ -887,6 +905,10 @@ class SnapcastClient {
   /// session" from "the same session re-locked after an excursion" -- which the servo state alone
   /// cannot, since both clear st.converged.
   std::atomic<uint32_t> session_epoch_{0};
+  /// Bumped whenever the playout accounting is re-baselined (a seed, or a fresh session), so any
+  /// fit or integral over the counters can tell "my window straddles a discontinuity" from "my
+  /// window is fine". r_push has been measured at -180 s of span across one of these.
+  std::atomic<uint32_t> playout_epoch_{0};
   std::atomic<uint8_t> phase_mode_{static_cast<uint8_t>(PhaseMode::NONE)};
 
   // Server settings shadow used by the tasks (buffer_ms/latency for deadlines).
