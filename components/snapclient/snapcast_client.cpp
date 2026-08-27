@@ -2042,6 +2042,33 @@ void SnapcastClient::player_task_() {
     ChunkRecord rec;
     this->player_iters_.fetch_add(1, std::memory_order_relaxed);
     this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::IDLE), std::memory_order_relaxed);
+    // MUTEX PROBE. The player blocks somewhere between this stamp and the next one, with records
+    // waiting and iters going 2565 -> 0: it spins through paths that need nothing, then stops dead
+    // on the first that does. The seqlock depth reader is bounded by construction (4 tries, then
+    // failure), so the remaining shared resource on that stretch is playout_mutex_ -- which the
+    // SPEAKER CALLBACK also takes, and which stays locked forever if that task is deleted inside
+    // notify_audio_played. Probing it here, before the servo has any reason to want it, turns
+    // "blocked somewhere" into a named answer.
+    if (!this->playout_mutex_.try_lock()) {
+      const int64_t probe_start = now_us();
+      bool got = false;
+      while (now_us() - probe_start < 2000000) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        if (this->playout_mutex_.try_lock()) {
+          got = true;
+          break;
+        }
+      }
+      if (!got) {
+        ESP_LOGE(TAG, "playout_mutex_ HELD BY SOMEONE ELSE for >2 s -- the player is about to block on it "
+                      "(this is the wedge; the holder is a task that died mid-section) t=%" PRId64,
+                 now_us());
+      } else {
+        this->playout_mutex_.unlock();
+      }
+    } else {
+      this->playout_mutex_.unlock();
+    }
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
       // No record. Normal between chunks; a WEDGE if it lasts, and this branch logged nothing at
       // all, which is why a wedged player task looked identical to a dead one. Throttled, and it
