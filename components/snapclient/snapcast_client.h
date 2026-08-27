@@ -556,6 +556,14 @@ class SnapcastClient {
     int64_t fast_splice_seen_us{0};
     bool fast_splice_active{false};
     uint32_t fast_splice_frames{0};  // frames spliced in the current episode, for the log
+    // r_push VALIDITY, counted per report window. r_push = pushed - src_received is the term a
+    // frames-based pivot would rest on, and measured over one session it is OUT OF RANGE 31-35% of
+    // the time -- stably so (-55817720 frames, i.e. -1265 s, repeating), which is the dangerous
+    // kind: a counter pair that does not share an origin after a pipeline restart, reading like
+    // data. Counted so the fraction is visible BEFORE anything is built on it.
+    uint32_t rpush_samples{0};
+    uint32_t rpush_bad{0};
+    int64_t rpush_log_us{0};
     // ACHIEVED RATE against server time: incremental least-squares of played_frames_total_ on
     // server time, in non-overlapping windows. See accumulate_achieved_rate_().
     //

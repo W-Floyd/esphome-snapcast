@@ -463,6 +463,14 @@ static constexpr int64_t STALE_BAILOUT_US = 3000000;
 // tonight was 8.5 ms, which sat BELOW the old threshold and was therefore unrepairable however
 // long it persisted. Every offset in the session (8.5, 28, 67, 73, 191, 198 ms) clears 2 ms.
 static constexpr int32_t DRIFT_REPAIR_US = 2000;
+// Bound on a believable r_push (pushed - src_received): what is genuinely in flight between our
+// push point and the mixer's source queue is the slice buffer plus a chunk or two. 10000 frames is
+// ~227 ms at 44.1 kHz, several times that, so this refuses only the counter pairs that were
+// re-zeroed independently -- which is a third of all samples, measured.
+static constexpr int64_t RPUSH_VALID_FRAMES = 10000;
+// How often to publish the validity fraction. Not per chunk: the number is a property of a window,
+// and the point is to make an input's trustworthiness visible, not to add traffic.
+static constexpr int64_t RPUSH_LOG_INTERVAL_US = 10000000;
 // Chunk divisor for the drift distribution sampling (see the sampler in the player loop).
 static constexpr uint32_t DRIFT_SAMPLE_EVERY_CHUNKS = 4;
 // A real split is STEADY: the original was observed rock-steady at +50.7 ms for 18
@@ -2777,6 +2785,14 @@ void SnapcastClient::player_task_() {
       st.unmute_anchor_wait_us = 0;
     }
 
+    if (st.rpush_samples > 0 && now_us() - st.rpush_log_us >= RPUSH_LOG_INTERVAL_US) {
+      st.rpush_log_us = now_us();
+      ESP_LOGD(TAG, "RPUSH n=%" PRIu32 " bad=%" PRIu32 " (%.1f%%) t=%" PRId64, st.rpush_samples, st.rpush_bad,
+               100.0f * static_cast<float>(st.rpush_bad) / static_cast<float>(st.rpush_samples), now_us());
+      st.rpush_samples = 0;
+      st.rpush_bad = 0;
+    }
+
     this->accumulate_achieved_rate_(st, rec);
     this->reanchor_after_relock_(st);
 
@@ -2885,6 +2901,16 @@ void SnapcastClient::player_task_() {
           } else {
             st.drift_min_us = std::min(st.drift_min_us, d);
             st.drift_max_us = std::max(st.drift_max_us, d);
+          }
+          // r_push validity, on the same samples. In range means the two counters share an
+          // origin: pushed leads src_received by what is genuinely in flight, which is bounded by
+          // the slice buffer and a chunk or two. Anything outside is a counter pair that was
+          // re-zeroed independently, and no arithmetic on it means anything.
+          const int64_t r_push = static_cast<int64_t>(this->pushed_frames_total_) -
+                                 static_cast<int64_t>(d_meas.dbg_src_received);
+          st.rpush_samples++;
+          if (r_push < -RPUSH_VALID_FRAMES || r_push > RPUSH_VALID_FRAMES) {
+            st.rpush_bad++;
           }
           st.drift_window_us[st.drift_window_idx] = d;
           st.drift_window_idx = (st.drift_window_idx + 1) % ServoState::DRIFT_WINDOW;
@@ -3221,6 +3247,7 @@ static constexpr double RATE_MIN_SAMPLES = 200.0;
 // orders past the 0.04 ppm this reference has to hit. 8 frames sits well above the clean cluster
 // and an order below the dirty one.
 static constexpr double RATE_MAX_SD_FRAMES = 8.0;
+
 
 void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord &rec) {
   if (rec.params.sample_rate == 0) {
