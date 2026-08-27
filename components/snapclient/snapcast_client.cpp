@@ -4259,6 +4259,22 @@ int64_t SnapcastClient::predict_next_play_us_(uint32_t sample_rate) {
   int64_t predicted = -1;
   if (this->playout_valid_) {
     const double nominal_slope = 1e6 / static_cast<double>(sample_rate);
+    // REVERTED, MEASURED: predicting with the REALISED slope (nominal / (1 + applied_ppm)) instead
+    // of the nominal one. The arithmetic argument was sound -- the pivot lags ~141,000 frames and
+    // crossing that lever with the wrong slope is the 3.15 us/ppm bias -- and the prediction really
+    // was more exact. It still destabilised the loop, within two minutes on hardware:
+    //
+    //     trim  a  ~50-65 ppm -> +164.9 ppm      median  a  +-20 us -> oscillating
+    //     trim  b  ~50 ppm    -> +23 / +72 ppm   median  b  -103, -107, +47 us
+    //
+    // Why: the nominal slope's INSENSITIVITY TO TRIM was load-bearing. It kept the controller's
+    // own output out of its error signal except through the feedback pivot, which is slow. Making
+    // `predicted` depend instantly on applied_ppm adds direct feedthrough from the controller to
+    // the error it is measuring, and against the 31-chunk median's ~0.4 s lag that oscillates.
+    //
+    // The term is still worth removing -- it is ~70% of the differential floor -- but as the
+    // frames-based comparison step 4 actually specifies, with KP and KI re-derived for the loop
+    // that results. Not as a slope swap into a loop tuned around the old plant.
     if (this->fb_samples_ >= 8) {
       // Smoothed pivot + exact nominal slope: averages away feedback quantization
       // without a fitted slope's lever-arm instability (see notify_audio_played)
