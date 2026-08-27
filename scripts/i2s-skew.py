@@ -90,6 +90,11 @@ MIN_PCM_COEF = 0.5      # decoded-PCM correlation below this is not a frame matc
 # A peak at least this fraction of the tallest is treated as tied with it, so continuity
 # with the previous capture decides between them rather than noise.
 RIVAL_MARGIN = 0.92
+# How far the best correlation peak must beat the runner-up before the row is a measurement at
+# all. See the gate below for the measurement this is drawn from; it is a MARGIN rather than an
+# absolute coefficient because the spurious matches carry coef 0.984 against the true match's
+# 0.985 -- indistinguishable on coefficient, obvious on margin.
+MIN_RIVAL_MARGIN = 0.05
 MIN_FRAMES = 200        # fewer frames than this in a capture is not worth fitting
 
 
@@ -2815,6 +2820,13 @@ def main():
     # count and a bad one propagates until something knocks it out.
     ref_hist = collections.deque(maxlen=REF_WINDOW)
     consec_reject = 0
+    # Recent ACCEPTED frame counts. `prefer` is fed to frame_lag(), where a peak within
+    # RIVAL_MARGIN of the best is treated as tied and the one nearest `prefer` wins -- so this
+    # is what actually decides the frame count when the correlation cannot, and the frame count
+    # decides which frames get PAIRED. A wrong k does not shift the answer after the fact; it
+    # pairs the wrong frames and the measurement is wrong by a whole frame by construction.
+    # Hence a median here too, for the same reason as ref_hist.
+    lag_hist = collections.deque(maxlen=REF_WINDOW)
     ppm_series = []          # (elapsed, ppm) so the per-capture slope can be plotted
     # Start from the primed offsets so the first in-loop poll reads only new bytes.
     events, log_off, last_plot = [], primed_offsets, 0.0
@@ -3008,15 +3020,44 @@ def main():
             if math.isfinite(off):
                 if prefer is not None and abs(k - prefer) > args.max_jump_frames:
                     if pending is not None and abs(k - pending) <= 4:
-                        prefer, pending = k, None      # confirmed twice: a real resync
+                        lag_hist.clear()               # confirmed twice: a real resync
+                        lag_hist.append(k)
+                        prefer, pending = k, None
                     else:
                         pending = k
                         reason = (f"frame lag jumped {k - prefer:+d} frames -- ambiguous "
                                   f"match or resync; held until the next capture agrees")
                         off, ppm = float("nan"), float("nan")
                 else:
-                    prefer, pending = k, None
-            if prefer is None and info.get("rival", 0) > RIVAL_MARGIN:
+                    # MEDIAN of recent accepted lags, not the last one. Measured 2026-08-27:
+                    # with prefer = last k, the reported offset sat on plateaus that stepped by
+                    # whole frames -- lag flipped between 12 and 13 while the true skew held
+                    # still, and each flip re-paired the frames and moved the answer 22.68 us.
+                    # A tie broken toward one recent outlier propagates, because that outlier
+                    # then becomes the tie-breaker for the next capture.
+                    lag_hist.append(k)
+                    pending = None
+                    prefer = int(sorted(lag_hist)[len(lag_hist) // 2])
+            # RIVAL MARGIN, CHECKED ON EVERY ROW. This used to be gated on `prefer is None`, so
+            # once a run had a preferred lag it never rejected on rival grounds again -- and that
+            # is exactly when it matters, because by then the ambiguity shows up as a lag that
+            # flips between two near-equal peaks rather than as a failure to lock at all.
+            #
+            # Measured 2026-08-27 over 6000 rows, splitting on the known-true branch (~270 us)
+            # against the spurious near-zero one:
+            #
+            #   good branch  coef 0.985  rival 0.884  margin +0.102 median
+            #   near-zero    coef 0.984  rival 0.988  margin -0.004 median
+            #
+            # On the bad rows the RUNNER-UP IS STRONGER THAN THE PICK. coef alone cannot see it
+            # (0.984 vs 0.985), which is why this is a margin test and not a coefficient test.
+            # A 0.05 margin keeps 66% of good rows and none of the bad; at ~45 rows/s, throwing
+            # away a third of the good ones to eliminate the branch entirely is a cheap trade.
+            if math.isfinite(off) and (coef - info.get("rival", 0.0)) < MIN_RIVAL_MARGIN:
+                reason = (f"ambiguous frame match: peak {coef:.3f} vs rival "
+                          f"{info.get('rival', 0.0):.3f} -- runner-up too close to call")
+                off, ppm = float("nan"), float("nan")
+            elif prefer is None and info.get("rival", 0) > RIVAL_MARGIN:
                 reason = reason or f"ambiguous frame match (rival {info['rival']:.2f})"
 
             # ONLY A VALUE THAT SURVIVED EVERY GATE EARNS THE RIGHT TO ANCHOR THE NEXT BLOCK.
