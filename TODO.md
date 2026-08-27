@@ -47,6 +47,34 @@ metrics (2026-08-27, MLS stimulus, analyser at sd 5.8 µs):
 - **Within a fixed disturbance, nothing measured predicts the displacement.** It is 73 ± 45 µs
   and apparently random.
 
+**RUNBOOK — the accounting error is the target, and it is measurable.** The devices' render
+phase is derived from `(pushed - played)`, so it inherits the very error it would need to
+correct (the code says so at that site). The defect is therefore:
+
+    accounting_error = measured_skew (logic analyser)  -  (render_phase_B - render_phase_A)
+
+Measured 2026-08-27 over 54318 paired rows: truth −27.2 µs (MAD 1.7), belief −1.0 µs (MAD 15.0),
+error −25.9 µs. The devices believe they are aligned while 27 µs apart, and reality is NINE
+TIMES more stable than their estimate of it. Everything else chased this month has been a proxy
+for this number.
+
+To continue:
+
+    python3 scripts/accounting-error.py a.log b.log test.csv --tail 600000 --out acct-err.csv
+    python3 scripts/skew-regress.py --minutes 240        # differenced corrs + placebo control
+
+Regress the error against the published accounting terms (`pushed`, `played`, `clamped`, `pad`,
+`queued`, `xfer`, `own`). A term that tracks it is the bug; if none do, the error is in
+something the firmware does not publish, which says what to instrument next. Exclude rows where
+either board has just reseeded — the absolute phase pair is meaningless there and those
+excursions are ~500 ms, not µs (`|believed| < 2000` dropped 4%).
+
+Bench state: both boards in their own snapserver group `4eb19e5e` on the `MLS44` stream (an
+MLS stimulus, added at runtime via `Stream.AddStream`, file source, loops); other speakers
+untouched on Spotify; `scratchpad/group-orig.json` restores the original grouping. MLS matters:
+on music the analyser cannot resolve this at all. `timing_diagnostics: true` is still set in
+`example/snapclient-base.yaml`.
+
 **THE PAIR IS ALIGNED TO SUB-MICROSECOND WHEN QUIET.** Per-frame skew (`--dump-skew`, ~44100
 rows/s) across a forced resync, 2026-08-27:
 
