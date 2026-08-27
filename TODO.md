@@ -47,6 +47,27 @@ metrics (2026-08-27, MLS stimulus, analyser at sd 5.8 µs):
 - **Within a fixed disturbance, nothing measured predicts the displacement.** It is 73 ± 45 µs
   and apparently random.
 
+**THE ACCOUNTING ERROR RATCHETS: ~8.5 µs PER RESYNC, ALWAYS THE SAME DIRECTION.** n=10 forced
+resyncs, 2026-08-27, MLS stimulus:
+
+    d_err: +2.9 +9.7 +7.4 +31.0 +58.6 +14.5 +7.4 +7.2 +12.0 +6.6   -- ALL POSITIVE
+    excluding two outliers: +8.5 ± 3.3 µs per resync
+    standing error over the campaign: −28.1 → +191.8 µs
+
+Ten of ten with the same sign is p ≈ 0.002 by chance, so this is a systematic bias the resync
+path injects, not noise the devices fail to track. It never self-corrects, so it accumulates
+without bound: ~85 µs per 10 resyncs, ~850 µs per 100.
+
+That is the defect, and it is a different shape from everything chased before it. The question
+is no longer "what plants a random displacement" — the displacement IS tracked by the render
+delta, with a residual that is constant in µs rather than proportional. The question is what
+adds a fixed positive quantity to the accounting on every resync.
+
+CAVEAT: measured with the leader on a different snapcast stream, i.e. outside render_delta's own
+contract. Stream-scoped leadership (committed) enforces it; re-measure before trusting the
+magnitude. The prediction to test is that the residual falls below 9 µs once the group shares a
+stream — and if the ratchet survives that, it is real.
+
 **RUNBOOK — the accounting error is the target, and it is measurable.** The devices' render
 phase is derived from `(pushed - played)`, so it inherits the very error it would need to
 correct (the code says so at that site). The defect is therefore:
