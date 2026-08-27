@@ -10,11 +10,10 @@ with synthetic frames.
 """
 
 import importlib.util
+import random
 import os
 import sys
 import types
-
-import numpy as np
 
 # Stub the sigrokdecode module the decoder imports. Only the pieces it touches are needed.
 srd = types.ModuleType("sigrokdecode")
@@ -45,12 +44,13 @@ FRAME = RATE / 44100  # samples per audio frame
 
 def build(lag_frames, skew_us, n=512, seed=0):
     """Two buses playing the same audio, B lagging A by `lag_frames` and skewed by `skew_us`."""
-    rng = np.random.default_rng(seed)
-    audio = rng.normal(0, 1000, n + abs(lag_frames) + 8)
+    rng = random.Random(seed)
+    audio = [rng.gauss(0, 1000) for _ in range(n + abs(lag_frames) + 8)]
     dec = pd.Decoder()
     dec.emitted = []
     dec.samplerate = RATE
-    dec.options = {"bits": 8, "bit_delay": 1, "win_frames": n, "min_margin": 0.05}
+    dec.options = {"bits": 8, "bit_delay": 1, "win_frames": n, "min_margin": 0.05,
+                   "max_lag": 64}
     dec.out_ann = 0
     dec.start()
     skew_samples = skew_us * 1e-6 * RATE
@@ -98,7 +98,8 @@ results = [
 # A window with no shared content must be refused, not answered: this is the failure that
 # produced +3187 us for a known -5000 us offset in the offline analyser.
 dec = build(0, 0.0)
-dec.state_b["pcm"] = list(np.random.default_rng(99).normal(0, 1000, len(dec.state_b["pcm"])))
+_r99 = random.Random(99)
+dec.state_b["pcm"] = [_r99.gauss(0, 1000) for _ in dec.state_b["pcm"]]
 dec.emitted = []
 dec.report_window()
 uncorrelated_ok = not [e for e in dec.emitted if e[2] == 0]

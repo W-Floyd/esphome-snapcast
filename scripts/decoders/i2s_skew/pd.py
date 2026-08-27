@@ -17,8 +17,15 @@ publishes the peak AND the runner-up, and refuses to annotate a skew when they a
 to separate -- a gap in the annotation row is information, a plausible number is not.
 """
 
-import numpy as np
 import sigrokdecode as srd
+
+# NO THIRD-PARTY IMPORTS, DELIBERATELY. libsigrokdecode embeds its own interpreter, and a decoder
+# that imports something that interpreter lacks does not report a useful error -- it simply fails
+# to load and never appears in PulseView's list, which is exactly how this one presented.
+#
+# numpy would buy nothing worth that risk: measured on this window size, the bounded correlation
+# takes 2.38 ms in pure Python against 0.11 ms with numpy, and the window covers 11.6 ms of audio.
+# A fifth of real time is ample, and one code path is one code path to test.
 
 
 class Decoder(srd.Decoder):
@@ -52,6 +59,12 @@ class Decoder(srd.Decoder):
         # Adjacent frames correlate at ~0.997, so an ambiguous match is the normal failure and
         # it produces a whole-frame error, not a small one.
         {"id": "min_margin", "desc": "Min peak margin (0-1)", "default": 0.05},
+        # Bounding the lag search does two jobs. It cuts the pure-Python correlation from O(n^2)
+        # to O(n * lags) -- 512x129 instead of 512x1023 -- and it refuses matches at physically
+        # implausible offsets, which is the mis-lock that produced +3187 us for a known -5000 us
+        # offset in the offline analyser. 64 frames is 1.45 ms; raise it only if the boards are
+        # genuinely expected further apart than that.
+        {"id": "max_lag", "desc": "Max lag searched (frames)", "default": 64},
     )
 
     annotations = (
@@ -91,6 +104,7 @@ class Decoder(srd.Decoder):
         self.delay = int(self.options["bit_delay"])
         self.win_frames = int(self.options["win_frames"])
         self.min_margin = float(self.options["min_margin"])
+        self.max_lag = int(self.options["max_lag"])
 
     # ---- decoding -------------------------------------------------------------------
 
@@ -133,27 +147,45 @@ class Decoder(srd.Decoder):
             bus["seen"] = 0
 
         while True:
-            pins = self.wait([{0: "r"}, {1: "e"}, {3: "r"}, {4: "e"}])
-            din_a, din_b = pins[2], pins[5]
-            m = self.matched_flags()
+            # ONLY WAIT ON EDGES THAT ARE STILL WANTED. This is the difference between running
+            # slower than real time and faster than it.
+            #
+            # BCLK is 2.82 MHz, so watching every BCLK edge on both buses is ~5.6M wait() returns
+            # per second of capture, each a Python iteration -- seconds of CPU per second of audio.
+            # But only the first `bit_delay + bits` edges of each slot carry anything this decoder
+            # reads; the remaining ~56 are dead weight. Once a slot is done, its bus drops its BCLK
+            # condition and waits for WS alone, so the loop wakes ~10 times per frame per bus
+            # instead of ~64. Decoding fewer bits shrinks the work per wake; this shrinks the
+            # number of wakes, which is where the time actually goes.
+            conds, tags = [], []
+            if self.state_a["counting"]:
+                conds.append({0: "r"})
+                tags.append(("bclk", self.state_a, 2))
+            conds.append({1: "e"})
+            tags.append(("ws", self.state_a, None))
+            if self.state_b["counting"]:
+                conds.append({3: "r"})
+                tags.append(("bclk", self.state_b, 5))
+            conds.append({4: "e"})
+            tags.append(("ws", self.state_b, None))
 
-            # WS first: a frame boundary closes the slot in progress, and on the rare sample
-            # where both a WS and a BCLK edge land together the boundary is what matters.
-            if m[1]:
-                self._on_ws_edge(self.state_a, self.samplenum)
-            elif m[0]:
-                self._on_bclk_edge(self.state_a, din_a)
-
-            if m[3]:
-                self._on_ws_edge(self.state_b, self.samplenum)
-            elif m[2]:
-                self._on_bclk_edge(self.state_b, din_b)
+            pins = self.wait(conds)
+            m = self.matched_flags(len(conds))
+            # WS is handled after BCLK for the same bus is ruled out: a frame boundary closes the
+            # slot in progress, and if both land on one sample the boundary is what matters.
+            for i, (kind, bus, din_idx) in enumerate(tags):
+                if not m[i]:
+                    continue
+                if kind == "ws":
+                    self._on_ws_edge(bus, self.samplenum)
+                else:
+                    self._on_bclk_edge(bus, pins[din_idx])
 
             if (len(self.state_a["pcm"]) >= self.win_frames
                     and len(self.state_b["pcm"]) >= self.win_frames):
                 self.report_window()
 
-    def matched_flags(self):
+    def matched_flags(self, count):
         """Which wait() conditions fired, as a list of bools.
 
         libsigrokdecode exposes this as a tuple of bools in current releases and as an integer
@@ -163,43 +195,64 @@ class Decoder(srd.Decoder):
         """
         matched = self.matched
         if isinstance(matched, int):
-            return [bool(matched & (1 << i)) for i in range(4)]
+            return [bool(matched & (1 << i)) for i in range(count)]
         return list(matched)
 
     # ---- measurement ----------------------------------------------------------------
 
+    def _corr_full(self, a, b):
+        """Normalised full cross-correlation, returned as (values, index_of_zero_lag).
+
+        Pure Python, and bounded to +-max_lag: that turns O(n^2) into O(n * lags) and keeps a
+        window inside a fifth of real time without a third-party import.
+        """
+        n = len(a)
+        ma, mb = sum(a) / n, sum(b) / n
+        an = [x - ma for x in a]
+        bn = [x - mb for x in b]
+        na = sum(x * x for x in an) ** 0.5
+        nb = sum(x * x for x in bn) ** 0.5
+        if na == 0 or nb == 0:
+            return None, 0
+        lags = min(self.max_lag, n - 1)
+        out = []
+        for k in range(-lags, lags + 1):
+            s = 0.0
+            for i in range(n):
+                j = i - k
+                if 0 <= j < n:
+                    s += an[i] * bn[j]
+            out.append(s / (na * nb))
+        return out, lags
+
     def report_window(self):
-        a = np.asarray(self.state_a["pcm"][: self.win_frames], dtype=np.float64)
-        b = np.asarray(self.state_b["pcm"][: self.win_frames], dtype=np.float64)
+        a = self.state_a["pcm"][: self.win_frames]
+        b = self.state_b["pcm"][: self.win_frames]
         ta = self.state_a["ws_times"][: self.win_frames]
         tb = self.state_b["ws_times"][: self.win_frames]
         start_s, end_s = ta[0], ta[-1]
 
-        an = a - a.mean()
-        bn = b - b.mean()
-        na, nb = np.linalg.norm(an), np.linalg.norm(bn)
-        if na == 0 or nb == 0:
+        corr, zero_idx = self._corr_full(a, b)
+        if corr is None:
             self.put(start_s, end_s, self.out_ann,
                      [2, ["silent window -- nothing to correlate", "silent"]])
             self.flush_window()
             return
 
-        corr = np.correlate(an, bn, mode="full") / (na * nb)
-        peak = int(np.argmax(np.abs(corr)))
-        best = float(abs(corr[peak]))
-        # np.correlate(a, b, "full") puts zero lag at index len(b)-1 and INCREASES the index as
-        # b is shifted EARLIER, so the lag in the sense used here -- how many frames B trails A --
-        # is the negative of the usual expression. Verified against synthetic frames with known
-        # lags in test_pd.py; the first version had this inverted, which mirrored every reported
-        # skew about its sub-frame part and would have looked like a plausible answer.
-        lag = (len(bn) - 1) - peak   # a[i] matches b[i + lag]
+        peak = max(range(len(corr)), key=lambda i: abs(corr[i]))
+        best = abs(corr[peak])
+        # Zero lag sits at index `zero_idx` and the index INCREASES as b shifts EARLIER, so the
+        # lag in the sense used here -- how many frames B trails A -- is zero_idx minus the peak,
+        # not the other way round. Verified against synthetic frames with known lags in
+        # test_pd.py; the first version had this inverted, which mirrored every reported skew
+        # about its sub-frame part and looked entirely plausible.
+        lag = zero_idx - peak   # a[i] matches b[i + lag]
 
         # Runner-up OUTSIDE the peak's immediate neighbours: adjacent lags are correlated by
         # construction, so a neighbour being high is expected and says nothing about ambiguity.
-        mask = np.ones(corr.size, dtype=bool)
-        lo, hi = max(0, peak - 2), min(corr.size, peak + 3)
-        mask[lo:hi] = False
-        rival = float(np.max(np.abs(corr[mask]))) if mask.any() else 0.0
+        lo, hi = max(0, peak - 2), min(len(corr), peak + 3)
+        others = [abs(corr[i]) for i in range(len(corr)) if not (lo <= i < hi)]
+        rival = max(others) if others else 0.0
         margin = best - rival
 
         if margin < self.min_margin:
@@ -223,8 +276,10 @@ class Decoder(srd.Decoder):
             self.flush_window()
             return
 
-        skew_us = (float(np.mean(deltas)) / self.samplerate) * 1e6
-        spread_us = (float(np.std(deltas)) / self.samplerate) * 1e6
+        mean_d = sum(deltas) / len(deltas)
+        var_d = sum((d - mean_d) ** 2 for d in deltas) / len(deltas)
+        skew_us = (mean_d / self.samplerate) * 1e6
+        spread_us = ((var_d ** 0.5) / self.samplerate) * 1e6
         self.put(start_s, end_s, self.out_ann,
                  [0, [f"{skew_us:+.2f} us  (lag {lag:+d} frames, {len(deltas)} pairs)",
                       f"{skew_us:+.2f}us"]])
