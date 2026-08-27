@@ -2787,10 +2787,15 @@ void SnapcastClient::player_task_() {
 
     if (st.rpush_samples > 0 && now_us() - st.rpush_log_us >= RPUSH_LOG_INTERVAL_US) {
       st.rpush_log_us = now_us();
-      ESP_LOGD(TAG, "RPUSH n=%" PRIu32 " bad=%" PRIu32 " (%.1f%%) t=%" PRId64, st.rpush_samples, st.rpush_bad,
-               100.0f * static_cast<float>(st.rpush_bad) / static_cast<float>(st.rpush_samples), now_us());
+      // Both counts, so the re-basing can be SHOWN to fix it rather than assumed to: raw is what a
+      // frames-based pivot would have consumed, rebased is what it will consume.
+      ESP_LOGD(TAG, "RPUSH n=%" PRIu32 " bad_raw=%" PRIu32 " (%.1f%%) bad_rebased=%" PRIu32 " (%.1f%%) t=%" PRId64,
+               st.rpush_samples, st.rpush_bad,
+               100.0f * static_cast<float>(st.rpush_bad) / static_cast<float>(st.rpush_samples), st.rpush_bad_reb,
+               100.0f * static_cast<float>(st.rpush_bad_reb) / static_cast<float>(st.rpush_samples), now_us());
       st.rpush_samples = 0;
       st.rpush_bad = 0;
+      st.rpush_bad_reb = 0;
     }
 
     this->accumulate_achieved_rate_(st, rec);
@@ -2906,11 +2911,23 @@ void SnapcastClient::player_task_() {
           // origin: pushed leads src_received by what is genuinely in flight, which is bounded by
           // the slice buffer and a chunk or two. Anything outside is a counter pair that was
           // re-zeroed independently, and no arithmetic on it means anything.
-          const int64_t r_push = static_cast<int64_t>(this->pushed_frames_total_) -
-                                 static_cast<int64_t>(d_meas.dbg_src_received);
+          const int64_t pushed_now = static_cast<int64_t>(this->pushed_frames_total_);
+          const int64_t src_now = static_cast<int64_t>(d_meas.dbg_src_received);
+          const int64_t r_push = pushed_now - src_now;
+          const uint32_t p_epoch = this->playout_epoch_.load(std::memory_order_relaxed);
+          if (!st.rpush_base_valid || p_epoch != st.rpush_epoch) {
+            st.rpush_epoch = p_epoch;
+            st.rpush_base_pushed = pushed_now;
+            st.rpush_base_src = src_now;
+            st.rpush_base_valid = true;
+          }
+          const int64_t r_push_reb = (pushed_now - st.rpush_base_pushed) - (src_now - st.rpush_base_src);
           st.rpush_samples++;
           if (r_push < -RPUSH_VALID_FRAMES || r_push > RPUSH_VALID_FRAMES) {
             st.rpush_bad++;
+          }
+          if (r_push_reb < -RPUSH_VALID_FRAMES || r_push_reb > RPUSH_VALID_FRAMES) {
+            st.rpush_bad_reb++;
           }
           st.drift_window_us[st.drift_window_idx] = d;
           st.drift_window_idx = (st.drift_window_idx + 1) % ServoState::DRIFT_WINDOW;

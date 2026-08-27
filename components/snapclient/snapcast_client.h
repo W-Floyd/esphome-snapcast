@@ -562,8 +562,19 @@ class SnapcastClient {
     // kind: a counter pair that does not share an origin after a pipeline restart, reading like
     // data. Counted so the fraction is visible BEFORE anything is built on it.
     uint32_t rpush_samples{0};
-    uint32_t rpush_bad{0};
+    uint32_t rpush_bad{0};      // raw pushed - src_received out of range
+    uint32_t rpush_bad_reb{0};  // and after re-basing, which is the fix being verified
     int64_t rpush_log_us{0};
+    // EPOCH ORIGIN for r_push. Our pushed counter restarts at zero on a pipeline restart while the
+    // mixer's src_received keeps counting from its own start, so their raw difference is
+    // meaningless until the mixer happens to restart too -- measured as stable garbage for minutes
+    // to hours (05:47 -> 07:57 in one case). Differencing both against their values at the first
+    // sample of the epoch gives them a common origin, which is all conservation needs: the
+    // quantity that must hold still is the CHANGE in what is in flight, not its absolute value.
+    int64_t rpush_base_pushed{0};
+    int64_t rpush_base_src{0};
+    bool rpush_base_valid{false};
+    uint32_t rpush_epoch{0};
     // ACHIEVED RATE against server time: incremental least-squares of played_frames_total_ on
     // server time, in non-overlapping windows. See accumulate_achieved_rate_().
     //
