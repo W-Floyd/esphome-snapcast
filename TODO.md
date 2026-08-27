@@ -31,6 +31,34 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**THE FIRMWARE CANNOT SEE A SUB-MILLISECOND PIPELINE DIFFERENCE, BY CONSTRUCTION.** Every latency
+component it knows is a NOMINAL, MILLISECOND-QUANTISED figure, and both boards report the same
+ones — measured 2026-08-27 over a quiet window, medians in µs:
+
+    xfer 20000   own 89728   sink_audio 120000   sink_lat 120000   down_audio 140000   pending 140000
+    B - A:    0        0            0                 0                 0                 0
+
+So two boards sitting 270 µs apart both report clean sync with medians of a few µs, and no
+internal instrument can contradict them. The mechanism is already named in the code, at the
+starvation clamp in `snapcast_client.cpp`: the framework "restarts it with an unpredictable
+buffer fill level between this feedback point and the DAC -- invisible to the accounting, so
+playback would settle audibly offset with clean-looking sync reports". That comment was written
+for the ~100-250 ms case and a re-baseline handles it; the sub-millisecond residual of the same
+mechanism is never measured and never corrected.
+
+Consequences worth keeping in mind before proposing a fix:
+
+- The sub-frame part is NOT the problem. The servo holds it to ~2 µs. The whole error is a
+  constant displacement chosen when the pipeline starts.
+- `server_latency` cannot correct it: it is integer MILLISECONDS (`Client.SetLatency`).
+- `inject_split` cannot either: it perturbs the accounting, which provokes the self-repair, and
+  the repair is corrective — its net steady-state effect is ~0.
+- Two hypotheses were tested and REFUTED on 2026-08-27. The accounting split difference matched
+  the skew exactly at one instant (+90 vs +295 against 205 µs measured) but is uncorrelated
+  across a capture (r = +0.08 while the split swings ±2500 µs). And anchor-at-unmute does not
+  predict the planted offset: board A re-locked carrying `anchor 19976 us` and the skew moved
+  50 µs.
+
 **THE WIRE OFFSET IS THE INTEGRAL OF THE DIFFERENTIAL RATE, AND NOTHING ELSE.** Measured with the
 analyser's `fs_a_hz`/`fs_b_hz` columns over three quiet runs of 92–499 s:
 
