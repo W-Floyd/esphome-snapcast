@@ -60,6 +60,7 @@ order; a swap shows up as slope +1 instead of -1.
 import argparse
 import bisect
 import concurrent.futures
+import json
 import math
 import queue
 import threading
@@ -1334,6 +1335,24 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     open(path, "w").write("\n".join(o))
 
 
+def _load_probe_bias_ns():
+    """Analyser zero error, in ns, from scripts/probe-cal.py. 0 when uncalibrated.
+
+    Kept OUT of the CSV schema deliberately: the file records what the rig measured after
+    correction, and a schema change would invalidate every capture running across it. The value is
+    printed at startup instead, so a corrected run is never mistaken for an uncorrected one.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "probe-cal.json")
+    try:
+        with open(path) as f:
+            cal = json.load(f)
+    except (OSError, ValueError):
+        return 0.0, None
+    return float(cal.get("bias_us", 0.0)) * 1000.0, cal
+
+
+PROBE_BIAS_NS, PROBE_CAL = _load_probe_bias_ns()
+
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
           "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
           "crystal_a_ppm,crystal_b_ppm,reason")
@@ -1440,6 +1459,13 @@ def load_existing(path):
                 except ValueError:
                     pass
         return ts, ys, None
+    if PROBE_CAL:
+        print(f"probe calibration: subtracting {PROBE_CAL.get('bias_us', 0.0):+.2f} us "
+              f"(measured {PROBE_CAL.get('when', '?')}, {PROBE_CAL.get('method', '?')})"
+              + (f", rig noise MAD {PROBE_CAL['noise_mad_us']:.2f} us" if "noise_mad_us" in PROBE_CAL else ""))
+    else:
+        print("probe calibration: NONE -- absolute offsets carry the rig's zero error "
+              "(~25 us measured once); run scripts/probe-cal.py")
     if head and head != SCHEMA:
         sys.exit(f"{path} has a different column layout:\n  found  {head}\n  "
                  f"expect {SCHEMA}\nPass a different --out, or move the old file aside.")
@@ -2807,6 +2833,14 @@ def main():
                     pending = pool.submit(capture) if more else None
                 off, ppm, coef, info = measure_capture(buf, chan, args, prefer,
                                                       dumpf, elapsed)
+                # Remove the analyser's own zero error. It is a property of the RIG -- probe
+                # delay, channel skew, threshold asymmetry -- not of the boards, and it is the
+                # same size as the offsets being chased: measured at ~-25 us on 2026-08-27, when a
+                # probe swap left the reading unchanged where a real difference must flip. A step
+                # calibration cannot see it, because a step is a difference and the bias cancels
+                # inside it. scripts/probe-cal.py measures it directly.
+                if PROBE_BIAS_NS and np.isfinite(off):
+                    off -= PROBE_BIAS_NS
             except RuntimeError as e:
                 print(f"{elapsed:9.1f}   capture failed: {e}", file=sys.stderr)
                 pending = None
