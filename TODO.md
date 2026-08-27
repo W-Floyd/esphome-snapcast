@@ -606,6 +606,30 @@ defect.
       stated reason for not zeroing) while removing exactly the term that displaces audio. Predicted
       step: ~0.17 x 50 ppm x 3 s ≈ 25 µs, i.e. a 4x cut, and it is a three-line change at the hold.
 
+- **2026-08-27 MORNING: THREE THINGS VALIDATED ON HARDWARE, ONE STILL OPEN.**
+    - **`r_push` re-basing: VALIDATED, 50 windows.** After a reconnect the RAW counter is invalid
+      **100%** of the time (`bad_raw=96 (100.0%)` in 39 windows, 95 and 97 in others) while the
+      per-epoch rebased value is **0%** invalid in every single window. That is the prediction made
+      when the fix was committed, confirmed. Step 4's input is now sound where it was stable garbage
+      a third of the time.
+    - **The unmute anchor gate holds.** Ten re-locks logged `anchor` of 0, −1, −1, −1, 91, −1, −1,
+      0, −1, −1 µs, all inside the 100 µs threshold — against the 158 µs that walked through the old
+      2000 µs gate and planted 215 µs on the wire. Caveat: the eight forced reconnects did NOT mute
+      (zero `Muting:` lines), so the gate was not stressed by them; the evidence is the earlier locks.
+    - **THE WIRE IS AT +2.1 µs (MAD 3.0) after eight forced reconnects** — inside the <10 µs goal.
+      For scale, yesterday's events planted 170 µs to 1.4 ms.
+    - **The wedge is now rare, not fixed.** 4 wedges in 4 reconnects BEFORE the `emit_pcm_`
+      reserve-space fix; 1 in 11 after. That is either a rarer surviving race, or the mutex probe
+      added to hunt it perturbs the timing enough to mask it — a try_lock plus a barrier on every
+      loop iteration is a classic way to hide a race, and the two cannot be told apart from here.
+      **Do not record the wedge as fixed.**
+    - **What the wedge is NOT** (each measured, so none of these get retried): the STOPPED handler
+      discarding a pending START (`bits=0x002002`, bit 0 clear), heap exhaustion (175 KB free), the
+      depth seqlock (bounded by construction, 4 tries), `is_connected()` (lock-free atomic), the
+      logger (other tasks log throughout), and PCM stranded without records (`records=112` waiting).
+      In the one captured wedge the player went `iters=+2565` then `iters=+0` — it spins, then
+      blocks, with work available.
+
 - **MATCHED A/B OF THE FORCED RE-ANCHOR, n=3 per arm: SUGGESTIVE, NOT SIGNIFICANT.** Six lone
   restarts of board b, flag alternated per trial so the arms interleave (conditions drift here —
   outages, wedges — and blocking the arms would confound the change with the afternoon). Landing
