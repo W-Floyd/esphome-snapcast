@@ -1941,9 +1941,33 @@ void SnapcastClient::emit_pcm_(const uint8_t *data, size_t len, int64_t server_t
   if (len == 0) {
     return;
   }
-  // Write the PCM first, then post the record: the player may then rely on a popped
-  // record's bytes being fully present in the ring. A full ring blocks here, which
-  // backpressures the TCP connection exactly like a desktop snapclient.
+  // Write the PCM first, then post the record: the player may then rely on a popped record's
+  // bytes being fully present in the ring. A full ring blocks here, which backpressures the TCP
+  // connection exactly like a desktop snapclient.
+  //
+  // BUT WAIT FOR ROOM FOR THE WHOLE CHUNK BEFORE WRITING ANY OF IT. Writing into a nearly-full
+  // ring strands PARTIAL PCM that no record describes, and that is a deadlock, not a delay: the
+  // player drains the ring only by consuming records, so it waits forever for a record that this
+  // function will never post, while this function waits forever for space only the player can
+  // free. Neither side is doing anything wrong, which is why nothing could see it -- the player
+  // is legitimately idle on an empty queue and the network task is legitimately writing.
+  //
+  // Diagnosed 2026-08-27 01:11 after being reproduced on demand: "PLAYER STALLED: no chunk
+  // completed for 10 s, phase=idle(record queue), ring=524288 bytes, output_active=1" -- a ring at
+  // exactly buffer_size with an empty record queue, on a healthy heap. It is the wedge that has
+  // needed a replug all day, and it takes the network with it (no ping, no API, no OTA, no mDNS)
+  // because this is the network task, blocked here, that serves everything else too.
+  //
+  // Waiting for the space first is enough: either the whole chunk fits and its record follows, or
+  // nothing is written and the player still has records for every byte in the ring, so it drains
+  // and space appears. There is no state in between for a deadlock to live in.
+  while (this->pcm_ring_->free() < len && !this->shutdown_.load(std::memory_order_relaxed)) {
+    if (!this->output_active_.load(std::memory_order_relaxed) &&
+        !this->stream_active_) {
+      return;  // nothing is going to drain this; drop rather than hold the network task
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));
+  }
   size_t written = 0;
   while (written < len && !this->shutdown_.load(std::memory_order_relaxed)) {
     written += this->pcm_ring_->write_without_replacement(data + written, len - written, pdMS_TO_TICKS(100));
