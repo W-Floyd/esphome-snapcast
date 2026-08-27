@@ -3872,6 +3872,12 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                      // differing by N frames of padding should sit N * (1e6 / rate) us apart on a
                      // logic analyser, which is the prediction to test.
                      measured.dbg_padded_frames);
+            // THE SAME COUNTERS ON A LINE SHORT ENOUGH TO SURVIVE. pad= is the last field of the
+            // RECON line above, which is long enough that the logger truncates it mid-number --
+            // it reads as "pad=882" then "pad=88" for a counter in the tens of millions, so the
+            // one field the prediction above needs cannot be read from that line at all.
+            ESP_LOGD(TAG, "PADDISP pad=%" PRIu32 " clamp=%" PRId64 " pushed=%" PRId64 " played=%" PRId64,
+                     measured.dbg_padded_frames, this->dbg_clamped_frames_, dbg_pushed, dbg_played);
           }
         }
       }

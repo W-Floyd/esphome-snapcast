@@ -31,6 +31,30 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**WHAT PLANTS IT IS STILL UNKNOWN — five hypotheses now dead.** n=14 cycles with per-resync
+metrics (2026-08-27, MLS stimulus, analyser at sd 5.8 µs):
+
+- **Snapshot staleness: DEAD.** r = +0.03 against signed delta, +0.32 against |delta|, against
+  a critical 0.532. Independent confirmation of the `DISPROVEN` note already in
+  `snapcast_client.cpp`, which was established at the 3.7–13 ms seed scale; this extends it to
+  the ~130 µs hard-resync scale. That note warns the reasoning "looks compelling and is wrong",
+  and it was proposed here anyway before the code was read — read it first.
+- **Disturbance size: a two-level effect, not a correlation.** Cycles at 18 chunk-drops gave
+  |delta| 73 ± 45 µs (n=11); three cycles at 79 drops gave 378 µs. Pooled, `drops` correlates
+  with |delta| at r = 0.874 and looks like a mechanism. WITHIN the 18-drop subset every
+  predictor collapses — rsyncs +0.40, sink_swing +0.56, age_max −0.08, none significant. The
+  pooled correlation is three outliers wearing the shape of a trend.
+- **Within a fixed disturbance, nothing measured predicts the displacement.** It is 73 ± 45 µs
+  and apparently random.
+
+The leading untested candidate is PADDING, and the prediction is already written in the code at
+`dbg_padded_frames`: "Two devices differing by N frames of padding should sit N * (1e6 / rate)
+µs apart on a logic analyser, which is the prediction to test." 130 µs is 5.7 frames. Padding is
+the only mechanism that moves the output while leaving every internal metric self-consistent,
+which is the measured signature: acoustic offset stable to sd 5.8 µs while both boards' own
+reported error wanders ±60 µs. `scripts/padding-test.py` tests it; it needs the PADDISP log line,
+because `pad=` is the last field of RECON and the logger truncates it mid-number.
+
 **A HARD RESYNC PLANTS A RANDOM DISPLACEMENT OF ~130 µs, AND IT DOES NOT NEED A RE-LOCK.**
 Measured 2026-08-27 on an MLS stimulus (sd 5.8 µs, zero frame errors — the first instrument
 this was measurable on), n=7 cycles of a 500 ms `server_latency` step out and back:
