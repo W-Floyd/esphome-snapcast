@@ -55,10 +55,16 @@ class Decoder(srd.Decoder):
         {"id": "bits", "desc": "Top bits to decode per slot", "default": 8},
         {"id": "bit_delay", "desc": "BCLK delay before MSB", "default": 1},
         {"id": "win_frames", "desc": "Correlation window (frames)", "default": 512},
-        # Refuse to report when the runner-up peak is within this fraction of the best one.
-        # Adjacent frames correlate at ~0.997, so an ambiguous match is the normal failure and
-        # it produces a whole-frame error, not a small one.
-        {"id": "min_margin", "desc": "Min peak margin (0-1)", "default": 0.05},
+        # A lone window is judged on two things: the peak must be strong in ABSOLUTE terms, and
+        # it must either stand clear of the background or agree with the previous window.
+        #
+        # Margin alone does not work on music. Audio is heavily autocorrelated -- the offline
+        # analyser's rival column sat at 0.75-0.99 all day while reporting perfectly good
+        # numbers -- so "beat every other peak by 0.05" refuses nearly every real window. What
+        # actually distinguishes a true match is that it does not move between windows.
+        {"id": "min_peak", "desc": "Min correlation peak (0-1)", "default": 0.50},
+        {"id": "min_margin", "desc": "Margin that alone confirms a lag", "default": 0.05},
+        {"id": "lag_slack", "desc": "Frames a lag may move between windows", "default": 2},
         # Bounding the lag search does two jobs. It cuts the pure-Python correlation from O(n^2)
         # to O(n * lags) -- 512x129 instead of 512x1023 -- and it refuses matches at physically
         # implausible offsets, which is the mis-lock that produced +3187 us for a known -5000 us
@@ -103,8 +109,11 @@ class Decoder(srd.Decoder):
         self.bits_per_slot = int(self.options["bits"])
         self.delay = int(self.options["bit_delay"])
         self.win_frames = int(self.options["win_frames"])
+        self.min_peak = float(self.options["min_peak"])
         self.min_margin = float(self.options["min_margin"])
+        self.lag_slack = int(self.options["lag_slack"])
         self.max_lag = int(self.options["max_lag"])
+        self.prev_lag = None
 
     # ---- decoding -------------------------------------------------------------------
 
@@ -255,13 +264,24 @@ class Decoder(srd.Decoder):
         rival = max(others) if others else 0.0
         margin = best - rival
 
-        if margin < self.min_margin:
+        # Accept on either evidence: a peak that stands clear of the background, or one that
+        # lands where the previous window's did. Continuity is the stronger test on music,
+        # because a spurious peak from the audio's own periodicity moves between windows while
+        # a real inter-board lag does not.
+        continuous = (self.prev_lag is not None
+                      and abs(lag - self.prev_lag) <= self.lag_slack)
+        if best < self.min_peak or not (margin >= self.min_margin or continuous):
+            why = ("weak peak" if best < self.min_peak
+                   else "close rival and no agreement with the previous window")
             self.put(start_s, end_s, self.out_ann,
-                     [2, [f"ambiguous match: peak {best:.3f} vs rival {rival:.3f} "
-                          f"(margin {margin:.3f}) -- no skew reported",
-                          f"ambiguous {margin:.3f}"]])
+                     [2, [f"unmatched: peak {best:.3f} rival {rival:.3f} lag {lag:+d} -- {why}",
+                          f"unmatched {best:.2f}"]])
+            # A rejected window must not seed continuity for the next one, or one bad lock
+            # would validate its own successors.
+            self.prev_lag = None
             self.flush_window()
             return
+        self.prev_lag = lag
 
         # Average every matched pair in the window rather than trusting one frame's edge.
         # Each edge carries the sampler's quantisation; the mean of hundreds does not.
@@ -285,7 +305,7 @@ class Decoder(srd.Decoder):
                       f"{skew_us:+.2f}us"]])
         self.put(start_s, end_s, self.out_ann,
                  [1, [f"peak {best:.3f} rival {rival:.3f} margin {margin:.3f} "
-                      f"spread {spread_us:.2f} us",
+                      f"spread {spread_us:.2f} us {'(continuity)' if continuous else '(margin)'}",
                       f"c{best:.2f} m{margin:.2f}"]])
         self.flush_window()
 

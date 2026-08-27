@@ -50,7 +50,7 @@ def build(lag_frames, skew_us, n=512, seed=0):
     dec.emitted = []
     dec.samplerate = RATE
     dec.options = {"bits": 8, "bit_delay": 1, "win_frames": n, "min_margin": 0.05,
-                   "max_lag": 64}
+                   "max_lag": 64, "min_peak": 0.50, "lag_slack": 2}
     dec.out_ann = 0
     dec.start()
     skew_samples = skew_us * 1e-6 * RATE
@@ -105,6 +105,42 @@ dec.report_window()
 uncorrelated_ok = not [e for e in dec.emitted if e[2] == 0]
 print(f"  {'uncorrelated audio is refused':38s} {'PASS' if uncorrelated_ok else 'FAIL'}")
 results.append(uncorrelated_ok)
+
+# CONTINUITY. Real music is heavily autocorrelated, so the margin is routinely tiny and the
+# margin test alone refuses nearly every genuine window. A lag that agrees with the previous
+# window is accepted despite a close rival -- a spurious peak from the audio's own periodicity
+# moves between windows, a real inter-board lag does not.
+dec = build(3, 0.0)
+dec.min_margin = 1.01          # nothing can ever clear the margin test
+dec.prev_lag = 3               # ...but this is where the previous window landed
+dec.emitted = []
+dec.report_window()
+cont_ok = bool([e for e in dec.emitted if e[2] == 0])
+print(f"  {'close rival, agrees with previous':38s} {'PASS' if cont_ok else 'FAIL'}")
+results.append(cont_ok)
+
+# ...and it must NOT be accepted when it disagrees, or continuity would just be "accept
+# everything" with extra steps.
+dec = build(3, 0.0)
+dec.min_margin = 1.01
+dec.prev_lag = -20
+dec.emitted = []
+dec.report_window()
+discont_ok = not [e for e in dec.emitted if e[2] == 0]
+print(f"  {'close rival, disagrees -> refused':38s} {'PASS' if discont_ok else 'FAIL'}")
+results.append(discont_ok)
+
+# A REFUSED window must clear prev_lag. Otherwise one bad lock would authenticate its own
+# successors and the decoder would report a whole run of confident wrong answers -- which is
+# precisely the failure continuity was added to catch.
+dec = build(3, 0.0)
+dec.min_margin = 1.01
+dec.prev_lag = -20             # disagrees -> refused, and prev_lag must be cleared
+dec.emitted = []
+dec.report_window()
+cleared_ok = dec.prev_lag is None
+print(f"  {'refusal clears continuity seed':38s} {'PASS' if cleared_ok else 'FAIL'}")
+results.append(cleared_ok)
 
 # Silence must be refused too, not divided by zero.
 dec = build(0, 0.0)
