@@ -1,0 +1,34 @@
+{
+  "decoder": {
+    "name": "I2S skew",
+    "authors": ["snapclient-esphome contributors"],
+    "license": "MIT",
+    "description": "Measures the time skew (delta) between LRC frames on two independent I2S buses. Probes BCLK, LRC (WS), and DIN on both boards to decode frames and compute inter-board timing offset at sub-sample precision.",
+    "references": [
+      "https://en.wikipedia.org/wiki/I2S",
+      "https://sigrok.org/wiki/Libsigrokdecode"
+    ]
+  },
+  "encoder": "",
+  "generator": "",
+  "order": ["BCLK_ONE", "LRC_ONE", "DIN_ONE", "BCLK_TWO", "LRC_TWO", "DIN_TWO"],
+  "channels": [
+    { "id": "bclk1", "name": "BCLK 1",  "desc": "Bit clock, board A (left channel)" },
+    { "id": "lrc1",  "name": "LRC 1",  "desc": "Word select / left-right clock, board A" },
+    { "id": "din1",  "name": "DIN 1",  "desc": "Data in, board A" },
+    { "id": "bclk2", "name": "BCLK 2", "desc": "Bit clock, board B (right channel)" },
+    { "id": "lrc2",  "name": "LRC 2", "desc": "Word select / left-right clock, board B" },
+    { "id": "din2",  "name": "DIN 2", "desc": "Data in, board B" }
+  ],
+  "options": [
+    { "id": "bitwidth",  "name": "Bit width",        "default": "16",  "desc": "I2S slot width in bits (auto if 0)" },
+    { "id": "fsamplerate", "name": "Sample rate Hz", "default": "44100", "desc": "Audio sample rate for display calculations" }
+  ],
+  "outputs": [
+    {
+      "id": "skew",
+      "name": "Skew measurements",
+      "desc": "Time delta (ns) between matched LRC frames on the two boards"
+    }
+  ]
+}
