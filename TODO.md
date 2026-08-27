@@ -606,6 +606,31 @@ defect.
       stated reason for not zeroing) while removing exactly the term that displaces audio. Predicted
       step: ~0.17 x 50 ppm x 3 s ≈ 25 µs, i.e. a 4x cut, and it is a three-line change at the hold.
 
+- **PADDING DOES NOT DISPLACE AUDIO — the prediction recorded here is REFUTED (2026-08-27).**
+  `dbg_padded_frames` carried a standing prediction: "two devices differing by N frames of padding
+  should sit N x (1e6/rate) us apart on a logic analyser". Tested by starving board b while a ran
+  clean:
+
+        dpad  a = +0 frames   b = +11551 frames (262 ms)
+        predicted d(b-a) = +261927 us
+        measured  d(b-a) =      +5.7 us
+
+  262 ms of padding produced no displacement. It is fully absorbed by the starvation re-baseline
+  and the `padding_debt_frames` repayment -- which is what that code is for, and it works. In
+  steady state no padding accrues at all (three 2-min windows, dpad = 0 on both boards, offset
+  wandering +-5 us, i.e. analyser noise). **Do not re-open padding as an offset mechanism.**
+- **THE HANDOFF IS ALIGNED; THE RESIDUAL MAY BE THE INSTRUMENT.** `raw-sync` (device feedback, no
+  probes, no prediction model) reads a-b = -0.8, -2.7, +2.6, -1.8, +2.2 us across five independent
+  windows. The analyser reads 0-70 us over the same period. Everything below the handoff is
+  therefore either a real per-board pipeline difference or the ANALYSER'S OWN ZERO ERROR -- and the
+  5 ms calibration proved SCALE (1%), which a step test can do, but says nothing about a constant
+  bias between two probes.
+    - **The deciding experiment is a PROBE SWAP**: exchange the two logic-analyser channels between
+      boards and re-measure. Sign flips -> the difference is real and in the boards. Sign holds ->
+      it is instrumental, the boards are aligned to ~3 us, and the "static offsets" of this size
+      reported today were measurement error.
+    - Until that is done, treat sub-25 us analyser readings as unverified.
+
 - **2026-08-27 MORNING: THREE THINGS VALIDATED ON HARDWARE, ONE STILL OPEN.**
     - **`r_push` re-basing: VALIDATED, 50 windows.** After a reconnect the RAW counter is invalid
       **100%** of the time (`bad_raw=96 (100.0%)` in 39 windows, 95 and 97 in others) while the
