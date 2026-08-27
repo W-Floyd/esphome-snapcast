@@ -1353,6 +1353,11 @@ def _load_probe_bias_ns():
 
 PROBE_BIAS_NS, PROBE_CAL = _load_probe_bias_ns()
 
+# How far the offset may sit from frame_lag * frame_period before the capture is rejected as
+# mis-locked. Three frames is ~15x the measured MAD of that residue and still ~120x smaller than
+# the mis-lock it exists to catch, so it cannot plausibly reject a real reading.
+MAX_LAG_RESIDUE_FRAMES = 3.0
+
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
           "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
@@ -2929,7 +2934,28 @@ def main():
                       else info.get("hint", f"no frame match (coef {coef:.2f})"))
             if math.isfinite(off) and info.get("overlap", 1.0) < 0.75:
                 reason = ""  # still a valid measurement, just note the reduced overlap
+            fs_meas = info.get("fs", (float("nan"), float("nan")))
+            frame_ns = (1e9 / fs_meas[0]) if (fs_meas and fs_meas[0] and fs_meas[0] > 1000) else float("nan")
             k = info.get("frame_lag", 0)
+            # INTERNAL CONSISTENCY. The offset is built as an integer frame count from the PCM
+            # match plus a sub-frame residue from the LRC edges, so `off` and `frame_lag` cannot
+            # disagree by more than a frame or so BY CONSTRUCTION. When they do, the capture has
+            # mis-locked and the number is not a measurement.
+            #
+            # Measured over 62088 confident rows: residue med -0.78 us, MAD 7.27, p5/p95
+            # -20.9/+14.7 -- inside one frame (22.68 us) -- with only 0.1% beyond three frames.
+            # Against that, the failure this catches was off by 362 FRAMES: on 2026-08-27 a 5 ms
+            # reference offset was reported as +3187 us while frame_lag said -222, which implies
+            # -5035. It plotted as a clean trace and would have been believed.
+            #
+            # coef alone does NOT catch it -- thousands of internally inconsistent rows carry
+            # coef 1.000 -- which is why the test is the identity rather than the correlation.
+            if math.isfinite(off) and math.isfinite(frame_ns) and frame_ns > 0:
+                residue = off - k * frame_ns
+                if abs(residue) > MAX_LAG_RESIDUE_FRAMES * frame_ns:
+                    reason = (f"offset {off/1000:.0f} us disagrees with frame_lag {k:+d} "
+                              f"(implies {k*frame_ns/1000:.0f} us) -- mis-locked capture")
+                    off, ppm = float("nan"), float("nan")
             if math.isfinite(off):
                 if prefer is not None and abs(k - prefer) > args.max_jump_frames:
                     if pending is not None and abs(k - pending) <= 4:
