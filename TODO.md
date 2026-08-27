@@ -31,20 +31,33 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-**THE FIRMWARE CANNOT SEE A SUB-MILLISECOND PIPELINE DIFFERENCE, BY CONSTRUCTION.** Every latency
-component it knows is a NOMINAL, MILLISECOND-QUANTISED figure, and both boards report the same
-ones — measured 2026-08-27 over a quiet window, medians in µs:
+**RETRACTED — "the firmware cannot see a sub-millisecond pipeline difference, by construction".**
+That was recorded here on 2026-08-27 and is WRONG. It rested on one quiet window (12:58–13:04)
+in which the pipeline happened to be sitting at its configured maxima, so every field read as a
+round number identical on both boards:
 
-    xfer 20000   own 89728   sink_audio 120000   sink_lat 120000   down_audio 140000   pending 140000
-    B - A:    0        0            0                 0                 0                 0
+    xfer 20000   own 89728   sink_audio 120000   sink_lat 120000   down_audio 140000
+    B - A:    0        0            0                 0                 0
 
-So two boards sitting 270 µs apart both report clean sync with medians of a few µs, and no
-internal instrument can contradict them. The mechanism is already named in the code, at the
-starvation clamp in `snapcast_client.cpp`: the framework "restarts it with an unpredictable
-buffer fill level between this feedback point and the DAC -- invisible to the accounting, so
-playback would settle audibly offset with clean-looking sync reports". That comment was written
-for the ~100-250 ms case and a re-baseline handles it; the sub-millisecond residual of the same
-mechanism is never measured and never corrected.
+Sampled again while the buffers were not saturated, the same fields are measured at microsecond
+resolution, take hundreds of distinct values, and DO differ between the boards:
+
+    sink_lat   A 117732   B 114694   B-A -3038 µs   (24 distinct values)
+    xfer       A  14785   B  13311   B-A -1474 µs   (15 distinct)
+    own        A  88980   B  88481   B-A  -499 µs   (268 distinct)
+
+Only `down_audio`, `pending`, `delay` and `inflight` are round and identical, and those are
+configured buffer TARGETS rather than measurements. So the accounting is not blind to
+sub-millisecond differences, and a per-board latency residual has not been ruled out as
+observable — it remains untested. Generalising "by construction" from a single saturated
+window was the error; the lesson is that these depth fields are only meaningful when the
+pipeline is not pinned at its limits.
+
+What the code DOES say, at the starvation clamp in `snapcast_client.cpp`, is that the framework
+"restarts it with an unpredictable buffer fill level between this feedback point and the DAC --
+invisible to the accounting, so playback would settle audibly offset with clean-looking sync
+reports". That is a real mechanism for the ~100-250 ms case it was written about, and a
+re-baseline handles it. Whether a sub-millisecond residual of it survives is still open.
 
 Consequences worth keeping in mind before proposing a fix:
 
