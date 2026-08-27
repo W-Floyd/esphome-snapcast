@@ -725,8 +725,12 @@ void SnapcastClient::loop() {
     if (progress != this->player_progress_seen_ || this->player_progress_at_us_ == 0) {
       this->player_progress_seen_ = progress;
       this->player_progress_at_us_ = now;
-    } else if (this->stream_active_ && now - this->player_progress_at_us_ >= PLAYER_STALL_US &&
+    } else if (this->stream_active_ && this->player_progress_seen_ > 0 &&
+               now - this->player_progress_at_us_ >= PLAYER_STALL_US &&
                now - this->player_stall_log_us_ >= PLAYER_STALL_US) {
+      // progress_seen_ > 0 keeps startup quiet: the stream goes active before the pipeline is
+      // feeding, so a fresh boot trips this once for ~7 s and a line that cries wolf at every boot
+      // is one nobody reads. A wedge always has chunks behind it, so the real case still fires.
       this->player_stall_log_us_ = now;
       static const char *const PHASE_NAMES[] = {"idle(record queue)", "keepalive", "ring read",
                                                 "servo", "write", "discard"};
