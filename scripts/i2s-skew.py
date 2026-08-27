@@ -1353,6 +1353,7 @@ def _load_probe_bias_ns():
 
 PROBE_BIAS_NS, PROBE_CAL = _load_probe_bias_ns()
 
+
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
           "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
           "crystal_a_ppm,crystal_b_ppm,reason")
@@ -2841,6 +2842,20 @@ def main():
                 # inside it. scripts/probe-cal.py measures it directly.
                 if PROBE_BIAS_NS and np.isfinite(off):
                     off -= PROBE_BIAS_NS
+                # FRAME-LAG UNWRAP: TRIED AND REMOVED, 2026-08-27. The theory was that the PCM
+                # correlation flips between rival peaks and moves the reported offset by exactly one
+                # frame (22.68 us) while the audio has not moved -- which would have explained a day
+                # of ~20-25 us readings that no correction could remove.
+                #
+                # The data refutes it. Across 20000 rows, frame_lag changed 3070 times and the
+                # offset delta at those rows was ZERO in every case: the lag increments smoothly as
+                # the true offset crosses a frame boundary, which is the decomposition working. And
+                # the apparent evidence -- that offset minus lag*frame is "tighter" than the raw
+                # offset (MAD 5.6 vs 9.5) -- is that subtraction removing the real drift, the same
+                # trap as de-meaning a series and declaring it stable.
+                #
+                # What IS happening is a genuine slow drift: ~23 us over 120 s, about 0.19 ppm of
+                # differential rate. Do not re-add an unwrap; fix the rate.
             except RuntimeError as e:
                 print(f"{elapsed:9.1f}   capture failed: {e}", file=sys.stderr)
                 pending = None
