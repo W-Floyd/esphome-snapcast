@@ -4259,50 +4259,15 @@ int64_t SnapcastClient::predict_next_play_us_(uint32_t sample_rate) {
   int64_t predicted = -1;
   if (this->playout_valid_) {
     const double nominal_slope = 1e6 / static_cast<double>(sample_rate);
-    // THE SLOPE IS THE REALISED RATE, NOT THE NOMINAL ONE. This is the pivot bias, and it is the
-    // largest single term left in the steady-state floor.
-    //
-    // The pivot (fb_mean_frames_, fb_mean_ts_) is an EWMA of the playout feedback -- a point ON the
-    // frames-vs-time line, which is what makes extrapolating from it legitimate however far it
-    // lags. But alpha = 1/64 at ~20 feedbacks/s is tau ~3.2 s, so it lags `pushed` by ~141,000
-    // frames, and extrapolating across that lever arm with the WRONG slope multiplies the rate
-    // error by the whole lever: measured at 3.15 us per ppm, which is ~70% of the 7.1 us
-    // differential floor and sits INSIDE the loop, where it becomes a 1/(1-KP*3.15) ~ 4.8x
-    // amplification.
-    //
-    // The DAC does not run at the nominal rate. It runs at nominal x (1 + trim), and while the
-    // crystal's own error would matter against an external clock, it does NOT matter here: the
-    // prediction is in LOCAL time, and the DAC clock and esp_timer derive from the same oscillator,
-    // so the crystal cancels exactly. What remains is the trim -- which is not an estimate, it is
-    // what we programmed, read back as the value the divider actually realised.
-    //
-    // Size of what this removes: trim runs ~50 ppm, so the bias is ~157 us. Most of that is
-    // common-mode and the servo absorbs it as an operating-point shift, but the boards' trims
-    // DIFFER by ~5 ppm, and 3.15 x 5 = ~16 us of DIFFERENTIAL static offset -- the same order as
-    // the floor we are trying to get under. The noise term goes with it: rate wander no longer
-    // reaches the error through a 141,000-frame lever.
-    double slope = nominal_slope;
-#ifdef USE_I2S_RATE_LOCK
-    if (this->rate_lock_ != nullptr) {
-      // applied_ppm(), not the PI's demand: the divider is rational, so what it realised is what
-      // the audio is actually clocked at, and the two sit 0.5-0.65 ppm apart on hardware.
-      const double applied_ppm = static_cast<double>(this->rate_lock_->applied_ppm());
-      slope = nominal_slope / (1.0 + applied_ppm * 1e-6);
-    }
-#endif
     if (this->fb_samples_ >= 8) {
-      // Smoothed pivot + REALISED slope: averages away feedback quantization without a fitted
-      // slope's lever-arm instability (see notify_audio_played), and without the nominal slope's
-      // bias across the pivot's lag.
+      // Smoothed pivot + exact nominal slope: averages away feedback quantization
+      // without a fitted slope's lever-arm instability (see notify_audio_played)
       predicted = static_cast<int64_t>(
           this->fb_mean_ts_ +
-          slope * (static_cast<double>(this->pushed_frames_total_) - this->fb_mean_frames_));
+          nominal_slope * (static_cast<double>(this->pushed_frames_total_) - this->fb_mean_frames_));
     } else {
-      // Startup path: the lever arm here is only the queued frames (~10,000, a fifth of a second),
-      // so the slope matters ~14x less -- but it is free to be right, and being right on both
-      // paths means the handoff at fb_samples_ == 8 does not step the prediction.
       const int64_t queued_frames = this->pushed_frames_total_ - this->played_frames_total_;
-      predicted = this->played_last_ts_us_ + static_cast<int64_t>(slope * static_cast<double>(queued_frames));
+      predicted = this->played_last_ts_us_ + queued_frames * 1000000 / static_cast<int64_t>(sample_rate);
     }
   }
   this->playout_mutex_.unlock();
