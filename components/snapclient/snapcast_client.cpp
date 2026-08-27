@@ -10,6 +10,7 @@
 
 #include <esp_timer.h>
 #ifdef USE_SNAPCLIENT_OPUS
+#include <esp_heap_caps.h>
 #include <esp_system.h>
 #endif
 #include <lwip/netdb.h>
@@ -730,13 +731,23 @@ void SnapcastClient::loop() {
       static const char *const PHASE_NAMES[] = {"idle(record queue)", "keepalive", "ring read",
                                                 "servo", "write", "discard"};
       const uint8_t phase = this->player_phase_.load(std::memory_order_relaxed);
+      // HEAP, because the wedge is not confined to audio. A wedged board answers no ping, no API
+      // (6053), no OTA (3232) and no mDNS, while its main loop keeps logging and its radio still
+      // reports RSSI -- and ARP still resolves it, so it is associated but its IP stack is not
+      // serving. One cause explains all of that at once: an exhausted heap. The mixer cannot
+      // allocate its ring buffer on start, sockets cannot be accepted, mDNS cannot answer, and the
+      // main loop carries on because it allocates nothing.
       ESP_LOGE(TAG,
                "PLAYER STALLED: no chunk completed for %" PRId64 " s, phase=%s, ring=%zu bytes, "
-               "output_active=%d, stream_active=1 -- audio is not being written",
+               "output_active=%d, heap free=%" PRIu32 " largest=%" PRIu32 " min_ever=%" PRIu32
+               " -- audio is not being written",
                (now - this->player_progress_at_us_) / 1000000,
                phase < (sizeof(PHASE_NAMES) / sizeof(PHASE_NAMES[0])) ? PHASE_NAMES[phase] : "?",
                this->pcm_ring_ != nullptr ? this->pcm_ring_->available() : 0,
-               this->output_active_.load(std::memory_order_relaxed) ? 1 : 0);
+               this->output_active_.load(std::memory_order_relaxed) ? 1 : 0,
+               static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+               static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+               static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)));
     }
   }
 
