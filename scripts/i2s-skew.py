@@ -1369,6 +1369,10 @@ MAX_LAG_RESIDUE_FRAMES = 3.0
 REF_WINDOW = 15
 # Consecutive consistency rejections before the reference is rebuilt from the correlation.
 REF_RESEED_AFTER = 3
+# How far this capture's frame count may sit from the running median before the rebuild declines
+# to touch it. Inside this, a differing k is ambiguity; beyond it, it may be a real step and the
+# jump gate decides.
+FRAME_REBUILD_MAX = 4
 
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
@@ -2915,6 +2919,8 @@ def main():
             # frame is the correlation having chosen a neighbouring lag, not the audio
             # having moved. Unwrapping recovered a smooth series from a measured one
             # whose step sd was 13.5 us: it fell to 2.3 us.
+            frame_ns_pre = 1e9 / info["fs"][0] if np.isfinite(info.get("fs", (0,))[0]) \
+                and info["fs"][0] > 1000 else 0.0
             fperiod = 1e9 / info["fs"][0] if np.isfinite(info.get("fs", (0,))[0]) \
                 and info["fs"][0] > 0 else 0.0
             # Correct ONLY the frame-flip signature, and never against a running total.
@@ -2943,6 +2949,28 @@ def main():
             # No clamp, because the ambiguity is not small; but the guard stays. A real
             # move of more than 0.3 frame between blocks (>40 ppm at 60 Hz) fails the
             # guard and is left alone, so a genuine fast slew is not quietly folded away.
+            # REBUILD THE FRAME COUNT FROM THE MEDIAN, KEEPING THIS CAPTURE'S SUB-FRAME PART.
+            #
+            # The offset is skew = (tb[ib] - ta[ia]) over frames paired k apart, so it decomposes
+            # exactly into k whole frames plus a sub-frame residue from the LRC edges. The residue
+            # is unambiguous -- it comes from edge times, not from the correlation. Only k is in
+            # doubt, and adjacent frames correlate at ~0.997 so a neighbouring lag is always a
+            # near-tie.
+            #
+            # Making `prefer` a median biases the TIE-BREAK, but does not override a capture that
+            # picks a neighbour confidently. Measured 2026-08-27 on a quiet run: residual dips of
+            # -0.99, -1.00 and -3.03 FRAMES (coef 0.965-0.985 against rival 0.925-0.931, i.e. a
+            # margin of 0.04-0.06 that scrapes past MIN_RIVAL_MARGIN). Real skew does not move in
+            # exact 22.68 us steps; those are frame-count errors and nothing else.
+            #
+            # So take the median frame count and this capture's residue. Bounded to +-4 frames of
+            # the median: beyond that the capture may be seeing a genuine step, which the jump
+            # gate below is there to confirm, and this must not quietly flatten it.
+            if (math.isfinite(off) and frame_ns_pre > 0 and prefer is not None
+                    and abs(k - prefer) <= FRAME_REBUILD_MAX):
+                residue_pre = off - k * frame_ns_pre
+                off = prefer * frame_ns_pre + residue_pre
+
             nwrap = 0
             # MEDIAN of the recent accepted values, not the previous one. Measured 2026-08-27:
             # with a single-value reference, 22% of accepted rows read ~0 us against a true
