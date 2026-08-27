@@ -85,6 +85,14 @@ class Decoder(srd.Decoder):
         ("warns", "Rejected", (2,)),
     )
 
+    # PulseView CANNOT GRAPH A DECODER'S NUMBERS. libsigrokdecode offers only ANN, BINARY, META
+    # and PYTHON outputs -- there is no analog/trace output type -- so blocks of text are the
+    # most PulseView can draw. A CSV binary stream is the way out: sigrok-cli dumps it headlessly
+    # and scripts/plot-decoder-skew.py turns it into the same SVG the offline analyser produces.
+    binary = (
+        ("csv", "CSV rows: time_s,skew_us,lag,peak,rival,spread_us,pairs"),
+    )
+
     def __init__(self):
         self.reset()
 
@@ -106,6 +114,8 @@ class Decoder(srd.Decoder):
 
     def start(self):
         self.out_ann = self.register(srd.OUTPUT_ANN)
+        self.out_bin = self.register(srd.OUTPUT_BINARY)
+        self.wrote_header = False
         self.bits_per_slot = int(self.options["bits"])
         self.delay = int(self.options["bit_delay"])
         self.win_frames = int(self.options["win_frames"])
@@ -307,7 +317,23 @@ class Decoder(srd.Decoder):
                  [1, [f"peak {best:.3f} rival {rival:.3f} margin {margin:.3f} "
                       f"spread {spread_us:.2f} us {'(continuity)' if continuous else '(margin)'}",
                       f"c{best:.2f} m{margin:.2f}"]])
+        self.emit_csv(start_s, skew_us, lag, best, rival, spread_us, len(deltas))
         self.flush_window()
+
+    def emit_csv(self, start_s, skew_us, lag, peak, rival, spread_us, pairs):
+        """One row per ACCEPTED window, for plotting outside PulseView.
+
+        Rejected windows are deliberately absent rather than written as blanks: a gap in the
+        plot is the honest rendering of "no measurement here", and it lines up with the
+        Rejected annotation row when both are on screen.
+        """
+        if not self.wrote_header:
+            self.put(start_s, start_s, self.out_bin,
+                     [0, b"time_s,skew_us,lag,peak,rival,spread_us,pairs\n"])
+            self.wrote_header = True
+        row = (f"{start_s / self.samplerate:.6f},{skew_us:+.3f},{lag:+d},"
+               f"{peak:.4f},{rival:.4f},{spread_us:.3f},{pairs}\n")
+        self.put(start_s, start_s, self.out_bin, [0, row.encode()])
 
     def flush_window(self):
         for bus in (self.state_a, self.state_b):

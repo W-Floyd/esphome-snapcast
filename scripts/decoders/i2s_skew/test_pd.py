@@ -19,14 +19,19 @@ import types
 srd = types.ModuleType("sigrokdecode")
 srd.SRD_CONF_SAMPLERATE = 1
 srd.OUTPUT_ANN = 0
+srd.OUTPUT_BINARY = 1
 srd.Error = RuntimeError
 
 
 class _Decoder:
-    def register(self, *_a, **_k):
-        return 0
+    def register(self, output_type, **_k):
+        # Distinct ids, so the test can tell an annotation from a binary CSV row.
+        return output_type
 
     def put(self, ss, es, out, data):
+        if out == srd.OUTPUT_BINARY:
+            self.csv.append(data[1].decode())
+            return
         self.emitted.append((ss, es, data[0], data[1][0]))
 
 
@@ -48,10 +53,11 @@ def build(lag_frames, skew_us, n=512, seed=0):
     audio = [rng.gauss(0, 1000) for _ in range(n + abs(lag_frames) + 8)]
     dec = pd.Decoder()
     dec.emitted = []
+    dec.csv = []
     dec.samplerate = RATE
     dec.options = {"bits": 8, "bit_delay": 1, "win_frames": n, "min_margin": 0.05,
                    "max_lag": 64, "min_peak": 0.50, "lag_slack": 2}
-    dec.out_ann = 0
+    dec.out_ann = srd.OUTPUT_ANN
     dec.start()
     skew_samples = skew_us * 1e-6 * RATE
     for i in range(n):
@@ -141,6 +147,33 @@ dec.report_window()
 cleared_ok = dec.prev_lag is None
 print(f"  {'refusal clears continuity seed':38s} {'PASS' if cleared_ok else 'FAIL'}")
 results.append(cleared_ok)
+
+# The CSV stream must AGREE WITH THE ANNOTATION. It exists because PulseView cannot graph a
+# decoder's numbers, so it is what gets plotted -- a second output that quietly disagrees with
+# the one on screen is worse than having no second output at all.
+dec = build(3, 11.0)
+dec.emitted = []
+dec.csv = []
+dec.report_window()
+rows = [r for r in dec.csv if not r.startswith("time_s")]
+ann_us = float([e for e in dec.emitted if e[2] == 0][0][3].split()[0])
+csv_us = float(rows[0].split(",")[1])
+csv_ok = len(rows) == 1 and abs(csv_us - ann_us) <= 0.005
+print(f"  {'CSV row matches the annotation':38s} {'PASS' if csv_ok else 'FAIL'}  "
+      f"csv {csv_us:+.2f} vs ann {ann_us:+.2f}")
+results.append(csv_ok)
+
+# A REFUSED window writes no row. A gap is the honest rendering of "no measurement here";
+# writing a blank or a zero would put a fake point on the plot.
+dec = build(0, 0.0)
+_r7 = random.Random(7)
+dec.state_b["pcm"] = [_r7.gauss(0, 1000) for _ in dec.state_b["pcm"]]
+dec.emitted = []
+dec.csv = []
+dec.report_window()
+norow_ok = not [r for r in dec.csv if not r.startswith("time_s")]
+print(f"  {'refused window writes no CSV row':38s} {'PASS' if norow_ok else 'FAIL'}")
+results.append(norow_ok)
 
 # Silence must be refused too, not divided by zero.
 dec = build(0, 0.0)
