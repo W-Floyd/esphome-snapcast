@@ -273,6 +273,28 @@ forward if upstream submission has any calendar pressure.
 
 ---
 
+## Instrument calibration (2026-08-27) — READ BEFORE TRUSTING A SUB-100 µs NUMBER
+
+Both wire instruments were calibrated against a KNOWN displacement: `server_latency` on one board
+moves its deadline by an exact number of milliseconds, so a +5 ms step is a signal with no
+modelling in it. Result:
+
+                     before        after +5 ms      step      expected
+    analyser (b−a)   −69.1 µs      −5018.1 µs       −4949     −5000   (1.0% error)
+    raw-sync (a−b)   −35.6 µs      +4997.5 µs       +5033     +5000   (0.7% error)
+
+- **Both track CHANGES to ~1%** with consistent signs. Either can grade a step.
+- **Their absolute zeros differ by ~105 µs, and that is a BIAS, not noise.** `raw-sync` measures
+  from `(played, played_ts)` — frames handed to the DAC — so it is blind to the final DMA/sink
+  stage, where a per-device difference of that size lives. The analyser watches the I2S lines.
+- **So: absolute alignment is the ANALYSER's to report, and raw-sync must not be used for it.**
+  Its ±2 µs is a fit standard error and says nothing about that bias.
+- Analyser resolution: MAD 3–8 µs over a 60 s window, so a static offset needs averaging (or a
+  longer window) before a sub-µs claim means anything.
+
+This is why the earlier "+2.1 µs" and "−26 µs" readings could not be compared: they came from
+different captures of an instrument whose absolute lock can shift, and nothing had been calibrated.
+
 ## Standing constraints
 
 - **Trust only `scripts/i2s-skew.py` on the wire.** The render phase is measured blind to absolute
