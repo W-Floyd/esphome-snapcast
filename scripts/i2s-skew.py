@@ -58,6 +58,7 @@ order; a swap shows up as slope +1 instead of -1.
 """
 
 import argparse
+import collections
 import bisect
 import concurrent.futures
 import json
@@ -1357,6 +1358,12 @@ PROBE_BIAS_NS, PROBE_CAL = _load_probe_bias_ns()
 # mis-locked. Three frames is ~15x the measured MAD of that residue and still ~120x smaller than
 # the mis-lock it exists to catch, so it cannot plausibly reject a real reading.
 MAX_LAG_RESIDUE_FRAMES = 3.0
+# Accepted values behind the continuity reference. Long enough that a handful of ambiguous
+# blocks cannot move the median, short enough to follow a genuine slew: at ~45 rows/s this is
+# well under a second, while the true skew moves nanoseconds in that time.
+REF_WINDOW = 15
+# Consecutive consistency rejections before the reference is rebuilt from the correlation.
+REF_RESEED_AFTER = 3
 
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
@@ -2802,6 +2809,12 @@ def main():
 
     t_start = anchor if (args.append and anchor is not None) else time.time()
     ppms, n, shown_cfg, prefer, pending, last_off = [], 0, False, None, None, None
+    # Continuity reference. The frame count is reconstructed from recent ACCEPTED values, and
+    # the reference is their MEDIAN rather than the single previous value: one stray block must
+    # not be able to move the anchor, because the anchor is what decides the next block's frame
+    # count and a bad one propagates until something knocks it out.
+    ref_hist = collections.deque(maxlen=REF_WINDOW)
+    consec_reject = 0
     ppm_series = []          # (elapsed, ppm) so the per-capture slope can be plotted
     # Start from the primed offsets so the first in-loop poll reads only new bytes.
     events, log_off, last_plot = [], primed_offsets, 0.0
@@ -2919,6 +2932,14 @@ def main():
             # move of more than 0.3 frame between blocks (>40 ppm at 60 Hz) fails the
             # guard and is left alone, so a genuine fast slew is not quietly folded away.
             nwrap = 0
+            # MEDIAN of the recent accepted values, not the previous one. Measured 2026-08-27:
+            # with a single-value reference, 22% of accepted rows read ~0 us against a true
+            # +207 us. A block that mis-correlates to lag 0 is SELF-CONSISTENT -- offset ~0 and
+            # frame_lag 0 agree -- so no gate here can catch it on its own merits; it is caught
+            # only by disagreeing with where the signal has recently been. One such block then
+            # became the reference and dragged its successors to 0 until the next rejection,
+            # which is the run of dropouts to zero seen on the plot.
+            last_off = (sorted(ref_hist)[len(ref_hist) // 2] if ref_hist else None)
             if math.isfinite(off) and fperiod > 0 and last_off is not None:
                 cand = round((last_off - off) / fperiod)
                 if args.max_frame_correct:
@@ -2954,24 +2975,36 @@ def main():
                     reason = (f"offset {off/1000:.0f} us disagrees with frame_lag {k:+d} "
                               f"(implies {k*frame_ns/1000:.0f} us) -- mis-locked capture")
                     off, ppm = float("nan"), float("nan")
-                    # AND DROP THE CONTINUITY REFERENCE. nwrap above reconstructs the whole-frame
-                    # count from last_off rather than from the correlation, so a reference that
-                    # has just been shown wrong will re-derive the same wrong count next block,
-                    # fail this same test, and reject FOREVER -- the run cannot recover without a
-                    # restart. Measured 2026-08-27: a deliberate +5 ms step on one board sent the
-                    # rejection rate to 100% and held it there for 20 minutes, while frame_lag sat
-                    # at +230 (5215 us) reporting the step correctly the whole time.
+                    # RE-SEED THE CONTINUITY REFERENCE FROM THE CORRELATION. nwrap above
+                    # reconstructs the whole-frame count from last_off rather than from the
+                    # correlation, so a reference that has just been shown wrong will re-derive
+                    # the same wrong count next block, fail this same test, and reject FOREVER --
+                    # the run cannot recover without a restart. Measured 2026-08-27: a deliberate
+                    # +5 ms step on one board sent the rejection rate to 100% and held it there
+                    # for 20 minutes, while frame_lag sat at +230 (5215 us) reporting the step
+                    # correctly the whole time.
                     #
-                    # Clearing it lets the next block take the correlation's answer unaided, which
-                    # is the estimator that stayed right. Same failure the sigrok decoder had: a
-                    # rejected window must never seed the next one's continuity.
-                    last_off = None
+                    # Seeded from k, NOT cleared to None. Clearing was tried first and swapped one
+                    # failure for another: with no reference the next block is uncorrected, and a
+                    # block that happens to correlate at lag 0 is then accepted at ~0 us AND
+                    # becomes the anchor, so continuity propagates the zero until the next
+                    # rejection. That is a run at the right ~207 us with repeated dropouts to 0.
+                    #
+                    # k is the right seed because this test has just established that `off` and
+                    # `frame_lag` disagree, and frame_lag is the estimator that survived the step.
+                    # Frame accuracy is all that is needed: the reference only ever supplies the
+                    # whole-frame count, never the sub-frame part.
+                    #
+                    # Only after several rejections IN A ROW, though. A lone rejection is far more
+                    # likely to be one ambiguous block than a genuine step, and re-seeding on it
+                    # would handrail the reference straight onto that block's own bad lag -- the
+                    # single-value failure again, wearing a different hat. A real step keeps
+                    # failing this test until the reference moves, so it clears the run easily.
+                    consec_reject += 1
+                    if consec_reject >= REF_RESEED_AFTER:
+                        ref_hist.clear()
+                        ref_hist.append(k * frame_ns)
 
-            # Only a value that SURVIVED the consistency test earns the right to anchor the next
-            # block. This assignment used to sit above the test, which is what made a bad lock
-            # self-perpetuating.
-            if math.isfinite(off):
-                last_off = off
             if math.isfinite(off):
                 if prefer is not None and abs(k - prefer) > args.max_jump_frames:
                     if pending is not None and abs(k - pending) <= 4:
@@ -2985,6 +3018,15 @@ def main():
                     prefer, pending = k, None
             if prefer is None and info.get("rival", 0) > RIVAL_MARGIN:
                 reason = reason or f"ambiguous frame match (rival {info['rival']:.2f})"
+
+            # ONLY A VALUE THAT SURVIVED EVERY GATE EARNS THE RIGHT TO ANCHOR THE NEXT BLOCK.
+            # This sat above the gates, which is what made a bad lock self-perpetuating; it has
+            # to stay below ALL of them, not just the consistency test, because the jump and
+            # rival gates invalidate `off` too and an anchor taken from a value one of them is
+            # about to reject repeats the same defect one layer down.
+            if math.isfinite(off):
+                ref_hist.append(off)
+                consec_reject = 0
             ts.append(elapsed)
             ys.append(off if math.isfinite(off) else float("nan"))
             if math.isfinite(ppm):
