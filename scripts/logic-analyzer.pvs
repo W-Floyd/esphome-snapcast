@@ -49,15 +49,15 @@ name=BCLK_TWO
 color=4281623972
 conv_options=0
 conversion_type=0
-enabled=false
-name=D6
+enabled=true
+name=DIN_TWO
 
 [D7]
 color=4285878395
 conv_options=0
 conversion_type=0
-enabled=true
-name=DIN_TWO
+enabled=false
+name=D7
 
 [decode_signal0]
 channel0\assigned_signal_name=BCLK_ONE
@@ -123,7 +123,7 @@ D3\trace_height=32
 D4\trace_height=32
 D5\trace_height=32
 D6\trace_height=32
-D7\trace_height=32
+D6\trace_height=32
 offset=22 serialization::archive 16 0 0 0 0 53256981 43370630 8886249 60705963 70788747 76670468 -8 0 0 6
 scale=3.8381007276981988e-08
 segment_display_mode=1
