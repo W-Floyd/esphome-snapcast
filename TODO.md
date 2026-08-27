@@ -47,6 +47,30 @@ metrics (2026-08-27, MLS stimulus, analyser at sd 5.8 µs):
 - **Within a fixed disturbance, nothing measured predicts the displacement.** It is 73 ± 45 µs
   and apparently random.
 
+**THE PAIR IS ALIGNED TO SUB-MICROSECOND WHEN QUIET.** Per-frame skew (`--dump-skew`, ~44100
+rows/s) across a forced resync, 2026-08-27:
+
+    baseline, 20 s before:   median -24.1 µs   sd 0.1 µs
+    settled stretches after: sd 0.2 – 0.7 µs
+
+So the <1 µs target is ALREADY MET between resyncs, and the sd ~5.8 µs quoted from the
+per-capture CSV is capture-to-capture MEASUREMENT noise, not device jitter. Any future work
+should quote the per-frame figure; the per-capture one understates the hardware by ~50x.
+
+**THE DISPLACEMENT IS NOT A DISCRETE STEP.** The same trace shows it is the residual of a
+ramp-and-collapse, not an insertion of N frames at one instant:
+
+    +13 s   +1658 µs  settled at a new position
+    +24 s   ramp begins, ~45 µs/s measured at 20 ms resolution (+0.8..+1.0 µs per 20 ms)
+    +47 s   +4618 µs  peak
+    +48 s   collapse when the latency offset is removed
+    +69 s   -122 µs   settles ~100 µs from where it started
+
+That retrospectively explains why every quantum-based hypothesis failed — padding, clamping,
+frame counts all predict a step of N × 22.68 µs at one instant, and no such step exists. A
+1391 µs "jump" at +57 s spans a 0.5 s gap where the analyser rejected, so it is NOT evidence of
+an instantaneous event; at 20 ms resolution either side, the motion is smooth.
+
 **PADDING: TESTED AND REFUTED (2026-08-27).** n=4 forced resyncs, MLS stimulus. Board B accrued
 18369 frames (417 ms) of padding while the net skew moved 18.6 µs; slope +0.0008 against a
 predicted +1.0, r = +0.11. Padding does not displace the output because the repayment path
