@@ -468,6 +468,10 @@ static constexpr int32_t DRIFT_REPAIR_US = 2000;
 // a silent unbounded wait is indistinguishable from a dead task, which is exactly how three wedges
 // today read in the logs. Long enough that ordinary inter-chunk gaps never trip it.
 static constexpr int64_t PUSH_STALL_LOG_US = 3000000;
+// How long the player may go without completing a chunk before the main loop says so. Well past
+// any legitimate gap: the keepalive path completes chunks, and a stream that has genuinely ended
+// clears stream_active_, which gates the warning.
+static constexpr int64_t PLAYER_STALL_US = 5000000;
 // Bound on a believable r_push (pushed - src_received): what is genuinely in flight between our
 // push point and the mixer's source queue is the slice buffer plus a chunk or two. 10000 frames is
 // ~227 ms at 44.1 kHz, several times that, so this refuses only the counter pairs that were
@@ -705,6 +709,37 @@ bool SnapcastClient::start() {
 
 // THREAD CONTEXT: Main loop (called from the hub's loop())
 void SnapcastClient::loop() {
+  // PLAYER-TASK WATCHDOG. THREAD CONTEXT: main loop -- deliberately, because it is the thread that
+  // keeps running through every wedge (wifi_diag logs throughout), while the player task's own
+  // stall reporting has failed three times over: every counter it keeps resets on partial
+  // progress, so a loop that occasionally succeeds stays silent forever.
+  //
+  // Says only what it can know: how long since the player finished a chunk, and which phase it
+  // stamped last. That is enough to separate the candidates that a silent task cannot -- waiting on
+  // an empty record queue, waiting for a popped record's PCM, or writing into something that is not
+  // draining.
+  {
+    const uint32_t progress = this->player_progress_.load(std::memory_order_relaxed);
+    const int64_t now = now_us();
+    if (progress != this->player_progress_seen_ || this->player_progress_at_us_ == 0) {
+      this->player_progress_seen_ = progress;
+      this->player_progress_at_us_ = now;
+    } else if (this->stream_active_ && now - this->player_progress_at_us_ >= PLAYER_STALL_US &&
+               now - this->player_stall_log_us_ >= PLAYER_STALL_US) {
+      this->player_stall_log_us_ = now;
+      static const char *const PHASE_NAMES[] = {"idle(record queue)", "keepalive", "ring read",
+                                                "servo", "write", "discard"};
+      const uint8_t phase = this->player_phase_.load(std::memory_order_relaxed);
+      ESP_LOGE(TAG,
+               "PLAYER STALLED: no chunk completed for %" PRId64 " s, phase=%s, ring=%zu bytes, "
+               "output_active=%d, stream_active=1 -- audio is not being written",
+               (now - this->player_progress_at_us_) / 1000000,
+               phase < (sizeof(PHASE_NAMES) / sizeof(PHASE_NAMES[0])) ? PHASE_NAMES[phase] : "?",
+               this->pcm_ring_ != nullptr ? this->pcm_ring_->available() : 0,
+               this->output_active_.load(std::memory_order_relaxed) ? 1 : 0);
+    }
+  }
+
   Event event;
   while (xQueueReceive(this->event_queue_, &event, 0) == pdTRUE) {
     if (this->listener_ == nullptr) {
@@ -1947,6 +1982,7 @@ void SnapcastClient::player_task_() {
   this->mark_kp_event_(st, "boot");
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
+    this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::IDLE), std::memory_order_relaxed);
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
       // No record. Normal between chunks; a WEDGE if it lasts, and this branch logged nothing at
       // all, which is why a wedged player task looked identical to a dead one. Throttled, and it
@@ -2819,7 +2855,10 @@ void SnapcastClient::player_task_() {
     this->accumulate_achieved_rate_(st, rec);
     this->reanchor_after_relock_(st);
 
+    this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::SERVO), std::memory_order_relaxed);
     this->push_chunk_(rec, drop_frames, !st.converged);
+    // One completed chunk. The main loop watches this for movement; see PlayerPhase.
+    this->player_progress_.fetch_add(1, std::memory_order_relaxed);
 
     // TEMPORARY DIAGNOSTIC: see dbg_early_recon_ -- this is the post-startup half.
     // Every term comes from ONE snapshot and the accounting is evaluated at that same instant, so
@@ -4174,6 +4213,7 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
 }
 
 void SnapcastClient::discard_ring_bytes_(size_t bytes) {
+  this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::DISCARD), std::memory_order_relaxed);
   int64_t starve_since = 0;
   while (bytes > 0 && !this->shutdown_.load(std::memory_order_relaxed)) {
     size_t n = this->pcm_ring_->read(this->slice_buffer_.get(), std::min(bytes, SLICE_BUFFER_SIZE),
@@ -4321,6 +4361,7 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
     // player task silent from the disconnect onward, and a silent unbounded wait cannot be told
     // from a dead task. Say where it is stuck.
     int64_t starve_since = 0;
+    this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::RING_READ), std::memory_order_relaxed);
     while (got < want && !this->shutdown_.load(std::memory_order_relaxed)) {
       const size_t n = this->pcm_ring_->read(this->slice_buffer_.get() + got, want - got, pdMS_TO_TICKS(100));
       got += n;
@@ -4359,6 +4400,7 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
     }
 
     uint32_t zero_writes = 0;
+    this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::WRITE), std::memory_order_relaxed);
     while (offset < got) {
       if (this->audio_listener_ == nullptr || !this->output_active_.load(std::memory_order_relaxed) ||
           this->shutdown_.load(std::memory_order_relaxed)) {

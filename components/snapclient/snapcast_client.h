@@ -973,6 +973,32 @@ class SnapcastClient {
   /// fit or integral over the counters can tell "my window straddles a discontinuity" from "my
   /// window is fine". r_push has been measured at -180 s of span across one of these.
   std::atomic<uint32_t> playout_epoch_{0};
+
+  /// PLAYER-TASK WATCHDOG, reported by the MAIN LOOP.
+  ///
+  /// Every attempt so far to have the player task report its own stall has failed for the same
+  /// reason: the counters reset on any progress, so a trickle keeps them quiet, and a task stuck
+  /// in a loop that occasionally succeeds says nothing at all. Three wedges today ended with the
+  /// player silent and no diagnostic firing.
+  ///
+  /// So the report comes from a thread that is provably alive -- the main loop, which keeps
+  /// logging wifi_diag throughout every wedge. The player only has to stamp where it is; it does
+  /// not have to be well enough to complain.
+  enum class PlayerPhase : uint8_t {
+    IDLE = 0,        // waiting on the record queue
+    KEEPALIVE = 1,   // pushing silence to hold the pipeline
+    RING_READ = 2,   // waiting for a popped record's PCM
+    SERVO = 3,       // in the servo/deadline arithmetic
+    WRITE = 4,       // writing audio downstream
+    DISCARD = 5,     // draining a chunk it will not play
+  };
+  std::atomic<uint8_t> player_phase_{static_cast<uint8_t>(PlayerPhase::IDLE)};
+  /// Bumped every time the player completes a chunk. The main loop watches it for movement, so a
+  /// stall is visible even when the stuck loop is making partial progress forever.
+  std::atomic<uint32_t> player_progress_{0};
+  uint32_t player_progress_seen_{0};
+  int64_t player_progress_at_us_{0};
+  int64_t player_stall_log_us_{0};
   std::atomic<uint8_t> phase_mode_{static_cast<uint8_t>(PhaseMode::NONE)};
 
   // Server settings shadow used by the tasks (buffer_ms/latency for deadlines).
