@@ -2928,8 +2928,6 @@ def main():
                     nwrap = int(cand)
                     off += nwrap * fperiod
                     ncorr += 1
-            if math.isfinite(off):
-                last_off = off
             reason = ("" if math.isfinite(off)
                       else info.get("hint", f"no frame match (coef {coef:.2f})"))
             if math.isfinite(off) and info.get("overlap", 1.0) < 0.75:
@@ -2956,6 +2954,24 @@ def main():
                     reason = (f"offset {off/1000:.0f} us disagrees with frame_lag {k:+d} "
                               f"(implies {k*frame_ns/1000:.0f} us) -- mis-locked capture")
                     off, ppm = float("nan"), float("nan")
+                    # AND DROP THE CONTINUITY REFERENCE. nwrap above reconstructs the whole-frame
+                    # count from last_off rather than from the correlation, so a reference that
+                    # has just been shown wrong will re-derive the same wrong count next block,
+                    # fail this same test, and reject FOREVER -- the run cannot recover without a
+                    # restart. Measured 2026-08-27: a deliberate +5 ms step on one board sent the
+                    # rejection rate to 100% and held it there for 20 minutes, while frame_lag sat
+                    # at +230 (5215 us) reporting the step correctly the whole time.
+                    #
+                    # Clearing it lets the next block take the correlation's answer unaided, which
+                    # is the estimator that stayed right. Same failure the sigrok decoder had: a
+                    # rejected window must never seed the next one's continuity.
+                    last_off = None
+
+            # Only a value that SURVIVED the consistency test earns the right to anchor the next
+            # block. This assignment used to sit above the test, which is what made a bad lock
+            # self-perpetuating.
+            if math.isfinite(off):
+                last_off = off
             if math.isfinite(off):
                 if prefer is not None and abs(k - prefer) > args.max_jump_frames:
                     if pending is not None and abs(k - pending) <= 4:
