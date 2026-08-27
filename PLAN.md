@@ -174,7 +174,29 @@ stepped — and points must be spaced on a quiet-wire gate rather than a fixed s
 were learned the hard way and are recorded in `TODO.md`. **Do not use `inject_starvation` for this**;
 it puts the fit floor at 162–1291 µs against 0.71 µs quiet.
 
-## Step 3 — achieved rate against server time, published in the beacon
+## Step 3 — achieved rate against server time — ⏳ MEASURED, 60x SHORT OF SPEC (`c09d3d9`)
+
+Built as `ARATE`: incremental least squares of the playout feedback against server time (and against
+local time as a control), diagnostics-only, never in the beacon yet. What 300 s of raw feedback pairs
+say, refitted offline at several window lengths:
+
+    whole capture (312 s)  +49.27 ppm    sd 24.7 frames    <- IS that board's programmed trim
+     30 s windows          sd 41.98 ppm  range -47.3 .. +109.7
+     60 s windows          sd  4.35 ppm  range +51.0 ..  +62.6
+    120 s windows          sd  2.43 ppm  range +43.5 ..  +48.4
+
+So the method works and recovers the right answer; the first version's +-100 ppm swings were a 30 s
+window beating against the depth wave and the feedback's quantisation (dframes in multiples of 441,
+one DMA buffer). **But 2.43 ppm at 120 s is still ~60x the 0.04 ppm the offset integral needs**, and
+the scaling from 60 s to 120 s (4.35 -> 2.43) says another 60x costs far more window than a recovery
+can wait for. Publishing this as an offset reference on today's evidence would repeat the trim's
+mistake in a new place.
+
+The open question is therefore whether the residual is NOISE (averages down, just slowly) or the
+depth wave (periodic, so model it and subtract rather than average it). That is the next
+measurement, and the capture harness for it now exists.
+
+## Step 3 (original design notes) — achieved rate against server time, published in the beacon
 
 The keystone, and after step 1's measurement the **only surviving route**, not merely the preferred
 one. An outside-the-loop rate reference de-trends the prediction (step 4) and, published beside
