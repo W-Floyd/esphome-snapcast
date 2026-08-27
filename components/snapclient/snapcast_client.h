@@ -27,6 +27,7 @@
 #include <freertos/task.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -559,8 +560,47 @@ class SnapcastClient {
     // timestamps carry ~300 us of jitter, so 30 s of baseline resolves only ~+-10 ppm, and the
     // spec this has to hit is 0.04 ppm (the offset is the integral of the rate, so a constant
     // error of e ppm costs e us per second of run).
-    double rate_n{0.0}, rate_sx{0.0}, rate_sy{0.0}, rate_sxx{0.0}, rate_sxy{0.0};
-    int64_t rate_x0{0};  // first sample's server time, subtracted to keep the sums conditioned
+    ///
+    /// Two fits are kept, on the SAME samples: one against server time (the quantity wanted) and
+    /// one against local time (the control). The first windows read +100 ppm on BOTH boards, which
+    /// cannot be a true achieved rate -- a locked device renders 44100 frames per second of server
+    /// time or its buffer drains, and 100 ppm is 3 ms per window. A common-mode bias like that is
+    /// either the local->server mapping or the frame counter itself, and the local fit separates
+    /// them in one window: ~ the programmed trim means the machinery is sound and the mapping is
+    /// at fault; ~ +100 ppm too means the counter grows faster than real time (padding, say),
+    /// which is a different and larger finding.
+    struct RateFit {
+      double n{0.0}, sx{0.0}, sy{0.0}, sxx{0.0}, sxy{0.0}, syy{0.0};
+      void reset() { this->n = this->sx = this->sy = this->sxx = this->sxy = this->syy = 0.0; }
+      void add(double x, double y) {
+        this->n += 1.0;
+        this->sx += x;
+        this->sy += y;
+        this->sxx += x * x;
+        this->sxy += x * y;
+        this->syy += y * y;
+      }
+      /// @return frames per microsecond, with @p sd_frames set to the fit's residual sd.
+      double slope(double &sd_frames) const {
+        sd_frames = 0.0;
+        const double sxx_c = this->sxx - this->sx * this->sx / this->n;
+        const double sxy_c = this->sxy - this->sx * this->sy / this->n;
+        const double syy_c = this->syy - this->sy * this->sy / this->n;
+        if (!(sxx_c > 0.0) || this->n < 3.0) {
+          return 0.0;
+        }
+        const double m = sxy_c / sxx_c;
+        // RESIDUAL sum of squares, not a covariance term -- the first version printed the latter
+        // and read 3e15, which says nothing about whether the fit found a rate or fitted jitter.
+        const double rss = syy_c - m * sxy_c;
+        sd_frames = std::sqrt(std::max(rss, 0.0) / (this->n - 2.0));
+        return m;
+      }
+    };
+    RateFit rate_server;
+    RateFit rate_local;
+    int64_t rate_x0{0};        // first sample's server time, subtracted to keep the sums conditioned
+    int64_t rate_x0_local{0};  // and its local time, for the control fit
     int64_t rate_y0{0};  // first sample's frame count, same reason
     int64_t rate_last_fb_ts{0};  // feedback timestamp already accumulated; skips duplicates
     int64_t rate_window_start_us{0};

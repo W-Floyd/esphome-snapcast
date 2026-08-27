@@ -3176,7 +3176,8 @@ void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord
   const uint32_t epoch = this->playout_epoch_.load(std::memory_order_relaxed);
   if (epoch != st.rate_epoch) {
     st.rate_epoch = epoch;
-    st.rate_n = st.rate_sx = st.rate_sy = st.rate_sxx = st.rate_sxy = 0.0;
+    st.rate_server.reset();
+    st.rate_local.reset();
     st.rate_last_fb_ts = 0;
     st.rate_window_start_us = 0;
   }
@@ -3204,37 +3205,35 @@ void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord
   return;
 #endif
 
-  if (st.rate_n == 0.0) {
+  if (st.rate_server.n == 0.0) {
     st.rate_x0 = server_ts;
+    st.rate_x0_local = played_ts;
     st.rate_y0 = played;
     st.rate_window_start_us = now_us();
   }
-  const double x = static_cast<double>(server_ts - st.rate_x0);
   const double y = static_cast<double>(played - st.rate_y0);
-  st.rate_n += 1.0;
-  st.rate_sx += x;
-  st.rate_sy += y;
-  st.rate_sxx += x * x;
-  st.rate_sxy += x * y;
+  st.rate_server.add(static_cast<double>(server_ts - st.rate_x0), y);
+  // The control fit, on the same samples: local time needs no mapping, so it cannot carry the
+  // mapping's errors. Its expected value is the programmed trim.
+  st.rate_local.add(static_cast<double>(played_ts - st.rate_x0_local), y);
 
   if (now_us() - st.rate_window_start_us < RATE_WINDOW_US) {
     return;
   }
-  const double denom = st.rate_n * st.rate_sxx - st.rate_sx * st.rate_sx;
-  if (st.rate_n >= RATE_MIN_SAMPLES && denom > 0.0) {
-    // frames per us -> Hz -> ppm against the stream's nominal rate.
-    const double slope = (st.rate_n * st.rate_sxy - st.rate_sx * st.rate_sy) / denom;
-    const double hz = slope * 1000000.0;
-    const double ppm = (hz / static_cast<double>(rec.params.sample_rate) - 1.0) * 1000000.0;
-    // Residual sd of the fit, in frames: the honest error bar. A fit whose residual is large is
-    // reporting the feedback's jitter, not the rate, and saying so is the difference between a
-    // number and data.
-    const double mean_y = st.rate_sy / st.rate_n;
-    const double ss = st.rate_sxx > 0.0 ? (st.rate_sxy - st.rate_sx * mean_y) : 0.0;
-    ESP_LOGD(TAG, "ARATE ppm=%+.4f hz=%.4f n=%.0f span=%.1f s ss=%.3g t=%" PRId64, ppm, hz, st.rate_n,
-             static_cast<double>(now_us() - st.rate_window_start_us) / 1e6, ss, now_us());
+  if (st.rate_server.n >= RATE_MIN_SAMPLES) {
+    const double nominal = static_cast<double>(rec.params.sample_rate);
+    double sd_s = 0.0, sd_l = 0.0;
+    const double hz_s = st.rate_server.slope(sd_s) * 1000000.0;
+    const double hz_l = st.rate_local.slope(sd_l) * 1000000.0;
+    ESP_LOGD(TAG,
+             "ARATE srv_ppm=%+.4f loc_ppm=%+.4f srv_hz=%.4f loc_hz=%.4f n=%.0f span=%.1f s "
+             "sd_srv=%.2f sd_loc=%.2f frames t=%" PRId64,
+             (hz_s / nominal - 1.0) * 1000000.0, (hz_l / nominal - 1.0) * 1000000.0, hz_s, hz_l,
+             st.rate_server.n, static_cast<double>(now_us() - st.rate_window_start_us) / 1e6, sd_s, sd_l,
+             now_us());
   }
-  st.rate_n = st.rate_sx = st.rate_sy = st.rate_sxx = st.rate_sxy = 0.0;
+  st.rate_server.reset();
+  st.rate_local.reset();
   st.rate_window_start_us = now_us();
 }
 
