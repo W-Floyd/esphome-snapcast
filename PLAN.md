@@ -187,14 +187,23 @@ say, refitted offline at several window lengths:
 
 So the method works and recovers the right answer; the first version's +-100 ppm swings were a 30 s
 window beating against the depth wave and the feedback's quantisation (dframes in multiples of 441,
-one DMA buffer). **But 2.43 ppm at 120 s is still ~60x the 0.04 ppm the offset integral needs**, and
-the scaling from 60 s to 120 s (4.35 -> 2.43) says another 60x costs far more window than a recovery
-can wait for. Publishing this as an offset reference on today's evidence would repeat the trim's
-mistake in a new place.
+one DMA buffer).
 
-The open question is therefore whether the residual is NOISE (averages down, just slowly) or the
-depth wave (periodic, so model it and subtract rather than average it). That is the next
-measurement, and the capture harness for it now exists.
+**CORRECTION, same night: the "60x short of spec" figure above was computed across CONTAMINATED
+windows.** On-device 120 s windows show the fit's own residual is an almost perfect predictor of
+whether a window can be believed:
+
+    sd 3.57 .. 4.68 frames  ->  srv_ppm  -0.27 .. +0.37    <- and loc_ppm recovers each trim
+    sd 24.2 .. 28.8 frames  ->  srv_ppm  -8.24 .. -4.70
+
+The clean cluster sits where physics demands (a locked device renders exactly nominal in SERVER
+time). Across those four windows the scatter is **~0.28 ppm**, and the differential between the two
+boards in the one simultaneous pair is **0.071 ppm** -- 2-7x off the 0.04 ppm spec rather than 60x.
+The reject threshold is now 8 frames, so dirty windows are marked rather than published.
+
+**Next:** collect clean simultaneous pairs over a quiet hour and take the sd of the DIFFERENTIAL,
+which is the quantity the spec is about. If that sits near 0.07 ppm, this is a viable reference and
+step 4 unblocks; if it does not, the residual structure (the depth wave) is the thing to model.
 
 ## Step 3 (original design notes) — achieved rate against server time, published in the beacon
 
