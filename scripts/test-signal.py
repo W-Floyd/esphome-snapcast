@@ -86,6 +86,7 @@ def main():
                     help="0-1. MLS is full-band noise; this is deliberately not loud")
     ap.add_argument("--fifo", help="write raw PCM to this FIFO")
     ap.add_argument("--tcp", help="HOST:PORT of a snapserver tcp source (mode=server)")
+    ap.add_argument("--out-file", help="write raw PCM to this file instead of streaming")
     ap.add_argument("--block-ms", type=float, default=12,
                     help="bytes per write, in ms of audio; sets the granularity of the "
                          "server's arrival timestamps")
@@ -103,8 +104,23 @@ def main():
     frame = b"".join(struct.pack("<hh", int(v * amp), int(v * amp)) for v in seq)
     period_s = len(seq) / args.rate
 
+    if args.out_file:
+        # A FILE SOURCE IS PACED BY SNAPSERVER'S OWN TIMER. pipe and tcp sources are stamped on
+        # ARRIVAL, so the writer's scheduling lands directly in the chunk timestamps: measured
+        # tbjit 600-2300 us on those against 3 us for a source snapserver paces itself, and the
+        # clients could not hold a lock at all. A file has no inherent rate, so the server must
+        # supply the clock.
+        n = int(args.seconds / period_s) if args.seconds else int(1200 / period_s)
+        with open(args.out_file, "wb") as f:
+            for _ in range(n):
+                f.write(frame)
+        total = n * period_s
+        print(f"wrote {args.out_file}: {total:.0f} s, {n} periods, "
+              f"{n*len(frame)/1e6:.0f} MB", file=sys.stderr)
+        return
+
     if not args.fifo and not args.tcp:
-        sys.exit("--fifo or --tcp is required (or --self-test)")
+        sys.exit("--fifo, --tcp or --out-file is required (or --self-test)")
 
     print(f"MLS order {args.order}: {len(seq)} frames, {period_s*1000:.2f} ms period, "
           f"amplitude {args.amplitude}", file=sys.stderr)
