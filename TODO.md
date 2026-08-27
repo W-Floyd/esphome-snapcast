@@ -31,6 +31,29 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**A HARD RESYNC PLANTS A RANDOM DISPLACEMENT OF ~130 µs, AND IT DOES NOT NEED A RE-LOCK.**
+Measured 2026-08-27 on an MLS stimulus (sd 5.8 µs, zero frame errors — the first instrument
+this was measurable on), n=7 cycles of a 500 ms `server_latency` step out and back:
+
+    |delta| mean 130 µs, median 130, range -142..+203     signed mean +50, sd 134
+    control, no step applied (n=3):  |delta| mean 7.8 µs
+    ratio: 17x
+
+Three things it is NOT:
+
+- Not the re-lock. Six cycles muted and re-locked (mean |delta| 121 µs); the seventh corrected
+  "staying unmuted" with no lock at all and moved 188 µs. The displacement rides on the HARD
+  RESYNC, not on the mute/converge/unmute path that was the working hypothesis all afternoon.
+- Not the anchor. r = -0.641 over 6 locks, and cycles 1, 3, 4 all carried `anchor 22` and
+  landed +125.8, -7.7, +115.2. Consistent with the earlier refutation, now on a good instrument.
+- Not deterministic, not bistable, and not a per-board constant. End states +49, -74, -78,
+  +46, +214, +64, +257 — spread 334 µs, no preferred value. A two-state reading survived four
+  cycles and died on the fifth.
+
+So a static per-device calibration cannot work: the quantity is re-drawn on every resync. What
+would work is either making the resync's landing point deterministic, or measuring and
+correcting the residual after each one.
+
 **RETRACTED — "the firmware cannot see a sub-millisecond pipeline difference, by construction".**
 That was recorded here on 2026-08-27 and is WRONG. It rested on one quiet window (12:58–13:04)
 in which the pipeline happened to be sitting at its configured maxima, so every field read as a
