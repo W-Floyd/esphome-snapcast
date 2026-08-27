@@ -1373,6 +1373,11 @@ REF_RESEED_AFTER = 3
 # to touch it. Inside this, a differing k is ambiguity; beyond it, it may be a real step and the
 # jump gate decides.
 FRAME_REBUILD_MAX = 4
+# Above this margin (coef - rival) the capture's own frame count is trusted and the whole
+# disambiguation machinery is skipped. It exists only for stimuli where the runner-up lag is a
+# near-tie; with a sharp-autocorrelation stimulus it has nothing to fix and, measured, actively
+# destroys the answer -- see the A/B in the commit that added this.
+DISAMBIG_MARGIN = 0.50
 
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
@@ -2581,6 +2586,12 @@ def main():
                    help="--stream: seconds per sigrok acquisition before restarting")
     p.add_argument("--no-prefetch", dest="prefetch", action="store_false",
                    help="do not overlap the next capture with this one's decode")
+    p.add_argument("--no-disambiguation", action="store_true",
+                   help="disable the whole-frame disambiguation machinery -- the median-lag "
+                        "tie-break, the frame-count rebuild and the continuity correction. "
+                        "They exist ONLY because program material correlates at ~0.997 between "
+                        "adjacent frames. With an MLS stimulus the runner-up is ~0.03 and none "
+                        "of it is needed; use this to prove that rather than assume it")
     p.add_argument("--max-frame-correct", type=int, default=0,
                    help="cap on the whole-frame ambiguity undone per row (0 = no cap). "
                         "The ambiguity is not small -- it was measured wandering over "
@@ -2966,7 +2977,14 @@ def main():
             # So take the median frame count and this capture's residue. Bounded to +-4 frames of
             # the median: beyond that the capture may be seeing a genuine step, which the jump
             # gate below is there to confirm, and this must not quietly flatten it.
-            if (math.isfinite(off) and frame_ns_pre > 0 and prefer is not None
+            # AMBIGUOUS CAPTURES ONLY. A capture whose runner-up peak is nowhere near the best
+            # one has already answered the frame count; overriding it with a running median can
+            # only be wrong. Measured on an MLS stimulus (rival 0.03): forcing it gave sd 792 us
+            # and rejected a third of rows, against sd 13.9 us and 100% accepted when left alone.
+            unambiguous = (coef - info.get("rival", 1.0)) >= DISAMBIG_MARGIN
+            disambiguate = not args.no_disambiguation and not unambiguous
+            if (disambiguate
+                    and math.isfinite(off) and frame_ns_pre > 0 and prefer is not None
                     and abs(k - prefer) <= FRAME_REBUILD_MAX):
                 residue_pre = off - k * frame_ns_pre
                 off = prefer * frame_ns_pre + residue_pre
@@ -2980,7 +2998,8 @@ def main():
             # became the reference and dragged its successors to 0 until the next rejection,
             # which is the run of dropouts to zero seen on the plot.
             last_off = (sorted(ref_hist)[len(ref_hist) // 2] if ref_hist else None)
-            if math.isfinite(off) and fperiod > 0 and last_off is not None:
+            if (disambiguate
+                    and math.isfinite(off) and fperiod > 0 and last_off is not None):
                 cand = round((last_off - off) / fperiod)
                 if args.max_frame_correct:
                     cand = int(np.clip(cand, -args.max_frame_correct,
@@ -3065,7 +3084,8 @@ def main():
                     # then becomes the tie-breaker for the next capture.
                     lag_hist.append(k)
                     pending = None
-                    prefer = int(sorted(lag_hist)[len(lag_hist) // 2])
+                    prefer = (None if (args.no_disambiguation or unambiguous)
+                              else int(sorted(lag_hist)[len(lag_hist) // 2]))
             # RIVAL MARGIN, CHECKED ON EVERY ROW. This used to be gated on `prefer is None`, so
             # once a run had a preferred lag it never rejected on rival grounds again -- and that
             # is exactly when it matters, because by then the ambiguity shows up as a lag that
