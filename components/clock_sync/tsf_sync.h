@@ -57,7 +57,11 @@ class TsfSync {
   /// @param est the caller's own Kalman estimate at @p local_now_us.
   /// @param server_id_hash identity of the connected server (FNV-1a of host:port);
   /// mappings are only shared between clients of the same server.
-  void service(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash);
+  /// @param stream_id_hash identity of the snapcast STREAM being played (FNV-1a of its
+  ///        name), 0 when unknown. Leadership is scoped to it as well as the BSS:
+  ///        render_phase is only comparable between devices on the same stream.
+  void service(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
+               uint32_t stream_id_hash = 0);
 
   /// @brief Computes the shared server−client offset, sampling TSF internally.
   /// @param local_now_us caller's esp_timer now (staleness check).
@@ -157,8 +161,10 @@ class TsfSync {
   /// reset_(), which is for the network genuinely changing underneath us.
   void demote_(const char *reason);
   void reset_(const char *reason);
-  void receive_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash);
-  void broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash);
+  void receive_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
+                uint32_t stream_id_hash);
+  void broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
+                  uint32_t stream_id_hash);
   /// Stores a mapping (from a packet, or our own broadcast) as the active one.
   void adopt_(int64_t tsf_base_us, int64_t tsf_minus_server_us, float drift_ppm, int64_t local_now_us);
   /// On promotion, continue the line the group is already playing to instead of
@@ -212,6 +218,7 @@ class TsfSync {
   bool warned_rejected_{false};  // one log line per rejection episode
   bool warned_foreign_bss_{false};
   bool warned_foreign_server_{false};
+  bool warned_foreign_stream_{false};
   bool warned_tx_{false};
   uint32_t rx_peer_count_{0};  // accepted packets (diagnostics)
 

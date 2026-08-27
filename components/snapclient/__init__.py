@@ -81,6 +81,7 @@ CONF_PAUSE_BEHAVIOR = "pause_behavior"
 CONF_SYNC_RESILIENCE = "sync_resilience"
 CONF_REANCHOR_AFTER_RECONNECT = "reanchor_after_reconnect"
 CONF_FAST_SPLICE_THRESHOLD = "fast_splice_threshold"
+CONF_RENDER_ALIGN_MAX = "render_align_max"
 
 
 def _none_to_empty_dict(value):
@@ -307,6 +308,14 @@ CONFIG_SCHEMA = cv.All(
             # error it has already fixed. 1ms is 8x converge_fine and above every steady-state
             # excursion measured. Off by default: this puts the splice path back in the loop while
             # unmuted, which wants measuring per install.
+            # Cap on the follower-side correction for the inter-device offset. 0 disables it,
+            # which is the default: the servo nulls each device against server time and nothing
+            # nulls the DIFFERENCE, so this is the only thing that can, but it is a second loop
+            # on the same audio and it should be switched on deliberately.
+            cv.Optional(CONF_RENDER_ALIGN_MAX, default="0ms"): cv.All(
+                cv.positive_time_period_microseconds,
+                cv.Range(max=cv.TimePeriod(milliseconds=20)),
+            ),
             cv.Optional(CONF_FAST_SPLICE_THRESHOLD, default="0ms"): cv.All(
                 cv.positive_time_period_microseconds
             ),
@@ -401,6 +410,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_sync_resilience(config[CONF_SYNC_RESILIENCE]))
     cg.add(var.set_reanchor_after_reconnect(config[CONF_REANCHOR_AFTER_RECONNECT]))
     cg.add(var.set_fast_splice_threshold(config[CONF_FAST_SPLICE_THRESHOLD].total_microseconds))
+    cg.add(var.set_render_align_max(config[CONF_RENDER_ALIGN_MAX].total_microseconds))
     hold = config[CONF_KEEPALIVE_HOLD]
     cg.add(var.set_keepalive_hold(0 if hold == CONF_NEVER else hold.total_milliseconds))
 

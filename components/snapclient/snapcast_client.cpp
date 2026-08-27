@@ -561,6 +561,14 @@ static constexpr int64_t REANCHOR_MIN_INTERVAL_US = 60000000;
 // So: splice ONLY well above the band, one frame per chunk, and hand back to the PI inside it.
 // Engaging at 1 ms rather than at the deadband is what keeps this away from the limit cycle: the
 // PI still owns everything below, and 1 ms is 8x converge_fine.
+// Follower-side inter-device alignment. Only a fraction of the measured delta is taken per
+// report so two devices cannot chase each other, and the per-step clamp bounds how fast the
+// target can move -- a target that jumps is a hard resync, which is the thing being repaired.
+static constexpr float RENDER_ALIGN_GAIN = 0.25f;
+static constexpr int32_t RENDER_ALIGN_MAX_STEP_US = 50;
+// Below this the delta is measurement noise: the render delta's own MAD is ~15 us against a
+// truth MAD of 1.7 us, so correcting inside that band would inject noise, not remove it.
+static constexpr int32_t RENDER_ALIGN_DEADBAND_US = 20;
 static constexpr int64_t FAST_SPLICE_RELEASE_US = 300;
 // Bound on one episode, so a mis-measurement cannot walk the audio indefinitely: 128 frames is
 // ~2.9 ms at 44.1 kHz, comfortably more than any planted offset measured (1.4 ms) and far less
@@ -1567,7 +1575,8 @@ void SnapcastClient::service_tx_() {
         est.drift = this->time_filter_.get_drift();
       }
       this->filter_mutex_.unlock();
-      this->tsf_sync_->service(now, est, this->server_id_hash_);
+      this->tsf_sync_->service(now, est, this->server_id_hash_,
+                               this->stream_id_hash_.load(std::memory_order_relaxed));
     }
   }
 #endif
@@ -4211,6 +4220,44 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
               // the two can be compared against the analyser before anything acts on either.
               snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " render %+" PRId32 " us)",
                        this->tsf_sync_->mapping_age_s(now_us()), depth_delta, render_delta);
+              // THE COMPARISON ABOVE HAS NOW BEEN MADE. Measured 2026-08-27 across n=9 forced
+              // resyncs on a probed pair, MLS stimulus, analyser at per-frame sd 0.1 us.
+              //
+              // The residual is roughly CONSTANT, not proportional: the displacement ranged
+              // 17-180 us while the render delta missed it by 8.7 +- 3.4 us each time (two
+              // outliers at 31 and 59 us excepted). Expressed as "percent tracked" that same
+              // fixed error reads 94% on a large displacement and 31% on a small one, which
+              // looks like an erratic signal and is not -- percent-tracked is simply the wrong
+              // statistic when the numerator is constant. Judge this by the residual in us.
+              //
+              // CAVEAT ON THOSE NUMBERS: they were taken with the leader on a DIFFERENT snapcast
+              // stream, which is outside render_delta's own contract (it requires both devices
+              // to be playing the same stream). Stream-scoped leadership now enforces that, and
+              // the residual is expected to fall below 9 us once it holds; re-measure before
+              // trusting any gain here.
+              //
+              // NOTHING NULLS THE DIFFERENCE BETWEEN TWO DEVICES otherwise: each servo drives
+              // its OWN error against server time to zero, so a hard resync's residual is held
+              // forever by a servo that is already at its setpoint and reports a clean median.
+              //
+              // Correct the DEADLINE, not the audio. Shifting this device's target lets the
+              // existing servo close the gap with its normal trim; a second controller splicing
+              // frames would fight the first for the same audio. Gain is deliberately low and
+              // the step is clamped: this runs once per report, and the failure mode to avoid
+              // is two devices chasing each other.
+              if (this->config_.render_align_max_us > 0) {
+                const int32_t cap = static_cast<int32_t>(this->config_.render_align_max_us);
+                int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
+                if (std::abs(render_delta) > RENDER_ALIGN_DEADBAND_US) {
+                  const int32_t step = std::clamp<int32_t>(
+                      static_cast<int32_t>(-render_delta * RENDER_ALIGN_GAIN),
+                      -RENDER_ALIGN_MAX_STEP_US, RENDER_ALIGN_MAX_STEP_US);
+                  bias = std::clamp<int32_t>(bias + step, -cap, cap);
+                  this->render_bias_us_.store(bias, std::memory_order_relaxed);
+                }
+                ESP_LOGD(TAG, "RALIGN render %+" PRId32 " us -> bias %+" PRId32 " us (cap %" PRId32 ")",
+                         render_delta, bias, cap);
+              }
             }
           }
         } else {
@@ -4314,6 +4361,16 @@ int64_t SnapcastClient::predict_next_play_us_(uint32_t sample_rate) {
   return predicted;
 }
 
+void SnapcastClient::set_stream_identity(const std::string &stream_name) {
+  // Empty means the control session has not reported a stream yet; keep 0 ("unknown"), which
+  // groups with anyone rather than isolating this device from the timebase.
+  const uint32_t h = stream_name.empty() ? 0u : fnv1_hash(stream_name);
+  const uint32_t prev = this->stream_id_hash_.exchange(h, std::memory_order_relaxed);
+  if (prev != h) {
+    ESP_LOGI(TAG, "TSF stream scope: '%s' (%08" PRIx32 ") -- leadership scoped to it", stream_name.c_str(), h);
+  }
+}
+
 int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
   // Effective playout buffer, matching the reference client (controller.cpp):
   // max(0, bufferMs - serverLatency - localLatency)
@@ -4330,7 +4387,11 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
     int64_t shared_offset_us;
     if (this->tsf_sync_->shared_server_offset_us(now_us(), shared_offset_us)) {
       this->deadline_on_shared_tsf_ = true;
-      return rec.server_ts_us + buffer_us - shared_offset_us;
+      // Follower-side inter-device correction; 0 unless render_align_max is configured. Applied
+      // only here, on the shared-TSF path: without a shared mapping the two devices' phases are
+      // not comparable and the bias would be meaningless.
+      return rec.server_ts_us + buffer_us - shared_offset_us +
+             this->render_bias_us_.load(std::memory_order_relaxed);
     }
     this->deadline_on_shared_tsf_ = false;
   }

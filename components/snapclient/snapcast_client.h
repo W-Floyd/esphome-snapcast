@@ -80,6 +80,13 @@ struct SnapcastClientConfig {
   // See FAST_SPLICE_RELEASE_US and fast_splice_(). Off by default: the splice path has a
   // limit-cycle history and this puts it back in the loop while unmuted.
   uint32_t fast_splice_threshold_us{0};
+  // Cap on the follower-side correction of the INTER-DEVICE offset; 0 disables it (default).
+  // The servo nulls each device against server time, so nothing nulls the difference between
+  // two of them and a hard resync's residual persists forever. render_delta_us() measures that
+  // difference and was previously log-only, pending validation -- measured 2026-08-27 across
+  // forced resyncs, it tracks the true displacement to 94-95%. Off by default because it is a
+  // second loop acting on the same audio.
+  uint32_t render_align_max_us{0};
   // Force one accounting repair cycle after each session start. OFF by default: the effect is
   // measured (n=12) but its mechanism is not, so this is opt-in until a lone reconnect has been
   // graded with it. See reanchor_after_session_() and REANCHOR_BIAS_US.
@@ -316,6 +323,8 @@ class SnapcastClient {
   /// @brief Sets this client's server-side latency via the control API (JSON-RPC,
   /// port 1705). The server persists it and pushes the updated ServerSettings back.
   void set_server_latency(int32_t latency_ms);
+  /// @brief Tell the client which snapcast stream it is playing, for TSF leadership scoping.
+  void set_stream_identity(const std::string &stream_name);
 
   // --- Playback feedback ---
 
@@ -865,6 +874,20 @@ class SnapcastClient {
   int64_t predict_next_play_us_(uint32_t sample_rate);
   /// Computes the local deadline for a chunk record.
   int64_t chunk_deadline_us_(const ChunkRecord &rec);
+
+  /// @brief Follower-side correction for the inter-device offset the servo cannot see.
+  ///
+  /// The per-device servo nulls its OWN error against server time, so nothing nulls the
+  /// difference between two devices; a hard resync leaves a residual that then persists
+  /// forever. render_delta_us() already measures that difference and, until now, was only ever
+  /// logged -- deliberately, pending validation against a logic analyser (see the comment at
+  /// its use site). Measured 2026-08-27 across forced resyncs, it tracks the true displacement
+  /// to 94-95%, which is what makes closing the loop defensible.
+  ///
+  /// Applied to the DEADLINE rather than by splicing audio: shifting the target lets the
+  /// existing servo do the work, instead of a second controller fighting it for the same
+  /// frames.
+  std::atomic<int32_t> render_bias_us_{0};
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
 
@@ -1160,6 +1183,12 @@ class SnapcastClient {
   // FNV-1a of the active session's "host:port" — identifies which server clock a
   // shared TSF mapping refers to
   uint32_t server_id_hash_{0};
+  // FNV-1a of the snapcast STREAM name, 0 until the control session reports one. Scopes TSF
+  // leadership: render_phase is expressed against the stream's server audio time, so it is only
+  // comparable between devices on the SAME stream, and a delta taken across two of them is not
+  // a playout offset at all. 0 means "unknown" and groups with anyone, which is the pre-existing
+  // behaviour and what a client without control-port access falls back to.
+  std::atomic<uint32_t> stream_id_hash_{0};
 #ifdef CLOCK_SYNC_TSF_ACTIVE
   int64_t last_peer_refresh_us_{0};  // TSF unicast roster refresh (network task)
 #endif

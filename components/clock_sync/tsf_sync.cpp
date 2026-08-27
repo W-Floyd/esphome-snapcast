@@ -258,6 +258,20 @@ struct __attribute__((packed)) TsfPacket {
   // timebase in BOTH directions, which is expensive, and an appended field cannot be misread by
   // an older receiver -- it simply is not there. The receiver accepts both lengths.
   float crystal_ppm;
+  // STREAM IDENTITY: FNV-1a of the snapcast stream this sender is playing, 0 when unknown.
+  //
+  // render_phase_us above is only comparable between devices playing the SAME stream -- its own
+  // contract says so -- because it is expressed against that stream's server audio time. Two
+  // devices on different streams of the same server produce a difference that means nothing,
+  // and acting on it would drive them apart. Measured 2026-08-27: with the probed pair on one
+  // stream and the leader on another, the render delta tracked the true displacement at
+  // 94/95/94/119/-42/81/131/119 percent -- i.e. sometimes inverted.
+  //
+  // So leadership is scoped to the stream as well as the BSS. Appended at the END with NO
+  // version bump, per the note at TSF_VERSION and the crystal_ppm precedent: an older sender
+  // simply does not carry it, and 0 means "unknown" and is accepted by anyone, so a
+  // half-flashed fleet degrades to the previous behaviour instead of splitting in two.
+  uint32_t stream_id_hash;
 };
 
 // Fields from render_phase_us onward are the newest additions, so an older sender's packet is
@@ -415,7 +429,8 @@ void TsfSync::adopt_(int64_t tsf_base_us, int64_t tsf_minus_server_us, float dri
   this->mapping_mutex_.unlock();
 }
 
-void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash) {
+void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
+                       uint32_t stream_id_hash) {
   TsfPacket pkt;
   struct sockaddr_in from = {};
   while (true) {
@@ -463,6 +478,18 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       }
       continue;
     }
+    // SAME STREAM ONLY. render_phase is expressed against the stream's server audio time, so a
+    // delta taken across two streams is not a playout offset at all. A zero hash means the
+    // sender predates this field (or has no stream yet) and is accepted, so a mixed fleet keeps
+    // the shared timebase rather than splitting.
+    if (pkt.stream_id_hash != 0 && stream_id_hash != 0 && pkt.stream_id_hash != stream_id_hash) {
+      if (!this->warned_foreign_stream_) {
+        this->warned_foreign_stream_ = true;
+        ESP_LOGD(TAG, "Ignoring TSF packets for a different stream (%08" PRIx32 " != %08" PRIx32 ")",
+                 pkt.stream_id_hash, stream_id_hash);
+      }
+      continue;
+    }
     this->rx_peer_count_++;
     // Learn the sender's address for unicast beacons: the server roster can predate
     // a peer's connection (boot race) and multicast may be blocked entirely
@@ -474,7 +501,7 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       // roster may not include us -- beacon back now (their address just got
       // learned above), rate-limited against reply ping-pong
       if (est.valid && local_now_us - this->last_tx_us_ >= 500000) {
-        this->broadcast_(local_now_us, est, server_id_hash);
+        this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
       }
       continue;
     }
@@ -638,7 +665,8 @@ void TsfSync::check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t loc
            (local_now_us - this->pipeline_diverged_since_us_) / 1e6);
 }
 
-void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash) {
+void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
+                         uint32_t stream_id_hash) {
   int64_t tsf_now, local_mid;
   if (!sample_tsf_(tsf_now, local_mid)) {
     return;
@@ -696,6 +724,7 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   memcpy(pkt.bssid, this->bssid_, 6);
   memcpy(pkt.sender_mac, this->my_mac_, 6);
   pkt.server_id_hash = server_id_hash;
+  pkt.stream_id_hash = stream_id_hash;
   pkt.tsf_base_us = tsf_now;
   pkt.tsf_minus_server_us = tms_pub;
   pkt.drift_ppm = drift_ppm;
@@ -743,7 +772,8 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
 }
 
-void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash) {
+void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
+                      uint32_t stream_id_hash) {
   const int64_t since_last_service = local_now_us - this->last_service_us_;
   if (since_last_service < SERVICE_MIN_INTERVAL_US) {
     return;
@@ -784,7 +814,7 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
     return;
   }
 
-  this->receive_(local_now_us, est, server_id_hash);
+  this->receive_(local_now_us, est, server_id_hash, stream_id_hash);
 
   const bool healthy = this->playout_healthy_.load(std::memory_order_relaxed);
   const Role role = this->role_.load(std::memory_order_relaxed);
@@ -821,7 +851,7 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
       }
     }
     if (local_now_us - this->last_tx_us_ >= BEACON_INTERVAL_US) {
-      this->broadcast_(local_now_us, est, server_id_hash);
+      this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
     }
     return;
   }
@@ -854,7 +884,7 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
     // leadership bouncing d->c->b->b->c->a in 50 s with re-locks throughout.
     this->seed_published_from_mapping_();
     this->role_.store(Role::LEADER, std::memory_order_relaxed);
-    this->broadcast_(local_now_us, est, server_id_hash);
+    this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
   }
 }
 
