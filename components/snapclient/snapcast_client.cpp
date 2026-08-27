@@ -600,7 +600,17 @@ static constexpr int64_t FAST_SPLICE_PERSIST_US = 4000000;
 // Set to DRIFT_REPAIR_US, i.e. "do not unmute carrying a split the repair would immediately act
 // on". Tighter is where a <10 us goal has to go, but not before a repair costs less than the
 // +-50 us it currently displaces.
-static constexpr int32_t UNMUTE_ANCHOR_US = DRIFT_REPAIR_US;
+// TIGHTENED from DRIFT_REPAIR_US (2000 us) on the first event that tested it. 00:14 on
+// 2026-08-27: a unmuted at anchor 0 us, b at anchor +158 us -- both inside the old threshold --
+// and the wire stepped from -21.7 us to -236.3 us. The 158 us DIFFERENCE and the ~215 us step are
+// the same quantity: the offset between two devices IS the difference of their anchor errors, and
+// the gate was letting through 20x more than the goal.
+//
+// 100 us against a drift-median floor of ~7 us leaves room to tighten further; the reason not to go
+// straight to the floor is that the median is over ~3.3 s of samples, so demanding single-digit us
+// at the unmute instant risks waiting out the bound on every event and unmuting late with no
+// benefit. Tighten again once an event has been graded at this value.
+static constexpr int32_t UNMUTE_ANCHOR_US = 100;
 // A bound on that wait. Silence is also a defect: if the anchor never settles -- a mixer reporting
 // a depth that does not describe the whole pipeline, say -- unmuting late but audible beats staying
 // quiet, and the log line says which happened. Long enough for the ~3.3 s drift window to fill
