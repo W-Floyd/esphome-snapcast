@@ -751,7 +751,7 @@ void SnapcastClient::loop() {
       ESP_LOGE(TAG,
                "PLAYER STALLED: no chunk completed for %" PRId64 " s, phase=%s, ring=%zu bytes, "
                "output_active=%d, heap free=%" PRIu32 " largest=%" PRIu32 " min_ever=%" PRIu32
-               " records=%u -- audio is not being written",
+               " records=%u iters=+%" PRIu32 " -- audio is not being written",
                (now - this->player_progress_at_us_) / 1000000,
                phase < (sizeof(PHASE_NAMES) / sizeof(PHASE_NAMES[0])) ? PHASE_NAMES[phase] : "?",
                this->pcm_ring_ != nullptr ? this->pcm_ring_->available() : 0,
@@ -765,7 +765,12 @@ void SnapcastClient::loop() {
                // is true, and it was never actually measured.
                this->record_queue_ != nullptr
                    ? static_cast<unsigned>(uxQueueMessagesWaiting(this->record_queue_))
-                   : 0u);
+                   : 0u,
+               // Iterations since the last report. Zero means the task is genuinely blocked;
+               // non-zero means it is running and taking a path that never completes a chunk,
+               // which the phase stamp cannot show because every such path re-stamps IDLE.
+               this->player_iters_.load(std::memory_order_relaxed) - this->player_iters_seen_);
+      this->player_iters_seen_ = this->player_iters_.load(std::memory_order_relaxed);
     }
   }
 
@@ -2035,6 +2040,7 @@ void SnapcastClient::player_task_() {
   this->mark_kp_event_(st, "boot");
   while (!this->shutdown_.load(std::memory_order_relaxed)) {
     ChunkRecord rec;
+    this->player_iters_.fetch_add(1, std::memory_order_relaxed);
     this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::IDLE), std::memory_order_relaxed);
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
       // No record. Normal between chunks; a WEDGE if it lasts, and this branch logged nothing at

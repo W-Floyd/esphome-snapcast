@@ -996,6 +996,12 @@ class SnapcastClient {
   /// Bumped every time the player completes a chunk. The main loop watches it for movement, so a
   /// stall is visible even when the stuck loop is making partial progress forever.
   std::atomic<uint32_t> player_progress_{0};
+  /// Bumped at the TOP of every player-loop iteration, whether or not the chunk is played.
+  /// Separates "the task is blocked" from "the task is spinning through a path that never
+  /// completes a chunk" -- opposite problems that look identical in the phase stamp, because every
+  /// discard path returns to the top and re-stamps IDLE on its way past.
+  std::atomic<uint32_t> player_iters_{0};
+  uint32_t player_iters_seen_{0};
   uint32_t player_progress_seen_{0};
   int64_t player_progress_at_us_{0};
   int64_t player_stall_log_us_{0};
