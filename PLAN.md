@@ -287,8 +287,19 @@ modelling in it. Result:
 - **Their absolute zeros differ by ~105 µs, and that is a BIAS, not noise.** `raw-sync` measures
   from `(played, played_ts)` — frames handed to the DAC — so it is blind to the final DMA/sink
   stage, where a per-device difference of that size lives. The analyser watches the I2S lines.
-- **So: absolute alignment is the ANALYSER's to report, and raw-sync must not be used for it.**
-  Its ±2 µs is a fit standard error and says nothing about that bias.
+- **CORRECTED BY A PROBE SWAP (same day): the bias is the ANALYSER'S, not raw-sync's.** Swapping
+  the two logic-analyser channels between boards left the reading at −23…−30 µs — same sign, same
+  magnitude, where a real difference would have flipped to +23…+30. So the analyser carries a fixed
+  ~−25 µs ZERO ERROR between its channels, and the earlier conclusion here (that absolute alignment
+  was the analyser's to report and raw-sync must not be used for it) was exactly backwards.
+    - **Analyser: trust CHANGES (calibrated to 1% on a known 5 ms step), not ABSOLUTE values.** A
+      step test proves scale and is blind to a constant bias, which is why the calibration missed it.
+    - **raw-sync: the better absolute reference**, reading the pair within ±3 µs across five windows
+      while the analyser insisted on 20–70 µs. Its blind spot (the final DAC stage) is evidently
+      small, or the swap would have revealed it.
+    - **Consequence for today's numbers:** every ABSOLUTE analyser reading in the 20–30 µs band was
+      mostly this bias, so the boards were closer to aligned than reported. Step measurements —
+      landing offsets, repair steps, the 1.3 ms outage recoveries — are unaffected, being differences.
 - Analyser resolution: MAD 3–8 µs over a 60 s window, so a static offset needs averaging (or a
   longer window) before a sub-µs claim means anything.
 
