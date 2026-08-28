@@ -4269,6 +4269,25 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // Ring occupancy shows how much dropout cushion is actually held client-side
       const uint32_t buffered_ms = static_cast<uint32_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000 / (frame_bytes * rec.params.sample_rate));
+      // DEDICATED LINE, not a field on the Sync report. The Sync line truncates at ~311 chars and
+      // the trim parenthetical sits at its END: measured 2026-08-28, only 3 of 142 lines on one
+      // board and 0 of 141 on the other survived intact, which silently turned every count taken
+      // from that field -- railed, split-hold, gate -- into a count of "did the line happen to fit".
+      // Several conclusions were drawn and retracted on the strength of it. See HANDOFF's "Log lines
+      // truncate" trap, which says exactly this and predates the mistake.
+#if defined(USE_I2S_RATE_LOCK) && defined(USE_SNAPCLIENT_TIMING_DIAG)
+      if (st.rate_lock_ok) {
+        ESP_LOGD(TAG,
+                 "TRIMDBG applied=%+.2f ppm samples=%" PRIu32 " railed=%" PRIu32 " span=%+.0f..%+.0f "
+                 "splithold=%" PRIu32 " gate=%d lock=%d conv=%d err=%" PRId32,
+                 this->rate_lock_->applied_ppm(), st.trim_samples, st.trim_railed,
+                 st.trim_samples > 0 ? st.trim_min_ppm : 0.0f, st.trim_samples > 0 ? st.trim_max_ppm : 0.0f,
+                 st.trim_split_holds, st.gate_seen ? 1 : 0, st.gate_rate_lock_ok ? 1 : 0,
+                 st.gate_converged ? 1 : 0, st.gate_median_err_us);
+      } else {
+        ESP_LOGD(TAG, "TRIMDBG rate_lock_ok=0 (no steering this report)");
+      }
+#endif
       char trim_str[112] = "";
   #ifdef USE_I2S_RATE_LOCK
       if (st.rate_lock_ok) {
