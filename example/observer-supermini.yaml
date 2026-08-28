@@ -1,0 +1,55 @@
+# TSF OBSERVER — an ESP32-S3 SuperMini that joins the group but drives no DAC.
+#
+# WHY. Every TSF measurement today is made by a device that is simultaneously decoding and
+# feeding a DAC, so that device's own scheduling jitter is baked into the reading and cannot be
+# separated from the timebase's own wander. This board answers questions the speakers cannot:
+#
+#   * A STABLE LEADER. Leadership requires a healthy device and every resync briefly disqualifies
+#     the incumbent — measured six handovers in seventeen minutes on a two-device group, which is
+#     what made the inter-device correction unmeasurable. A board that never has to recover is
+#     never unhealthy. NOTE: it still needs `always_healthy` (see TODO) to hold the crown through
+#     a group-wide upset; without that this is a third participant, not yet a stable reference.
+#   * A THIRD RENDER PHASE. render_phase comes from played/pushed counters, so an observer only
+#     has one if it actually renders — which is why this runs the full client rather than a
+#     cut-down TSF-only build. With three phases the group median stops being a two-device mean.
+#   * DIAGNOSTICS WITHOUT COST TO AUDIO YOU CAN HEAR. Same instrumentation, and nothing audible
+#     if it misbehaves.
+#
+# IT MUST SHARE THE STREAM. TSF leadership is scoped to (BSS, snapserver, snapcast STREAM), so
+# this only joins the probed pair's group if it is playing the same stream — put it on MLS44
+# alongside them, or it forms its own group and observes nothing.
+#
+# I2S GOES TO UNUSED PINS, NOT THE DAC PINS. This runs on a real speaker board with its DAC
+# still wired, so the audio has to go somewhere harmless rather than be muted: mute or volume-0
+# risks the client short-circuiting the playout path, and render_phase is derived from the
+# played/pushed counters -- if it stops rendering it loses the one thing an observer is for.
+# Routing the peripheral to spare GPIOs keeps the playout path bit-identical while GPIO4/5/6 sit
+# idle, so the DAC receives no clock and stays silent with nothing to unwire.
+substitutions:
+  name: snapclient-observer
+  friendly_name: Snapclient Observer
+
+  board: esp32-s3-devkitc-1
+  flash_size: 4MB
+  psram_mode: quad
+  psram_speed: 80MHz
+
+  # Spare S3 GPIOs: not strapping (0/3/45/46), not USB (19/20), not flash/PSRAM (26-32),
+  # not the UART (43/44), and clear of the board's DAC pins (4/5/6) and LED (48).
+  pin_lrclk: GPIO15
+  pin_bclk: GPIO16
+  pin_dout: GPIO17
+  pin_led: GPIO48
+
+packages:
+  base: !include snapclient-base.yaml
+
+snapclient:
+  id: snap
+  # Never report unhealthy, so this board holds TSF leadership through upsets that would
+  # disqualify a speaker, and log the group-median inputs (own phase, each peer phase with its
+  # age, the median). Safe ONLY because nothing is wired to the I2S pins.
+  tsf_observer: true
+
+wifi:
+  output_power: 8.5dB

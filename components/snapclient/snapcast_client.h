@@ -87,6 +87,11 @@ struct SnapcastClientConfig {
   // forced resyncs, it tracks the true displacement to 94-95%. Off by default because it is a
   // second loop acting on the same audio.
   uint32_t render_align_max_us{0};
+  // TSF OBSERVER MODE: never report this device as unhealthy, so it holds leadership through
+  // upsets that would disqualify a speaker, and log the group's phase inputs. Only for a device
+  // that drives no DAC -- on a speaker it defeats the guard that stops a device whose playout has
+  // diverged from publishing a timebase everyone follows. See set_always_healthy().
+  bool tsf_observer{false};
   // Force one accounting repair cycle after each session start. OFF by default: the effect is
   // measured (n=12) but its mechanism is not, so this is opt-in until a lone reconnect has been
   // graded with it. See reanchor_after_session_() and REANCHOR_BIAS_US.

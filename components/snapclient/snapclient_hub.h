@@ -70,6 +70,7 @@ class SnapclientHub final : public Component,
   /// @brief Standing offset (us) at which fast POSITION correction engages; 0 disables.
   void set_fast_splice_threshold(uint32_t us) { this->fast_splice_threshold_us_ = us; }
   void set_render_align_max(uint32_t us) { this->render_align_max_us_ = us; }
+  void set_tsf_observer(bool v) { this->tsf_observer_ = v; }
 
   /// @brief Force one accounting repair cycle after each session start; see REANCHOR_BIAS_US.
   void set_reanchor_after_reconnect(bool enable) { this->reanchor_after_reconnect_ = enable; }
@@ -199,6 +200,7 @@ class SnapclientHub final : public Component,
   bool reanchor_after_reconnect_{false};
   uint32_t fast_splice_threshold_us_{0};
   uint32_t render_align_max_us_{0};
+  bool tsf_observer_{false};
   PauseBehavior pause_behavior_{PauseBehavior::ALLOW};
   uint32_t sync_deadband_us_{128};
   uint32_t converge_fine_us_{2000};

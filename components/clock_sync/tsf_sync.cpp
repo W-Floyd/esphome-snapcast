@@ -591,6 +591,26 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
   }
 }
 
+void TsfSync::log_phase_inputs(int64_t local_now_us) const {
+  const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
+  char buf[192];
+  int n = snprintf(buf, sizeof(buf), "PHASEIN mine=%lld", static_cast<long long>(mine));
+  for (size_t i = 0; i < MAX_PHASE_PEERS && n > 0 && n < static_cast<int>(sizeof(buf)); i++) {
+    if (!this->peer_phase_[i].used) {
+      continue;
+    }
+    // Age matters as much as the value: an entry is accepted up to PHASE_STALE_US (15 s) old,
+    // and a peer that reseeded its counters inside that window contributes a phase describing a
+    // position it no longer holds.
+    n += snprintf(buf + n, sizeof(buf) - n, " | %02X%02X d=%+lld age=%lldms",
+                  this->peer_phase_[i].mac[4], this->peer_phase_[i].mac[5],
+                  static_cast<long long>(this->peer_phase_[i].phase_us - mine),
+                  static_cast<long long>((local_now_us - this->peer_phase_[i].seen_us) / 1000));
+  }
+  ESP_LOGD(TAG, "%s | group=%ld", buf,
+           static_cast<long>(this->render_group_delta_us_.load(std::memory_order_relaxed)));
+}
+
 void TsfSync::record_peer_phase_(const uint8_t mac[6], int64_t phase_us, int64_t local_now_us) {
   if (phase_us == RENDER_PHASE_UNKNOWN) {
     return;

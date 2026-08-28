@@ -82,6 +82,7 @@ CONF_SYNC_RESILIENCE = "sync_resilience"
 CONF_REANCHOR_AFTER_RECONNECT = "reanchor_after_reconnect"
 CONF_FAST_SPLICE_THRESHOLD = "fast_splice_threshold"
 CONF_RENDER_ALIGN_MAX = "render_align_max"
+CONF_TSF_OBSERVER = "tsf_observer"
 
 
 def _none_to_empty_dict(value):
@@ -312,6 +313,11 @@ CONFIG_SCHEMA = cv.All(
             # which is the default: the servo nulls each device against server time and nothing
             # nulls the DIFFERENCE, so this is the only thing that can, but it is a second loop
             # on the same audio and it should be switched on deliberately.
+            # TSF OBSERVER: never report unhealthy, so this device holds leadership through
+            # upsets that would disqualify a speaker, and log the group's phase inputs. ONLY for
+            # a board driving no DAC -- on a speaker it defeats the guard that stops a device
+            # whose own playout has diverged from publishing the group's timebase.
+            cv.Optional(CONF_TSF_OBSERVER, default=False): cv.boolean,
             cv.Optional(CONF_RENDER_ALIGN_MAX, default="0ms"): cv.All(
                 cv.positive_time_period_microseconds,
                 cv.Range(max=cv.TimePeriod(milliseconds=20)),
@@ -411,6 +417,7 @@ async def to_code(config: ConfigType) -> None:
     cg.add(var.set_reanchor_after_reconnect(config[CONF_REANCHOR_AFTER_RECONNECT]))
     cg.add(var.set_fast_splice_threshold(config[CONF_FAST_SPLICE_THRESHOLD].total_microseconds))
     cg.add(var.set_render_align_max(config[CONF_RENDER_ALIGN_MAX].total_microseconds))
+    cg.add(var.set_tsf_observer(config[CONF_TSF_OBSERVER]))
     hold = config[CONF_KEEPALIVE_HOLD]
     cg.add(var.set_keepalive_hold(0 if hold == CONF_NEVER else hold.total_milliseconds))
 

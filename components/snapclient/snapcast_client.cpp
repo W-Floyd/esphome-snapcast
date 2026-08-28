@@ -708,6 +708,11 @@ bool SnapcastClient::start() {
   // from our own estimate would hard-resync us -- reject it instead
   this->tsf_sync_ =
       std::make_unique<TsfSync>(static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000);
+  if (this->config_.tsf_observer) {
+    // Hold leadership through upsets that would disqualify a speaker; see set_always_healthy().
+    this->tsf_sync_->set_always_healthy(true);
+    ESP_LOGI(TAG, "TSF observer mode: always healthy, phase inputs logged");
+  }
 #endif
 
   this->control_session_ = std::make_unique<ControlSession>(this->config_.client_id);
@@ -4272,6 +4277,9 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
               // spent ten reports walking its bias toward a delta that vanished when the
               // displacement was removed. The servo owns the transient; this owns the standing
               // offset the servo cannot see.
+              if (this->config_.tsf_observer) {
+                this->tsf_sync_->log_phase_inputs(now_us());
+              }
               const int32_t group_delta = this->tsf_sync_->render_group_delta_us();
               // Only every Nth report: the loop delay is ~2 reports, so correcting on every one
               // means acting on a measurement that does not yet contain the previous correction.

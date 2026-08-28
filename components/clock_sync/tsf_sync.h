@@ -84,9 +84,30 @@ class TsfSync {
   ///        regardless, and an implausible deadline arrives group-wide, so stepping
   ///        down only destroys the timebase everyone is relying on.
   void set_playout_healthy(bool healthy, bool deadline_implausible = false) {
-    this->playout_healthy_.store(healthy, std::memory_order_relaxed);
-    this->deadline_implausible_.store(deadline_implausible, std::memory_order_relaxed);
+    this->playout_healthy_.store(healthy || this->always_healthy_, std::memory_order_relaxed);
+    this->deadline_implausible_.store(deadline_implausible && !this->always_healthy_,
+                                      std::memory_order_relaxed);
   }
+
+  /// @brief Never report this device as unhealthy, so it can hold leadership indefinitely.
+  ///
+  /// Leadership requires a healthy device, and a device recovering from a resync is briefly not
+  /// one -- measured six handovers in seventeen minutes on a two-device group, which is enough
+  /// to make anything referenced to the leader useless. A dedicated observer that drives no DAC
+  /// has nothing audible to protect, so it is the right device to hold the crown through an
+  /// upset that would disqualify a speaker.
+  ///
+  /// ONLY SET THIS ON A DEVICE NOBODY LISTENS TO. On a speaker it defeats the guard that stops a
+  /// device whose own playout has diverged from publishing a timebase the whole group follows.
+  void set_always_healthy(bool v) { this->always_healthy_ = v; }
+
+  /// @brief Dump the group-median INPUTS: own phase, every peer phase with its age, the median.
+  ///
+  /// Every conclusion about render_group_delta_us so far was inferred from its OUTPUT, and those
+  /// inferences contradicted each other -- a regression against a logic analyser put the slope at
+  /// -0.10 where the arithmetic demands -2.0. An output that is already suspect cannot diagnose
+  /// itself; the inputs have to be visible.
+  void log_phase_inputs(int64_t local_now_us) const;
 
   /// @brief Reports our own playout pipeline depth (pushed-but-unplayed audio, us).
   /// Published in our beacons and compared against the leader's, because absolute
@@ -230,6 +251,7 @@ class TsfSync {
   bool warned_foreign_bss_{false};
   bool warned_foreign_server_{false};
   bool warned_foreign_stream_{false};
+  bool always_healthy_{false};
 
   /// Published render phases, one slot per peer MAC, for the group median. Fixed and small: a
   /// stream group is a handful of speakers, and a full table evicts the stalest entry rather
