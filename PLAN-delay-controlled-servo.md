@@ -529,18 +529,56 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   corrects position, not rate, so it learns no crystal offset and there is nothing to seed from at a
   genuine cold boot — the integral starts at zero.
 
-  The cold-boot wind-up plays **unmuted**, over ~3·Ti (90 s at Ti = 30 s, ~30 s at Ti = 8-10 s), as a
-  sub-threshold error ramping toward `crystal/Kp` while the integral catches up. `fast_splice_` runs
-  **episodes, not lone splices**: it arms only after the effective error holds at or above the
-  threshold for `FAST_SPLICE_PERSIST_US` (4 s), then corrects one frame per chunk until the error is
-  inside `FAST_SPLICE_RELEASE_US` (300 µs) or it hits the 128-frame bound. At ~40 ppm an uncorrected
-  error accrues ~1 ms every ~25 s, so the wind-up emits **episodes of ~30 frames (~0.7 ms over
-  ~0.8 s), one per ~25 s, lengthening in interval as the integral catches up** — each handing back at
-  300 µs, not at zero. Inaudible because the correction is one frame per chunk, which is the property
-  that matters, not because anything is muted.
+  The cold-boot wind-up plays **unmuted**, and the loop is running throughout — so the error follows
+  the **closed-loop PI response to a `crystal_ppm` rate step with the integral at zero**, not an
+  open-loop accrual. With `Ti = tau`, damping is `zeta = 0.5` and the peak is `~0.5·crystal/sqrt(Ki)`:
+
+      tau = 30 s   peak ~600 us   vs the 1 ms splice threshold -- 1.6x margin
+      tau = 10 s   peak ~200 us   -- 5x margin
+
+  **Both are below the threshold, so the expected number of splice episodes during wind-up is ZERO**
+  and the transient should be silent. Grade the peak on the bench: it is one number, visible in the
+  first 30-90 s of a cold boot. The 1.6x margin at tau = 30 s is thin enough that ordinary variation
+  in `crystal_ppm` across boards or with temperature could cross it — a second argument for the
+  shorter tau, alongside mid-band convergence speed.
+
+  For reference, `fast_splice_` runs **episodes, not lone splices**, if it does arm: it requires the
+  effective error to hold at or above threshold for `FAST_SPLICE_PERSIST_US` (4 s), then corrects one
+  frame per chunk (~870 µs/s) until inside `FAST_SPLICE_RELEASE_US` (300 µs) or 128 frames.
 
   Persisting the crystal offset across boots would remove the transient entirely; it is a separate
   work item and is not part of this plan.
+
+  > **REVIEW 5 — the episode arithmetic is wrong a third time: it models the error as UNCORRECTED
+  > while the loop is running.** "~1 ms accrues every ~25 s" is the open-loop rate; from handoff the
+  > P term opposes the drift and the integral winds concurrently, so the error follows the
+  > closed-loop PI response to a 40 ppm rate step with the integral at zero. With Ti = tau the
+  > damping is ζ = Kp/(2·sqrt(Ki)) = 0.5 and the peak is roughly 0.5·crystal/sqrt(Ki): **~600-700 µs
+  > at tau = Ti = 30 s, ~160-190 µs at 8-10 s — both BELOW the 1 ms splice threshold.** The expected
+  > episode count is zero, not one per 25 s. Better news than claimed, but the narrative should
+  > state the closed-loop peak (and grade it on the bench) rather than an accrual rate that assumes
+  > the loop it describes does not exist.
+
+  > **RESPONSE — correct, and the arithmetic checks. Third revision of this same paragraph.**
+  >
+  > Verified: with `Ti = tau` and `tau = 1/Kp`, `Ki = Kp/Ti = Kp²`, so `sqrt(Ki) = Kp` and
+  > `zeta = Kp/(2·sqrt(Ki)) = 0.5` exactly. The response to a `crystal` rate step with the integral
+  > at zero peaks at roughly `0.5·crystal/sqrt(Ki)`:
+  >
+  >     tau = 30 s   Kp = 0.033   peak ~ 0.5 x 40 / 0.033  = ~600 us
+  >     tau = 10 s   Kp = 0.1     peak ~ 0.5 x 40 / 0.1    = ~200 us
+  >
+  > Both below the 1 ms threshold, so **the expected episode count is zero** and the wind-up should be
+  > silent. I had modelled the error as accruing open-loop while describing a loop whose entire job is
+  > to stop it accruing — the first version claimed four single-frame splices, the second ~30-frame
+  > episodes every 25 s, and both assumed the controller was not running.
+  >
+  > **It also sharpens the tau choice, which is worth more than the correction itself.** At tau = 30 s
+  > the peak is 600 us against a 1 ms threshold — 1.6x margin, so ordinary variation in `crystal_ppm`
+  > across boards or temperature could push a cold boot over it. At tau = 8-10 s the margin is 5x.
+  > That is now a second independent argument for the shorter tau, alongside the mid-band convergence
+  > speed from REVIEW 2. Grade the peak on the bench: it is a single number visible in the first
+  > 30-90 s of a cold boot.
 
   > **REVIEW 4 — the splice cadence misdescribes the mechanism being reused.** `fast_splice_` does
   > not emit lone splices; it runs EPISODES: it arms only after the effective error holds at or
@@ -605,9 +643,80 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   > It also argues for the shorter tau: at Ti = 8-10 s the wind-up is ~30 s and roughly one splice.
 * **What `converged` means for the new loop.** The `fast_splice_` gate requires `st.converged`
   (`snapcast_client.cpp:3676`), which is servo state — so without a definition the fast path never
-  engages at all, including through the cold-boot wind-up above. **Adopted: converged once
-  `|err_tag|` has stayed inside `converge_fine_us` for a full integral time constant (Ti).** Same
-  shape as the existing definition, expressed in the measured error rather than the predicted one.
+  engages at all. **Adopted: converged LATCHES once `|err_tag|` has stayed inside `converge_fine_us`
+  for a full integral time constant (Ti), and is cleared only by mute and hard events** — the same
+  clearing conditions as today (set at :3091, cleared at :3522). It must latch: `converge_fine` sits
+  ~8x below the splice threshold, so an un-latching definition would clear on any error above ~125 µs
+  and disarm the splice path at exactly the errors splices exist to correct — a deadlock, not a
+  degradation.
+* **The splice in-flight horizon must be re-derived, not inherited.** `SPLICE_HIST = MEDIAN_WINDOW/2`
+  (15 chunks) compensates for a splice reaching the 31-chunk median only after half a window. Driven
+  by `err_tag` the blind spot is a different quantity: one pipeline depth (~10-12 chunks) before a
+  splice shows in rendered audio, plus N/2 arrivals of averaging. Similar magnitude today by
+  coincidence. **Derive it as `pipeline_depth_chunks + N/2`, taking the depth from the measured
+  `render_latency()`**, so it tracks `buffer_duration`, the DMA span and N instead of assuming them.
+  At ~870 µs/s of correction a ~300 ms blind spot hides ~260 µs — most of the 300 µs release band,
+  and enough to overshoot and re-arm.
+
+  > **REVIEW 5 — the name checks out (`converge_fine_us`, `snapcast_client.h:73`, config
+  > `converge_fine`, default 2 ms), but the definition is half-stated.** Today `converged` is a
+  > LATCH: set once (`:3091`), cleared only by mute and hard events (`:2698`, `:3522`), not by the
+  > error re-leaving the band. Say whether the new definition latches the same way — it must,
+  > because on the bench `converge_fine` runs well below the splice threshold (the config comment
+  > calls 1 ms "8x converge_fine"), so an un-latching definition would disarm the splice path at
+  > exactly the errors it exists to correct.
+
+  > **RESPONSE — correct, and the omission would have deadlocked the fast path. It LATCHES.**
+  >
+  > Verified: `st.converged` is set at exactly one site (`:3091`) and cleared at one (`:3522`) — a
+  > latch, not a window test — and the "1 ms is 8x converge_fine" comment appears twice in the source
+  > (`__init__.py:309`, `snapcast_client.cpp:611`), so the band really does sit an order of magnitude
+  > below the splice threshold.
+  >
+  > The consequence of getting this wrong is a **deadlock, not a degradation**: an un-latching
+  > definition would clear `converged` as soon as the error left a ~125 µs band, which disarms the
+  > `fast_splice_` gate — and the splice path is the only mechanism that acts between ~125 µs and the
+  > millisecond scale. The error would then have to be corrected by the very path its own size had
+  > just disabled.
+  >
+  > **Definition, now complete: converged LATCHES once `|err_tag|` has stayed inside `converge_fine_us`
+  > for a full integral time constant, and is cleared only by mute and hard events — the same clearing
+  > conditions as today.** "Half-stated" was exactly right: I specified the set condition and said
+  > nothing about the clear, which is where the behaviour actually lives.
+
+  > **REVIEW 5 — the splice in-flight compensation horizon must be re-derived for `err_tag`.**
+  > `SPLICE_HIST = MEDIAN_WINDOW / 2` (15 chunks, `snapcast_client.h:625`) exists because a splice
+  > reaches the MEDIAN only after half its window; the comment above it records the overshoot limit
+  > cycle that happens without it. Driven by `err_tag`, the lag is different in kind: one pipeline
+  > depth (~10-12 chunks) before a splice is visible in rendered audio, plus half the averaging
+  > window. Similar magnitude by coincidence, but it is a different quantity and must be derived
+  > from the pipeline depth, not inherited — an episode correcting ~870 µs/s against a ~300 ms
+  > blind spot overshoots the 300 µs release point without it.
+
+  > **RESPONSE — correct, and this is the subtlest thing found in five rounds. Added as a work item.**
+  >
+  > Verified: `SPLICE_HIST = MEDIAN_WINDOW / 2` = 15 chunks, and `splice_sum` is the total of splices
+  > within that horizon, subtracted as `in_flight_us` before the threshold test. Its purpose is
+  > specific — a splice changes the rendered error immediately but reaches the 31-chunk MEDIAN only
+  > after half a window, so without the compensation the loop keeps splicing against corrections it
+  > has already made. The comment above it records the resulting limit cycle.
+  >
+  > **Driven by `err_tag` the blind spot is a different quantity with a similar magnitude, which is
+  > the dangerous kind of coincidence.** It is one pipeline depth (~250-300 ms, ~10-12 chunks) before
+  > a splice appears in rendered audio, plus half the averaging window (N/2 arrivals). Inheriting 15
+  > chunks would be right by accident today and wrong the moment `buffer_duration`, the DMA span, or
+  > N changes — none of which the constant references.
+  >
+  > The magnitude confirms it matters: one frame per chunk is 22.7 µs / 26.1 ms = **~870 µs/s**, so a
+  > ~300 ms blind spot hides ~260 µs of correction — most of the 300 µs release band, which is
+  > precisely enough to overshoot it and re-arm.
+  >
+  > **Work item: derive the horizon as `pipeline_depth_chunks + N/2` and take the depth from the
+  > measured `render_latency()` rather than a constant**, so it tracks the configuration instead of
+  > assuming it. This is the third thing in this plan that was correct only because two unrelated
+  > numbers happened to be close (the others: the 1 ms / 2 ms threshold ordering, and `SPLICE_HIST`
+  > matching the pipeline depth) — worth stating as a pattern, because each one is a latent bug
+  > waiting for a config change.
 * **Do NOT make any hold common-mode across devices.** Freezing every device captures each one's PI
   output at an arbitrary point in its own transient, converting N momentary corrections into N
   sustained rate offsets. This was proposed and is wrong.
