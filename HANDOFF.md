@@ -268,6 +268,67 @@ Things to know before debugging it:
   re-stating identity on every write costs one entry per chunk, not one per write. An evicted tag
   yields a SKIPPED reading, never a fabricated one.
 
+## Where the alignment problem actually went (2026-08-28, end of session)
+
+**`render_align` is still 0ms, and should stay there -- but the reason changed.** Measured on a
+settled bench, two independent instruments agreeing:
+
+    on-device group delta   A median  -9 us  MAD 26   B median +0 us  MAD 16
+                            n=232/230, availability 100%, ZERO |delta|>1000 outliers
+    logic analyser (B-A)    median +1.2 us   MAD 20.0   sd 46.7   p2p 242.8   rival 0.029
+
+The pair is aligned to about a microsecond. The plan disqualified `RECON drift` because
+"correcting a tens-of-us error with a 23-45 us MAD signal injects noise of its own size"; that
+objection still holds at MAD 16-26, but it is now academic, because **the error being corrected is
+1-9 us**. Any correction would be pure injected noise.
+
+None of that came from `render_align`. It came from:
+
+| fix | effect |
+|---|---|
+| stream scoping repaired | foreign-stream peers out of the consensus; the ms-scale bursts vanished |
+| freshness gate 1 s -> 100 ms | stale phases refused rather than published |
+| mixer forwards tags per boundary | `off` within one chunk went 22% -> 100% |
+| LEAVING THE BENCH ALONE | sync medians 200-400 us -> ~20 us |
+
+That last row is not a joke. Thirteen reflashes in one session made the operator the dominant
+disturbance: |median error| is 154 us within 15 s of a consensus membership change against 93 us
+elsewhere (p90 674 vs 286), and every reflash causes five of them.
+
+**The largest remaining inter-device term is the SPLIT-HOLD**, and it is understood:
+
+    15:03:13  A: applied=+64.00 ppm  samples=0    splithold=128   <- A freezes
+    15:03:14  B: applied=+38.15 ppm  samples=128  splithold=0     <- B keeps steering
+              ~26 ppm differential x 3 s hold = ~78 us of skew
+
+While a sustained accounting split is timed toward `DRIFT_REPAIR_HOLD_US` (3 s), the trim is
+pinned to the PI's INTEGRAL -- deliberately, because steering on a prediction about to be declared
+wrong plants a permanent displacement (measured: -101.5 us per repair before the integral-hold
+existed, ~25 us predicted after). Each board is individually right. The PAIR is wrong anyway,
+because neither knows the other is holding. Do NOT "fix" this by making the hold common-mode: that
+would freeze every device's transient PI output simultaneously, which is worse.
+
+**The tagged render signal sees what the ledger-based one cannot, and this is now measured twice.**
+`inject_split(+1000)` on A, reading the two error signals side by side:
+
+    err_live  barely moved (-57..+95)   the servo NULLS it by displacing real audio, so it is
+                                        structurally blind to the displacement it just created
+    err_tag   moved ~1100 us            it measures where the audio actually is
+    diff      -1020..-1052              ratio 1.02-1.05 against 1000 us injected
+                                        recovered to -33 us within ~15 s of the negated restore
+
+Same result as the render-PHASE test earlier the same day (0.94 against 0.12). What is NOT yet
+established is whether the tag signal is quiet enough to close a loop on -- accuracy is proven,
+precision is not. See `CLAUDE.md` for why the first two attempts to measure that were both wrong.
+
+**B WEDGED ONCE (14:56), and it needed the power pulled.** Four `Pipeline refusing audio for 2 s`
+warnings, then TOTAL log silence for 2 m 23 s -- not a zombied player task still emitting other
+components' lines, but complete stoppage. That matches a documented mixer failure mode ("stayed on
+wifi and answered pings, but declared healthy API clients unresponsive and refused OTA"), whose
+mitigation is ALREADY in the code being run. So either it does not cover this path or there is a
+second wedge with the same presentation. 4 MB of `b.log` around it is the only evidence that
+survives a power cycle; one instance is not a rate.
+
 ## Traps that cost real time
 
 * **`a.log`/`b.log` span days and carry no date.** `grep "^\[13:5"` matches a previous day's build.
