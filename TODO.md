@@ -227,6 +227,30 @@ all, so the feature stays off:
 follower's correction destabilises the leader, the coupling is not through the code path built
 here, and it is not yet understood. That is where to start.
 
+**CORE AFFINITY WAS COSTING REAL JITTER.** Every task in the audio path was created with
+`xTaskCreate`, which on ESP-IDF is `tskNO_AFFINITY` — the scheduler places them on either core
+and may migrate them. In this build wifi AND the ESPHome main loop are both on CPU0
+(`CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0`, `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`), and the wifi
+driver runs at priority 23 — above every task in the chain, including `speaker_task` at 19.
+
+Pinning `snap_player` (prio 8) and `snap_net` (prio 5) to CPU1, matched 4-minute windows:
+
+    unpinned     n=4949  median +5.62 µs  sd 6.24  p95 +19.3
+    pinned CPU1  n=4871  median +4.47 µs  sd 3.58  p95 +11.0
+
+sd down 1.7x, p95 down 1.8x, from a one-line change. `bb94f20`
+
+STILL UNPINNED, and the obvious next experiment: `speaker_task` (prio 19, feeds the I2S DMA)
+and `mixer` (prio 10), both in the esphome fork. The speaker task is the most timing-critical in
+the chain and can still be scheduled onto CPU0 beneath a priority-23 radio.
+
+Task map for reference:
+
+    speaker_task  19  unpinned   (fork)      mixer         10  unpinned  (fork)
+    snap_player    8  CPU1                   snap_net       5  CPU1
+    ESPHome loop   1  CPU0                   wifi driver   23  CPU0
+    lwIP TCP/IP   18  unpinned
+
 **THE PAIR IS ALIGNED TO SUB-MICROSECOND WHEN QUIET.** Per-frame skew (`--dump-skew`, ~44100
 rows/s) across a forced resync, 2026-08-27:
 
