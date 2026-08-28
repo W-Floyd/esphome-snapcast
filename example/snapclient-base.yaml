@@ -98,7 +98,21 @@ snapclient:
   # removes ~2/3 of whatever standing offset the device carries. ON here to grade it: the
   # effect is measured (n=12), the mechanism is not, so watch a lone reconnect and check the
   # planted offset collapses to the ±50 µs residual rather than staying at milliseconds.
-  reanchor_after_reconnect: true
+  # OFF as of 2026-08-28. It fires inject_split(+2500 us) ten seconds after every re-lock, and the
+  # boards never fire it together -- measured 12 s apart (A 10:35:46, B 10:35:58) after one event.
+  # Each ramps 2500 us at 100 us/s over 25 s, so a stagger of S seconds is up to S*100 us of pure
+  # DIFFERENTIAL excursion, and what the servos leave behind is a fresh standing offset. Every
+  # observed event this morning was followed by exactly that pattern.
+  #
+  # It was enabled empirically -- its own config comment says "the effect is measured (n=12) but its
+  # mechanism is not" -- to force one accounting-repair cycle because the boot re-baseline planted an
+  # offset. That planting is what the DMA-span fix addressed (esphome fork 56601e6bc6): the seed's
+  # systematic +5 ms bias is gone, measured as 4/8 signs against a prior 10/10. So this is now
+  # plausibly ADDING offsets to correct a problem that no longer takes the same form.
+  #
+  # Re-enable only with a fresh grading of the LANDING OFFSET after a lone reconnect, which is the
+  # n=12 measurement that justified it.
+  reanchor_after_reconnect: false
   # Position correction for a standing offset, engaging well above the band. The rate loop
   # needs ~40 s to integrate a millisecond away; 43 single-frame splices (~23 µs each,
   # inaudible) do it in about a second. 0ms disables. On here to measure it.
