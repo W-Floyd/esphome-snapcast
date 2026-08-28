@@ -561,10 +561,24 @@ static constexpr int64_t REANCHOR_MIN_INTERVAL_US = 60000000;
 // So: splice ONLY well above the band, one frame per chunk, and hand back to the PI inside it.
 // Engaging at 1 ms rather than at the deadband is what keeps this away from the limit cycle: the
 // PI still owns everything below, and 1 ms is 8x converge_fine.
-// Follower-side inter-device alignment. Only a fraction of the measured delta is taken per
-// report so two devices cannot chase each other, and the per-step clamp bounds how fast the
-// target can move -- a target that jumps is a hard resync, which is the thing being repaired.
-static constexpr float RENDER_ALIGN_GAIN = 0.25f;
+// Follower-side inter-device alignment.
+//
+// GAIN AND RATE ARE SET FROM THE MEASURED LOOP DELAY, not from how fast convergence would be
+// nice. At gain 0.25 stepping every report, the pair held a sustained LIMIT CYCLE: period 26.2 s
+// (7.8 report intervals), amplitude 207 us p2p, measured on the analyser. For a proportional
+// loop against a delay, sustained oscillation sits at period ~= 4x the delay, so the loop sees
+// its own correction about 6.5 s late -- roughly two reports. That is physical: the render phase
+// is computed once per report from playout that already reflects earlier audio, and the servo
+// then needs time to act on the shifted deadline.
+//
+// So the previous gain was at or above the ultimate gain. Ziegler-Nichols puts a stable
+// proportional gain near 0.5x ultimate; 0.05 is a 5x reduction on a value already known to
+// oscillate. Stepping every third report puts the correction interval beyond the loop delay as
+// well, which does not depend on the gain estimate being right.
+static constexpr float RENDER_ALIGN_GAIN = 0.05f;
+// Reports between corrections. One report was inside the loop delay, which is what sustained the
+// cycle above.
+static constexpr uint32_t RENDER_ALIGN_EVERY_N_REPORTS = 3;
 static constexpr int32_t RENDER_ALIGN_MAX_STEP_US = 50;
 // Below this the delta is measurement noise: the render delta's own MAD is ~15 us against a
 // truth MAD of 1.7 us, so correcting inside that band would inject noise, not remove it.
@@ -4252,7 +4266,12 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
               // displacement was removed. The servo owns the transient; this owns the standing
               // offset the servo cannot see.
               const int32_t group_delta = this->tsf_sync_->render_group_delta_us();
-              if (this->config_.render_align_max_us > 0 && st.converged && group_delta != INT32_MIN) {
+              // Only every Nth report: the loop delay is ~2 reports, so correcting on every one
+              // means acting on a measurement that does not yet contain the previous correction.
+              this->render_align_tick_++;
+              const bool align_due = (this->render_align_tick_ % RENDER_ALIGN_EVERY_N_REPORTS) == 0;
+              if (this->config_.render_align_max_us > 0 && st.converged && align_due &&
+                  group_delta != INT32_MIN) {
                 const int32_t cap = static_cast<int32_t>(this->config_.render_align_max_us);
                 int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
                 if (std::abs(group_delta) > RENDER_ALIGN_DEADBAND_US) {
