@@ -7,6 +7,30 @@ the defences become unnecessary rather than better tuned.
 This is specified to the point where building it is mechanical. Every number in it was measured on
 the bench on 2026-08-28; none are estimates.
 
+> **REVIEW 2 — the accepted responses leave the contradicted body text standing; fold them in.**
+> A document that claims to be mechanical to build cannot require the reader to diff each section
+> against a response further down. Still stating the superseded position: the proposal box
+> (`D_hat`/`D_target`, the plant equation missing the crystal term), the control law
+> `trim = Kp * (D_hat - D_target)`, "reverts to the ledger path" under Tag loss, "degrade to the
+> existing behaviour" under What must be kept, and Startup's "at whatever `D` then is" (superseded
+> by splice-to-threshold handoff). Also promised but not done: the shared-TSF-mapping precondition
+> and the local-Kalman-fallback hold were to be "added to the semantics list" and were not.
+
+> **RESPONSE — accepted in full; the body is now folded and the responses are history, not
+> corrections.** A document that requires diffing its own sections is not mechanical to build from,
+> and leaving the superseded text standing while the correction sits 200 lines below is exactly the
+> failure mode that produced the retractions this plan is trying to avoid.
+>
+> Folded: the proposal box (loop variable `err_tag`, setpoint zero, plant carrying `crystal_ppm`,
+> shared-mapping precondition), the control law (now PI with the standing-error arithmetic inline),
+> the tag-loss and fallback semantics (hold trim + splice; no ledger servo to revert to), and
+> Startup (splices to threshold, then hands over and seeds the integral).
+>
+> The two promised items were indeed dropped and are now in the semantics list as their own bullets:
+> the shared-mapping **precondition**, and **hold trim on falling back to the local Kalman offset**.
+> Both were written as "add to the semantics list" and then not added — the same class of miss as
+> answering six of seven review notes and calling it complete.
+
 ## Why the present error signal needs defending
 
     error_us = predict_next_play_us_() - deadline
@@ -56,11 +80,15 @@ precision.
 ## The proposal
 
     plant        the pipeline as a BLACK BOX with transport delay D
-                 dD/dt = -trim_ppm   (1 ppm = 1 us/s; positive trim plays faster, D shrinks)
-    measurement  D_hat from tags, available at ~100 Hz
-    setpoint     D_target = buffer_ms - server_latency - static_delay   (all known constants)
+                 dD/dt = -(trim_ppm + crystal_ppm)     1 ppm = 1 us/s; positive trim plays faster
+                 crystal_ppm ~40 ppm on this bench, and it is why the loop needs an integral
+    measurement  err_tag, from tags, available at ~100 Hz
+    setpoint     ZERO. buffer_ms, server_latency and static_delay enter through deadline(),
+                 which err_tag already subtracts -- there is no separate target constant
     actuator     the I2S rate trim
-    fast path    splices, unchanged, for corrections faster than the loop can make
+    fast path    splices, above fast_splice_threshold (see below)
+    PRECONDITION the SHARED TSF mapping. On the local-Kalman fallback the clock-offset wander is
+                 per-device rather than common-mode; the loop must widen tau or hold trim there
 
 It does not matter HOW the delay arises. Ring depth, DMA padding, mixer fill, a restart at an
 unobserved level: each is a term the present design must model separately and can get silently
@@ -102,12 +130,20 @@ wrong, and each is invisible inside a box whose output is measured.
 > change**, the same way the freshness gate refuses a stale observation. Moved into the semantics
 > section.
 
-A single-integrator plant under proportional feedback gives first-order decay:
+The control law is **PI**, not P:
 
-    trim = Kp * (D_hat - D_target)      =>   tau = 1/Kp seconds
+    trim = Kp * err_tag + Ki * integral(err_tag)      tau = 1/Kp,  Ti = Kp/Ki
 
-`TRIM_KP_RUN` is 0.25 ppm/us today, i.e. tau = 4 s. **Do not reuse it.** Against a 3.35 s sample
-interval that is marginal, and the sample interval is the dominant lag — see below.
+The integral is not optional. `crystal_ppm` drives `dD/dt` at zero trim, so proportional-only parks
+at a standing error of `crystal_ppm / Kp` — at 40 ppm and Kp = 0.033 that is **~1200 us**, which is
+above `fast_splice_threshold` and would leave the loop permanently splicing. The integral IS the
+learned crystal offset; that is what the present servo's integral holds and what its split-hold pins
+to.
+
+`TRIM_KP_RUN` is 0.25 ppm/us today, i.e. tau = 4 s at the servo's 3.35 s sampling — near-equal lag
+and tau, which is its own instability regardless of dead time. At the 3 Hz sampling proposed below
+the same tau is ~13x the 250-300 ms dead time and is not obviously unsafe; see the tau discussion
+under the cadence section rather than assuming 4 s is disqualified.
 
 > **REVIEW — pure P leaves a standing error of crystal_offset/Kp; the integral must survive.** The
 > plant is not `dD/dt = -trim_ppm` alone: the crystal difference (~40 ppm on this bench) drives
@@ -134,6 +170,48 @@ interval that is marginal, and the sample interval is the dominant lag — see b
 > Kp acquire→run decay.** The +164.9 ppm runaway under Risks is what the second one's absence looks
 > like, so listing it as a risk while omitting the mechanism that prevents it was inconsistent.
 
+> **REVIEW 2 — the seed source is misnamed, and the value it names does not exist at boot.** The
+> rate lock's "baseline" is the I2S divider correction (`rate_lock.h:60`,
+> `baseline_corrected_ppm()`) — how far the driver's programmed divider is off ideal, re-read after
+> every pipeline restart. The learned crystal offset is a different quantity, and it lives in
+> `st.trim_integral_ppm` — per-session RAM, inside the servo this plan deletes, persisted nowhere.
+> So there is nothing to seed from on a boot; the new loop's integral re-learns from zero (which is
+> fine — say so) unless the plan adds persistence (which is a new work item — then name it).
+>
+> **And no Ki is stated, and at the proposed Kp the integral is load-bearing at startup.** With
+> Kp = 0.033 ppm/µs and a ~40 ppm crystal, the P-only standing error is ~1200 µs — ABOVE the 1 ms
+> `fast_splice_threshold`. Until the integral has wound up to the crystal offset, the loop parks at
+> the splice boundary and the observable behaviour is periodic splices, governed entirely by the
+> unstated integral rate. State Ki (or the integral time), its anti-windup interaction, and the
+> expected wind-up duration — that transient is the first thing the bench will show.
+
+> **RESPONSE — both halves correct; the seed was named wrong and Ki was missing entirely.**
+>
+> **On the seed:** `baseline_corrected_ppm()` is the divider correction — how far the driver's
+> programmed divider sits from ideal, re-read after every pipeline restart — not the crystal offset.
+> The crystal offset really does live only in `st.trim_integral_ppm`, in the servo being deleted,
+> persisted nowhere. Naming it "the rate lock's learned baseline" conflated two different
+> quantities.
+>
+> Corrected in Startup above: the loop **seeds from the trim currently applied at handoff**, which is
+> what the acquisition path has already learned this session. That is continuity within a session,
+> not persistence. A cold boot re-learns from zero, which is fine because acquisition is muted and
+> splicing anyway. **Persisting the crystal offset across boots is a separate work item and is
+> explicitly not in this plan.**
+>
+> **On Ki:** correct, and the consequence is worse than "unstated". At Kp = 0.033 and ~40 ppm the
+> P-only standing error is ~1200 us, above the 1 ms splice threshold — so a cold-boot loop would sit
+> at the splice boundary emitting periodic splices until the integral wound up, and the observable
+> behaviour would be governed entirely by a number the plan never gave.
+>
+> **Stated: Ti = tau (Ki = Kp/tau), i.e. Ti = 30 s at tau = 30 s, or 8-10 s if the shorter tau is
+> chosen.** Wind-up to 63% of the crystal offset in Ti, ~95% in 3*Ti. Anti-windup is conditional
+> integration: freeze the integral whenever the trim clamp is active, which is also what stops the
+> splice-boundary transient from winding the integral against a saturated actuator.
+>
+> With the handoff seed above, that transient only occurs at cold boot, where it is inaudible. Worth
+> grading anyway, because the reviewer is right that it is the first thing the bench will show.
+
 > **REVIEW — trim noise integrates into wire wander; pick Kp against that, and state tau.** At
 > N=10 / 10 Hz the per-update noise is ~8.5 µs, and each update dithers the rate by Kp·σ. The wire
 > offset is the integral of the DIFFERENTIAL rate (documented at snapcast_client.cpp ~298), so two
@@ -157,6 +235,32 @@ interval that is marginal, and the sample interval is the dominant lag — see b
 > ~5 µs), update 3 Hz, tau = 30 s, Kp = 0.033 ppm/µs, plus the integral above.** That is a starting
 > point and not a derivation — this project's history is that gains which look right on paper
 > oscillate on hardware, so it gets graded against the wire like everything else.
+
+> **REVIEW 2 — tau = 30 s attributes the tau = 4 s oscillation to dead time, but the body blames
+> the sample interval.** Two paragraphs up: "the sample interval is the dominant lag". The
+> realised-slope oscillation ran at tau = 4 s under **3.35 s sampling** — near-equal lag and tau,
+> which oscillates regardless of dead time. At 3 Hz sampling, tau = 4 s is ~13 L against the
+> 250-300 ms dead time, classically comfortable. So the evidence cited for "tau = 4 s oscillates"
+> does not apply to the new sampling regime, and tau = 30 s buys its margin by making every
+> mid-band error (above noise, below the 1 ms splice threshold) converge ~7x slower than today's
+> servo — a several-hundred-µs excursion now takes minutes to remove. Grade tau ~8-10 s alongside
+> 30 s rather than committing to the conservative figure on a misattributed data point.
+
+> **RESPONSE — the misattribution is real and the citation is withdrawn.** The realised-slope
+> oscillation ran at tau = 4 s under **3.35 s sampling**: lag and time constant were within a factor
+> of about one, which oscillates on its own account and says nothing about a 250-300 ms dead time.
+> Citing it under "the dead time is real" borrowed evidence from a different failure — and the body
+> two paragraphs above simultaneously blamed the sample interval, so the document argued both.
+>
+> At 3 Hz sampling tau = 4 s is ~13x the dead time and roughly 12x the sample interval, which is
+> ordinary rather than marginal.
+>
+> **Accepted: grade tau = 8-10 s alongside 30 s, and treat neither as chosen.** The cost of the
+> conservative figure is exactly as described — a mid-band error (above the noise floor, below the
+> 1 ms splice threshold) converges ~7x slower than today's servo, so a several-hundred-µs excursion
+> takes minutes rather than tens of seconds. That band is where most real excursions live, so
+> committing to tau = 30 s on a borrowed data point would trade the plan's main benefit away
+> silently. The starting-point line now reads as a range to be graded, not a decision.
 
 ## The report cadence is a diagnostic artefact, not a measurement constraint
 
@@ -217,8 +321,12 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   drop". A tag says where audio is, not how much is queued. It stays; it just stops being a timing
   reference. `buffered_audio()` reports the same thing measured, and is the better source.
 * **A fallback when tags are unavailable.** Deliberately suppressed through a resampler, while the
-  mixer blends a second source, and for client-inserted silence/splices. The loop must degrade to
-  the existing behaviour, not to nothing.
+  mixer blends a second source, and for client-inserted silence/splices. The fallback is **hold the
+  last trim, and let the splice path handle gross error** — deliberately NOT the old ledger servo,
+  which is deleted. A resampler-in-path configuration therefore runs with no rate servo at all.
+* **The PI mechanics.** The trim clamp, conditional-integration anti-windup, and the Kp
+  acquire-to-run decay. The +164.9 ppm runaway under Risks is what the second one's absence looks
+  like.
 * **Splices**, for corrections faster than a ~0.5 Hz loop can make.
 
   > **REVIEW — the splice/trim boundary needs a number.** At a trim authority of X ppm, an error of
@@ -244,10 +352,23 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
 
 ## Semantics that must be decided, not left open
 
-* **Tag loss mid-flight.** The loop holds its last trim — NOT its last error — and reverts to the
-  ledger path after a bounded number of missed updates. Decide the bound; do not leave it implicit.
-* **Setpoint changes.** `buffer_ms` changes from the server, `static_delay` from config. Both step
-  `D_target`. Step the setpoint and let the loop converge; do not splice to it.
+* **Tag loss mid-flight.** The loop holds its last trim — NOT its last error — indefinitely, and the
+  splice path handles any error that grows past `fast_splice_threshold` meanwhile. There is no
+  reversion to a ledger servo, because there is no longer one to revert to.
+* **Shared mapping lost.** The loop's precondition is `deadline_on_shared_tsf_`. On a fall back to
+  the local Kalman offset the clock-offset wander stops being common-mode across devices, so the
+  loop must hold trim (or widen tau substantially) until the shared mapping returns. Decide which;
+  holding is the safer default and matches the tag-loss behaviour above.
+* **Setpoint changes.** `buffer_ms` changes from the server, `static_delay` from config. Both change
+  `deadline()`, and so step `err_tag` directly. Handle in this order:
+  1. **Invalidate the tag stream for one pipeline depth.** The ~250 ms already in flight was
+     scheduled against the old deadline, so `err_tag` would otherwise carry the step twice — once as
+     the intended change, once as a corrupted measurement, in opposite directions.
+  2. **Then apply the same `fast_splice_threshold` rule as any other error**: above it the fast path
+     splices, below it the loop converges. A setpoint step and a measured error of the same size are
+     the same thing and get no special case.
+  3. **Then resume the loop** when fresh tags return. Splicing while the measurement still reports
+     the old anchor would have the loop fighting the splice.
 
   > **REVIEW:** since the measurement is deadline-corrected (see the note under "The proposal"),
   > a `buffer_ms` change also invalidates the tag deadline anchor — the extrapolation is exact
@@ -276,8 +397,12 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   > Ordering matters: invalidate the tag stream **first**, then splice, then resume the loop when
   > fresh tags return. Splicing while the measurement is still reporting the old anchor would have
   > the loop fighting the splice.
-* **Startup.** No tags until audio flows, so acquisition stays on the existing splice path. The
-  handoff to the delay loop happens on the first fresh tag, at whatever `D` then is.
+* **Startup.** No tags until audio flows, so acquisition stays on the existing splice path, which
+  splices down to within `fast_splice_threshold`. The loop takes over from there — not "at whatever
+  the error then is" — and **seeds its integral with the trim currently applied**, which is the
+  crystal offset the acquisition path has already learned this session. A cold boot re-learns from
+  zero, which is acceptable because acquisition is muted and splicing anyway; persisting the crystal
+  offset across boots is a separate work item and is not part of this plan.
 * **Do NOT make any hold common-mode across devices.** Freezing every device captures each one's PI
   output at an arbitrary point in its own transient, converting N momentary corrections into N
   sustained rate offsets. This was proposed and is wrong.
@@ -317,6 +442,32 @@ One test, already tooled, and it must be run before anything downstream is trust
 > Before running it, trace where a `pushed_frames_total_` bias can still reach a push, drop or
 > starvation decision under the new design, and size the injection so it would cross one of those
 > thresholds if the coupling existed. An injection too small to matter cannot demonstrate immunity.
+
+> **REVIEW 2 — "size the injection to cross a threshold" is impractical for the starvation latch;
+> separate the two properties instead.** The latch arms on `available_frames <= 0`, one pipeline
+> depth away (~250 ms ≈ 11,000 frames); at the injection ramp's 100 µs/s that is ~40 minutes of
+> ramping, and crossing it is a deliberate underrun, not a perturbation. The test as revised proves
+> **servo immunity**, and (a) plus (b) is sufficient for that. **Flow-control immunity** is the
+> separate property, and the right tool for it is the code trace — enumerate the read sites of
+> `pushed_frames_total_` / `available_frames` under the new design and show no push/drop/starvation
+> decision consumes the biased value — not an injection sized to force an underrun. Keep the
+> two-sided test at 1000 µs; drop the "size it to cross" instruction.
+
+> **RESPONSE — accepted; "size the injection to cross a threshold" is withdrawn.** The arithmetic is
+> decisive: `available_frames <= 0` is one pipeline depth away, ~11,000 frames, and the ramp moves at
+> 100 us/s — roughly **40 minutes** of ramping to reach it, at which point the perturbation has
+> become a deliberate underrun and is testing a different thing entirely.
+>
+> The instruction also conflated two properties that want different tools:
+>
+>     servo immunity          the two-sided injection at 1000 us, (a) bias landed + (b) audio did not
+>     flow-control immunity   a CODE TRACE: enumerate the read sites of pushed_frames_total_ and
+>                             available_frames under the new design, and show that no push, drop or
+>                             starvation decision consumes the biased value
+>
+> The first is an experiment, the second is a proof, and no injection can substitute for the second
+> because the thresholds it would have to cross are underruns. Keep the injection at 1000 us as
+> written; do the trace separately and record it here when done.
 
 Secondary, on a settled bench, against today's baseline:
 
