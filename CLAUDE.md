@@ -116,6 +116,26 @@ Therefore:
   errors are masquerading as findings. One run had `rival = 0.942` on 100% of rows because
   `--samples 200000` was dropped from the command line.
 
+## Verifying a claim about code
+
+* **Match the variable and the operator, never the expected values.** Checking that `st.converged`
+  was only touched in known places, the query used was
+  `grep "st.converged = true\|st.converged = false"`. It found two sites and missed two more —
+  `st.converged = st.converged && !mute_now` — because a conditional clear cannot match a literal
+  one. The result was reported as "set at one site, cleared at one" with the confidence of having
+  checked. `grep "st\.converged\s*="` costs nothing and cannot miss a form.
+* **A search narrow enough to confirm an expectation will not disturb it.** Same defect as the
+  256-byte log ceiling and the trailing field `SYNC_RE` required: the instrument was shaped by what
+  was expected, so it could only return that.
+* **"Measured on the bench" and "checked against the source" are different guarantees.** Five review
+  rounds on one plan found a control law missing a plant term, a seed naming a value that does not
+  exist at boot, a citation borrowed from an unrelated failure, two mechanisms described without
+  reading their shape, and a headline test that failed by construction. **Every one was findable by
+  reading the code; none needed hardware.** Read the mechanism before citing it by name.
+* **Watch for conclusions that hold only because two unrelated numbers happen to be close.** Three
+  arose in one document (a threshold ordering, a history depth matching a pipeline depth, a
+  compensation horizon). Each is a latent bug waiting for a config change, not a design that holds.
+
 ## Before proposing a mechanism
 
 * **Read the relevant code first.** Twice in one session a mechanism was proposed that the codebase

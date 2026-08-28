@@ -645,7 +645,8 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   (`snapcast_client.cpp:3676`), which is servo state — so without a definition the fast path never
   engages at all. **Adopted: converged LATCHES once `|err_tag|` has stayed inside `converge_fine_us`
   for a full integral time constant (Ti), and is cleared only by mute and hard events** — the same
-  clearing conditions as today (set at :3091, cleared at :3522). It must latch: `converge_fine` sits
+  clearing conditions as today (set at `:3091`; cleared at `:3522`, and at `:2698`/`:2724` by the
+  mute term `st.converged = st.converged && !mute_now`). It must latch: `converge_fine` sits
   ~8x below the splice threshold, so an un-latching definition would clear on any error above ~125 µs
   and disarm the splice path at exactly the errors splices exist to correct — a deadlock, not a
   degradation.
@@ -683,6 +684,34 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   > for a full integral time constant, and is cleared only by mute and hard events — the same clearing
   > conditions as today.** "Half-stated" was exactly right: I specified the set condition and said
   > nothing about the clear, which is where the behaviour actually lives.
+
+  > **REVIEW 6 — one miscount in the verification above, semantics unaffected.** "Cleared at one
+  > site (`:3522`)" is wrong: `st.converged` is also cleared at `:2698` and `:2724`
+  > (`st.converged = st.converged && !mute_now`) — three clear sites, of which two are the mute
+  > clears. The adopted semantics ("cleared only by mute and hard events") already covers all
+  > three, so nothing changes; corrected here only so the verification record stays exact.
+
+  > **RESPONSE — correct, and the way I got it wrong is worth more than the correction.**
+  >
+  > Confirmed: four assignment sites, `:2698` and `:2724` (`st.converged = st.converged && !mute_now`),
+  > `:3091` (set), `:3522` (clear). Three clear sites, two of them the mute clears.
+  >
+  > **My grep was `st.converged = true\|st.converged = false`.** It could only ever find literal
+  > assignments, so a conditional clear was invisible to it by construction — and I reported the
+  > result as "set at one site, cleared at one" with the confidence of having checked. The pattern
+  > matched what I expected to find rather than what I needed to know.
+  >
+  > That is the same defect as the 256-byte log ceiling and the required trailing field in `SYNC_RE`,
+  > which is why it belongs in the record rather than being quietly fixed: **a search narrow enough to
+  > confirm your expectation will not disturb it.** The correct query was `st\.converged\s*=`, which
+  > costs nothing extra and cannot miss a form.
+  >
+  > The adopted semantics were stated behaviourally — "cleared only by mute and hard events" — and
+  > cover all three, so the design is unaffected. It happens to be right, not by having checked
+  > properly, and that distinction is exactly what the verification record exists to preserve.
+  >
+  > `CLAUDE.md` gains the rule: **when verifying that state is only touched in known places, match the
+  > variable and the assignment operator, never the expected values.**
 
   > **REVIEW 5 — the splice in-flight compensation horizon must be re-derived for `err_tag`.**
   > `SPLICE_HIST = MEDIAN_WINDOW / 2` (15 chunks, `snapcast_client.h:625`) exists because a splice
