@@ -765,6 +765,70 @@ it exists to correct, on any gain, with any reference, mean or median. Every mea
 of them are evidence about gain either way. `render_align_max` stays 0 not pending tuning but
 pending a different signal.
 
+**THE SIGNAL render_align NEEDS: THE SINK MUST ECHO AN IDENTITY, NOT REPORT A QUANTITY.**
+Specified 2026-08-28, with the two cheaper alternatives measured and eliminated first.
+
+THE UNIFYING DIAGNOSIS, which both of tonight's real bugs share: the API returns the right number
+of the WRONG KIND.
+
+    DMA span            returned CAPACITY        needed REMAINING     (fixed, fork 56601e6bc6)
+    output callback     returns  QUANTITY        needs  IDENTITY      (this)
+
+`CallbackManager<void(uint32_t, int64_t)>` -- frames and a timestamp. Never *which* audio. So
+`render_phase` has to infer the mapping via `s_ts - (pushed - played)/rate`, and a device cannot
+detect that its own running counter is biased by consulting that counter. After the servo repairs a
+bias, the bias and the resulting audio displacement are equal and opposite inside that subtraction
+and cancel exactly. No gain, reference, mean-vs-median or filter choice fixes an identity problem
+with arithmetic on quantities.
+
+THE FIX: let the caller attach an opaque tag to audio it hands over, and have the sink return that
+tag when THAT audio completes.
+
+    caller: push(chunk, tag = server_ts of its first real frame)
+    sink:   on completion -> callback(frames, adjusted_ts, tag)
+    caller: "the audio I tagged S rendered at local time T" -> convert T to TSF
+
+A CAPTURED pair, not an inferred one. `pushed`/`played` never enter it.
+
+CHEAP TO CARRY: `write_records_queue_` already holds one record per descriptor and is already
+maintained in lockstep with completion events (there is an `ERR_LOCKSTEP_DESYNC` bit guarding that
+invariant), so extending `uint32_t` -> `{real_frames, tag}` rides existing structure. And
+`adjusted_ts` already does the hard part, subtracting trailing silence to find when the real audio
+finished.
+
+TWO DESIGN WRINKLES, both real: a descriptor can span chunks, so the tag wants to be
+(server_ts, offset) of its first real frame rather than a bare chunk id; and THE MIXER MIXES
+MULTIPLE SOURCES, so a single tag per descriptor is ambiguous whenever more than one source is
+active. On this bench only one is, but the design has to say something -- probably "tag only while
+a single source is active, otherwise report unsupported".
+
+FALSIFIABLE TEST, using tooling that already exists: with tags, an `inject_split` ledger bias
+should read at ratio ~= 1.0 where it currently reads 0.003. That is the same experiment already run
+tonight, so the pass/fail is unambiguous.
+
+TWO CHEAPER OPTIONS MEASURED AND ELIMINATED (2026-08-28), which is what justifies the API change
+rather than assuming it:
+
+  * **Fix the ledger from the depth cross-check** instead of bypassing it. `RECON drift` is the
+    ledger-error signal and needs no new API. DEAD ON RESOLUTION: with the coherence gate live the
+    floor is median +22 us / MAD 23 (A) and +44 / MAD 45 (B). Correcting a tens-of-us error with a
+    23-45 us MAD signal injects noise of the same order. Worth noting separately that the per-board
+    MEDIANS differ systematically (+22 vs +44), and that ~22 us differential is a candidate for a
+    SYSTEMATIC component of the standing offset, unlike the random walk.
+  * **`min(r_push)` as a bias estimator.** `r_push = our pushed - the SOURCE's received count`, and
+    the source's counter is independent of ours, so at the instant nothing is in flight their
+    difference IS the bias. DEAD ON QUANTISATION: pushes happen a chunk at a time, so r_push takes
+    values k*1152 + 128 frames and the per-block floor has sd 512 frames (11.6 ms). It cannot
+    resolve one chunk, let alone 44 frames. Also note r_push is only meaningful WITHIN one session
+    -- `dbg_pushed` and `dbg_src_received` have different epochs, so across a reconnect the
+    difference reads in the tens of millions of frames.
+
+NOT IMPLEMENTED. It is a cross-component API change (speaker base, i2s speaker, mixer passthrough,
+snapclient consumer) in an upstream-bound tree, and it should not be stacked on top of three
+already-unmeasured changes (TRIM_KP_RUN 0.125, 30 Hz beacons, reanchor off) on an event-prone bench.
+Build it when the bench is quiet and those three are graded.
+
+Older framing, kept because the reasoning is the reusable part:
 WHAT A WORKING SIGNAL WOULD NEED: independence from the local running frame counter. The device
 cannot detect that its own ledger is wrong by consulting that ledger. Options, unexplored:
   * A PER-CHUNK ledger -- record each chunk's server timestamp against the frame index at push
