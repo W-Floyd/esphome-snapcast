@@ -213,7 +213,26 @@ struct __attribute__((packed)) TsfPacket {
   uint8_t version;
   uint8_t bssid[6];
   uint8_t sender_mac[6];
-  uint8_t reserved;
+  // ROLE: 0 = leader (authoritative timebase), 1 = follower (PHASE REPORT ONLY).
+  //
+  // Followers beacon so the group has more than one published render phase to correct toward.
+  // Correcting toward the LEADER alone references every correction to whoever holds the crown,
+  // and leadership legitimately changes -- six handovers in seventeen minutes on a two-device
+  // group, since leadership needs a healthy device and each resync briefly disqualifies the
+  // incumbent. The group median barely moves when the crown does.
+  //
+  // A FOLLOWER BEACON MUST BE EXCLUDED FROM ELECTION, ADOPTION AND THE LEADER-SILENCE TIMER.
+  // Getting this wrong wedged both boards: the first attempt recorded the phase but let follower
+  // beacons fall through to the election block, so devices demoted to "follow" a follower, and
+  // every follower beacon refreshed last_rx_us_ ("last valid packet from another LEADER"), which
+  // is what takeover uses to detect silence. No device could ever take over; when the incumbent
+  // demoted itself the group was left with no leader, no mapping, no deadlines, and both players
+  // stalled with only wifi_diag still logging.
+  //
+  // Was `reserved`, so this costs no bytes and no version bump. An older receiver reads it as
+  // padding and would adopt a follower beacon as a leader's -- bounded, because a follower's
+  // mapping fields carry the mapping it is itself following, i.e. a copy of the leader's.
+  uint8_t role;
   uint32_t server_id_hash;
   int64_t tsf_base_us;
   int64_t tsf_minus_server_us;
@@ -494,6 +513,13 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     // Learn the sender's address for unicast beacons: the server roster can predate
     // a peer's connection (boot race) and multicast may be blocked entirely
     this->learn_peer_(from.sin_addr.s_addr);
+    // FOLLOWER BEACON: contribute the phase and stop. It is not evidence of a live leader, so it
+    // must not reach the election below, must not be adopted, and must not refresh last_rx_us_
+    // -- see the note at TsfPacket::role for what happens when it does.
+    if (pkt.role != 0) {
+      this->record_peer_phase_(pkt.sender_mac, pkt.render_phase_us, local_now_us);
+      continue;
+    }
     const bool sender_outranks = memcmp(pkt.sender_mac, this->my_mac_, 6) < 0;
     const Role role = this->role_.load(std::memory_order_relaxed);
     if (role == Role::LEADER && !sender_outranks) {
@@ -557,11 +583,75 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       }
     }
     this->warned_rejected_ = false;
+    this->record_peer_phase_(pkt.sender_mac, pkt.render_phase_us, local_now_us);
     this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
     this->check_pipeline_divergence_(pkt.pipeline_us, local_now_us);
     this->check_render_phase_(pkt.render_phase_us, local_now_us);
     this->check_crystal_delta_(pkt.crystal_ppm, local_now_us);
   }
+}
+
+void TsfSync::record_peer_phase_(const uint8_t mac[6], int64_t phase_us, int64_t local_now_us) {
+  if (phase_us == RENDER_PHASE_UNKNOWN) {
+    return;
+  }
+  int slot = -1, oldest = 0;
+  for (size_t i = 0; i < MAX_PHASE_PEERS; i++) {
+    if (this->peer_phase_[i].used && memcmp(this->peer_phase_[i].mac, mac, 6) == 0) {
+      slot = static_cast<int>(i);
+      break;
+    }
+    if (!this->peer_phase_[i].used && slot < 0) {
+      slot = static_cast<int>(i);
+    }
+    if (this->peer_phase_[i].used && this->peer_phase_[i].seen_us < this->peer_phase_[oldest].seen_us) {
+      oldest = static_cast<int>(i);
+    }
+  }
+  if (slot < 0) {
+    slot = oldest;
+  }
+  memcpy(this->peer_phase_[slot].mac, mac, 6);
+  this->peer_phase_[slot].phase_us = phase_us;
+  this->peer_phase_[slot].seen_us = local_now_us;
+  this->peer_phase_[slot].used = true;
+  this->recompute_group_delta_(local_now_us);
+}
+
+void TsfSync::recompute_group_delta_(int64_t local_now_us) {
+  const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
+  if (mine == RENDER_PHASE_UNKNOWN) {
+    this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
+    return;
+  }
+  // Our own phase is IN the group. With two devices that makes the median their mean, so each
+  // corrects half the gap and they meet in the middle rather than one chasing the other.
+  int64_t vals[MAX_PHASE_PEERS + 1];
+  size_t n = 0;
+  vals[n++] = mine;
+  for (size_t i = 0; i < MAX_PHASE_PEERS && n < MAX_PHASE_PEERS + 1; i++) {
+    if (this->peer_phase_[i].used && local_now_us - this->peer_phase_[i].seen_us <= PHASE_STALE_US) {
+      vals[n++] = this->peer_phase_[i].phase_us;
+    }
+  }
+  if (n < 2) {
+    this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
+    return;
+  }
+  for (size_t i = 1; i < n; i++) {  // insertion sort; n <= 9
+    const int64_t v = vals[i];
+    size_t j = i;
+    while (j > 0 && vals[j - 1] > v) {
+      vals[j] = vals[j - 1];
+      j--;
+    }
+    vals[j] = v;
+  }
+  const int64_t med = (n % 2) ? vals[n / 2] : (vals[n / 2 - 1] + vals[n / 2]) / 2;
+  const int64_t d = mine - med;
+  this->render_group_delta_us_.store(
+      static_cast<int32_t>(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, d))),
+      std::memory_order_relaxed);
 }
 
 void TsfSync::check_render_phase_(int64_t leader_phase_us, int64_t local_now_us) {
@@ -665,6 +755,39 @@ void TsfSync::check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t loc
            (local_now_us - this->pipeline_diverged_since_us_) / 1e6);
 }
 
+void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_hash) {
+  // A FOLLOWER'S PHASE REPORT. Deliberately NOT broadcast_(), which does three things a follower
+  // must not: it opens with sample_tsf_() -- a TSF sandwich read costing 45-81 us, budgeted in
+  // its own comment as "nothing at 3.3 s intervals"; it mutates tsf_rate_ppm_ and the rate
+  // reference, which another comment states is "measured on the network task and only while
+  // leading"; and it unicasts to every peer and learned peer on top of the multicast.
+  //
+  // MEASURED COST OF IGNORING THAT: publishing follower beacons through broadcast_() degraded
+  // skew stability from sd 5.4 us to sd 81.6 us -- a factor of ~15 -- with the correction
+  // DISABLED, i.e. from the beacons alone. Controlled against a build with stream scoping and no
+  // follower beacons, which reproduced sd 5.24 us.
+  //
+  // So: no TSF read, no rate state touched, multicast only. Mapping fields stay zero because a
+  // receiver seeing role != 0 records the phase and returns before reading them.
+  TsfPacket pkt = {};
+  pkt.magic = TSF_MAGIC;
+  pkt.version = TSF_VERSION;
+  memcpy(pkt.bssid, this->bssid_, 6);
+  memcpy(pkt.sender_mac, this->my_mac_, 6);
+  pkt.role = 1;
+  pkt.server_id_hash = server_id_hash;
+  pkt.stream_id_hash = stream_id_hash;
+  pkt.pipeline_us = this->pipeline_us_.load(std::memory_order_relaxed);
+  pkt.render_phase_us = this->render_phase_us_.load(std::memory_order_relaxed);
+  pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
+
+  struct sockaddr_in dest = {};
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons(TSF_PORT);
+  dest.sin_addr.s_addr = inet_addr(TSF_GROUP);
+  sendto(this->sock_, &pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
+}
+
 void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
                          uint32_t stream_id_hash) {
   int64_t tsf_now, local_mid;
@@ -725,6 +848,7 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   memcpy(pkt.sender_mac, this->my_mac_, 6);
   pkt.server_id_hash = server_id_hash;
   pkt.stream_id_hash = stream_id_hash;
+  pkt.role = (this->role_.load(std::memory_order_relaxed) == Role::LEADER) ? 0 : 1;
   pkt.tsf_base_us = tsf_now;
   pkt.tsf_minus_server_us = tms_pub;
   pkt.drift_ppm = drift_ppm;
@@ -854,6 +978,17 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
       this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
     }
     return;
+  }
+
+  // FOLLOWERS PUBLISH THEIR PHASE, cheaply -- see broadcast_phase_only_() for why not through
+  // broadcast_(). Quarter of the leader's rate: this feeds a correction that steps every ~10 s,
+  // so it need not be fast, and every transmit is radio time the audio path competes for.
+  // Tracked on its own timer, because last_tx_us_ paces LEADERSHIP.
+  if (this->role_.load(std::memory_order_relaxed) == Role::FOLLOWER &&
+      this->render_phase_us_.load(std::memory_order_relaxed) != RENDER_PHASE_UNKNOWN &&
+      local_now_us - this->last_phase_tx_us_ >= 4 * BEACON_INTERVAL_US) {
+    this->last_phase_tx_us_ = local_now_us;
+    this->broadcast_phase_only_(server_id_hash, stream_id_hash);
   }
 
   // Takeover: silence beyond the timeout plus a per-MAC stagger (lower MACs move

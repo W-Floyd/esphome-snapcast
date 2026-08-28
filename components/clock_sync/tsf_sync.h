@@ -110,6 +110,17 @@ class TsfSync {
   /// skew, measured without the servo, the prediction model or the pipeline depth in the path.
   int32_t render_delta_us() const { return this->render_delta_us_.load(std::memory_order_relaxed); }
 
+  /// @brief This device's render phase minus the GROUP MEDIAN, us; INT32_MIN when fewer than two
+  ///        devices have published one.
+  ///
+  /// Prefer this over render_delta_us() for anything that ACTS. The leader-relative delta is
+  /// referenced to whoever holds the crown, and leadership legitimately changes -- measured six
+  /// handovers in seventeen minutes on a two-device group. The median hardly moves when the
+  /// crown does, because a handover does not change where anyone is rendering.
+  int32_t render_group_delta_us() const {
+    return this->render_group_delta_us_.load(std::memory_order_relaxed);
+  }
+
   /// @brief Our crystal rate minus the leader's, in ppm, or NaN when either side is unknown.
   ///
   /// Each device measures its own clock against the RADIO timebase, so this difference is a
@@ -219,6 +230,27 @@ class TsfSync {
   bool warned_foreign_bss_{false};
   bool warned_foreign_server_{false};
   bool warned_foreign_stream_{false};
+
+  /// Published render phases, one slot per peer MAC, for the group median. Fixed and small: a
+  /// stream group is a handful of speakers, and a full table evicts the stalest entry rather
+  /// than allocating on the network task.
+  static constexpr size_t MAX_PHASE_PEERS = 8;
+  /// A phase older than this says nothing about where that device is now.
+  static constexpr int64_t PHASE_STALE_US = 15000000;
+  struct PeerPhase {
+    uint8_t mac[6];
+    int64_t phase_us;
+    int64_t seen_us;
+    bool used;
+  };
+  PeerPhase peer_phase_[MAX_PHASE_PEERS]{};
+  std::atomic<int32_t> render_group_delta_us_{INT32_MIN};
+  /// Cheap follower phase report: no TSF read, no rate state, multicast only. See its definition.
+  void broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_hash);
+  /// Separate from last_tx_us_, which paces LEADERSHIP rather than phase reporting.
+  int64_t last_phase_tx_us_{0};
+  void record_peer_phase_(const uint8_t mac[6], int64_t phase_us, int64_t local_now_us);
+  void recompute_group_delta_(int64_t local_now_us);
   bool warned_tx_{false};
   uint32_t rx_peer_count_{0};  // accepted packets (diagnostics)
 
