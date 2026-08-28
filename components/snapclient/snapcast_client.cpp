@@ -718,13 +718,20 @@ bool SnapcastClient::start() {
     return false;
   }
 
+  // PINNED TO CPU1, AWAY FROM WIFI AND THE MAIN LOOP. Both of those are on CPU0 in this build
+  // (CONFIG_ESP_WIFI_TASK_PINNED_TO_CORE_0, CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0), and the wifi
+  // driver runs at priority 23 -- above every task here, including the speaker task at 19. Left
+  // unpinned (xTaskCreate is tskNO_AFFINITY on ESP-IDF) these tasks can be scheduled onto CPU0
+  // and preempted by a bursty radio, and can migrate between cores, which costs cache locality
+  // on a path whose errors are measured in microseconds.
+  //
   // The player outranks the network task so decode bursts cannot starve playout.
-  if (xTaskCreate(SnapcastClient::player_task_trampoline, "snap_player", 6144, this, 8, &this->player_task_handle_) !=
-      pdPASS) {
+  if (xTaskCreatePinnedToCore(SnapcastClient::player_task_trampoline, "snap_player", 6144, this, 8,
+                              &this->player_task_handle_, 1) != pdPASS) {
     return false;
   }
-  if (xTaskCreate(SnapcastClient::network_task_trampoline, "snap_net", 8192, this, 5, &this->network_task_handle_) !=
-      pdPASS) {
+  if (xTaskCreatePinnedToCore(SnapcastClient::network_task_trampoline, "snap_net", 8192, this, 5,
+                              &this->network_task_handle_, 1) != pdPASS) {
     return false;
   }
   return true;
