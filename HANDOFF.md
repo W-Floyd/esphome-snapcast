@@ -44,7 +44,39 @@ masquerade as findings. On MLS the runner-up correlation is ~0.03.
 
 `scripts/test-signal.py --self-test` proves the sidelobe level; regenerate with `--out-file`.
 
-**MLS44 LOOPS EVERY 20 MINUTES AND EACH LOOP FIRES A ~100 ms HARD RESYNC ON EVERY CLIENT.**
+**FIXED 2026-08-28: MLS44 now loops SEAMLESSLY via a process stream.** The stream URI is now
+
+    process:///usr/share/snapserver/sandbox/mls44-loop.sh?chunk_ms=26&codec=flac&name=MLS44&sampleformat=44100:16:2
+
+reading a script that does `while cat /data/mls44.pcm; do :; done`, so there is no EOF and
+snapserver never goes idle. Confirmed at the source before the change: the server log showed
+`AsioStream ... End of file` -> `playing => idle` -> `idle => playing` across **101 ms**, matching
+the -101/-102/-104/-107/-118 ms client resyncs exactly.
+
+**IT IS EPHEMERAL AND WILL COME BACK.** `/usr/share/snapserver/sandbox/` is inside the container
+IMAGE, not a mounted volume, and snapserver refuses a process stream anywhere else
+("Process stream executable must be located in '/usr/share/snapserver/sandbox'"). So the script is
+lost on any container recreate/update, and MLS44 reverts to the 20-minute EOF. For permanence, add
+to `/opt/stacks/snapcast/compose.yaml`:
+
+      - ${DOCKER_ROOT}/snapcast/sandbox/:/usr/share/snapserver/sandbox/
+
+and keep the script in `${DOCKER_ROOT}/snapcast/sandbox/`. That needs a container restart, which
+interrupts Spotify, so it was not done unprompted. A copy of the script also lives at
+`/mnt/fast/dockge/snapcast/data/mls44-loop.sh`, which IS on a mounted volume and survives.
+
+TWO TRAPS FROM DOING THIS, both of which cost time:
+* `while :; do cat f; done` SPINS. When the reader closes the pipe, cat dies on SIGPIPE and the
+  loop restarts it immediately, forever -- a throwaway `| head -c 8` test left it burning 3.2% CPU
+  inside the container. Use `while cat f; do :; done`, which loops on clean EOF and exits on
+  SIGPIPE.
+* **`Stream.RemoveStream` CLEARS THE GROUP'S `stream_id`.** Removing and re-adding MLS44 left group
+  4eb19e5e with `stream=''` and all three boards silent until `Group.SetStream` was re-issued. Any
+  script that touches a stream must re-point the group in a `finally`.
+
+Historical, for the record:
+
+**MLS44 LOOPED EVERY 20 MINUTES AND EACH LOOP FIRED A ~100 ms HARD RESYNC ON EVERY CLIENT.**
 Measured 2026-08-28 overnight: both boards hard-resync at :06:03, :26:03 and :46:03 past the hour,
 same second, same magnitude (-101, -102, -104, -107, -118 ms), i.e. group-wide and server-side
 rather than a client fault. A 20-minute file at 44.1 kHz/16/2 is ~212 MB, which fits
