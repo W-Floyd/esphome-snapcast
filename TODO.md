@@ -133,7 +133,28 @@ untouched on Spotify; `scratchpad/group-orig.json` restores the original groupin
 on music the analyser cannot resolve this at all. `timing_diagnostics: true` is still set in
 `example/snapclient-base.yaml`.
 
-**`render_align` DOES NOT WORK YET — 10x WORSE THAN OFF. Left disabled (`render_align_max: 0ms`).**
+**CORRECTION TO THE BELOW: THE DESTABILISER IS FOLLOWER BEACONING, NOT THE CORRECTION.**
+`render_align_max: 0ms` gates only the CORRECTION; follower beaconing runs regardless. So the
+"OFF" arm below was not the same firmware as the original baseline, and every number in that
+table is confounded. Controlled properly by flashing `3c4356c` (stream scoping, NO follower
+beacons):
+
+    21:22  no follower beacons, no correction    sd  5.4 µs   <- original baseline
+    22:33  follower beacons,    no correction    sd 81.6 µs   <- what was called "OFF"
+    22:49  no follower beacons, no correction    sd  5.24 µs  <- control, reproduces baseline
+
+The control reproduces the baseline exactly, so publishing follower beacons costs a factor of
+~15 in skew stability all by itself. **The correction has therefore never been evaluated** — it
+was measured only ever on top of a destabilised system, and the conclusion below that it is
+"10x worse than off" does not follow from the data.
+
+WHERE TO LOOK: `broadcast_()` from the follower path. It runs on the network task and touches
+the mapping mutex, so the likely mechanisms are contention with the player task or the extra
+transmit perturbing timing-sensitive TSF reads. Fix that, then re-measure the correction against
+a clean baseline before drawing any conclusion about it.
+
+**~~`render_align` DOES NOT WORK YET — 10x WORSE THAN OFF~~ (CONFOUNDED — see above).** Left
+disabled (`render_align_max: 0ms`).**
 Measured 2026-08-27, same analyser, four configurations:
 
     era                              sd(d fs_a)  sd(d fs_b)   skew sd
