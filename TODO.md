@@ -31,6 +31,62 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**30 Hz BEACONS: MEASURED, DOES NOT HURT, AND IT RETIRES THE RADIO-CONTENTION HYPOTHESIS
+(2026-08-28, `f93eb9d`).** Three constants, since two are hard ceilings: `BEACON_INTERVAL_US`
+1 s -> 33.3 ms, `SERVICE_MIN_INTERVAL_US` 200 ms -> 20 ms (service() returns early inside it, so
+beacons would otherwise cap at 5 Hz and the experiment would silently not happen), and
+`CONSENSUS_INTERVAL_US` 500 ms -> 100 ms.
+
+VERIFIED LIVE BY MEASUREMENT, not by the flash succeeding: the observer's PHASEIN peer ages fell
+from ~1000 ms to 46-111 ms. That implies an EFFECTIVE ~10-20 Hz rather than 30 -- worth knowing,
+and probably service() call frequency (it runs per arriving message, ~38/s) or packet loss rather
+than the constant.
+
+    sd, matched instrument, correction off
+    pre-KP,  1 Hz      6.326 us  (1.5 h window)
+    post-KP, 1 Hz      1.694 us  (45 s window)
+    post-KP, 30 Hz     2.319 us  (n=336, p2p 7.154)
+
+**SO THE 15x FOLLOWER-BEACON REGRESSION WAS NOT RADIO CONTENTION.** That was the one hypothesis
+never excluded when `broadcast_()`'s trailing `adopt_()` was identified as the cause (`27ad3de`).
+30x the beacon traffic leaves sd in the same band, so contention is not a material term and the
+`adopt_()` explanation stands.
+
+WHAT IT DID NOT BUY, as predicted: nothing measurable for the timebase. The consensus averages
+LINES carrying drift_ppm, so a stale peer line is extrapolated rather than stale-valued and 1 s of
+staleness costs ~1 us, against a measured 137-920 us spread between the devices' own raw estimates.
+The rate was never the limiting term.
+
+STILL UNTESTED, and the reason to keep it: render-phase PAIRING. `PHASE_PAIR_WINDOW_US` is 300 ms
+against a phase written once per sync report, and only ~25% of arrivals used to pair. 10-20x the
+arrivals should transform that, which is the signal `render_align` needs -- but `render_align` is
+blocked on ledger-independence, so there is nothing yet to consume it.
+
+**A STRUCTURAL DIFFERENTIAL RAMP, worth recording as a candidate for part of the standing offset:**
+
+    A: Offset ramp +3.20 ppm (tsf-local +43.02, map +39.82)
+    B: Offset ramp -3.10 ppm (tsf-local +37.00, map +40.10)
+
+`map` is COMMON (~40 ppm, the shared consensus drift, as it must be) while `tsf-local` differs by
+6 ppm -- the crystal difference. So each device's offset filter sees a ramp differing by 6.3 ppm
+BY CONSTRUCTION. Through the documented lag mechanism that is 6.3 ppm x tau 6.7 s ~= 42 us, against
+an observed -48.6 us at the time.
+
+DO NOT READ THAT AS THE ANSWER, tempting as the match is: a differential EWMA lag is a FIXED POINT,
+so the offset would return to ~-42 us after every event. It does not -- it went
++89 -> +136 -> +85 -> -183 -> -77 -> -49 us across the morning, which is a random walk. The
+event-planted mechanism still explains the standing offset better and the magnitude agreement is
+most likely coincidence.
+
+**BENCH CONDITION, and it currently blocks all precision work:** roughly one multi-board excursion
+every 5 minutes since ~06:19, against a 1.5 h event-free run at ~05:00 that produced the baseline.
+The affected subset VARIES (09:47 A+B, 09:57 A only, 10:07 A+observer, B's stalls at 08:00/09:05/
+09:47), so it is not one weak board, and it coincides with Spotify-stream clients being affected in
+parallel -- i.e. server or network side, not firmware. Consequence: `TRIM_KP_RUN` 0.125 is still
+UNGRADED after three 5-minute windows aborted on events, and its known cost is real (per-board
+median 1-217 us against +-30-60 at 0.25). Do not stack further parameter changes until the event
+rate returns to the overnight level; nothing can be resolved at this one.
+
 **MEASURED: THE RATCHET IS GONE (2026-08-28). 8 forced starvations, post-fix:**
 
     plants: +13.4  -105.0  -6.0  +89.6  -44.8  +75.3  -45.5  +62.6   us
