@@ -2448,6 +2448,9 @@ void SnapcastClient::player_task_() {
     // inside 90 us, because the servo was faithfully hitting a target that had been
     // moved.
     const int64_t error_us = predicted - deadline;  // >0: this chunk would play late
+    // Anchor for the SHADOW error (see the SHADOW log line). Stored, not recomputed.
+    st.last_deadline_us = deadline;
+    st.last_deadline_server_ts = rec.server_ts_us;
 
 #ifdef CLOCK_SYNC_TSF_ACTIVE
     // RAW timing sample, for offline cross-device analysis. Deliberately built from
@@ -4432,6 +4435,37 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             this->tsf_sync_->set_render_phase_us(measured_phase, phase_local);
           } else {
             this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
+          }
+
+          // SHADOW ERROR: what the servo's error signal WOULD be if it were measured rather than
+          // predicted. Computed, logged, and acted on by nothing.
+          //
+          // The live error is `predict_next_play_us_() - deadline`: a model of when audio will
+          // render, extrapolated from an EWMA pivot along the nominal slope. Every defence around
+          // it -- the accounting split, the 3 s trim hold, the repair that steps
+          // pushed_frames_total_, the starvation re-baseline -- exists because that model can
+          // diverge from reality. A render tag measures the same quantity directly, so there is
+          // nothing for a split to be a split BETWEEN.
+          //
+          // Two terms are worth watching in the comparison, both already documented as costs of the
+          // predicted form in predict_next_play_us_():
+          //   * the nominal-vs-realised slope bias, called out there as ~70% of the differential
+          //     floor, and unremovable because the prediction depends on the model. A measured
+          //     render instant has no slope at all.
+          //   * loop delay. The pivot lags ~141,000 frames (~3.2 s); a tagged observation lags one
+          //     pipeline depth (~250-300 ms). The measurement is an order of magnitude fresher.
+          //
+          // deadline() is linear in server time for a fixed buffer and offset, so the tagged
+          // frame's target is the last chunk's target plus their server-time difference. Exact, and
+          // free of a second call into chunk_deadline_us_(), which mutates state.
+          if (tag_fresh && st.last_deadline_server_ts != 0) {
+            const int64_t rate_i = static_cast<int64_t>(tr.sample_rate);
+            const int64_t tag_server_us = tr.server_ts_us + static_cast<int64_t>(tr.offset_frames) * 1000000 / rate_i;
+            const int64_t tag_local_us = tr.adjusted_ts_us - static_cast<int64_t>(tr.frames) * 1000000 / rate_i;
+            const int64_t tag_deadline = st.last_deadline_us + (tag_server_us - st.last_deadline_server_ts);
+            const int64_t shadow_err = tag_local_us - tag_deadline;
+            ESP_LOGD(TAG, "SHADOW err_tag=%" PRId64 " err_live=%" PRId64 " diff=%" PRId64 " age=%" PRId64,
+                     shadow_err, median_err_us, shadow_err - median_err_us, tag_age_us);
           }
 
 #ifdef USE_SNAPCLIENT_TIMING_DIAG

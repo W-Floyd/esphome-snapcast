@@ -569,6 +569,15 @@ class SnapcastClient {
     bool gate_rate_lock_ok{false};
     bool gate_converged{false};
     int32_t gate_median_err_us{0};
+    /// @brief The most recent chunk's target and the server time it belongs to.
+    ///
+    /// Kept so the SHADOW error can be evaluated at the report without recomputing a deadline --
+    /// and without CALLING chunk_deadline_us_() again, which has side effects. The deadline is
+    /// linear in server time for a fixed buffer and clock offset, so
+    /// deadline(T) == last_deadline_us + (T - last_deadline_server_ts) exactly, for any T inside
+    /// the same report. That identity is what makes the shadow free rather than a second model.
+    int64_t last_deadline_us{0};
+    int64_t last_deadline_server_ts{0};
     uint32_t trim_railed{0};
     // TIME-INTEGRAL of the applied trim over the report window, its audio time, and the
     // audio time actually covered by a programmed trim.
