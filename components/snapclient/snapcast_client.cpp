@@ -4535,14 +4535,23 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         }
       }
   #endif
+      // SPLIT ACROSS TWO LINES, and this is not cosmetic. The formatting ceiling is 256 bytes of
+      // message; the single combined line ran to exactly that on 140 of 144 reports and was cut
+      // mid-token. Everything at its tail -- trim, tsf, split, tbjit -- was therefore absent most
+      // of the time, and worse, the analyser's SYNC_RE REQUIRES the trim field, so a truncated
+      // line was dropped whole and took that report's frame corrections, hard resyncs and pipeline
+      // steps with it. Silent, and it invalidated several conclusions before it was noticed.
+      //
+      // The first line carries what must never be lost: the error summary and the correction
+      // counts. Everything derived or diagnostic goes on SYNCX, which is short enough to survive.
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
-               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs, feedback %" PRId64
-               " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32 " ms%s%s%s%s%s over %" PRIu32
-               " chunks",
-               st.err_accum_us / st.err_count, st.err_peak_us, median_err_us, st.soft_dropped_frames, st.soft_inserted_frames,
-               st.hard_resyncs, fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, drift_str,
-               dl_str, trim_str, tsf_str, st.err_count);
+               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs%s over %" PRIu32 " chunks",
+               st.err_accum_us / st.err_count, st.err_peak_us, median_err_us, st.soft_dropped_frames,
+               st.soft_inserted_frames, st.hard_resyncs, trim_str, st.err_count);
+      ESP_LOGD(TAG, "SYNCX feedback %" PRId64 " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32
+                    " ms%s%s%s%s",
+               fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, drift_str, dl_str, tsf_str);
       st.err_accum_us = 0;
       st.err_peak_us = 0;
       st.err_count = 0;

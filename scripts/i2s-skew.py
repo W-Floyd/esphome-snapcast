@@ -719,10 +719,17 @@ REPAIRS = {}
 # board -> [(elapsed_s, injected_us)] from each deliberate accounting-split injection.
 INJECTS = {}
 
+# `trim` is OPTIONAL and must stay that way. It used to be required, and the firmware's Sync line
+# hit the 256-byte formatting ceiling on 140 of 144 reports -- so the trim field was cut off, the
+# regex failed, and the WHOLE line was discarded along with its frame corrections, hard resyncs and
+# pipeline steps. A parser that drops a record because one trailing field is missing turns a
+# formatting limit into silent data loss, which is the worst kind: the plot simply showed fewer
+# events and looked fine. Firmware now splits the report across `Sync:` and `SYNCX`, but old logs
+# still have the truncated form and must remain readable.
 SYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?"
-    r"corrected -(\d+)/\+(\d+) frames,\s*(\d+) hard resyncs.*?"
-    r"trim ([+-][\d.]+) ppm")
+    r"corrected -(\d+)/\+(\d+) frames,\s*(\d+) hard resyncs"
+    r"(?:.*?trim ([+-][\d.]+) ppm)?")
 
 # DEVICE TIMESTAMP, esp_timer microseconds since boot, appended to every series line the
 # firmware emits for plotting. Preferred over the "[HH:MM:SS]" prefix for placing points,
@@ -822,6 +829,23 @@ PHASEIN_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?PHASEIN mine=(unknown|-?\d+)(.*?)\| group=(-?\d+)")
 PHASEIN_PEER_RE = re.compile(r"\| ([0-9A-F]{4}) d=([+-]\d+) age=(\d+)ms")
 
+# "TRIMDBG applied=+18.75 ppm samples=128 railed=0 span=+16..+22 splithold=0 gate=0 lock=1 ..."
+# The steering attribution, on its own line precisely because it used to live at the END of the
+# Sync report and was truncated away on ~99% of reports. Every count taken from that field was
+# really a count of "did the line happen to fit".
+TRIMDBG_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?TRIMDBG applied=([+-][\d.]+) ppm samples=(\d+) "
+    r"railed=(\d+) span=([+-][\d.]+)\.\.([+-][\d.]+) splithold=(\d+) gate=(\d)")
+TRIMDBG_OFF_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?TRIMDBG rate_lock_ok=0")
+
+# "SYNCX feedback ... buffered ... pipeline ... , tsf=consensus(n5, 1.2s, depth .. render .. us)"
+# The tail of the old Sync line, moved so it survives. `pipeline` markers are read from here now.
+SYNCX_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SYNCX .*?pipeline (-?\d+) ms")
+# Consensus size and mapping age, when the tsf= field is present on SYNCX.
+SYNCX_TSF_RE = re.compile(r"tsf=(\w+)\(n(\d+), ([\d.]+)s")
+
 RSYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RSYNC\[(\d+)\] t=(\d+) err=(-?\d+) med=(-?\d+) "
     r"ring=(\d+) drops=(\d+)")
@@ -911,6 +935,9 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
     injects = []
     last_trim, last_resync = state.get("trim"), state.get("resync")
     last_pipe = state.get("pipe")
+    # Boxed so the SYNCX branch can update it without a nonlocal; carried across incremental
+    # reads like the other running state, so a membership change is not re-reported every poll.
+    last_consensus = [state.get("consensus")]
     last_role = state.get("role")
     try:
         f = open(path, errors="replace")
@@ -1026,6 +1053,46 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
                     rsyncs.append((tod_p, -(first_seq - i), t, errs[i], meds[i],
                                    rings[i], drops[i]))
             continue
+        td = TRIMDBG_RE.match(line)
+        if td:
+            tod_d = (int(td.group(1)) * 3600 + int(td.group(2)) * 60 + int(td.group(3))
+                     + int(td.group(4)) / (10 ** len(td.group(4))))
+            applied, samples = float(td.group(5)), int(td.group(6))
+            railed, splithold, gated = int(td.group(7)), int(td.group(10)), int(td.group(11))
+            # The three ways steering can fail to happen, each previously invisible because the
+            # field carrying them sat past the truncation point.
+            if samples == 0:
+                why = "split-hold" if splithold else ("gated" if gated else "no chunks")
+                ev.append((tod_d, "trimstop", f"{board}: no steering ({why})"))
+            elif railed:
+                ev.append((tod_d, "trimrail", f"{board}: trim railed {railed}/{samples}"))
+            if last_trim is not None and abs(applied - last_trim) >= trim_ppm:
+                ev.append((tod_d, "trim", f"{board}: trim {last_trim:+.0f}->{applied:+.0f} ppm"))
+            last_trim = applied
+            continue
+        to = TRIMDBG_OFF_RE.match(line)
+        if to:
+            tod_o = (int(to.group(1)) * 3600 + int(to.group(2)) * 60 + int(to.group(3))
+                     + int(to.group(4)) / (10 ** len(to.group(4))))
+            ev.append((tod_o, "trimstop", f"{board}: rate lock unavailable"))
+            continue
+        sx = SYNCX_RE.match(line)
+        if sx:
+            tod_x = (int(sx.group(1)) * 3600 + int(sx.group(2)) * 60 + int(sx.group(3))
+                     + int(sx.group(4)) / (10 ** len(sx.group(4))))
+            pipe = int(sx.group(5))
+            if last_pipe is not None and abs(pipe - last_pipe) >= pipe_ms:
+                ev.append((tod_x, "pipeline", f"{board}: pipeline {last_pipe}->{pipe} ms"))
+            last_pipe = pipe
+            tm = SYNCX_TSF_RE.search(line)
+            if tm and last_consensus[0] is not None and int(tm.group(2)) != last_consensus[0]:
+                # A consensus MEMBERSHIP change: measured 2026-08-28 to raise |median error| from
+                # 93 us to 154 us (p90 286 -> 674) within 15 s of one, so it belongs on the plot.
+                ev.append((tod_x, "consensus",
+                           f"{board}: consensus n{last_consensus[0]}->{tm.group(2)}"))
+            if tm:
+                last_consensus[0] = int(tm.group(2))
+            continue
         rt = RENDERTAG_RE.match(line)
         if rt:
             tod_t = (int(rt.group(1)) * 3600 + int(rt.group(2)) * 60 + int(rt.group(3))
@@ -1064,8 +1131,11 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         if span is not None:
             span[0] = tod if span[0] is None else min(span[0], tod)
             span[1] = tod if span[1] is None else max(span[1], tod)
-        down, up, nres, trim = (int(m.group(5)), int(m.group(6)),
-                                int(m.group(7)), float(m.group(8)))
+        down, up, nres = int(m.group(5)), int(m.group(6)), int(m.group(7))
+        # None when the line was truncated before the trim field, or when the firmware puts trim
+        # on its own TRIMDBG line. Never crash on it: the corrections and resyncs above are the
+        # load-bearing part of this record and must survive a missing trailing field.
+        trim = float(m.group(8)) if m.group(8) is not None else None
         # The sync error itself is the best marker of what actually moves the wire.
         # Measured: peak(B-A) correlates -0.76 with the wire skew, median(B-A) -0.54,
         # while trim correlates only -0.23 -- trim is reported "(idle)", i.e. computed
@@ -1088,12 +1158,14 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         if last_resync is not None and nres > last_resync:
             ev.append((tod, "resync", f"{board}: {nres - last_resync} hard resync"))
         last_resync = nres
-        if last_trim is not None and abs(trim - last_trim) >= trim_ppm:
-            ev.append((tod, "trim", f"{board}: trim {last_trim:+.0f}->{trim:+.0f} ppm"))
-        last_trim = trim
+        if trim is not None:
+            if last_trim is not None and abs(trim - last_trim) >= trim_ppm:
+                ev.append((tod, "trim", f"{board}: trim {last_trim:+.0f}->{trim:+.0f} ppm"))
+            last_trim = trim
     end = f.tell()
     f.close()
     state["trim"], state["resync"], state["pipe"] = last_trim, last_resync, last_pipe
+    state["consensus"] = last_consensus[0]
     state["role"] = last_role
     return ev, end, state, temps, trims, extras, rsyncs, seeds, repairs, injects
 
@@ -1320,7 +1392,8 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     bar_bottom = bands[-1][1] if bands else top1
     colours = {"corrected": "#d9534f", "resync": "#8e44ad", "trim": "#e0a800",
                "sync": "#1a7f37", "pipeline": "#0969da", "role": "#000000",
-               "rendertag": "#c2410c", "phasein": "#0e7490"}
+               "rendertag": "#c2410c", "phasein": "#0e7490",
+               "trimstop": "#b91c1c", "trimrail": "#a16207", "consensus": "#7c3aed"}
     for i, (ex, kind, label) in enumerate(sorted(events)):
         if not (x0 <= ex <= x1):
             continue
