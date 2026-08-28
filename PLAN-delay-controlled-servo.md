@@ -280,12 +280,30 @@ that bound instead of being the bound.
 Not "improved" — **deleted**, because with no ledger there is nothing for a split to be a split
 between:
 
-* `drift` / the accounting split, `DRIFT_REPAIR_US`, `DRIFT_STEADY_BAND_US`
-* the 3 s `split_pending` trim hold, and `trim_split_holds` with it
-* `Accounting split repaired` and the `pushed_frames_total_` step
-* the starvation re-baseline and the phantom-frame clamp's re-arming logic
-* `predict_next_play_us_()` and the EWMA feedback pivot, with the nominal-vs-realised slope
-  bias documented there as ~70% of the differential floor
+**Deleted outright:**
+
+* the 3 s `split_pending` trim hold, and `trim_split_holds` with it — this is the one unconditional
+  win, and the largest identified inter-device term
+* the starvation re-baseline and the phantom-frame clamp's re-arming logic — **only because flow
+  control moves to the measured `buffered_audio()` and the ledger becomes diagnostic-only.** They are
+  not servo defences; they are what keeps `pushed - played` truthful, so deleting them while any
+  consumer still trusts the ledger would leave it permanently biased after the first restart
+
+**Conditional on a code trace, NOT yet decided:**
+
+* `drift` / the accounting split, `DRIFT_REPAIR_US`, `DRIFT_STEADY_BAND_US`, `Accounting split
+  repaired` and the `pushed_frames_total_` step. These defended the prediction *because the rate loop
+  consumed it*. The rate loop no longer does — but the retained per-chunk consumers still do, and
+  `fast_splice_threshold` (1 ms) sits below `DRIFT_REPAIR_US` (2 ms), so a bias between them could
+  move audio through the splice path unseen. Trace the retained consumers of `error_us` and find the
+  smallest ledger bias that changes a decision before deleting these.
+
+**Demoted, not deleted:**
+
+* `predict_next_play_us_()` and the EWMA feedback pivot. They stop being the **rate servo's** error
+  signal — which is where the nominal-vs-realised slope bias, ~70% of the differential floor, was
+  costing — but survive as the **per-chunk scheduling comparison** driving hard resync, stale
+  bailout, storm mute and splices. Those act at millisecond scale, where that bias does not bind.
 
 > **REVIEW — this list contradicts the fallback.** "Tag loss mid-flight" below says the loop
 > "reverts to the ledger path after a bounded number of missed updates", and "What must be kept"
@@ -317,9 +335,11 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
 
 ## What must be kept
 
-* **The ledger, for FLOW CONTROL.** `pushed - played` also answers "how much is in flight, push or
-  drop". A tag says where audio is, not how much is queued. It stays; it just stops being a timing
-  reference. `buffered_audio()` reports the same thing measured, and is the better source.
+* **Flow control, moved to `buffered_audio()`.** "How much is in flight, push or drop" is answered by
+  the sink's MEASURED depth, not by `pushed - played`. The ledger becomes **diagnostic-only**, which
+  is what allows the starvation re-baseline and phantom clamp to be deleted: nothing load-bearing
+  trusts a counter that rots after the first restart. Consequence for the test below: RECON `drift`
+  is no longer a reliable positive control.
 * **A fallback when tags are unavailable.** Deliberately suppressed through a resampler, while the
   mixer blends a second source, and for client-inserted silence/splices. The fallback is **hold the
   last trim, and let the splice path handle gross error** — deliberately NOT the old ledger servo,
@@ -349,6 +369,73 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   > loop takes over from there rather than "at whatever D then is".
 * **`supports_render_tags()` and the freshness gate.** A signal that reports its own absence is the
   whole reason this is trustworthy; do not let the fallback hide it.
+
+> **REVIEW 3 — the kept splice path runs on the DELETED prediction.** The fast path is not a
+> separate mechanism: per chunk, `error_us = predicted - deadline`
+> (`snapcast_client.cpp:2498`, from `predict_next_play_us_()` at 2415) is the input to the hard
+> resyncs, the stale bailout, the storm mute, AND the fast splices — everything this plan keeps.
+> Deleting `predict_next_play_us_()` deletes the fast path's error signal. Decide what drives
+> per-chunk push/drop/splice under the new design: `err_tag` (then specify the behaviour when tags
+> are absent — which is exactly the tag-loss and startup windows where the plan says splices are
+> the ONLY remaining mechanism), or a retained minimal prediction (then the deletion list
+> overstates for the second time, and "demoted, not deleted" applies here too).
+
+> **RESPONSE — correct, and it is the second option: `predict_next_play_us_()` is DEMOTED, not
+> deleted. The deletion list overstated again.**
+>
+> The circularity in the first option is fatal and decides it. Per-chunk push/drop/resync decisions
+> happen every 26 ms; tags are neither guaranteed nor chunk-aligned, and are absent precisely during
+> tag loss and startup — the windows where splices are said to be the only mechanism. A fast path
+> that needs tags cannot be the fallback for tags being unavailable.
+>
+> So the prediction survives as **the per-chunk scheduling comparison** — hard resync, stale bailout,
+> storm mute, splice — and stops being **the rate servo's error signal**. Those are different jobs
+> with different tolerances: the scheduling comparison acts at millisecond scale, the rate loop at
+> tens of microseconds.
+>
+> **This narrows the plan's central claim and the narrowing must be stated plainly.** What is deleted
+> is the split/hold/repair apparatus, not the prediction. The justification for deleting the split
+> detector is now conditional rather than structural: it defended the prediction *because the rate
+> loop consumed it*, and the rate loop no longer does. Whether it can go therefore depends on
+> whether the retained consumers are sensitive to a ledger bias — and `fast_splice_threshold` is
+> 1 ms while `DRIFT_REPAIR_US` is 2 ms, so a bias between those can move audio through the splice
+> path with the servo blind to it.
+>
+> **That is an open structural question, not a decided one.** It needs the same code trace REVIEW 2
+> asked for on flow control: enumerate the retained consumers of `error_us` and establish the
+> smallest ledger bias that changes any of their decisions. If that bias is below
+> `fast_splice_threshold`, the split detector must stay too, and the plan's benefit shrinks to
+> deleting the 3 s hold alone.
+
+> **REVIEW 3 — the kept ledger rots without the deleted corrections.** The starvation re-baseline
+> and the phantom clamp are not servo defences; they are what keeps `pushed - played` truthful.
+> Delete them and the first pipeline restart leaves the discarded frames counted forever (the
+> death-spiral comment at `snapcast_client.cpp:1124-1141`), so the ledger "kept for flow control"
+> is permanently biased after the first restart of every session. Either flow control moves wholly
+> to the measured `buffered_audio()` and the ledger becomes diagnostic-only — then say so, and note
+> that the RECON `drift` positive control in the test below inherits the same staleness — or these
+> two corrections belong in "What must be kept".
+
+> **RESPONSE — correct; taking the first option. Flow control moves to `buffered_audio()` and the
+> ledger becomes DIAGNOSTIC-ONLY.**
+>
+> The observation is exactly right and I had the category wrong: the starvation re-baseline and the
+> phantom clamp are not servo defences at all, they are what stops `pushed - played` diverging from
+> reality after a restart discards frames. Keeping the ledger for flow control while deleting them
+> would leave it permanently biased from the first restart of every session — the death spiral the
+> comment at 1124-1141 describes.
+>
+> Moving flow control to `buffered_audio()` is the consistent choice: it is measured rather than
+> inferred, which is this plan's whole thesis, and it cannot rot because nothing accumulates. "What
+> must be kept" is amended — the ledger is kept only as a diagnostic, and the two corrections go with
+> the rest of the ledger machinery.
+>
+> **And the corollary is right and damaging to the test.** A diagnostic-only ledger makes RECON
+> `drift` an unreliable positive control, because after the first restart it may be biased for
+> reasons unrelated to the injection. The (a) criterion needs a witness that does not depend on the
+> ledger staying truthful: use the injection's own ramp state (`split_ramp_remaining_us_` reaching
+> zero, already logged at the ramp site) as proof the perturbation was applied, and keep RECON
+> `drift` only as corroboration.
 
 ## Semantics that must be decided, not left open
 
@@ -400,9 +487,49 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
 * **Startup.** No tags until audio flows, so acquisition stays on the existing splice path, which
   splices down to within `fast_splice_threshold`. The loop takes over from there — not "at whatever
   the error then is" — and **seeds its integral with the trim currently applied**, which is the
-  crystal offset the acquisition path has already learned this session. A cold boot re-learns from
-  zero, which is acceptable because acquisition is muted and splicing anyway; persisting the crystal
-  offset across boots is a separate work item and is not part of this plan.
+  **delay loop's own prior trim if one survives in RAM** from earlier in the session. The splice path
+  corrects position, not rate, so it learns no crystal offset and there is nothing to seed from at a
+  genuine cold boot — the integral starts at zero.
+
+  The cold-boot wind-up plays **unmuted**, over ~3·Ti (90 s at Ti = 30 s, ~30 s at Ti = 8-10 s), as a
+  sub-threshold error ramping toward `crystal/Kp` while the integral catches up. At ~40 ppm an
+  uncorrected error accrues ~1 ms every ~25 s, so the fast path emits roughly **one single-frame
+  splice (~23 µs) every ~25 s — about four over a 90 s wind-up, or one at the shorter Ti.** That is
+  acceptable because four inaudible splices are acceptable, not because anything is muted.
+
+  Persisting the crystal offset across boots would remove the transient entirely; it is a separate
+  work item and is not part of this plan.
+
+  > **REVIEW 3 — two claims here don't hold.** (1) The splice/acquisition path learns no rate — it
+  > corrects position. Within a session the value being seeded is the delay loop's own prior trim
+  > surviving in RAM; "the acquisition path has already learned" attributes it to a mechanism that
+  > cannot produce it. (2) "acceptable because acquisition is muted" is wrong on duration: the
+  > integral winds to ~95% in 3·Ti — 90 s at Ti = 30 s — which far outlives the mute. The cold-boot
+  > transient plays UNMUTED as a sub-threshold error ramping toward `crystal/Kp` with periodic
+  > single-frame splices until the integral catches up. That may well be inaudible, but say that,
+  > with the splice cadence (~1 ms accrues in ~25 s at 40 ppm), rather than claiming the mute
+  > covers it.
+
+  > **RESPONSE — both wrong as written, and the second was a hand-wave.**
+  >
+  > **(1)** The splice path corrects **position**, not rate; it learns no crystal offset and cannot.
+  > Within a session the value being seeded is the delay loop's **own prior trim surviving in RAM**,
+  > which is worth having but is not what I called it. At a genuine cold boot there is **nothing to
+  > seed from at all** — the integral starts at zero and must wind up.
+  >
+  > **(2)** "Acceptable because acquisition is muted" was wrong on duration and is withdrawn. The
+  > integral reaches ~95% in 3·Ti = **90 s** at Ti = 30 s, far outliving the mute. So the cold-boot
+  > transient plays **unmuted**: a sub-threshold error ramping toward `crystal/Kp` while the integral
+  > catches up.
+  >
+  > **The honest statement, with the cadence rather than an appeal to the mute:** at ~40 ppm an
+  > uncorrected error accrues ~1 ms every ~25 s, so during wind-up the fast path emits roughly one
+  > single-frame splice (~23 µs) every ~25 s — about **four splices over the 90 s**. Single-frame
+  > splices at 23 µs are inaudible by the same argument the existing `fast_splice_threshold` comment
+  > makes, so this is acceptable — but it is acceptable because it is four inaudible splices, not
+  > because anything is muted.
+  >
+  > It also argues for the shorter tau: at Ti = 8-10 s the wind-up is ~30 s and roughly one splice.
 * **Do NOT make any hold common-mode across devices.** Freezing every device captures each one's PI
   output at an arbitrary point in its own transient, converting N momentary corrections into N
   sustained rate offsets. This was proposed and is wrong.
@@ -411,11 +538,26 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
 
 One test, already tooled, and it must be run before anything downstream is trusted:
 
-    inject_split(+1000 us) on one board.
-    A delay-controlled servo should NOT MOVE THE AUDIO AT ALL: the ledger is not in its loop,
-    so a ledger bias is not an error it can see.
-      present servo:  displaces ~1100 us, then reports a clean error having done so
-      this design:    wire displacement ~0    <- pass
+    inject_split(+1000 us) on one board. TWO-SIDED -- a null proves nothing unless the
+    perturbation demonstrably landed:
+
+      (a) the bias LANDED    split_ramp_remaining_us_ reached zero (logged at the ramp site)
+                             RECON `drift` may corroborate, but is NOT the witness: the ledger
+                             is diagnostic-only under this design and may be biased for
+                             unrelated reasons after the first restart
+      (b) the audio did NOT  wire displacement ~0
+
+      (a) without (b) = the servo is still ledger-coupled somewhere -- most likely through the
+                        retained per-chunk splice path, whose threshold sits BELOW DRIFT_REPAIR_US
+      (b) without (a) = the injection reached nothing; the test is VOID, not passed
+
+    present servo, measured 2026-08-28: displaces ~1100 us, then reports a clean error having
+    done so (err_live -57..+95 throughout).
+
+Flow-control immunity is a SEPARATE property and is not testable by injection: the starvation
+latch is ~11,000 frames away, ~40 minutes of ramping, and crossing it is a deliberate underrun.
+Establish it by code trace instead — enumerate the read sites of `pushed_frames_total_` and
+`available_frames` and show no push, drop or starvation decision consumes the biased value.
 
 > **REVIEW — verify the pass criterion survives the ledger's remaining job.** The ledger stays for
 > flow control, and `inject_split` biases exactly that ledger. If a +1000 µs accounting bias can
@@ -484,8 +626,22 @@ and cannot improve meaningfully — **do not judge this on the median.**
 * **Board A's 12.5 us floor against board B's 5.0 us is unexplained.** If it is a property of the
   measurement rather than of that board, the achievable resolution is the worse number.
 * **The dead time is real.** ~250-300 ms of pipeline. A loop tuned as if the measurement were
-  instantaneous will oscillate. `predict_next_play_us_()` records precisely this failure from the
-  realised-slope experiment: trim ran away to +164.9 ppm and medians oscillated within two minutes.
+  instantaneous will oscillate — a general property of loops with transport delay, and the reason
+  tau must be many multiples of it. No precedent is cited here on purpose: the realised-slope
+  runaway was a sampling-interval failure (tau comparable to lag), not a dead-time one, and using it
+  as evidence would be borrowing from a different mechanism.
+
+  > **REVIEW 3 — this citation was withdrawn two sections up and still stands here.** The response
+  > under the cadence discussion concedes the realised-slope oscillation was a sampling-interval
+  > failure (tau ≈ lag), "borrowed evidence from a different failure" — yet this bullet still
+  > offers it as the dead-time precedent. The risk itself is fine; cite it as a general property of
+  > loops with dead time, or not at all.
+
+  > **RESPONSE — correct; the citation is removed from the bullet above.** Conceding a point in one
+  > section and leaving it standing as evidence in another is the same defect REVIEW 2 opened with,
+  > committed again in the same pass that claimed to have fixed it. The risk now states dead time as
+  > a general property and cites no precedent, because the only precedent on hand was a
+  > sampling-interval failure.
 * **Do not trust a floor measured on a churned bench.** Every reflash causes five consensus
   membership changes, worth 154 us vs 93 us in |median error|. Today's best numbers came from
   twenty uninterrupted minutes.
