@@ -1175,6 +1175,25 @@ class SnapcastClient {
   /// Tagged renders seen since the last sync report, so the report can say whether the signal is live
   /// at all rather than leaving a silent fallback to the inferred phase looking like a measurement.
   uint32_t tagged_render_count_{0};
+  /// @brief Running mean and spread of the TRANSPORT DELAY across the report window.
+  ///
+  /// The delay is (local render instant of a tagged frame) - (that frame's server time): a direct,
+  /// captured measurement of the one quantity the whole system exists to control. It needs no
+  /// ledger, and it does not care HOW the delay arises -- ring depth, DMA padding, mixer fill, a
+  /// restart at an unobserved level are all just terms inside a black box whose output is measured.
+  ///
+  /// ACCUMULATED, not sampled. ~334 tagged renders arrive per 3.35 s report and the diagnostic was
+  /// keeping only the newest, so a measurement available at ~100 Hz was being read at 0.3 Hz. A
+  /// single observation carries ~70 us of sample-to-sample jitter (measured, both boards); if that
+  /// jitter is independent, the window mean should land near 70/sqrt(334) ~ 4 us. Whether it
+  /// actually does is the point of collecting this: if the spread does not shrink as sqrt(N), the
+  /// 70 us is real phase movement rather than noise, and that is equally worth knowing.
+  ///
+  /// Welford, so the variance is stable without keeping the samples. Reset each report.
+  /// Written on the speaker callback thread under playout_mutex_, read by the player task.
+  uint32_t delay_n_{0};
+  double delay_mean_us_{0.0};
+  double delay_m2_us_{0.0};
   /// Sample rate the tag offsets are counted in, published by the player task when it tags and read
   /// on the speaker callback. Atomic because those are different threads and this is the one term of
   /// a tagged observation that does not travel with the tag.

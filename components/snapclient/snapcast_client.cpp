@@ -1049,9 +1049,23 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
   if (rate == 0) {
     return;
   }
+  // The transport delay for THIS observation: when the tagged frame rendered, minus the server time
+  // it belongs to. Computed here rather than at the report so every arrival contributes, instead of
+  // the report seeing only whichever one happened to be last.
+  const int64_t rate_i = static_cast<int64_t>(rate);
+  const int64_t first_frame_local = adjusted_ts - static_cast<int64_t>(frames) * 1000000 / rate_i;
+  const int64_t frame_server_us =
+      static_cast<int64_t>(tag.server_ts) + static_cast<int64_t>(tag.offset_frames) * 1000000 / rate_i;
+  const double delay_us = static_cast<double>(first_frame_local - frame_server_us);
+
   this->playout_mutex_.lock();
   this->tagged_render_ = TaggedRender{adjusted_ts, frames, static_cast<int64_t>(tag.server_ts), tag.offset_frames, rate};
   this->tagged_render_count_++;
+  // Welford: mean and M2 without retaining samples.
+  this->delay_n_++;
+  const double d1 = delay_us - this->delay_mean_us_;
+  this->delay_mean_us_ += d1 / static_cast<double>(this->delay_n_);
+  this->delay_m2_us_ += d1 * (delay_us - this->delay_mean_us_);
   this->playout_mutex_.unlock();
 }
 
@@ -4375,7 +4389,24 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           const TaggedRender tr = this->tagged_render_;
           const uint32_t tr_count = this->tagged_render_count_;
           this->tagged_render_count_ = 0;
+          const uint32_t d_n = this->delay_n_;
+          const double d_mean = this->delay_mean_us_;
+          const double d_sd = d_n > 1 ? std::sqrt(this->delay_m2_us_ / static_cast<double>(d_n - 1)) : 0.0;
+          this->delay_n_ = 0;
+          this->delay_mean_us_ = 0.0;
+          this->delay_m2_us_ = 0.0;
           this->playout_mutex_.unlock();
+
+          // DELAY: the measured transport delay averaged over the whole report window, with the
+          // spread that produced it and the standard error of the mean. sem is the number that
+          // decides whether this is controllable: a single observation jitters ~70 us, and if that
+          // jitter is independent then sem = sd/sqrt(n) should reach single digits at n~334.
+          // If sem does NOT shrink with n, the jitter is real phase movement and no amount of
+          // averaging will help -- which is the same answer, arrived at honestly.
+          if (d_n > 1) {
+            ESP_LOGD(TAG, "DELAY mean=%.1f us sd=%.1f n=%" PRIu32 " sem=%.2f us", d_mean, d_sd, d_n,
+                     d_sd / std::sqrt(static_cast<double>(d_n)));
+          }
 
           // A tagged observation older than this describes a pipeline state that has since changed.
           //
