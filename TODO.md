@@ -408,11 +408,70 @@ EXTERNALLY planted offsets and is blind to model-coherent ones. Which means the 
 reports at r = -0.98 is not displacement at all -- it is a different quantity that happens to
 anti-correlate with the wire's wander, and that is the thing to identify.
 
-NEXT: a **500 ms latency step**, which TODO already records as the only magnitude that forces a
-mute, and which is the perturbation the 94%-tracking campaign used. It plants the offset
-EXTERNALLY -- the class the instrument demonstrably can see -- so it can settle the sign where a
-deadline shift cannot. Expect the wire to go nan across the step itself and read it after the
-resync settles.
+**RUN, AND THE INSTRUMENT IS VINDICATED: ratio -1.0000 on a known 500 ms displacement.**
++500 ms server latency on B, which forces a mute and a hard resync (B logged `Hard resync 499 ms`,
+so latency DOES reach the client). The wire cannot measure this state at all -- at 500 ms the two
+boards share no audio in the capture window -- but the ground truth is known from the server
+setting, so the wire is not needed:
+
+    baseline   3458 paired chunks   B - A median        +3.2 us
+    step       3442 paired chunks   B - A median   -499987.6 us
+    shift                              -499990.8 us against a known 500000
+    ratio                                  -1.0000   (9 us in 500000, 0.002%)
+
+Sign negative, i.e. B renders EARLIER for +500 ms of latency, which is what
+`server_ts + bufferMs - serverLatency` demands. So the DC sign is right as well as the gain.
+
+    perturbation            class                                    on-device response
+    inject_split(+1000)     deadline shift (audio + model together)        0.3%
+    latency +500 ms         externally planted                          100.00%
+
+The instrument sees what it was built to see and is blind to what it was built to difference out.
+Both behaviours are CORRECT, and the 0.3% was invisible-by-construction as suspected, not a fault.
+
+RETRACTED: "render_align was steering on an inverted signal throughout its tuning, so the
+1150 -> 118 -> 58 us table was never about gain." That does not follow. `render_align` exists to
+remove resync-planted residuals -- the externally-planted class -- and for that class the signal
+is accurate to 0.002% with the correct sign. The gain interpretation of that table stands.
+
+**THE ANSWER: AN ADDITIVE ERROR FLOOR OF ~10-30 us, NOT A GAIN OR SIGN ERROR.** The same campaign
+restored latency to 0, forcing a second resync, and measured the residual the pair of resyncs left:
+
+    BASELINE      wire  -2.92 us    on-device +3.21 us
+    POST-RESTORE  wire -27.95 us    on-device +6.44 us
+    RESIDUAL      wire -25.03 us    on-device +3.22 us     ratio -0.129
+
+    displacement    on-device ratio
+    500 ms             -1.0000
+    25 us              -0.129
+
+Scale-dependent response with a constant offset is an ADDITIVE FLOOR: ~10-30 us is 0.002% of
+500 ms and over 100% of 25 us. And -0.129 is essentially the "slope -0.10 where the arithmetic
+demands -2.0" recorded above, now with a mechanism instead of a mystery.
+
+The note at `render_delta`'s use site described this floor and did not name it as one: "the residual
+is roughly CONSTANT, not proportional: the displacement ranged 17-180 us while the render delta
+missed it by 8.7 +- 3.4 us each time". That is the floor, measured, and the reason "percent tracked"
+looked erratic -- percent is the wrong statistic against a constant error.
+
+IT EXPLAINS EVERY OBSERVATION AT ONCE, and retires the inversion as a separate phenomenon:
+  * the r = -0.92..-0.98 wander anti-correlation -- the +-4 us wander lies ENTIRELY INSIDE the
+    floor, so what the instrument reports there is its own error, not displacement. No inversion
+    needs explaining.
+  * ratio -0.129 at 25 us -- signal and floor are the same size, so the sign is arbitrary.
+  * ratio -1.0000 at 500 ms -- signal swamps the floor.
+  * `expl 0%` on the offset integral -- that integral is built from small offsets, all sub-floor.
+  * **`render_align` failing "10x worse than off"** -- it operates in the 20-200 us regime, which
+    is exactly where the floor is comparable to the signal. No sign error required.
+
+CONSEQUENCE: the floor has to be identified and removed before `render_align` can work at all.
+Nothing about gain, reference choice or median-vs-mean matters until it is, and all three were
+tuned on top of it.
+
+CANDIDATE, on arithmetic and not yet tested: `(pushed - played)` are FRAME COUNTS, and one frame at
+44.1 kHz is 22.7 us -- squarely inside the observed 10-30 us. A systematic one-frame accounting
+difference between two boards produces exactly a constant offset of this size. Cheap to test: look
+for a persistent +-1 frame bias between the boards' `pushed - played` at equal `s_ts`.
 
 TRAP, LIVE, COST REAL TIME TONIGHT: **`inject_split(0)` IS NOT A RESTORE.** The field is documented
 "REQUEST in us, consumed once by the player task; 0 when none" -- 0 means no request pending, so
