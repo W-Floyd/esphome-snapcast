@@ -227,6 +227,28 @@ all, so the feature stays off:
 follower's correction destabilises the leader, the coupling is not through the code path built
 here, and it is not yet understood. That is where to start.
 
+**MEDIAN-OF-THREE IS DISCONTINUOUS — the reason the observer made the correction WORSE.** With
+two devices the median IS the mean: smooth, and each device moves half the gap. With three it is
+the MIDDLE VALUE, which hops whenever the ordering changes — two phases close together and a
+third crossing between them steps the correction target with no real movement behind it.
+Measured 2026-08-28 with the observer in the group:
+
+    group delta seen by the speakers   +14 -31 +63 +81 +13 +11 +96 -33   (swinging ±96 µs)
+    group delta seen by the observer   median +3 µs, sd 12               (same instant, clean)
+    skew, correction ON                sd 13-28 µs
+    skew, correction OFF               sd 8.48 µs
+
+So the fix is to average rather than take a median for small groups, or to difference against the
+mean of PEERS excluding self. The median was chosen for outlier robustness, which matters at
+larger group sizes and actively hurts at three. Left disabled until that is changed.
+
+TWO REAL BUGS WERE FIXED GETTING HERE, both worth keeping:
+- Phases were differenced across a ~3.3 s staleness gap, so the signal measured relative DRIFT
+  (~165 µs at 50 ppm) rather than skew. Now paired within 300 ms. `b49ae48`
+- A failed pairing WIPED a good delta, and only ~25% of beacon arrivals pair, so the consumer
+  essentially never saw a value — zero corrections ran. Now a miss keeps the last valid delta
+  until it is genuinely stale. `c0648fb`
+
 **CORE AFFINITY WAS COSTING REAL JITTER.** Every task in the audio path was created with
 `xTaskCreate`, which on ESP-IDF is `tskNO_AFFINITY` — the scheduler places them on either core
 and may migrate them. In this build wifi AND the ESPHome main loop are both on CPU0
