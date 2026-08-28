@@ -44,6 +44,22 @@ masquerade as findings. On MLS the runner-up correlation is ~0.03.
 
 `scripts/test-signal.py --self-test` proves the sidelobe level; regenerate with `--out-file`.
 
+**MLS44 LOOPS EVERY 20 MINUTES AND EACH LOOP FIRES A ~100 ms HARD RESYNC ON EVERY CLIENT.**
+Measured 2026-08-28 overnight: both boards hard-resync at :06:03, :26:03 and :46:03 past the hour,
+same second, same magnitude (-101, -102, -104, -107, -118 ms), i.e. group-wide and server-side
+rather than a client fault. A 20-minute file at 44.1 kHz/16/2 is ~212 MB, which fits
+`file:///data/mls44.pcm`. So the stimulus injects a disturbance into every measurement three times
+an hour, and always has.
+
+CONSEQUENCE FOR MEASUREMENT: a window longer than ~18 minutes cannot avoid one. Keep windows short
+and check for a resync inside them, or make the loop seamless (pad the file to an exact chunk
+boundary, or use a longer one). Every "settled" number in TODO.md was taken between loop events
+without knowing they were there.
+
+They are COMMON-MODE and mostly absorbed -- the standing offset held +132 us for 1.5 h across
+several of them. The big steps come from the rarer wedge episodes (A at 06:24, B at 08:00 with
+`PLAYER STALLED`), not from the loop.
+
 ## Before measuring anything
 
     python3 scripts/bench/preflight.py    # refuses unless all three boards are latency 0, same stream
