@@ -1,0 +1,16 @@
+{
+ "id": "4eb19e5e-980b-d833-2243-a50f716ef86d",
+ "stream_id": "Spotify",
+ "clients": [
+  "A0:F2:62:F0:4D:74",
+  "28:84:85:48:22:1C",
+  "A0:F2:62:F0:4F:C4",
+  "E0:72:A1:E9:85:E8"
+ ],
+ "names": [
+  "Snapclient SuperMini f04d74",
+  "ESP32-Caster",
+  "Snapclient SuperMini f04fc4",
+  "Snapclient SuperMini e985e8"
+ ]
+}

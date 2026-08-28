@@ -21,6 +21,16 @@ Analyser (keep running; it writes `test.csv` + `test.svg`):
 **The analyser goes silent rather than exiting when the USB capture device drops**
 (`LIBUSB_ERROR_NO_DEVICE` in its stderr). A stalled `test.csv` usually means that, not a bug.
 
+**NEVER REDIRECT ITS STDOUT TO A FILE.** When it cannot CLAIM the device -- PulseView holding it,
+`LIBUSB_ERROR_ACCESS` -- it does not go quiet, it error-loops without exiting. Redirected, that
+wrote a **143 GB** `skew.out` and filled the disk (2026-08-28), which then killed both live
+analyser instances mid-window and froze `test.csv`. Nothing warned: the boards kept logging
+normally, `test.csv` simply stopped, and no preflight checks free space. Leave it on the terminal,
+and check `df` before trusting a window.
+
+**BACK UP `test.csv` BEFORE RESTARTING THE ANALYSER** -- `--out test.csv` truncates it, so a
+restart destroys the window you just measured.
+
 ## Stimulus — this matters more than anything else
 
 The boards play **MLS44**, a maximum-length-sequence stimulus, not music. On music the analyser
@@ -30,17 +40,22 @@ masquerade as findings. On MLS the runner-up correlation is ~0.03.
     server:  192.168.1.2, snapserver in docker, config /mnt/fast/dockge/snapcast/config/
     stream:  MLS44, file:///data/mls44.pcm, added at runtime via Stream.AddStream (loops)
     group:   4eb19e5e — A, B and the observer, all latency 0
-    restore: scratchpad/group-orig.json has the original grouping
+    restore: scripts/bench/group-orig.json has the original grouping
 
 `scripts/test-signal.py --self-test` proves the sidelobe level; regenerate with `--out-file`.
 
 ## Before measuring anything
 
-    python3 <scratchpad>/preflight.py     # refuses unless both boards are latency 0, same stream
+    python3 scripts/bench/preflight.py    # refuses unless all three boards are latency 0, same stream
 
 A campaign killed mid-cycle once left a board at `latency=500 ms` server-side and every
 measurement afterwards was contaminated — including one reported as a finding. Campaign scripts
 now `trap` to restore on exit; check anyway.
+
+The bench tooling lives in `scripts/bench/` (`preflight.py`, `snapctl.py`, `group-orig.json`).
+It used to live only in a session scratchpad under `/private/tmp`, i.e. one temp cleanup away from
+gone, while this file referenced it as load-bearing. `preflight.py` resolves `snapctl.py` as its
+own sibling, so the directory moves as a unit.
 
 ## State of the work
 
@@ -74,6 +89,11 @@ overturned; both are struck through rather than deleted, because how they happen
   resync; `inject_starvation` never trips the storm. Only a **500 ms** step forces a mute.
 * **`esphome` lives at a versioned Cellar path** — resolve it as
   `$(head -1 "$(command -v esphome)" | sed 's|^#!||')`; a brew upgrade broke it mid-session.
+* **`./reflash.sh` exits 0 even when every build failed.** With Docker Desktop not running,
+  all four configs failed on `failed to connect to the docker API` and the script still returned
+  0 and printed no summary — a silent no-op flash that looks identical to a successful one. Check
+  for `OTA successful` per device, not the exit code. (Docker also dropped out MID-RUN once,
+  taking only the last config with it.)
 * **Commit before flashing.** A `git checkout` bundled into a flash command destroyed 20 minutes
   of uncommitted work.
 * **Log lines truncate.** `pad=` at the end of `RECON` reads as `pad=882` for a counter in the

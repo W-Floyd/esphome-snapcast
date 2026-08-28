@@ -38,12 +38,31 @@ adopted mapping is slewed rather than stepped, and `Role`/takeover/`last_rx_us_`
 `LEAD_COOLDOWN_US`/`always_healthy`/`set_playout_healthy` are deleted. `render_delta_us()`
 (leader-relative) is gone; depth and crystal deltas are against the peer mean.
 
-NOT YET MEASURED AGAINST THE ANALYSER. Judge it as the plan says — **the same or better sd with
-the churn gone**, not a better median:
+FIRST MEASUREMENT (2026-08-28, one clean 4-minute window, correction OFF, preflight verified,
+n=10726). **Fails the sd bar; the churn goal is met outright.**
 
-    now, leader-based, all fixes in     median +3.0 µs  sd 16.9   (settling)
-    best sustained                      median +4.5 µs  sd  3.6
-    target                              no worse on sd, and no leadership events at all
+    era                              median      sd     MAD    notes
+    best sustained, leader-based      +4.5 µs    3.6      -     two-device group
+    leader-based, all fixes in        +3.0 µs   16.9      -     settling
+    LEADERLESS, three-device group    +0.47 µs   8.06    4.03   0 re-anchors all night
+    LEADERLESS, second window         -1.79 µs   9.50    5.48   reproduces (n=11139)
+
+    sd within any 30 s slice: 3.49 - 10.48, typically 3.5-6  (i.e. near baseline)
+
+The 4-minute sd is inflated by the MEDIAN ITSELF WANDERING +-4.4 µs on a ~30 s timescale, not by
+broadband noise -- hence MAD 4.03 against sd 8.06. Under a leader that wander was common-mode
+(one publisher, one mapping) and cancelled; under consensus each device computes and slews toward
+its own mean, so the two adopted mappings can differ slightly and that difference is free to move.
+
+CONFOUNDED BY GROUP SIZE, and this is not a small caveat: the 3.6 µs baseline was a TWO-device
+group (n=4871, the CPU-pinning window) and this window is THREE -- the observer now contributes an
+estimate and renders. The plan's own risk list flags exactly this ("a device joining or leaving
+moves the mean for everyone"). The discriminating test is one RPC: move the observer off MLS44 and
+re-measure the pair alone against the two-device baseline. Until that is run, "consensus is worse
+than a leader" is NOT established.
+
+Corroboration that the mean position itself is sound: `raw-sync.py` over the same window puts
+A - B at **-2.2 ± 2.1 µs, not significant**, agreeing with the wire's +0.47 µs median.
 
 If sd worsens, the two suspects are in that order: the consensus being fed back (it is not — our
 beacon reads `pub_*`, never `map_*`; check that first anyway), and the beacon rate, since every
@@ -259,6 +278,102 @@ all, so the feature stays off:
 (`sd(d fs_a)` 0.10 against a 0.033 baseline, while the correcting follower sits at 0.043). If a
 follower's correction destabilises the leader, the coupling is not through the code path built
 here, and it is not yet understood. That is where to start.
+
+**THE ON-DEVICE DIFFERENTIAL OFFSET LOOKS INVERTED — r = -0.98 AGAINST THE WIRE.** Measured
+2026-08-28 on the leaderless build, correction OFF, one clean 4-minute window (n=10726 wire
+samples, preflight verified, MLS resolving at peak 1.0000 / runner-up 0.027 throughout).
+
+Method, because the result depends entirely on it. The on-device series is NOT `render_group_delta`
+and NOT the render-phase log line: both update once per sync report (~3.4 s), whose per-sample
+noise (sd 13.3 us) exceeds the +-4 us signal, and pairing two independent 3.4 s series inside the
+300 ms window yields 5 usable points in four minutes. Instead the per-chunk `RAW` lines are used
+directly, ~38/s, and paired on **`s_ts`** -- the server's timestamp for a chunk, the same number on
+every device for the same audio, so there is no sampling-instant problem to bound. Both series are
+then re-bucketed on ABSOLUTE WALL TIME (the first attempt bucketed each from its own first sample,
+leaving the grids ~10 s apart, a third of a bucket).
+
+    30 s bucket medians, both B - A, us
+    wire       -2.72  -3.33  +1.96  +7.25  +3.87  +6.11  +0.31  +0.10  -5.55
+    on-device  +5.50  +7.50  -0.50  -3.50  -0.50  -2.50  +2.50  +2.50  +7.50
+
+    r = -0.980  (n=9)    wire sd 4.35 us   on-device sd 4.13 us   SE ~1 us/bucket
+    r = -0.975 / -0.989 / -0.967 / -0.973 / -0.945  at 10 / 15 / 20 / 45 / 60 s buckets
+
+Same amplitude, opposite sign. THE ARITHMETIC SAYS IT SHOULD BE +1: if B renders a server frame
+late by d, its `(pushed - played)` is larger by d*rate, so `server_time = s_ts - (pushed-played)/rate`
+is smaller by d, and `phase = shared_tsf - server_time` is larger by d. So either that derivation
+or one of the instruments is wrong. No mechanism is proposed here.
+
+RULED OUT — a/b channel swap, which fits r = -1 at equal amplitude and was the leading suspect.
+The analyser's own built-in check (`--replot --annotate`, documented at its docstring: "a swap
+shows up as slope +1 instead of -1") reads **slope -0.622, corr -0.791**, and its constant offset
+**-5.245 ppm** matches what the boards publish about themselves (A `mine +44.453`, B `mine +39.346`
+-> B-A = -5.1 ppm) in both sign and magnitude. A swap would have put the wire at +5.2 against the
+devices' -5.1. Skew and rate come from the same channel assignment, so the skew sign is right too.
+The agreeing MEANS are NOT evidence either way (+0.89 wire vs +2.05 on-device, against a
+bucket-median sd of 4.3) and were briefly cited as such -- they are not.
+
+THIS IS THE SAME THREAD as "the group delta is disconnected from reality, not merely sign-inverted"
+(`6f468bf`) and the regression that read slope -0.10 where the arithmetic demanded -2.0. The same
+`--replot` run now reads that check as:
+
+    trim mean (offset integral, bw - aw): expected slope -1.0
+      span 258.7 s  n=255  corr +0.068  slope +0.001  resid 7.91 us  expl 0%
+
+0% explained, against a RATE reference on the same run that works (corr -0.791, constant matching
+the published crystal delta to 0.1 ppm). An inverted offset measurement is a coherent account of
+why: the correlation cancels in the integral. Rate reference good, offset reference carrying no
+information, and a candidate reason for it.
+
+CONSEQUENCE: **do not enable `render_align`** until this is settled. It steers on `-group_delta`,
+so an inverted input drives the pair apart at double rate -- which is also what the 1150 / 118 / 58
+table above measured, and would mean those numbers were never about gain.
+
+**REPLICATED** on an independent window (01:33:40+), a RESTARTED analyser process and a healthy
+disk, preflight verified:
+
+    bucket     wire      on-device   (both B - A, us)
+    93:30     +4.91       +3.35
+    94:00    -10.34      +12.35
+    94:30     +9.07       -8.65
+    95:00    -10.00      +11.35
+    95:30     +3.13       -0.65
+    96:00     -4.50      +10.35
+    96:30     -0.30       +0.35
+
+    r = -0.921  (n=7)   wire sd 7.46 us   on-device sd 7.74 us
+
+(An intervening attempt, 01:14-01:18, is contaminated and is neither confirmation nor refutation:
+analyser NaN rows from a USB capture dropout, wire swinging +-1.5 ms, and B logging
+`RECON drift=-52223` at 01:12:11 with `pad=255666` against A's `pad=51598`.)
+
+WHAT IS ESTABLISHED IS THE AC TERM, NOT THE DC TERM -- and the distinction decides the fix. The
+standing offset, which is the only thing `render_align` exists to remove, is NOT resolved:
+
+    window 1   raw-sync B-A  +2.2 +- 2.1 us (not significant)   wire median +0.47
+    window 3   raw-sync B-A  -4.5 +- 2.3 us (not significant)   wire median -1.79
+
+Both agree in sign with the wire, both are explicitly not significant, and they disagree with each
+other. SO DO NOT SIMPLY FLIP THE SIGN: that fixes the fluctuation and may invert a DC term that is
+currently correct.
+
+MECHANISM: TWO CANDIDATES DEAD, both killed cheaply, neither by argument.
+
+1. **In-flight sample-stuffing entering `(pushed - played)`.** Precedent was good -- the sync report
+   already subtracts corrections in flight "so it cannot overshoot an error it has already fixed",
+   and `render_phase` has no such subtraction. DEAD: across window 3 both boards report
+   `corrected -0/+0 frames` on every one of 84 and 86 reports. `rate_lock` steers instead, so there
+   is no splicing to contaminate anything.
+2. **Differential trim.** Each board's trim swings ~90 ppm p2p within a 4-minute window (A
+   +10.5..+99.7, B +10.8..+93.8) on the same ~30 s timescale as the wander. DEAD on the analyser's
+   own integral check: the swings are near-common-mode (`d_sd_ppm 2.631`), and 2.6 ppm integrated
+   over 30 s is ~78 us against the 7.9 us observed, correlating at `+0.068` / `expl 0%`. It
+   predicts an order of magnitude too much and explains none of it.
+
+NEXT, and it tests the instrument END-TO-END rather than term-by-term, which is where three
+term-by-term guesses have now gone: step one board's server-side latency by a known +5 ms and see
+which way each instrument moves. That is ~500x the noise floor, settles the DC sign outright, and
+HANDOFF records 5 ms steps as absorbed without a resync. Restore under a trap.
 
 **MEDIAN-OF-THREE IS DISCONTINUOUS — the reason the observer made the correction WORSE.** With
 two devices the median IS the mean: smooth, and each device moves half the gap. With three it is
