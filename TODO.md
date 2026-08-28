@@ -434,7 +434,10 @@ RETRACTED: "render_align was steering on an inverted signal throughout its tunin
 remove resync-planted residuals -- the externally-planted class -- and for that class the signal
 is accurate to 0.002% with the correct sign. The gain interpretation of that table stands.
 
-**THE ANSWER: AN ADDITIVE ERROR FLOOR OF ~10-30 us, NOT A GAIN OR SIGN ERROR.** The same campaign
+**~~THE ANSWER: AN ADDITIVE ERROR FLOOR OF ~10-30 us~~ (WRONG -- see THE ACTUAL ANSWER below.**
+A floor of 10-30 us predicts `inject_split(+1000)` reading ~970-1030 us, i.e. ~100%. It read
+3.4 us. A floor cannot produce a gain of 0.003 at 1000 us, so this explained the 25 us point and
+failed on the 1000 us point. Kept because the arithmetic that kills it is the useful part.)** The same campaign
 restored latency to 0, forcing a second resync, and measured the residual the pair of resyncs left:
 
     BASELINE      wire  -2.92 us    on-device +3.21 us
@@ -468,10 +471,53 @@ CONSEQUENCE: the floor has to be identified and removed before `render_align` ca
 Nothing about gain, reference choice or median-vs-mean matters until it is, and all three were
 tuned on top of it.
 
-CANDIDATE, on arithmetic and not yet tested: `(pushed - played)` are FRAME COUNTS, and one frame at
-44.1 kHz is 22.7 us -- squarely inside the observed 10-30 us. A systematic one-frame accounting
-difference between two boards produces exactly a constant offset of this size. Cheap to test: look
-for a persistent +-1 frame bias between the boards' `pushed - played` at equal `s_ts`.
+**THE ACTUAL ANSWER: `render_phase` IS STRUCTURALLY BLIND TO A REPAIRED ACCOUNTING BIAS -- which is
+the exact class of fault `render_align` exists to remove.**
+
+Read what `inject_split` does before interpreting any of the above. It is one line:
+
+    this->pushed_frames_total_ += shift;
+
+and the re-anchor path that shares it says so: "Biases the ACCOUNTING only, leaving the audio
+alone." So it never displaced the audio. It planted a LEDGER bias, and the servo then repaired it
+by moving the audio -- "the repair is the only step on the wire", which is the design.
+
+That reframes all three points as CLASS-dependent, not scale-dependent:
+
+    perturbation        what it perturbs                          ledger?   ratio
+    inject_split        frame ledger; servo repairs by moving audio  yes     0.003
+    resync residual     re-baseline of the ledger, same shape        yes     0.13
+    server latency      deadline input only                          no      1.000
+
+MECHANISM: `phase` consumes `(pushed - played)`. After the servo repairs a ledger bias, the bias
+and the audio displacement are equal and opposite INSIDE that formula, so they cancel and the phase
+reads ~zero while the audio is genuinely displaced. The blindness is structural and permanent, not
+a gain, a sign, or a floor.
+
+This is the failure mode already recorded at PIPELINE_DIVERGE_US -- "each was planted by a
+re-baseline anchoring to a per-device instantaneous measurement, and each was invisible to every
+other metric on the device by construction" -- now with the reason.
+
+CONSEQUENCE: **`render_align` cannot work as designed.** Its signal cannot see the class of offset
+it exists to correct, on any gain, with any reference, mean or median. Every measurement in the
+1150 -> 118 -> 58 us table was taken on a signal that was structurally blind to the fault, so none
+of them are evidence about gain either way. `render_align_max` stays 0 not pending tuning but
+pending a different signal.
+
+WHAT A WORKING SIGNAL WOULD NEED: independence from the local running frame counter. The device
+cannot detect that its own ledger is wrong by consulting that ledger. Options, unexplored:
+  * A PER-CHUNK ledger -- record each chunk's server timestamp against the frame index at push
+    time, so "played frame N" maps to a server time that was CAPTURED rather than inferred from a
+    running difference. A bias in the running counter then cannot corrupt the mapping. Whether the
+    bias corrupts the index itself needs thinking through.
+  * Accept that only an external reference sees this class, and stop trying to correct it
+    on-device. That is the honest reading of "the group is the only reference we have" -- except
+    the group comparison is ALSO built from each device's own ledger, which is why it inherits the
+    blindness.
+
+DEAD CANDIDATE, recorded so it is not re-proposed: a systematic one-frame (22.7 us) accounting
+difference between boards. It was the floor hypothesis's mechanism and the floor hypothesis is
+refuted above.
 
 TRAP, LIVE, COST REAL TIME TONIGHT: **`inject_split(0)` IS NOT A RESTORE.** The field is documented
 "REQUEST in us, consumed once by the player task; 0 when none" -- 0 means no request pending, so
