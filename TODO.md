@@ -31,6 +31,29 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**LEADERLESS TIMEBASE IS IMPLEMENTED AND UNMEASURED (2026-08-28).** `PLAN-leaderless.md`, all
+five steps: every device beacons its own raw server↔TSF line, everyone adopts the robustly
+weighted MEAN of all of them (its own included), nobody ever publishes the consensus, the
+adopted mapping is slewed rather than stepped, and `Role`/takeover/`last_rx_us_`/
+`LEAD_COOLDOWN_US`/`always_healthy`/`set_playout_healthy` are deleted. `render_delta_us()`
+(leader-relative) is gone; depth and crystal deltas are against the peer mean.
+
+NOT YET MEASURED AGAINST THE ANALYSER. Judge it as the plan says — **the same or better sd with
+the churn gone**, not a better median:
+
+    now, leader-based, all fixes in     median +3.0 µs  sd 16.9   (settling)
+    best sustained                      median +4.5 µs  sd  3.6
+    target                              no worse on sd, and no leadership events at all
+
+If sd worsens, the two suspects are in that order: the consensus being fed back (it is not — our
+beacon reads `pub_*`, never `map_*`; check that first anyway), and the beacon rate, since every
+device now sends a mapping every second where only the leader used to. See the retired
+follower-beacon diagnosis below, which explains why that is expected to be safe now.
+
+Entity/log surface changed with it: text sensor `tsf_role` → `tsf_state`, publishing
+`Consensus`/`Solo`/`Inactive`; the sync report prints `tsf=consensus(n2, 1.0s, depth … render …)`;
+new `Consensus over N estimate(s): spread …` every 10 s and `Timebase re-anchor: …` on a snap.
+
 **WHAT PLANTS IT IS STILL UNKNOWN — five hypotheses now dead.** n=14 cycles with per-resync
 metrics (2026-08-27, MLS stimulus, analyser at sd 5.8 µs):
 
@@ -190,10 +213,20 @@ The control reproduces the baseline exactly, so publishing follower beacons cost
 was measured only ever on top of a destabilised system, and the conclusion below that it is
 "10x worse than off" does not follow from the data.
 
-WHERE TO LOOK: `broadcast_()` from the follower path. It runs on the network task and touches
-the mapping mutex, so the likely mechanisms are contention with the player task or the extra
-transmit perturbing timing-sensitive TSF reads. Fix that, then re-measure the correction against
-a clean baseline before drawing any conclusion about it.
+**MECHANISM FOUND (2026-08-28), and it was not radio time.** `broadcast_()` ended with
+`adopt_()` — "the leader plays from its own published mapping so everyone quantizes alike",
+correct for a leader. A FOLLOWER running the same function therefore overwrote the shared
+mapping with its own private Kalman line every two seconds, so the group stopped sharing a
+timebase at all. That is a far better explanation of a 15× degradation than a few hundred µs of
+transmit, and it retires the "contention or transmit perturbation" hypothesis above. Verified
+against `352a9f7`: `service()` called `broadcast_()` on the follower path, and `broadcast_()`
+line 863 adopted what it had just sent.
+
+CONSEQUENCE FOR THE LEADERLESS BUILD: every device now beacons a mapping every second, which is
+the thing that measured 15× worse — but nothing adopts from `broadcast_()` any more. Adoption
+happens in exactly one place, `update_consensus_()`, from the average. If skew stability
+regresses anyway, that is the first place to look and the beacon rate is the first thing to
+halve.
 
 **~~`render_align` DOES NOT WORK YET — 10x WORSE THAN OFF~~ (CONFOUNDED — see above).** Left
 disabled (`render_align_max: 0ms`).**
@@ -240,7 +273,13 @@ Measured 2026-08-28 with the observer in the group:
 
 So the fix is to average rather than take a median for small groups, or to difference against the
 mean of PEERS excluding self. The median was chosen for outlier robustness, which matters at
-larger group sizes and actively hurts at three. Left disabled until that is changed.
+larger group sizes and actively hurts at three.
+
+**DONE (2026-08-28), unmeasured.** Both the group delta and the new timebase consensus use one
+reweighting pass around the MEAN instead: `w = 1/(1 + (d/(2·scale))²)` with `scale = max(MAD,
+floor)`. Continuous in every input, so no reordering can step it, while a value far outside the
+pack still contributes almost nothing; with two devices it degenerates to exactly their mean.
+`render_align_max` is still `0ms` — re-measure before enabling.
 
 TWO REAL BUGS WERE FIXED GETTING HERE, both worth keeping:
 - Phases were differenced across a ~3.3 s staleness gap, so the signal measured relative DRIFT

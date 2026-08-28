@@ -52,8 +52,15 @@ phase-only follower beacons (sd 81.6 → 4.62), CPU1 pinning (sd 6.24 → 3.58).
 understood reason: median-of-three is discontinuous — measured hopping ±96 µs while the
 underlying data sat at ±12. Fix is to average for small groups.
 
-**Next, and preferred:** `PLAN-leaderless.md` — consensus averaging instead of a leader. Four of
-this session's bugs were downstream of "there is a leader and it changes".
+**`PLAN-leaderless.md` IS IMPLEMENTED AND UNFLASHED (2026-08-28).** Consensus averaging replaced
+the leader: every device beacons its own raw server↔TSF line, everyone adopts the robustly
+weighted mean, nobody publishes the consensus back, and the adopted mapping slews rather than
+steps. Election, takeover, `always_healthy` and the health hook are deleted. Both firmwares
+compile; **nothing has been measured**. Judge it on sd against the analyser with the churn gone,
+not on the median — see the Sync section of `TODO.md` for the bar and the two things to suspect
+if sd worsens.
+
+`e99574` no longer needs special status: `tsf_observer` now only enables the phase-input log.
 
 `TODO.md` carries the full record, including retractions. Two findings were reported and later
 overturned; both are struck through rather than deleted, because how they happened is useful.
