@@ -915,6 +915,17 @@ void SnapcastClient::loop() {
       this->listener_->on_stream_metadata(metadata);
     }
   }
+
+  // Stream IDENTITY, taken separately from metadata because it is known whenever the server
+  // resolves us into a group, while metadata is optional -- see take_stream_identity(). This is
+  // what scopes the TSF group, so leaving it to a callback a process stream never fires meant the
+  // scope silently stayed "unknown" and the group accepted phases from other streams.
+  if (this->control_session_ != nullptr) {
+    std::string stream_identity;
+    if (this->control_session_->take_stream_identity(stream_identity)) {
+      this->set_stream_identity(stream_identity);
+    }
+  }
 }
 
 // THREAD CONTEXT: Main loop

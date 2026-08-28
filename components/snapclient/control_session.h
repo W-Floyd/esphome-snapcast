@@ -63,6 +63,14 @@ class ControlSession {
   bool send_set_latency(int32_t latency_ms, int64_t now_us);
 
   /// @brief Fetches the latest metadata if it changed since the last call.
+  /// @brief Takes the name of the stream this client's group is playing, when it has changed.
+  ///
+  /// Separate from take_metadata() on purpose: the identity is known whenever the server status
+  /// resolves this client into a group, whereas metadata is optional and a process stream has
+  /// none. Tying the two together left the TSF stream scope unset for every metadata-less stream.
+  /// @return true when a new identity was taken; `out` is untouched otherwise.
+  bool take_stream_identity(std::string &out);
+
   bool take_metadata(StreamMetadata &out);
 
   /// @brief Fetches the latest connected-client roster (sockaddr s_addr values)
@@ -113,6 +121,8 @@ class ControlSession {
   Mutex mutex_;
   StreamMetadata metadata_;
   bool metadata_dirty_{false};
+  std::string stream_identity_;
+  bool stream_identity_dirty_{false};
   std::vector<uint32_t> peers_;
   bool peers_dirty_{false};
 };

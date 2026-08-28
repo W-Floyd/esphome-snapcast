@@ -15,8 +15,26 @@ flashing it as a speaker puts I2S back on its live DAC and renames it, breaking 
 
 Analyser (keep running; it writes `test.csv` + `test.svg`):
 
-    python3 scripts/i2s-skew.py --stream --interval 0 --count 0 --samples 400000 \
-        --plot-every 0.0167 --plot-window 45 --annotate a.log b.log --out test.csv --plot test.svg
+    python3 scripts/i2s-skew.py --stream --interval 0 --count 0 --samplerate 12M --samples 200000 \
+        --plot-every 0.0167 --plot-window 45 --annotate a.log b.log observer.log \
+        --out test.csv --plot test.svg
+
+**`observer.log` goes THIRD.** The first two `--annotate` logs are taken as board A and board B in
+that order; anything after is parsed for events only. The observer is the only board that emits
+`PHASEIN` -- the group-consensus INPUTS, naming which peer moved -- so leaving it out throws away
+the one line that can attribute a group-delta excursion to a device.
+
+Two annotation thresholds, both defaulted so they need no flag: `--rendertag-us` (500) marks a
+`RENDERTAG` line whose measured and inferred phases disagree, i.e. a ledger bias the inferred form
+cannot see, and always marks `measured=unknown` because the signal refusing IS the event.
+`--phasein-us` (1000) marks a peer publishing a phase that far from ours, and names it. Drop it to
+200 to see the ordinary spread rather than only excursions.
+
+**`--log-tail-mb` defaults to 4 MB and that is far too small for `--replot` on these logs.** It
+reached back only ~12 minutes of `observer.log` and silently reported zero events for a window
+that contained a 36-second group-wide burst -- an under-read that looks exactly like "nothing
+happened". Use `--log-tail-mb 60` when replotting history. The default is fine for `--stream`,
+where it only primes baselines before following the logs forward.
 
 **The analyser goes silent rather than exiting when the USB capture device drops**
 (`LIBUSB_ERROR_NO_DEVICE` in its stderr). A stalled `test.csv` usually means that, not a bug.

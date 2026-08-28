@@ -804,6 +804,24 @@ SEEDDRAIN_RE = re.compile(
 SEEDANCHOR_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SEEDANCHOR latency=(\d+) age=(-?\d+) frames=(-?\d+)")
 
+# "RENDERTAG measured=-1035.. inferred=-1035.. tags=335 age=9705 frames=441 off=1908 sup=1" --
+# the captured render phase beside the ledger-inferred one. Two things are worth a mark: the
+# measured value going `unknown` (the signal REFUSING, which is the healthy response to a stalled
+# pipeline and the moment the old signal would have published a wrong number instead), and the two
+# disagreeing, which is a ledger bias the inferred form cannot see.
+RENDERTAG_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RENDERTAG measured=(unknown|-?\d+) "
+    r"inferred=(unknown|-?\d+) tags=(\d+) ")
+
+# "PHASEIN mine=-1035.. | 4D74 d=+85 age=484ms | 49C8 d=+33 age=81ms | .. | group=-17" -- the
+# GROUP CONSENSUS INPUTS, emitted only by a board with tsf_observer set. This is the one line that
+# names WHICH peer moved: a single peer publishing a wild phase drags the group statistic, and with
+# the pairing window admitting 0-2 peers 94% of the time there is often no other contributor to
+# outvote it. Marking the offending peer by name is the whole point.
+PHASEIN_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?PHASEIN mine=(unknown|-?\d+)(.*?)\| group=(-?\d+)")
+PHASEIN_PEER_RE = re.compile(r"\| ([0-9A-F]{4}) d=([+-]\d+) age=(\d+)ms")
+
 RSYNC_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RSYNC\[(\d+)\] t=(\d+) err=(-?\d+) med=(-?\d+) "
     r"ring=(\d+) drops=(\d+)")
@@ -861,7 +879,8 @@ RAMP_RE = re.compile(
 
 
 def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=None,
-                      sync_us=200, peak_us=600, pipe_ms=25, tail_bytes=0):
+                      sync_us=200, peak_us=600, pipe_ms=25, tail_bytes=0,
+                      rendertag_us=500, phasein_us=1000):
     """Clock-affecting events from a device log: (time_of_day_s, kind, text).
 
     Three kinds, all read off the one Sync line the firmware emits every ~3.3 s:
@@ -1006,6 +1025,33 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
                         t += dts[i]  # dt[0] is the gap to the PREVIOUS line, not within this one
                     rsyncs.append((tod_p, -(first_seq - i), t, errs[i], meds[i],
                                    rings[i], drops[i]))
+            continue
+        rt = RENDERTAG_RE.match(line)
+        if rt:
+            tod_t = (int(rt.group(1)) * 3600 + int(rt.group(2)) * 60 + int(rt.group(3))
+                     + int(rt.group(4)) / (10 ** len(rt.group(4))))
+            meas, inf = rt.group(5), rt.group(6)
+            if meas == "unknown":
+                ev.append((tod_t, "rendertag",
+                           f"{board}: render phase unknown (tags {rt.group(7)})"))
+            elif inf != "unknown":
+                gap = int(meas) - int(inf)
+                if abs(gap) >= rendertag_us:
+                    ev.append((tod_t, "rendertag", f"{board}: ledger bias {gap:+d} us"))
+            continue
+        pi = PHASEIN_RE.match(line)
+        if pi:
+            tod_i2 = (int(pi.group(1)) * 3600 + int(pi.group(2)) * 60 + int(pi.group(3))
+                      + int(pi.group(4)) / (10 ** len(pi.group(4))))
+            # Name the worst peer rather than reporting that "something" moved: the whole reason
+            # this line exists is that the group's OUTPUT could not say which input caused it.
+            worst, worst_d = None, 0
+            for mac, d, _age in PHASEIN_PEER_RE.findall(pi.group(6)):
+                if abs(int(d)) > abs(worst_d):
+                    worst, worst_d = mac, int(d)
+            if worst is not None and abs(worst_d) >= phasein_us:
+                ev.append((tod_i2, "phasein",
+                           f"peer {worst} phase {worst_d:+d} us (group {pi.group(7)})"))
             continue
         m = SYNC_RE.match(line)
         if not m:
@@ -1273,7 +1319,8 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
 
     bar_bottom = bands[-1][1] if bands else top1
     colours = {"corrected": "#d9534f", "resync": "#8e44ad", "trim": "#e0a800",
-               "sync": "#1a7f37", "pipeline": "#0969da", "role": "#000000"}
+               "sync": "#1a7f37", "pipeline": "#0969da", "role": "#000000",
+               "rendertag": "#c2410c", "phasein": "#0e7490"}
     for i, (ex, kind, label) in enumerate(sorted(events)):
         if not (x0 <= ex <= x1):
             continue
@@ -2587,6 +2634,16 @@ def main():
                    help="--annotate: how much of each log's tail to read on the first "
                         "poll. Reading whole multi-MB logs inside the capture loop "
                         "stalled it for 30 s; the tail is all that baselines need")
+    p.add_argument("--rendertag-us", type=float, default=500.0,
+                   help="--annotate: mark a RENDERTAG line whose measured and inferred phases "
+                        "disagree by this much -- a ledger bias the inferred form cannot see. "
+                        "A measured=unknown is always marked, since the signal refusing is "
+                        "itself the event")
+    p.add_argument("--phasein-us", type=float, default=1000.0,
+                   help="--annotate: mark a PHASEIN line (observer logs only) where any PEER "
+                        "publishes a phase this far from ours, and name that peer. The group "
+                        "statistic is computed from 0-2 peers 94%% of the time, so one bad "
+                        "contributor often has nothing to outvote it")
     p.add_argument("--trim-ppm", type=float, default=100.0,
                    help="--annotate: minimum trim step to mark (it moves every report)")
     p.add_argument("--replot", action="store_true",
@@ -2681,7 +2738,8 @@ def main():
                                                                 offsets.get(path, 0), span,
                                                                 LOG_STATE.get(path), args.sync_us,
                                                                 args.peak_us, args.pipeline_ms,
-                                                                args.log_tail_mb * (1 << 20))
+                                                                args.log_tail_mb * (1 << 20),
+                                                                args.rendertag_us, args.phasein_us)
             # Device time is placed on the host axis PER BOOT EPOCH -- see place_device_times for
             # why a single offset across a log spanning reboots lands nowhere. Each series is
             # anchored from its own rows, in log order, so the epoch split is well defined.

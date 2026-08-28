@@ -324,6 +324,19 @@ void ControlSession::parse_server_(const void *server_variant) {
     this->warned_not_found_ = false;
   }
   this->group_id_ = my_group;
+  if (my_stream != this->stream_id_) {
+    // The stream IDENTITY is known here, from the group's stream_id, and it must not ride on the
+    // metadata callback the way it used to. A `process://` stream carries no metadata at all, so
+    // set_metadata_() returns early on a null variant and the name never propagates -- leaving
+    // stream_id_hash at 0, which the TSF guard treats as "unknown, accept anyone". Measured on the
+    // bench: the scope was adopted once at 10:03, lost at the next reboot, and never re-established
+    // over the following 37 minutes, during which render phases from boards playing a DIFFERENT
+    // stream were being folded into the group statistic.
+    this->mutex_.lock();
+    this->stream_identity_ = my_stream;
+    this->stream_identity_dirty_ = true;
+    this->mutex_.unlock();
+  }
   this->stream_id_ = my_stream;
 
   JsonArray streams = server["streams"];
@@ -400,6 +413,17 @@ bool ControlSession::send_set_latency(int32_t latency_ms, int64_t now_us) {
                            "\"params\":{\"id\":\"%s\",\"latency\":%ld}}\r\n",
                            this->client_id_.c_str(), static_cast<long>(latency_ms));
   return this->send_raw_(req, len, now_us);
+}
+
+bool ControlSession::take_stream_identity(std::string &out) {
+  this->mutex_.lock();
+  const bool dirty = this->stream_identity_dirty_;
+  if (dirty) {
+    out = this->stream_identity_;
+    this->stream_identity_dirty_ = false;
+  }
+  this->mutex_.unlock();
+  return dirty;
 }
 
 bool ControlSession::take_metadata(StreamMetadata &out) {

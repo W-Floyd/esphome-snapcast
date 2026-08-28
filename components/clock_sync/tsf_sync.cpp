@@ -1,5 +1,7 @@
 #include "tsf_sync.h"
 
+#include <string>
+
 #ifdef CLOCK_SYNC_TSF_ACTIVE
 
 #include "esphome/core/log.h"
@@ -571,10 +573,10 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       }
       continue;
     }
-    // SAME STREAM ONLY. render_phase is expressed against the stream's server audio time, so a
-    // delta taken across two streams is not a playout offset at all. A zero hash means the
-    // sender predates this field (or has no stream yet) and is accepted, so a mixed fleet keeps
-    // the shared timebase rather than splitting.
+    // SAME STREAM ONLY, for the MAPPING. A zero hash means the sender predates this field (or has
+    // no stream yet) and is accepted, so a mixed fleet keeps the shared timebase rather than
+    // splitting -- which is right for the mapping, because the server<->TSF line is a property of
+    // the CLOCK and is common-mode across whatever anyone is playing.
     if (pkt.stream_id_hash != 0 && stream_id_hash != 0 && pkt.stream_id_hash != stream_id_hash) {
       if (!this->warned_foreign_stream_) {
         this->warned_foreign_stream_ = true;
@@ -583,6 +585,18 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       }
       continue;
     }
+    // RENDER PHASE IS STRICTER, and the difference is not a nicety. A phase is expressed against
+    // the stream's server audio time, so a delta taken across two streams is not a playout offset
+    // at all -- it is the distance between two unrelated timelines. The permissive zero above is
+    // exactly wrong here: "I do not know what I am playing" is not evidence of playing the same
+    // thing, and one such peer is enough to poison the group statistic, which the 300 ms pairing
+    // window leaves with 0-2 contributors 94% of the time.
+    //
+    // Measured 2026-08-28: two boards on Spotify contributed phases to a group playing MLS44,
+    // medians 33 ms and 15 ms out, and were the worst contributor in 705 of 2164 observer reports.
+    // Nothing was misbehaving -- those were correct phases for a different stream.
+    const bool phase_comparable = pkt.stream_id_hash != 0 && stream_id_hash != 0 &&
+                                  pkt.stream_id_hash == stream_id_hash;
     this->rx_peer_count_++;
     // Learn the sender's address for unicast beacons: the server roster can predate
     // a peer's connection (boot race) and multicast may be blocked entirely
@@ -592,7 +606,12 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     peer->seen_us = local_now_us;
     peer->pipeline_us = pkt.pipeline_us;
     peer->crystal_ppm = pkt.crystal_ppm;
-    this->record_peer_phase_(*peer, pkt.render_phase_us, local_now_us);
+    // An incomparable phase is dropped, not recorded as UNKNOWN: record_peer_phase_ deliberately
+    // keeps a peer's last phase when it reports UNKNOWN, so overwriting would be a no-op anyway,
+    // and what we want is for this peer never to enter the statistic at all.
+    if (phase_comparable) {
+      this->record_peer_phase_(*peer, pkt.render_phase_us, local_now_us);
+    }
 
     // PHASE-ONLY BEACON: the sender has no settled estimate to pool. Its phase and diagnostics
     // are recorded above; the mapping fields are zero and must not be read.
@@ -860,10 +879,24 @@ void TsfSync::update_consensus_(int64_t local_now_us) {
 
 void TsfSync::log_phase_inputs(int64_t local_now_us) const {
   const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
+  const bool mine_known = mine != RENDER_PHASE_UNKNOWN;
   char buf[192];
-  int n = snprintf(buf, sizeof(buf), "PHASEIN mine=%lld", static_cast<long long>(mine));
+  // Print the sentinel as a word. `d=` below is a DIFFERENCE against this value, so an unknown own
+  // phase printed as INT64_MIN turns every peer column into 2^63 of overflow -- which is not merely
+  // ugly, it is unreadable exactly when the device is in the state worth reading about. Measured: a
+  // 2164-row sample showed max|d| of 9.2e18 on all four peers, purely from this.
+  int n = snprintf(buf, sizeof(buf), "PHASEIN mine=%s",
+                   mine_known ? std::to_string(mine).c_str() : "unknown");
   for (size_t i = 0; i < MAX_PEERS && n > 0 && n < static_cast<int>(sizeof(buf)); i++) {
     if (!this->peer_[i].used || this->peer_[i].phase_us == RENDER_PHASE_UNKNOWN) {
+      continue;
+    }
+    if (!mine_known) {
+      // No baseline to difference against: report the peer's own value, not a difference from a
+      // sentinel.
+      n += snprintf(buf + n, sizeof(buf) - n, " | %02X%02X phase=%lld age=%lldms", this->peer_[i].mac[4],
+                    this->peer_[i].mac[5], static_cast<long long>(this->peer_[i].phase_us),
+                    static_cast<long long>((local_now_us - this->peer_[i].phase_seen_us) / 1000));
       continue;
     }
     // Age matters as much as the value: an entry is accepted up to PHASE_STALE_US (15 s) old,
