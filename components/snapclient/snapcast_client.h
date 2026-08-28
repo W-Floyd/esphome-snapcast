@@ -80,17 +80,15 @@ struct SnapcastClientConfig {
   // See FAST_SPLICE_RELEASE_US and fast_splice_(). Off by default: the splice path has a
   // limit-cycle history and this puts it back in the loop while unmuted.
   uint32_t fast_splice_threshold_us{0};
-  // Cap on the follower-side correction of the INTER-DEVICE offset; 0 disables it (default).
+  // Cap on the correction of the INTER-DEVICE offset; 0 disables it (default).
   // The servo nulls each device against server time, so nothing nulls the difference between
-  // two of them and a hard resync's residual persists forever. render_delta_us() measures that
-  // difference and was previously log-only, pending validation -- measured 2026-08-27 across
-  // forced resyncs, it tracks the true displacement to 94-95%. Off by default because it is a
-  // second loop acting on the same audio.
+  // two of them and a hard resync's residual persists forever. render_group_delta_us() measures
+  // that difference -- measured 2026-08-27 across forced resyncs, it tracks the true displacement
+  // to within a roughly constant 8.7 +- 3.4 us. Off by default because it is a second loop acting
+  // on the same audio.
   uint32_t render_align_max_us{0};
-  // TSF OBSERVER MODE: never report this device as unhealthy, so it holds leadership through
-  // upsets that would disqualify a speaker, and log the group's phase inputs. Only for a device
-  // that drives no DAC -- on a speaker it defeats the guard that stops a device whose playout has
-  // diverged from publishing a timebase everyone follows. See set_always_healthy().
+  // TSF OBSERVER MODE: log the group's phase inputs (own phase, each peer's with its age, the
+  // resulting delta). For a device that drives no DAC and exists to instrument the others.
   bool tsf_observer{false};
   // Force one accounting repair cycle after each session start. OFF by default: the effect is
   // measured (n=12) but its mechanism is not, so this is opt-in until a lone reconnect has been
@@ -187,9 +185,12 @@ struct ServerCandidate {
   }
 };
 
-/// @brief TSF group-sync role, for diagnostics entities. INACTIVE covers: feature
-/// off/unsupported (no wifi), no session, or no election result yet.
-enum class TsfRole : uint8_t { INACTIVE, FOLLOWER, LEADER };
+/// @brief TSF group-sync state, for diagnostics entities. There is no leader and no role: every
+/// device publishes its own server<->TSF estimate and adopts the average of everyone's.
+///   INACTIVE  feature off/unsupported (no wifi), no session, or no mapping held
+///   SOLO      a mapping, but consensed from our own estimate alone -- nobody else is audible
+///   CONSENSUS a mapping averaged over two or more devices, i.e. a genuinely shared timebase
+enum class TsfState : uint8_t { INACTIVE, SOLO, CONSENSUS };
 
 /// @brief Events the client pushes to its listener.
 ///
@@ -392,21 +393,20 @@ class SnapcastClient {
   // --- Diagnostics (main loop) ---
 
   bool is_connected() const { return this->connected_.load(std::memory_order_relaxed); }
-  /// @brief Current TSF group-sync role (atomic read; INACTIVE when unavailable).
-  TsfRole get_tsf_role() const {
+  /// @brief Current TSF group-sync state (atomic read; INACTIVE when unavailable).
+  TsfState get_tsf_state() const {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
     if (this->tsf_sync_ != nullptr) {
-      switch (this->tsf_sync_->role()) {
-        case TsfSync::Role::LEADER:
-          return TsfRole::LEADER;
-        case TsfSync::Role::FOLLOWER:
-          return TsfRole::FOLLOWER;
-        default:
-          break;
+      const uint8_t n = this->tsf_sync_->consensus_n();
+      if (n >= 2) {
+        return TsfState::CONSENSUS;
+      }
+      if (n == 1) {
+        return TsfState::SOLO;
       }
     }
 #endif
-    return TsfRole::INACTIVE;
+    return TsfState::INACTIVE;
   }
   /// @brief Current server-minus-client clock offset estimate in ms.
   float get_clock_offset_ms();
@@ -674,9 +674,13 @@ class SnapcastClient {
     // never applied.
     float kp_active{0.0f};
 #ifdef CLOCK_SYNC_TSF_ACTIVE
-    // Last observed TSF role, for detecting a leadership change. -1 = not yet observed, so the
-    // first chunk records the role rather than reporting a change that never happened.
-    int8_t kp_last_role{-1};
+    // Last observed TSF timebase epoch, for detecting a re-anchor: the timebase the servo measures
+    // itself against actually stepped, so whatever it had converged to is now referenced to a
+    // different clock. Under leader election this was the ROLE, and it fired on every handover --
+    // six in seventeen minutes. Consensus makes joins and departures slew instead, so this fires
+    // only on a real discontinuity. UINT32_MAX = not yet observed, so the first chunk records the
+    // epoch rather than reporting a change that never happened.
+    uint32_t kp_last_epoch{UINT32_MAX};
 #endif
     // PRE-TRIGGER history cursors for that trace. The burst above is armed BY the threshold
     // crossing, so its first line already shows the ring empty and it structurally cannot show
@@ -707,13 +711,6 @@ class SnapcastClient {
     uint32_t fill_sample_countdown{0};
     // Mute-until-synced: real audio flows only after a full window of in-band medians
     bool converged{false};
-    // Latched from an excursion so large the DEADLINE, not our clock, must be wrong, and held
-    // until convergence returns. The instantaneous test cannot do this job: an implausible
-    // deadline is a single huge error, and the splice that absorbs it drops the median back
-    // under the bar within a window or two, while `converged` -- and therefore "healthy" --
-    // stays false for the whole re-lock. A LEADER that reads the gap as its own fault demotes
-    // and takes the group's only timebase with it. See set_playout_healthy().
-    bool deadline_implausible{false};
     // Frames of DMA SILENCE PADDING baked into the starvation re-baseline's seed, owed back once
     // that padding drains. The seed is deliberately padding-inclusive because the prediction
     // extrapolates "frame N renders at frame M's time plus (N-M)/rate", which is exact only while
@@ -880,14 +877,13 @@ class SnapcastClient {
   /// Computes the local deadline for a chunk record.
   int64_t chunk_deadline_us_(const ChunkRecord &rec);
 
-  /// @brief Follower-side correction for the inter-device offset the servo cannot see.
+  /// @brief Correction for the inter-device offset the servo cannot see.
   ///
   /// The per-device servo nulls its OWN error against server time, so nothing nulls the
   /// difference between two devices; a hard resync leaves a residual that then persists
-  /// forever. render_delta_us() already measures that difference and, until now, was only ever
-  /// logged -- deliberately, pending validation against a logic analyser (see the comment at
-  /// its use site). Measured 2026-08-27 across forced resyncs, it tracks the true displacement
-  /// to 94-95%, which is what makes closing the loop defensible.
+  /// forever. render_group_delta_us() measures that difference against the group average.
+  /// Measured 2026-08-27 across forced resyncs, it tracks the true displacement with a roughly
+  /// constant 8.7 +- 3.4 us residual, which is what makes closing the loop defensible.
   ///
   /// Applied to the DEADLINE rather than by splicing audio: shifting the target lets the
   /// existing servo do the work, instead of a second controller fighting it for the same

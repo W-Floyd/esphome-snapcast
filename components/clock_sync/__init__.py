@@ -9,11 +9,11 @@ consuming component's job.
   knows nothing about how they were obtained, nor about audio: header-only standard C++
   with no ESPHome include, so it lifts out of here unchanged and would serve NTP, PTP or
   any two drifting clocks.
-- ``TsfSync`` -- 802.11 TSF as a shared timebase for co-located clients: leader
-  election, a slew-limited published mapping, sandwiched TSF reads. Generic distributed
-  clock sync; the only audio in it is the naming of two hooks
-  (``set_playout_healthy``, ``set_pipeline_us``), both of which mean "is this node's
-  output on time" and "how deep is its output queue".
+- ``TsfSync`` -- 802.11 TSF as a shared timebase for co-located clients: leaderless
+  consensus over every node's server→TSF estimate, a slew-limited published line,
+  sandwiched TSF reads. Generic distributed clock sync; the only audio in it is the
+  naming of two diagnostic hooks (``set_pipeline_us``, ``set_render_phase_us``), which
+  mean "how deep is this node's output queue" and "when does it render a known frame".
 
 Neither includes a protocol header or references a protocol type. There is no YAML
 config: a consumer requests the optional pieces through the helpers below, which is also

@@ -25,7 +25,10 @@ import math
 import re
 import statistics
 
-RP = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*Render phase mine (-?\d+) leader (-?\d+) delta (-?\d+) us")
+# Only "mine" is used. The reference term after it is the peer GROUP average since the
+# leaderless change (2026-08-28) and was the leader before it; both are accepted because
+# these logs span days across that change.
+RP = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*Render phase mine ([+-]?\d+) (?:group\(\d+\)|leader [+-]?\d+) delta ([+-]?\d+) us")
 
 
 def load_phase(path, tail):

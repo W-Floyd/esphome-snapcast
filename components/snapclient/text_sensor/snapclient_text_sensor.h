@@ -10,9 +10,9 @@
 namespace esphome::snapclient {
 
 /// @brief Publishes this device's TSF group-sync role: "Leader" / "Follower" /
-/// "Inactive" (tsf_sync off or unsupported, no session, or no election yet).
+/// "Inactive" (tsf_sync off or unsupported, no session, or no mapping yet).
 /// Polled from loop() with change detection — the underlying read is one atomic.
-class SnapclientTsfRoleTextSensor final : public SnapclientChild, public text_sensor::TextSensor {
+class SnapclientTsfStateTextSensor final : public SnapclientChild, public text_sensor::TextSensor {
  public:
   void setup() override { this->publish_(); }
   void loop() override { this->publish_(); }
@@ -21,7 +21,7 @@ class SnapclientTsfRoleTextSensor final : public SnapclientChild, public text_se
  protected:
   void publish_();
 
-  TsfRole last_role_{TsfRole::INACTIVE};
+  TsfState last_state_{TsfState::INACTIVE};
   bool published_{false};
 };
 

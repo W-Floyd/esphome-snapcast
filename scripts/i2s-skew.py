@@ -154,6 +154,7 @@ def stream_blocks(args):
     it defaults to once a minute rather than once a second.
     """
     block = args.samples
+    starved = 0
     while True:
         cmd = [args.sigrok_cli,
                "-d", args.driver + (f":conn={args.conn}" if args.conn else ""),
@@ -166,6 +167,7 @@ def stream_blocks(args):
         errbuf = []
         threading.Thread(target=lambda: errbuf.append(proc.stderr.read()),
                          daemon=True).start()
+        nblk = 0
         try:
             while True:
                 chunks, got = [], 0
@@ -177,6 +179,7 @@ def stream_blocks(args):
                     got += len(d)
                 if got < block:
                     break                      # acquisition ended; restart below
+                nblk += 1
                 yield np.frombuffer(b"".join(chunks), dtype=np.uint8)
         finally:
             if proc.poll() is None:
@@ -184,6 +187,26 @@ def stream_blocks(args):
             err = (errbuf[0].decode(errors="replace").strip() if errbuf else "")
         if err and ("LIBUSB" in err or "Failed to open" in err):
             raise RuntimeError("cannot claim the analyser -- is PulseView open?\n  " + err)
+        # AN ACQUISITION THAT ENDS EARLY MUST BE SAID OUT LOUD. Measured 2026-08-28: at
+        # samplerate=24M this fx2 delivers a couple of MB and then simply stops sending,
+        # and sigrok sits out the whole --time before reporting "Device only sent N
+        # samples". Restarting that silently is a hang with no output: the loop consumed
+        # its three blocks, then waited minutes per restart for a stream that never came
+        # back. 12M and 8M sustain the full duration on the same rig, so this is a rate
+        # ceiling, not a dead device -- which is worth saying rather than making the
+        # operator bisect it.
+        expect = int(args.stream_seconds * args_rate_hz(args) / block)
+        if nblk < max(1, expect // 2):
+            starved += 1
+            print(f"  WARNING: acquisition ended after {nblk} of ~{expect} blocks"
+                  + (f" -- {err}" if err else ""), file=sys.stderr)
+            if starved >= 3:
+                raise RuntimeError(
+                    f"the analyser will not sustain samplerate={args.samplerate}: three "
+                    f"acquisitions in a row stopped early. Try --samplerate 12M "
+                    f"(halve --samples to keep the same block duration).")
+        else:
+            starved = 0
 
 
 def stream_reader(args, depth=16):
@@ -663,10 +686,14 @@ def match_temperature(line):
 # Above this many samples the plot is decimated for drawing (the data is untouched).
 MAX_PLOT_POINTS = 2500
 
-# TSF role, e.g. "tsf=leader(peers 5)" / "tsf=follower(0.9s, depth +2267 us)". Matched on
-# the first letter only: the Sync line is long and the logger truncates it mid-token, so
-# "tsf=follow", "tsf=foll" and "tsf=le" all occur and must not be missed.
-ROLE_RE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?\btsf=([lf])")
+# TSF group state, e.g. "tsf=consensus(n2, 1.0s, depth +2267 render +12 us)" / "tsf=solo(...)".
+# Matched on the first letter only: the Sync line is long and the logger truncates it mid-token,
+# so "tsf=consen", "tsf=cons" and "tsf=so" all occur and must not be missed.
+#
+# l/f are the RETIRED leader/follower states, kept because a.log and b.log span days and still
+# carry them; the firmware is leaderless as of 2026-08-28 and emits only c/s/i.
+STATE_NAMES = {"c": "consensus", "s": "solo", "i": "inactive", "l": "leader", "f": "follower"}
+ROLE_RE = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?\btsf=([lfcsi])")
 
 
 LOG_COVERAGE = {}
@@ -721,10 +748,13 @@ DEV_T_RE = re.compile(r"\bt=(\d+)")
 # same AP TSF, so the AP's crystal cancels and the delta is the two devices' crystal difference,
 # measured outside the audio servo loop. That difference is the whole of the differential trim's
 # constant offset from the true achieved rate (-5.25..-5.40 ppm measured on the wire), so this
-# line is what lets a speaker compute the correction with no analyser present. Followers only:
-# a leader has no leader to difference against.
+# line is what lets a speaker compute the correction with no analyser present. Needs at least one
+# peer to difference against, so a device alone in its group emits nothing.
+#
+# "group" is the current wording and "leader" the retired one; both are accepted because a.log and
+# b.log span days across the leaderless change.
 CRYSTAL_RE = re.compile(
-    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Crystal: mine ([+-][\d.]+) leader ([+-][\d.]+) "
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Crystal: mine ([+-][\d.]+) (?:group|leader) ([+-][\d.]+) "
     r"delta ([+-][\d.]+) ppm")
 
 # "RSYNC[7] t=... err=52123 med=-1914 ring=1697 drops=3" -- the armed per-chunk burst around
@@ -822,8 +852,9 @@ TRIM_NONE_RE = re.compile(
 # median is a median of negatives only.
 PHASE_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Render phase .*?delta ([+-]?\d+) us")
+# "vs group" is the current wording, "vs leader" the retired one; both are accepted, see CRYSTAL_RE.
 DEPTH_RE = re.compile(
-    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Playout depth ([+-]?\d+) us vs leader")
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Playout depth ([+-]?\d+) us vs (?:group|leader)")
 # Comparable to the ppm this script measures per capture from the LRC edges.
 RAMP_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Offset ramp ([+-][\d.]+) ppm")
@@ -885,7 +916,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         if rm:
             tod_r = (int(rm.group(1)) * 3600 + int(rm.group(2)) * 60 + int(rm.group(3))
                      + int(rm.group(4)) / (10 ** len(rm.group(4))))
-            role = "leader" if rm.group(5) == "l" else "follower"
+            role = STATE_NAMES.get(rm.group(5), rm.group(5))
             if last_role is not None and role != last_role:
                 ev.append((tod_r, "role", f"{board}: {last_role} -> {role}"))
             last_role = role
@@ -911,7 +942,7 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         # Each carries the device timestamp when the firmware is new enough; None falls back
         # to the host prefix so an older log still plots.
         # The value's capture group is carried per pattern rather than assumed to be 5: the
-        # Crystal line reports mine, leader AND the delta, and the delta is the useful one.
+        # Crystal line reports mine, the group AND the delta, and the delta is the useful one.
         for key, rx, grp in (("phase_us", PHASE_RE, 5),
                              ("depth_us", DEPTH_RE, 5),
                              ("ramp_ppm", RAMP_RE, 5),
@@ -1610,7 +1641,7 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None,
         dt = win(dtrim)
         if dt:
             panels.append(("differential trim mean (ppm)", {"b - a": dt}))
-    # What each board BELIEVES its offset from the leader is, next to the measured ppm.
+    # What each board BELIEVES its offset from the group is, next to the measured ppm.
     # Same units, so it goes on one panel and any disagreement is read directly.
     ramp = {f"{b} ramp": win(FIRMWARE.get((b, "ramp_ppm"), [])) for b in ("a", "b")}
     ramp = {k: v for k, v in ramp.items() if v}
@@ -1624,7 +1655,7 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None,
     tsfl = {f"{b} crystal delta": win(FIRMWARE.get((b, "crystal_ppm"), [])) for b in ("a", "b")}
     tsfl = {k: v for k, v in tsfl.items() if v}
     if tsfl:
-        panels.append(("crystal delta vs leader (ppm)", tsfl))
+        panels.append(("crystal delta vs group (ppm)", tsfl))
     return panels
 
 
@@ -1638,13 +1669,13 @@ def firmware_overlays(lo, hi, which=("phase",)):
     belief and measurement diverge, the gap is the blind spot.
     """
     # Selectable because the two series live on different scales: render phase sits at a
-    # median of -41 us, comparable with the wire, while depth-vs-leader medians are +12 ms
+    # median of -41 us, comparable with the wire, while depth-vs-group medians are +12 ms
     # and -6.6 ms. Since the axis now expands to fit whatever is overlaid, including depth
     # by default would stretch the range 300x and flatten the measurement to a line.
     out = {}
     for board in ("a", "b"):
         for sel, key, label in (("phase", "phase_us", "render phase"),
-                                ("depth", "depth_us", "depth vs leader")):
+                                ("depth", "depth_us", "depth vs group")):
             if sel not in which:
                 continue
             pts = [(x, v * 1000.0) for x, v in FIRMWARE.get((board, key), [])
@@ -2616,7 +2647,7 @@ def main():
     p.add_argument("--overlay", default="phase",
                    help="firmware offset estimates to draw over the measured skew, comma "
                         "separated: phase, depth, none. The axis expands to fit whatever "
-                        "is overlaid, and depth-vs-leader is ms-scale, so it is opt-in")
+                        "is overlaid, and depth-vs-group is ms-scale, so it is opt-in")
     p.add_argument("--y-free", action="store_true",
                    help="scale the vertical axis to the data instead of always including "
                         "zero; use when the shape of the variation matters more than its "

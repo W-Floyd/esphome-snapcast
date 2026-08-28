@@ -157,11 +157,6 @@ static constexpr int64_t FILL_CORR_MAX_US = 400000;
 // demonstrably not after a re-baseline -- which is the case the gate exists for.
 static constexpr int64_t UNMUTE_BAND_DEADBANDS = 2;
 
-// Median error below which our playout counts as tracking the timebase, reported
-// to the TSF layer for leader eligibility. Generous: this gates "am I fit to
-// publish the group timebase", not servo precision.
-static constexpr int64_t PLAYOUT_HEALTHY_US = 5000;
-
 #ifdef USE_I2S_RATE_LOCK
 // Rate-lock PI gains. The plant is an integrator -- queue depth integrates any
 // rate mismatch, so the error's *slope* is the trim -- which is why a stepping
@@ -709,9 +704,7 @@ bool SnapcastClient::start() {
   this->tsf_sync_ =
       std::make_unique<TsfSync>(static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000);
   if (this->config_.tsf_observer) {
-    // Hold leadership through upsets that would disqualify a speaker; see set_always_healthy().
-    this->tsf_sync_->set_always_healthy(true);
-    ESP_LOGI(TAG, "TSF observer mode: always healthy, phase inputs logged");
+    ESP_LOGI(TAG, "TSF observer mode: phase inputs logged");
   }
 #endif
 
@@ -1585,12 +1578,11 @@ void SnapcastClient::service_tx_() {
          (!this->stream_active_ && now - this->last_peer_refresh_us_ >= TSF_PEER_REFRESH_US))) {
       this->refresh_tsf_peers_();
     }
-    // Elections/beacons only while a stream is active: that is when deadlines are
-    // computed AND when the hub holds high-performance wifi. While idle, modem
-    // power save makes TSF reads fail intermittently (observed: sporadic beacons
-    // and "TSF unreadable" role flapping on an idle pair). Roles freeze across
-    // idle gaps; the leader resumes beaconing on the first active tick, and stale
-    // mappings expire into the Kalman fallback on their own.
+    // Beacons only while a stream is active: that is when deadlines are computed AND
+    // when the hub holds high-performance wifi. While idle, modem power save makes
+    // TSF reads fail intermittently (observed: sporadic beacons and "TSF unreadable"
+    // on an idle pair). Everyone resumes beaconing on the first active tick, and
+    // stale mappings expire into the Kalman fallback on their own.
     if (this->stream_active_) {
       TsfSync::Estimate est;
       this->filter_mutex_.lock();
@@ -2448,15 +2440,6 @@ void SnapcastClient::player_task_() {
       const bool stale_mutes = resilience != SyncResilience::NEVER_MUTE;
       mute_now = (storm_mutes && st.storm_resyncs >= RESYNC_STORM_COUNT) ||
                  (stale_mutes && std::abs(error_us) > stale_us);
-      if (std::abs(error_us) > stale_us) {
-        // Past the server's own bufferMs the DEADLINE is wrong, not our clock, and it is wrong
-        // for the whole group at once -- measured on a pause/resume as a 2111 ms and a 2091 ms
-        // excursion on two devices within 3 ms of each other. Latch it: the splice absorbs the
-        // error within a window or two, so an instantaneous test stops being true long before
-        // the re-lock finishes, and a leader in that gap demotes for something that was never
-        // its fault. Cleared on convergence, below.
-        st.deadline_implausible = true;
-      }
       if (st.converged && !mute_now && st.storm_resyncs == 1) {
         // INFO because it IS audible -- a skip of roughly this length. Logged only for
         // the first of a window so a storm cannot flood the link on its way to muting.
@@ -2480,16 +2463,16 @@ void SnapcastClient::player_task_() {
     // all. ring= is here because the other open question is whether the ring drains because the
     // client is behind or because the correction is draining it.
 #ifdef CLOCK_SYNC_TSF_ACTIVE
-    // A LEADERSHIP CHANGE swaps the timebase the deadline is computed against, so whatever the
-    // servo had converged to is now measured against a different clock. Checked per chunk (an
-    // atomic load) rather than at report cadence, because a 3.3 s delay would spend most of the
-    // decay before the schedule noticed the event.
+    // A TIMEBASE RE-ANCHOR steps the clock the deadline is computed against, so whatever the servo
+    // had converged to is now measured against a different one. Checked per chunk (an atomic load)
+    // rather than at report cadence, because a 3.3 s delay would spend most of the decay before
+    // the schedule noticed the event.
     if (this->tsf_sync_ != nullptr) {
-      const int8_t role_now = static_cast<int8_t>(this->tsf_sync_->role());
-      if (st.kp_last_role >= 0 && role_now != st.kp_last_role) {
-        this->mark_kp_event_(st, "role change");
+      const uint32_t epoch_now = this->tsf_sync_->timebase_epoch();
+      if (st.kp_last_epoch != UINT32_MAX && epoch_now != st.kp_last_epoch) {
+        this->mark_kp_event_(st, "timebase re-anchor");
       }
-      st.kp_last_role = role_now;
+      st.kp_last_epoch = epoch_now;
     }
 #endif
 
@@ -2887,23 +2870,15 @@ void SnapcastClient::player_task_() {
     }
 #endif
 
-#ifdef CLOCK_SYNC_TSF_ACTIVE
-    // Report our own tracking quality to the TSF layer: a leader publishes the
-    // timebase the whole group follows, so it must hand off while its own playout
-    // is diverged (observed: a device stuck in a degraded buffer state kept
-    // leading, with every peer following its mapping)
-    if (this->tsf_sync_ != nullptr) {
-      // The second argument is the LATCH, not the live median. A leader must hold its timer for
-      // as long as it is recovering from a group-wide bad deadline, which is the whole re-lock --
-      // not merely while the median is still enormous. Observed before this: both clients logged
-      // "Stepping down (own playout unsynced)" after a pause, the group lost its only publisher,
-      // and every follower sat muted for ~47 s with its own servo already in band, because the
-      // unmute gate rightly refuses to unmute a follower onto a dead timebase.
-      this->tsf_sync_->set_playout_healthy(
-          st.converged && st.err_window_filled == MEDIAN_WINDOW && std::abs(median_err_us) < PLAYOUT_HEALTHY_US,
-          st.deadline_implausible || std::abs(median_err_us) > stale_us);
-    }
-#endif
+    // NO PLAYOUT-HEALTH REPORT TO THE TSF LAYER. There used to be one, because a leader
+    // publishing the group's timebase had to hand off while its own playout was diverged. Nobody
+    // publishes for anybody now -- each device publishes its own server<->TSF estimate, which is
+    // a property of its clock and not of its audio -- so health gates nothing.
+    //
+    // The cure was worse than the disease anyway: a device is briefly unhealthy after every
+    // resync, so the gate produced six leadership changes in seventeen minutes, and when both
+    // clients stepped down after a pause the group lost its only publisher and every device sat
+    // muted for ~47 s with its own servo already in band.
 
     // Mute-until-synced (reference behavior): convergence corrections are chunky and
     // audible (drops of 14 frames/chunk in the proportional band), so the audio is
@@ -2918,12 +2893,11 @@ void SnapcastClient::player_task_() {
     // are trim-only and inaudible.
     if (std::abs(median_err_us) <= UNMUTE_BAND_DEADBANDS * this->config_.sync_deadband_us) {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
-      // Don't unmute onto a provisional timebase: a follower still on its Kalman
-      // fallback (leader's mapping rejected while our own estimate is raw) will
-      // step by up to the plausibility bound when it finally adopts the shared
-      // mapping -- audible corrections right after unmute on every speaker join.
-      const bool timebase_settled = this->tsf_sync_ == nullptr ||
-                                    this->tsf_sync_->role() != TsfSync::Role::FOLLOWER ||
+      // Don't unmute onto a provisional timebase: a device still on its Kalman fallback while
+      // peers are audible will step by up to the plausibility bound when it finally adopts the
+      // shared mapping -- audible corrections right after unmute on every speaker join. A device
+      // consensing alone has nothing to converge onto, so it is not made to wait.
+      const bool timebase_settled = this->tsf_sync_ == nullptr || this->tsf_sync_->consensus_n() < 2 ||
                                     this->deadline_on_shared_tsf_;
 #else
       const bool timebase_settled = true;
@@ -2945,8 +2919,6 @@ void SnapcastClient::player_task_() {
             now_us() - st.unmute_anchor_wait_us >= UNMUTE_ANCHOR_MAX_WAIT_US;
         if (anchor_ok || waited_out) {
           st.converged = true;
-          // Recovery is over, so the leader-side hold is released with it.
-          st.deadline_implausible = false;
           st.unmute_anchor_wait_us = 0;
           if (waited_out) {
             ESP_LOGW(TAG, "Sync locked (median %" PRId64 " us) but the anchor still reads %" PRId32
@@ -4224,98 +4196,76 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
           }
         }
-        const TsfSync::Role role = this->tsf_sync_->role();
+        // tsf= now reports the CONSENSUS, not a role. n is how many raw estimates the adopted
+        // mapping averages, our own included: 1 means nobody else is audible and we are playing
+        // to our own line, >=2 means a genuinely shared timebase. There is no leader to name.
+        const uint8_t consensus_n = this->tsf_sync_->consensus_n();
+        const float age_s = this->tsf_sync_->mapping_age_s(now_us());
         const int64_t own_phase = this->tsf_sync_->render_phase_us();
-        if (role == TsfSync::Role::LEADER) {
-          snprintf(tsf_str, sizeof(tsf_str), ", tsf=leader(peers %u, phase %s)", this->tsf_sync_->peer_count(),
+        const int32_t group_delta = this->tsf_sync_->render_group_delta_us();
+        if (consensus_n == 0) {
+          snprintf(tsf_str, sizeof(tsf_str), ", tsf=inactive(kalman)");
+        } else if (consensus_n < 2) {
+          snprintf(tsf_str, sizeof(tsf_str), ", tsf=solo(%.1fs, peers %u, phase %s)", age_s,
+                   this->tsf_sync_->peer_count(),
                    own_phase == TsfSync::RENDER_PHASE_UNKNOWN ? "unknown" : "set");
-        } else if (role == TsfSync::Role::FOLLOWER) {
-          // depth delta vs the leader: the only visibility we have into an absolute
-          // playout offset, which the median above cannot show by construction
-          const int32_t depth_delta = this->tsf_sync_->pipeline_delta_us();
-          if (depth_delta == INT32_MIN) {
-            snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs)", this->tsf_sync_->mapping_age_s(now_us()));
-          } else {
-            const int32_t render_delta = this->tsf_sync_->render_delta_us();
-            if (render_delta == INT32_MIN) {
-              // Say WHICH side is missing: "mine" means this device has not computed a phase,
-              // "leader" means the beacon carried none. Without that the absence is mute.
-              snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " us, render none/%s)",
-                       this->tsf_sync_->mapping_age_s(now_us()), depth_delta,
-                       own_phase == TsfSync::RENDER_PHASE_UNKNOWN ? "mine" : "leader");
-            } else {
-              // render= is the one to trust of the two; depth= is kept alongside it precisely so
-              // the two can be compared against the analyser before anything acts on either.
-              snprintf(tsf_str, sizeof(tsf_str), ", tsf=follower(%.1fs, depth %+" PRId32 " render %+" PRId32 " us)",
-                       this->tsf_sync_->mapping_age_s(now_us()), depth_delta, render_delta);
-              // THE COMPARISON ABOVE HAS NOW BEEN MADE. Measured 2026-08-27 across n=9 forced
-              // resyncs on a probed pair, MLS stimulus, analyser at per-frame sd 0.1 us.
-              //
-              // The residual is roughly CONSTANT, not proportional: the displacement ranged
-              // 17-180 us while the render delta missed it by 8.7 +- 3.4 us each time (two
-              // outliers at 31 and 59 us excepted). Expressed as "percent tracked" that same
-              // fixed error reads 94% on a large displacement and 31% on a small one, which
-              // looks like an erratic signal and is not -- percent-tracked is simply the wrong
-              // statistic when the numerator is constant. Judge this by the residual in us.
-              //
-              // CAVEAT ON THOSE NUMBERS: they were taken with the leader on a DIFFERENT snapcast
-              // stream, which is outside render_delta's own contract (it requires both devices
-              // to be playing the same stream). Stream-scoped leadership now enforces that, and
-              // the residual is expected to fall below 9 us once it holds; re-measure before
-              // trusting any gain here.
-              //
-              // NOTHING NULLS THE DIFFERENCE BETWEEN TWO DEVICES otherwise: each servo drives
-              // its OWN error against server time to zero, so a hard resync's residual is held
-              // forever by a servo that is already at its setpoint and reports a clean median.
-              //
-              // Correct the DEADLINE, not the audio. Shifting this device's target lets the
-              // existing servo close the gap with its normal trim; a second controller splicing
-              // frames would fight the first for the same audio. Gain is deliberately low and
-              // the step is clamped: this runs once per report, and the failure mode to avoid
-              // is two devices chasing each other.
-              // TOWARD THE GROUP MEDIAN, NOT THE LEADER: the leader-relative delta is referenced
-              // to whoever holds the crown, and leadership changed six times in seventeen minutes
-              // on this pair. ONLY WHILE CONVERGED: during a forced 500 ms displacement the loop
-              // spent ten reports walking its bias toward a delta that vanished when the
-              // displacement was removed. The servo owns the transient; this owns the standing
-              // offset the servo cannot see.
-              if (this->config_.tsf_observer) {
-                this->tsf_sync_->log_phase_inputs(now_us());
-              }
-              const int32_t group_delta = this->tsf_sync_->render_group_delta_us();
-              // Only every Nth report: the loop delay is ~2 reports, so correcting on every one
-              // means acting on a measurement that does not yet contain the previous correction.
-              this->render_align_tick_++;
-              const bool align_due = (this->render_align_tick_ % RENDER_ALIGN_EVERY_N_REPORTS) == 0;
-              if (this->config_.render_align_max_us > 0 && st.converged && align_due &&
-                  group_delta != INT32_MIN) {
-                const int32_t cap = static_cast<int32_t>(this->config_.render_align_max_us);
-                int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
-                if (std::abs(group_delta) > RENDER_ALIGN_DEADBAND_US) {
-                  const int32_t step = std::clamp<int32_t>(
-                      static_cast<int32_t>(-group_delta * RENDER_ALIGN_GAIN),
-                      -RENDER_ALIGN_MAX_STEP_US, RENDER_ALIGN_MAX_STEP_US);
-                  bias = std::clamp<int32_t>(bias + step, -cap, cap);
-                  this->render_bias_us_.store(bias, std::memory_order_relaxed);
-                }
-                ESP_LOGD(TAG,
-                         "RALIGN group %+" PRId32 " (leader %+" PRId32 ") -> bias %+" PRId32
-                         " us (cap %" PRId32 ")",
-                         group_delta, render_delta, bias, cap);
-              }
-            }
-          }
         } else {
-          // Roleless does NOT imply no shared timebase: a leader that handed off keeps
-          // its mapping for the election, and deadlines still come from it. Printing
-          // nothing here read as "fell back to Kalman" and sent an earlier diagnosis
-          // down the wrong path, so say which it is.
-          const float age_s = this->tsf_sync_->mapping_age_s(now_us());
-          if (age_s >= 0.0f) {
-            snprintf(tsf_str, sizeof(tsf_str), ", tsf=roleless(mapping %.1fs)", age_s);
-          } else {
-            snprintf(tsf_str, sizeof(tsf_str), ", tsf=inactive(kalman)");
+          // depth= compares buffer OCCUPANCY against the peer mean and is the only instrument
+          // that can see an absolute playout offset, which the sync median cannot show by
+          // construction. render= is the one to trust of the two; depth= is kept alongside it
+          // precisely so the two can be compared against the analyser before anything acts on
+          // either. Both are INT32_MIN until the group has published enough to compare.
+          const int32_t depth_delta = this->tsf_sync_->pipeline_delta_us();
+          char depth_buf[24] = "none";
+          char render_buf[24] = "none";
+          if (depth_delta != INT32_MIN) {
+            snprintf(depth_buf, sizeof(depth_buf), "%+" PRId32, depth_delta);
           }
+          if (group_delta != INT32_MIN) {
+            snprintf(render_buf, sizeof(render_buf), "%+" PRId32, group_delta);
+          }
+          snprintf(tsf_str, sizeof(tsf_str), ", tsf=consensus(n%u, %.1fs, depth %s render %s us)", consensus_n,
+                   age_s, depth_buf, render_buf);
+        }
+        if (this->config_.tsf_observer) {
+          this->tsf_sync_->log_phase_inputs(now_us());
+        }
+        // NOTHING NULLS THE DIFFERENCE BETWEEN TWO DEVICES otherwise: each servo drives its OWN
+        // error against server time to zero, so a hard resync's residual is held forever by a
+        // servo that is already at its setpoint and reports a clean median.
+        //
+        // Correct the DEADLINE, not the audio. Shifting this device's target lets the existing
+        // servo close the gap with its normal trim; a second controller splicing frames would
+        // fight the first for the same audio. Gain is deliberately low and the step is clamped:
+        // this runs once per report, and the failure mode to avoid is two devices chasing each
+        // other.
+        //
+        // TOWARD THE GROUP AVERAGE. It used to be the leader's phase, which referenced every
+        // correction to whoever held the crown while the crown moved six times in seventeen
+        // minutes; then a group MEDIAN, which is discontinuous over three values and hopped
+        // +-96 us on data sitting at +-12. It is a robustly weighted mean now -- see
+        // TsfSync::render_group_delta_us().
+        //
+        // ONLY WHILE CONVERGED: during a forced 500 ms displacement the loop spent ten reports
+        // walking its bias toward a delta that vanished when the displacement was removed. The
+        // servo owns the transient; this owns the standing offset the servo cannot see.
+        //
+        // Only every Nth report: the loop delay is ~2 reports, so correcting on every one means
+        // acting on a measurement that does not yet contain the previous correction.
+        this->render_align_tick_++;
+        const bool align_due = (this->render_align_tick_ % RENDER_ALIGN_EVERY_N_REPORTS) == 0;
+        if (this->config_.render_align_max_us > 0 && st.converged && align_due && group_delta != INT32_MIN) {
+          const int32_t cap = static_cast<int32_t>(this->config_.render_align_max_us);
+          int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
+          if (std::abs(group_delta) > RENDER_ALIGN_DEADBAND_US) {
+            const int32_t step =
+                std::clamp<int32_t>(static_cast<int32_t>(-group_delta * RENDER_ALIGN_GAIN),
+                                    -RENDER_ALIGN_MAX_STEP_US, RENDER_ALIGN_MAX_STEP_US);
+            bias = std::clamp<int32_t>(bias + step, -cap, cap);
+            this->render_bias_us_.store(bias, std::memory_order_relaxed);
+          }
+          ESP_LOGD(TAG, "RALIGN group %+" PRId32 " -> bias %+" PRId32 " us (cap %" PRId32 ")", group_delta, bias,
+                   cap);
         }
       }
   #endif

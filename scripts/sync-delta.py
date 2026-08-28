@@ -161,8 +161,8 @@ def report_depth(names, depths):
     fleet was audibly BEHIND by roughly the deficit (-150 ms deficit -> ~150 ms late,
     -105 ms -> audibly late again), with textbook-clean medians throughout.
 
-    The group median is the reference because no single device has one -- notably the
-    TSF leader, which receives no beacons and so cannot self-check on-device.
+    The group median is the reference because no single device is authoritative -- a device
+    that hears no beacons cannot self-check on-device at all.
     """
     have = {k: v for k, v in depths.items() if v}
     if len(have) < 2:

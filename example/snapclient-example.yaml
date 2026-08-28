@@ -63,7 +63,7 @@ snapclient:
   # pause_behavior: allow         # allow | resume | ignore
   # keepalive_hold: never         # or a duration; never keeps the speaker always ready
   # stream_idle_timeout: 3s       # ends the stream once disconnected
-  # tsf_sync: false               # share one 802.11 timebase between same-AP clients
+  # tsf_sync: false               # same-AP clients average into one shared 802.11 timebase
   # timing_diagnostics: false     # per-chunk RAW lines for scripts/raw-sync.py
   # rate_lock:                    # unset. S3 only: steers the I2S divider rather than
   #   i2s_audio_id: i2s_out         # splicing. The bus BY ID — ports are assigned, not
@@ -141,7 +141,7 @@ text_sensor:
     snapclient_id: snap
     name: Stream Format
   - platform: snapclient
-    type: tsf_role                # Leader | Follower | Inactive
+    type: tsf_state               # Consensus | Solo | Inactive
     snapclient_id: snap
     name: TSF Role
   - platform: snapclient

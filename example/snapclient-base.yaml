@@ -92,7 +92,7 @@ snapclient:
   pause_behavior: ignore
   rate_lock:
     i2s_audio_id: i2s_out       # by id: a PDM mic would take port 0 and renumber this
-  tsf_sync: true                # same-AP clients share one server→TSF mapping
+  tsf_sync: true                # same-AP clients average their server→TSF mappings
   # Force one accounting repair ~10 s after each session start. A reconnect's fresh anchor
   # plants a static offset nothing on-device can see (~1.3-1.4 ms measured), and a repair
   # removes ~2/3 of whatever standing offset the device carries. ON here to grade it: the
@@ -229,7 +229,7 @@ text_sensor:
     snapclient_id: snap
     name: Stream Format
   - platform: snapclient
-    type: tsf_role
+    type: tsf_state
     snapclient_id: snap
     name: TSF Role
   # Now-playing from the server's control API; empty when it is disabled

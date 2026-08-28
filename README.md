@@ -94,7 +94,7 @@ playback offsets. Check with the `stream_format` sensor.
 | `channel_mode` | `stereo` | `stereo`, `left`, `right`, `mono` |
 | `phase_invert` | `none` | `none`, `left`, `right`, `both` |
 | `rate_lock` | off | steer the S3's I2S divider instead of splicing frames; requires `i2s_audio_id` naming the bus |
-| `tsf_sync` | `false` | share one server→TSF mapping between same-AP clients |
+| `tsf_sync` | `false` | same-AP clients average their server→TSF mappings into one shared timebase |
 | `timing_diagnostics` | `false` | per-chunk `RAW` lines for `scripts/raw-sync.py` |
 | `static_delay` (media_source) | `0ms` | per-device latency trim |
 
@@ -102,7 +102,7 @@ playback offsets. Check with the `stream_format` sensor.
 `select` — `channel_mode`, `phase`, `pause_behavior`, `server`;
 `number` — `server_latency` (set on the server, not locally);
 `text` — manual `host[:port]` override, highest precedence;
-`text_sensor` — `stream_format`, `tsf_role`, `stream_name`, `stream_title`,
+`text_sensor` — `stream_format`, `tsf_state`, `stream_name`, `stream_title`,
 `stream_artist`, `stream_album`.
 
 ## Design
@@ -117,8 +117,9 @@ queue, so tasks never touch entities.
 Sync comes from a 2-state Kalman clock filter (Sage-Husa adaptive noise, Huber outlier
 weighting), a smoothed DAC-feedback pivot, and a median-filtered servo trimming one frame
 per chunk by sample stuffing. Playback is muted until first lock, so convergence is
-inaudible. Optionally, co-located clients share one 802.11 TSF timebase and steady-state
-corrections steer the I2S clock rather than splicing.
+inaudible. Optionally, co-located clients share one 802.11 TSF timebase — leaderless, each
+publishing its own server→TSF mapping and adopting the average — and steady-state corrections
+steer the I2S clock rather than splicing.
 
 **[TIMING.md](TIMING.md)** is the real documentation: the clock chain, every buffer stage,
 why the gains are what they are, the measured error budget, and which quantities the

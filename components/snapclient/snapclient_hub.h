@@ -139,7 +139,9 @@ class SnapclientHub final : public Component,
   void set_server_latency(int32_t latency_ms);
 
   /// @brief Current TSF group-sync role (INACTIVE when off/unsupported/idle).
-  TsfRole get_tsf_role() const { return this->client_ != nullptr ? this->client_->get_tsf_role() : TsfRole::INACTIVE; }
+  TsfState get_tsf_state() const {
+    return this->client_ != nullptr ? this->client_->get_tsf_state() : TsfState::INACTIVE;
+  }
 
   // --- Server selection (main loop thread) ---
   // Connection-target precedence: manual (text entity) > selection (select entity)

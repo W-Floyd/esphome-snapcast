@@ -4,18 +4,17 @@
 # feeding a DAC, so that device's own scheduling jitter is baked into the reading and cannot be
 # separated from the timebase's own wander. This board answers questions the speakers cannot:
 #
-#   * A STABLE LEADER. Leadership requires a healthy device and every resync briefly disqualifies
-#     the incumbent — measured six handovers in seventeen minutes on a two-device group, which is
-#     what made the inter-device correction unmeasurable. A board that never has to recover is
-#     never unhealthy. NOTE: it still needs `always_healthy` (see TODO) to hold the crown through
-#     a group-wide upset; without that this is a third participant, not yet a stable reference.
+#   * A THIRD ESTIMATE IN THE CONSENSUS. The timebase is the weighted mean of every member's own
+#     server→TSF mapping, so noise falls as √N and a board that never has to recover from a
+#     resync is a clean third term. (It gets no special status — there is no leader to hold, and
+#     the `always_healthy` hack that used to prop one up is gone with it.)
 #   * A THIRD RENDER PHASE. render_phase comes from played/pushed counters, so an observer only
 #     has one if it actually renders — which is why this runs the full client rather than a
-#     cut-down TSF-only build. With three phases the group median stops being a two-device mean.
+#     cut-down TSF-only build.
 #   * DIAGNOSTICS WITHOUT COST TO AUDIO YOU CAN HEAR. Same instrumentation, and nothing audible
 #     if it misbehaves.
 #
-# IT MUST SHARE THE STREAM. TSF leadership is scoped to (BSS, snapserver, snapcast STREAM), so
+# IT MUST SHARE THE STREAM. The TSF group is scoped to (BSS, snapserver, snapcast STREAM), so
 # this only joins the probed pair's group if it is playing the same stream — put it on MLS44
 # alongside them, or it forms its own group and observes nothing.
 #
@@ -46,9 +45,8 @@ packages:
 
 snapclient:
   id: snap
-  # Never report unhealthy, so this board holds TSF leadership through upsets that would
-  # disqualify a speaker, and log the group-median inputs (own phase, each peer phase with its
-  # age, the median). Safe ONLY because nothing is wired to the I2S pins.
+  # Log the group phase inputs (own phase, each peer phase with its age, the resulting delta).
+  # Safe ONLY because nothing is wired to the I2S pins.
   tsf_observer: true
 
 wifi:

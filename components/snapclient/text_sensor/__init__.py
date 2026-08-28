@@ -1,4 +1,4 @@
-"""Text sensors for snapclient: TSF group-sync role, stream format, and metadata."""
+"""Text sensors for snapclient: TSF group-sync state, stream format, and metadata."""
 
 import esphome.codegen as cg
 from esphome.components import text_sensor
@@ -9,11 +9,11 @@ from .. import CONF_SNAPCLIENT_ID, SnapclientHub, snapclient_ns
 
 CODEOWNERS = ["@W-Floyd"]
 
-CONF_TSF_ROLE = "tsf_role"
+CONF_TSF_STATE = "tsf_state"
 CONF_STREAM_FORMAT = "stream_format"
 
-SnapclientTsfRoleTextSensor = snapclient_ns.class_(
-    "SnapclientTsfRoleTextSensor", cg.Component, text_sensor.TextSensor
+SnapclientTsfStateTextSensor = snapclient_ns.class_(
+    "SnapclientTsfStateTextSensor", cg.Component, text_sensor.TextSensor
 )
 SnapclientStreamFormatTextSensor = snapclient_ns.class_(
     "SnapclientStreamFormatTextSensor", cg.Component, text_sensor.TextSensor
@@ -44,14 +44,16 @@ def _hub_schema(schema):
 CONFIG_SCHEMA = cv.All(
     cv.typed_schema(
         {
-            # "Leader" / "Follower" / "Inactive" — which role this device holds in
-            # the TSF group sync; Inactive when tsf_sync is off,
-            # no wifi, no session, or no election result yet
-            CONF_TSF_ROLE: _hub_schema(
+            # "Consensus" / "Solo" / "Inactive" — whether the TSF timebase this
+            # device plays to is shared with anyone. There is no leader: every device
+            # publishes its own server→TSF estimate and adopts the average. Solo means
+            # nothing else is audible on this AP/server/stream; Inactive when tsf_sync
+            # is off, no wifi, no session, or no mapping yet
+            CONF_TSF_STATE: _hub_schema(
                 text_sensor.text_sensor_schema(
-                    SnapclientTsfRoleTextSensor,
+                    SnapclientTsfStateTextSensor,
                     entity_category=ENTITY_CATEGORY_DIAGNOSTIC,
-                    icon="mdi:account-star",
+                    icon="mdi:account-group",
                 )
             ),
             # The format snapserver is actually sending, e.g. "48000 Hz, 16 bit, 2 ch".

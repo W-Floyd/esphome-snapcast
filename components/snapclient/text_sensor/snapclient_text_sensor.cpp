@@ -11,19 +11,22 @@ namespace esphome::snapclient {
 
 static const char *const TAG = "snapclient.text_sensor";
 
-void SnapclientTsfRoleTextSensor::publish_() {
-  const TsfRole role = this->parent_->get_tsf_role();
-  if (this->published_ && role == this->last_role_) {
+void SnapclientTsfStateTextSensor::publish_() {
+  const TsfState state = this->parent_->get_tsf_state();
+  if (this->published_ && state == this->last_state_) {
     return;
   }
   this->published_ = true;
-  this->last_role_ = role;
-  switch (role) {
-    case TsfRole::LEADER:
-      this->publish_state("Leader");
+  this->last_state_ = state;
+  switch (state) {
+    // There is no leader to be. What this reports is whether the timebase this device plays to is
+    // shared with anybody: "Consensus" is the working state, "Solo" means it is running on its own
+    // estimate because nothing else is audible on this AP/server/stream.
+    case TsfState::CONSENSUS:
+      this->publish_state("Consensus");
       break;
-    case TsfRole::FOLLOWER:
-      this->publish_state("Follower");
+    case TsfState::SOLO:
+      this->publish_state("Solo");
       break;
     default:
       this->publish_state("Inactive");
@@ -31,7 +34,7 @@ void SnapclientTsfRoleTextSensor::publish_() {
   }
 }
 
-void SnapclientTsfRoleTextSensor::dump_config() { LOG_TEXT_SENSOR("", "Snapclient TSF Role Text Sensor", this); }
+void SnapclientTsfStateTextSensor::dump_config() { LOG_TEXT_SENSOR("", "Snapclient TSF State Text Sensor", this); }
 
 void SnapclientStreamFormatTextSensor::setup() {
   this->parent_->add_stream_state_callback(

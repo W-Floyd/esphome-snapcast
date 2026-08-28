@@ -28,11 +28,26 @@ Each client Kalman-filters NTP-style exchanges into an offset estimate that wand
 ±100–300 µs, **uncorrelated between devices** — precisely the error that moves a stereo
 image, since only *relative* timing is audible.
 
-TSF sidesteps it. One elected leader publishes a single TSF→server mapping; every member,
-leader included, computes deadlines from that published line, so the mapping's own error
-is common-mode and cancels. What remains per-device is only local TSF read noise.
+TSF sidesteps it. Every member multicasts its **own** raw TSF→server mapping once a second
+and adopts the (robustly weighted) **mean** of everyone's, its own included, so the group
+computes deadlines from one shared line and the mapping's own error is common-mode and
+cancels. What remains per-device is only local TSF read noise.
 
-Election, failover and the Kalman fallback: `components/clock_sync/tsf_sync.h`.
+**Leaderless, by consensus averaging.** There is no election: TSF is already a shared
+broadcast timebase that the AP does not participate in, and the leader existed only to
+publish a number — which does not require electing anyone. Averaging also beats inheriting:
+noise falls as √N, nothing is handed over so there is no reference discontinuity to correct
+around, and a device rebooting shifts the mean slightly instead of collapsing the timebase.
+Leadership had been changing six times in seventeen minutes on a two-device group, and every
+quantity referenced to the leader moved with it.
+
+Two invariants hold it up, both of whose failures would look healthy from inside the device:
+a member publishes only its **own raw** estimate, never the consensus (feeding it back is
+positive feedback that lets the whole group walk while everyone agrees); and the adopted
+mapping is **slewed, never stepped** (membership changes move the mean, and a stepped
+timebase is a hard resync).
+
+Consensus, the adoption slew and the Kalman fallback: `components/clock_sync/tsf_sync.h`.
 Measured: the four devices agree on the server-versus-TSF rate within 2 ppm (−16.7 to
 −18.5 ppm), an independent check that they share one timebase.
 
@@ -162,7 +177,7 @@ every on-device metric read clean — medians inside 90 µs, no resyncs, drift s
 |---|---|---|
 | `median` in the sync report | tracking error against *this device's* prediction | any error in the prediction itself |
 | `pipeline` / `fill` / `drift` | accumulator vs observed pipeline content | anything downstream of the reported stages |
-| `depth ±N ms` (TSF beacon) | this device's depth vs the leader's | a fault shared by both |
+| `depth ±N ms` (TSF beacon) | this device's depth vs the peer mean | a fault shared by the whole group |
 | **`raw-sync.py`** | **actual inter-device rendering, from raw observations** | anything past the I2S pin |
 
 ### raw-sync.py

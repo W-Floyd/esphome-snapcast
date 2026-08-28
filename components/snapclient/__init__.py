@@ -309,14 +309,13 @@ CONFIG_SCHEMA = cv.All(
             # error it has already fixed. 1ms is 8x converge_fine and above every steady-state
             # excursion measured. Off by default: this puts the splice path back in the loop while
             # unmuted, which wants measuring per install.
-            # Cap on the follower-side correction for the inter-device offset. 0 disables it,
+            # Cap on the correction for the inter-device offset. 0 disables it,
             # which is the default: the servo nulls each device against server time and nothing
             # nulls the DIFFERENCE, so this is the only thing that can, but it is a second loop
             # on the same audio and it should be switched on deliberately.
-            # TSF OBSERVER: never report unhealthy, so this device holds leadership through
-            # upsets that would disqualify a speaker, and log the group's phase inputs. ONLY for
-            # a board driving no DAC -- on a speaker it defeats the guard that stops a device
-            # whose own playout has diverged from publishing the group's timebase.
+            # TSF OBSERVER: log the group's phase inputs (own phase, each peer's with its age,
+            # the resulting delta). For a board driving no DAC that exists to instrument the
+            # others; it gets no special status in the group, which is leaderless.
             cv.Optional(CONF_TSF_OBSERVER, default=False): cv.boolean,
             cv.Optional(CONF_RENDER_ALIGN_MAX, default="0ms"): cv.All(
                 cv.positive_time_period_microseconds,
@@ -340,7 +339,7 @@ CONFIG_SCHEMA = cv.All(
             # instant resumption. A stream that resumed after 7.5 h idle still came
             # back with a 6.9 h stale deadline and took 9.6-16 s to settle, with the
             # pipeline held the entire time. The residual cost there was the servo
-            # settling plus a TSF re-election, not the teardown this prevents.
+            # settling plus the TSF mapping being re-acquired, not the teardown this prevents.
             cv.Optional(CONF_KEEPALIVE_HOLD, default=CONF_NEVER): cv.Any(
                 cv.positive_time_period_milliseconds,
                 cv.one_of(CONF_NEVER, lower=True),

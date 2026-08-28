@@ -7,7 +7,7 @@ Encodes the failure taxonomy learned in the field. Feed it one log per device
     python3 scripts/diagnose-logs.py a.log b.log c.log d.log
 
 It extracts events (starvations, hard resyncs, pipeline wedges, reconnects,
-stream-idle, OTA, TSF role churn, ring low-water, accounting anomalies), groups
+stream-idle, OTA, TSF timebase events, ring low-water, accounting anomalies), groups
 them into per-device incidents, correlates incidents across the fleet, and
 classifies each into a failure plane:
 
@@ -46,8 +46,12 @@ MARKERS = [
     ("Stream idle for", "stream_idle"),
     ("Starting update from", "ota_start"),
     ("Update complete", "ota_done"),
+    # Leadership is retired (2026-08-28); the two markers stay because a.log and b.log span
+    # days and still carry them. A re-anchor is the leaderless equivalent event: the timebase
+    # the servo measures against actually stepped.
     ("Assuming TSF leadership", "tsf_lead"),
     ("Yielding leadership", "tsf_yield"),
+    ("Timebase re-anchor", "tsf_reanchor"),
     ("Sync locked", "lock"),
 ]
 

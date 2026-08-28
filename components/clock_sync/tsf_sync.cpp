@@ -47,8 +47,8 @@ static constexpr uint8_t TSF_VERSION = 1;
 // offset by F too and the error reads ~0 while the audio is physically F late.
 // Observed: one device sat at 72-118 ms of pipeline against a fleet norm of ~250 ms
 // and was audibly ~150 ms behind its pair, with textbook-clean sync reports on every
-// device. The group is the only available reference, so followers compare their own
-// depth against the leader's and shout when it diverges.
+// device. The group is the only available reference, so each device compares its own
+// depth against the mean of its peers' and shouts when it diverges.
 //
 // 100 ms -> 5 ms. The old value was sized against the spread of the INSTANTANEOUS depth
 // (224-282 ms across four boards = 58 ms), which was almost entirely sampling phase: the
@@ -72,18 +72,15 @@ static constexpr int64_t PIPELINE_DIVERGE_MIN_US = 5000000;
 static constexpr int64_t PIPELINE_DIVERGE_LOG_US = 30000000;
 static constexpr int32_t PIPELINE_UNKNOWN = INT32_MIN;
 
-static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // leader broadcast cadence
-static constexpr int64_t LEADER_TIMEOUT_US = 3500000;    // silence before takeover…
-static constexpr int64_t STAGGER_STEP_US = 100000;       // …plus per-MAC stagger
+static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // every device publishes at this rate
 static constexpr int64_t MAPPING_EXPIRY_US = 5000000;    // stale mapping → Kalman fallback
-// A leader tolerates this much continuous playout divergence before handing off
-static constexpr int64_t LEADER_UNHEALTHY_US = 5000000;
-// After stepping down, do not grab leadership again for this long: a device whose
-// health flickers would otherwise re-take it seconds later and oscillate
-static constexpr int64_t LEAD_COOLDOWN_US = 20000000;
-// Playout must be tracking this long before a device is eligible to lead
-static constexpr int64_t LEAD_HEALTHY_MIN_US = 2000000;
 static constexpr int64_t SERVICE_MIN_INTERVAL_US = 200000;
+// How often the consensus is recomputed and re-adopted. Faster than the beacon rate on purpose:
+// the slew below is expressed per second, so a coarse cadence would make each adoption step
+// bigger for the same tracking speed, and a fresh adoption is also what keeps the mapping inside
+// MAPPING_EXPIRY_US when beacons are lost.
+static constexpr int64_t CONSENSUS_INTERVAL_US = 500000;
+static constexpr int64_t CONSENSUS_LOG_INTERVAL_US = 10000000;
 // Age clamp on TSF extrapolation: an AP reboot resets TSF to ~zero with the BSSID
 // unchanged, leaving tsf_base "hours in the future" — evaluating that mapping would
 // produce garbage deadlines (guaranteed hard-resync mute) until the next anchor
@@ -127,16 +124,16 @@ static constexpr int SANDWICH_ATTEMPTS = 5;
 // genuinely busier, rather than latching a lucky early read forever.
 static constexpr int64_t SANDWICH_TRUST_FACTOR = 2;
 static constexpr uint32_t SANDWICH_FLOOR_BLOCK = 256;
-// Baseline spacing for the leader's own TSF-vs-esp_timer rate measurement
+// Baseline spacing for this device's own TSF-vs-esp_timer rate measurement
 static constexpr int64_t RATE_WINDOW_US = 4000000;
 // Beacons arrive once a second; the render phase moves far slower than that.
-// Render phase is recomputed on every leader beacon, i.e. at BEACON_INTERVAL_US, so anything
-// slower than that throws away data the device already has. Measured before this was lowered:
-// 2 lines in 600 s, because the log also sits behind follower-role and valid-leader-phase
-// conditions, so a 4 s throttle on top produced a series far too sparse to compare against a
+// The group diagnostics are recomputed on every beacon we SEND, i.e. at BEACON_INTERVAL_US, so
+// anything slower than that throws away data the device already has. Measured before this was
+// lowered: 2 lines in 600 s, because the log also sat behind role conditions that no longer
+// exist, so a 4 s throttle on top produced a series far too sparse to compare against a
 // ~58 Hz wire measurement. At one line per second this is the cheapest resolution in the
-// system -- and it is differenced between two followers of one leader to stand in for the
-// analyser, which is exactly the comparison that needs the points.
+// system -- and it is differenced between two devices to stand in for the analyser, which is
+// exactly the comparison that needs the points.
 static constexpr int64_t RENDER_LOG_INTERVAL_US = 1000000;
 
 // Player-side TSF-vs-local rate, used to DE-TREND the offset filter (see
@@ -175,6 +172,52 @@ static constexpr int64_t TMS_SLEW_CATCHUP_US_PER_S = 300;  // once |delta| > 1 m
 static constexpr int64_t TMS_CATCHUP_THRESHOLD_US = 1000;
 static constexpr int64_t TMS_SNAP_US = 20000;
 
+// THE ADOPTED CONSENSUS IS SLEW-LIMITED TOO, and for a different reason than the published line
+// above. That one low-passes our own estimate's jitter; this one bounds what MEMBERSHIP can do.
+// A device joining or leaving moves the mean for everyone at once -- by (its disagreement)/N,
+// which for a joiner still inside the plausibility bound can be milliseconds -- and a stepped
+// timebase IS a hard resync, i.e. exactly the event this whole subsystem exists to avoid. So the
+// group walks to the new mean instead of jumping to it, and because every member walks at the
+// same rate the walk is common-mode: audible as nothing, and invisible on the wire between them.
+//
+// Same rates as the publish slew, deliberately. They are the same physical quantity moving at the
+// same acceptable pace, and two different numbers here would only invite tuning one of them.
+// The snap bound is where "membership moved the mean" stops being a credible explanation: past
+// it, the timebase genuinely changed (an AP reboot, a re-anchor after a long outage) and smearing
+// a real correction over minutes is worse than one step. A snap bumps timebase_epoch_ so the
+// consumer's servo is told, which is the leaderless replacement for watching the role change.
+//
+// TWICE the publish rate, and that factor is not a taste. Every contributor's line already moves
+// at up to TMS_SLEW_MAX_US_PER_S, so their mean does too; an adoption limit equal to it would
+// leave zero margin and the adopted mapping would lag its own target indefinitely under nothing
+// worse than steady tracking. Double gives the follower authority to catch its input.
+static constexpr int64_t MAP_SLEW_MAX_US_PER_S = 2 * TMS_SLEW_MAX_US_PER_S;
+static constexpr int64_t MAP_SLEW_CATCHUP_US_PER_S = 2 * TMS_SLEW_CATCHUP_US_PER_S;
+static constexpr int64_t MAP_CATCHUP_THRESHOLD_US = TMS_CATCHUP_THRESHOLD_US;
+static constexpr int64_t MAP_SNAP_US = TMS_SNAP_US;
+
+// OUTLIER ROBUSTNESS WITHOUT A MEDIAN. A median is robust and DISCONTINUOUS: over three values it
+// is the middle one, so it steps whenever the ordering changes even though nothing moved.
+// Measured 2026-08-28 on the render-phase group delta, which used one: it hopped +-96 us while
+// the underlying data sat at +-12, and the correction driven by it was worse than no correction.
+//
+// So: one reweighting pass around the plain mean. Each value's weight falls off smoothly with its
+// distance from that first mean, measured in units of the sample's own spread --
+//
+//     w_i = 1 / (1 + (d_i / (CONSENSUS_REWEIGHT_K * scale))^2),  scale = max(MAD, floor)
+//
+// -- which is continuous in every input, so no reordering can step the result, while a value far
+// outside the pack still contributes almost nothing. With two devices the deviations are equal by
+// construction, the weights are equal, and this is exactly their mean.
+//
+// The scale FLOOR is what stops a tight cluster from turning the reweighting into a median by
+// another route: without it, three values spread over 3 us would give one of them a large d/scale
+// and near-zero weight, which is discrimination against noise. Below the floor everything is
+// noise and everything should count equally.
+static constexpr double CONSENSUS_REWEIGHT_K = 2.0;
+static constexpr double CONSENSUS_SCALE_FLOOR_US = 50.0;
+static constexpr double CONSENSUS_PHASE_SCALE_FLOOR_US = 20.0;
+
 // Low-pass on the shared offset: 1/32 over per-chunk calls (~26 ms) is a ~0.8 s time constant,
 // cutting uncorrelated TSF read noise by ~sqrt(32). See shared_server_offset_us().
 // 1/64 over per-chunk calls (~26 ms) is a ~1.7 s time constant, cutting uncorrelated
@@ -202,7 +245,7 @@ static constexpr int64_t TMS_SNAP_US = 20000;
 //
 // If absolute latency ever matters more than imaging, this is the first constant to put back.
 static constexpr double OFFSET_EWMA_ALPHA = 1.0 / 256.0;
-// Above this, the raw sample is a real re-anchor (leader change, reconnect), not slew or
+// Above this, the raw sample is a real re-anchor (a consensus snap, a reconnect), not slew or
 // noise: the published mapping moves at most TMS_SLEW_CATCHUP_US_PER_S, and read
 // noise is bounded by the sandwich. Snap instead of smearing it in over ~0.8 s.
 static constexpr double OFFSET_SNAP_US = 2000.0;
@@ -213,26 +256,19 @@ struct __attribute__((packed)) TsfPacket {
   uint8_t version;
   uint8_t bssid[6];
   uint8_t sender_mac[6];
-  // ROLE: 0 = leader (authoritative timebase), 1 = follower (PHASE REPORT ONLY).
+  // 0 = this packet carries a raw server<->TSF estimate; 1 = PHASE REPORT ONLY, the mapping
+  // fields are zero and must not be read.
   //
-  // Followers beacon so the group has more than one published render phase to correct toward.
-  // Correcting toward the LEADER alone references every correction to whoever holds the crown,
-  // and leadership legitimately changes -- six handovers in seventeen minutes on a two-device
-  // group, since leadership needs a healthy device and each resync briefly disqualifies the
-  // incumbent. The group median barely moves when the crown does.
+  // There is no leader, so this is no longer a role: every device publishes its own raw estimate
+  // and every device averages all of them. What this flag distinguishes is whether the sender
+  // HAS an estimate worth pooling -- a device whose Kalman has not settled publishes phase only,
+  // because an unsettled estimate converges in 100+ ms steps and pooling those drags the mean
+  // (the same objection that used to gate leadership, divided by N).
   //
-  // A FOLLOWER BEACON MUST BE EXCLUDED FROM ELECTION, ADOPTION AND THE LEADER-SILENCE TIMER.
-  // Getting this wrong wedged both boards: the first attempt recorded the phase but let follower
-  // beacons fall through to the election block, so devices demoted to "follow" a follower, and
-  // every follower beacon refreshed last_rx_us_ ("last valid packet from another LEADER"), which
-  // is what takeover uses to detect silence. No device could ever take over; when the incumbent
-  // demoted itself the group was left with no leader, no mapping, no deadlines, and both players
-  // stalled with only wifi_diag still logging.
-  //
-  // Was `reserved`, so this costs no bytes and no version bump. An older receiver reads it as
-  // padding and would adopt a follower beacon as a leader's -- bounded, because a follower's
-  // mapping fields carry the mapping it is itself following, i.e. a copy of the leader's.
-  uint8_t role;
+  // ENCODING IS UNCHANGED FROM THE LEADER ERA on purpose, so a rolling reflash degrades rather
+  // than misreads: an old leader's 0 still means "mapping present" and an old follower's 1 still
+  // means "phase only", both of which are true in the new reading.
+  uint8_t no_mapping;
   uint32_t server_id_hash;
   int64_t tsf_base_us;
   int64_t tsf_minus_server_us;
@@ -268,9 +304,9 @@ struct __attribute__((packed)) TsfPacket {
   // inside a speaker.
   //
   // Sourced from offset_rate_ppm_, NOT tsf_rate_ppm_. They are the same physical quantity but
-  // the latter is measured on the network task and only while leading, so a follower's copy is
-  // stale and a device that has never led has none. offset_rate_ppm_ comes from the samples the
-  // offset filter already takes on the player task, in every role.
+  // the latter is measured on the network task from the beacon's own TSF reads, which stop the
+  // moment a device has nothing to publish. offset_rate_ppm_ comes from the samples the offset
+  // filter already takes on the player task, which run whenever audio does.
   //
   // Diagnostics only -- never feeds the timebase. Appended at the END and the version is NOT
   // bumped, per the note at TSF_VERSION: a bump makes a half-flashed fleet lose the shared
@@ -400,39 +436,29 @@ bool TsfSync::ensure_socket_() {
   return this->joined_;
 }
 
-// Stepping down is NOT the network changing, and must not use reset_().
+// RESET IS FOR THE NETWORK GENUINELY CHANGING UNDERNEATH US -- a roam, a disassociation, a new
+// BSSID -- and nothing else. Everything keyed to the AP's TSF counter becomes meaningless at
+// that moment: our published line, every peer's, and the consensus of them.
 //
-// A leader hands off because ITS OWN PLAYOUT has diverged. That says nothing about the
-// mapping it published: server<->TSF does not depend on whether this device's audio is
-// tracking. The TSF rate estimate is a property of the radio's clock and the peer list
-// a property of the network, neither of which the role affects either. So all of it
-// survives a demotion, and the client keeps computing deadlines from this mapping right
-// through the election -- shared_server_offset_us() gates on mapping validity and
-// MAPPING_EXPIRY_US (5 s), not on role, and that grace covers LEADER_TIMEOUT_US plus
-// the per-MAC stagger. The new leader's mapping is then adopted as an ordinary follower
-// step.
-//
-// Using reset_() here instead cost a measured ~6 s: the ex-leader dropped to the raw
-// Kalman fallback with medians at +-1 ms and trim swinging +543/-486 ppm, taking 16.0 s
-// to re-lock where a device that stayed a follower took 9.6 s.
-void TsfSync::demote_(const char *reason) {
-  ESP_LOGD(TAG, "Stepping down (%s); keeping mapping for the handoff", reason);
-  this->role_.store(Role::IDLE, std::memory_order_relaxed);
-  this->unhealthy_since_us_ = 0;
-}
-
+// It is deliberately NOT reachable from anything about this device's own audio. Under leader
+// election it was, and that cost a measured ~6 s every time a leader stepped down: the ex-leader
+// dropped to the raw Kalman fallback with medians at +-1 ms and trim swinging +543/-486 ppm,
+// taking 16.0 s to re-lock where a device that had not led took 9.6 s. There is no step-down any
+// more, but the rule that produced that bug is worth keeping explicit: a device's playout being
+// unhealthy says nothing whatsoever about the validity of a server<->TSF mapping.
 void TsfSync::reset_(const char *reason) {
-  if (this->role_.load(std::memory_order_relaxed) != Role::IDLE || this->mapping_valid_) {
+  if (this->mapping_valid_ || this->pub_valid_) {
     ESP_LOGD(TAG, "Reset (%s)", reason);
   }
-  this->role_.store(Role::IDLE, std::memory_order_relaxed);
-  this->last_rx_us_ = 0;
-  this->unhealthy_since_us_ = 0;
   this->tsf_rate_valid_ = false;
   this->rate_ref_local_us_ = 0;
   this->pub_valid_ = false;  // TSF timebase changed; the published line with it
+  for (Peer &p : this->peer_) {
+    p.map_valid = false;  // every peer's line is expressed in the OLD TSF epoch
+  }
   this->learned_peers_.clear();  // addresses may change with the network
   this->update_peer_count_();
+  this->consensus_n_.store(0, std::memory_order_relaxed);
   this->mapping_mutex_.lock();
   this->mapping_valid_ = false;
   this->mapping_mutex_.unlock();
@@ -463,11 +489,13 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       continue;  // runt packet: too short even for the timebase core
     }
     if (n < static_cast<ssize_t>(sizeof(pkt))) {
-      // Older sender, before crystal_ppm was appended. Default it rather than reject the
-      // packet: its timebase fields are all at their original offsets and perfectly usable.
-      // MUST be reset every iteration, since pkt is reused and would otherwise carry the
-      // previous sender's value.
+      // Older sender, before crystal_ppm and stream_id_hash were appended. Default them rather
+      // than reject the packet: its timebase fields are all at their original offsets and
+      // perfectly usable. BOTH must be reset every iteration, since pkt is reused and would
+      // otherwise carry the PREVIOUS sender's values -- for stream_id_hash that means silently
+      // accepting a short packet as belonging to whatever stream the last long packet named.
       pkt.crystal_ppm = NAN;
+      pkt.stream_id_hash = 0;
     }
     if (pkt.magic != TSF_MAGIC || pkt.version != TSF_VERSION) {
       continue;
@@ -513,43 +541,21 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     // Learn the sender's address for unicast beacons: the server roster can predate
     // a peer's connection (boot race) and multicast may be blocked entirely
     this->learn_peer_(from.sin_addr.s_addr);
-    // FOLLOWER BEACON: contribute the phase and stop. It is not evidence of a live leader, so it
-    // must not reach the election below, must not be adopted, and must not refresh last_rx_us_
-    // -- see the note at TsfPacket::role for what happens when it does.
-    if (pkt.role != 0) {
-      this->record_peer_phase_(pkt.sender_mac, pkt.render_phase_us, local_now_us);
-      continue;
-    }
-    const bool sender_outranks = memcmp(pkt.sender_mac, this->my_mac_, 6) < 0;
-    const Role role = this->role_.load(std::memory_order_relaxed);
-    if (role == Role::LEADER && !sender_outranks) {
-      // We outrank a rival leader: they yield only if they can hear us, and their
-      // roster may not include us -- beacon back now (their address just got
-      // learned above), rate-limited against reply ping-pong
-      if (est.valid && local_now_us - this->last_tx_us_ >= 500000) {
-        this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
-      }
-      continue;
-    }
-    // Election first, independent of mapping sanity: any valid packet from an
-    // outranking sender proves a live leader. Tying this to mapping acceptance
-    // made a rejection episode flap roles every few seconds (observed on
-    // hardware: yield -> reject -> timeout -> assume -> yield ...).
-    if (role == Role::LEADER) {
-      ESP_LOGI(TAG, "Yielding leadership to %02X:%02X:%02X:%02X:%02X:%02X", pkt.sender_mac[0], pkt.sender_mac[1],
-               pkt.sender_mac[2], pkt.sender_mac[3], pkt.sender_mac[4], pkt.sender_mac[5]);
-    } else if (role != Role::FOLLOWER) {
-      ESP_LOGI(TAG, "Following TSF leader %02X:%02X:%02X:%02X:%02X:%02X", pkt.sender_mac[0], pkt.sender_mac[1],
-               pkt.sender_mac[2], pkt.sender_mac[3], pkt.sender_mac[4], pkt.sender_mac[5]);
-    }
-    this->role_.store(Role::FOLLOWER, std::memory_order_relaxed);
-    memcpy(this->leader_mac_, pkt.sender_mac, 6);
-    this->last_rx_us_ = local_now_us;
 
-    // Mapping gates (adoption only; rejected mappings leave the previous one to
-    // expire into the Kalman fallback). Plausibility: a mapping farther from our
-    // own estimate than the hard-resync threshold is garbage (or the leader's
-    // clock is) -- playing to it would hard-resync.
+    Peer *peer = this->find_peer_(pkt.sender_mac, local_now_us);
+    peer->seen_us = local_now_us;
+    peer->pipeline_us = pkt.pipeline_us;
+    peer->crystal_ppm = pkt.crystal_ppm;
+    this->record_peer_phase_(*peer, pkt.render_phase_us, local_now_us);
+
+    // PHASE-ONLY BEACON: the sender has no settled estimate to pool. Its phase and diagnostics
+    // are recorded above; the mapping fields are zero and must not be read.
+    if (pkt.no_mapping != 0) {
+      continue;
+    }
+
+    // Estimate gates. A rejected estimate simply does not join the consensus; it never
+    // invalidates the mapping we hold, which continues to expire on its own timer.
     int64_t implied_offset_us, extrapolation_us;
     const EvalResult ev =
         evaluate_mapping_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, implied_offset_us,
@@ -558,36 +564,224 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       if (!this->warned_rejected_) {
         this->warned_rejected_ = true;
         if (ev == EvalResult::NO_TSF) {
-          ESP_LOGD(TAG, "Rejected mapping (TSF unreadable)");
+          ESP_LOGD(TAG, "Rejected peer estimate (TSF unreadable)");
         } else {
-          ESP_LOGD(TAG, "Rejected mapping (age clamp: extrapolation %" PRId64 " us)", extrapolation_us);
+          ESP_LOGD(TAG, "Rejected peer estimate (age clamp: extrapolation %" PRId64 " us)", extrapolation_us);
         }
       }
       continue;
     }
-    // Plausibility only means something when our own estimate deserves trust: a
-    // freshly-booted follower's raw Kalman swings +-100 ms under the post-reboot
-    // congestion, vetoing the (maturity-gated, trustworthy) leader's mapping and
-    // churning on its own bad clock instead (observed: a whole fleet rejecting
-    // sign-flipping "implausible" deltas for minutes after a simultaneous OTA).
-    // Immature followers adopt the leader's mapping unconditionally.
+    // Plausibility only means something when our own estimate deserves trust: a freshly-booted
+    // device's raw Kalman swings +-100 ms under the post-reboot congestion, and vetoing every
+    // (maturity-gated, trustworthy) peer on the strength of it leaves us churning on our own bad
+    // clock instead -- observed as a whole fleet rejecting sign-flipping "implausible" deltas for
+    // minutes after a simultaneous OTA. An immature device pools its peers unconditionally, which
+    // is also how it gets a timebase at all: it has none of its own to contribute.
+    //
+    // The gate is per-peer now rather than per-leader, and that is a real strengthening: one
+    // device with a broken clock is excluded by everybody instead of being either the sole
+    // authority or nothing.
     if (est.valid && est.mature) {
       const int64_t own_offset_us = static_cast<int64_t>(est.offset_ms * 1000.0);
       if (std::abs(implied_offset_us - own_offset_us) > this->plausibility_us_) {
         if (!this->warned_rejected_) {
           this->warned_rejected_ = true;
-          ESP_LOGD(TAG, "Rejected mapping (implausible: %+" PRId64 " us vs own estimate)",
+          ESP_LOGD(TAG, "Rejected peer estimate (implausible: %+" PRId64 " us vs own estimate)",
                    implied_offset_us - own_offset_us);
         }
         continue;
       }
     }
     this->warned_rejected_ = false;
-    this->record_peer_phase_(pkt.sender_mac, pkt.render_phase_us, local_now_us);
-    this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
-    this->check_pipeline_divergence_(pkt.pipeline_us, local_now_us);
-    this->check_render_phase_(pkt.render_phase_us, local_now_us);
-    this->check_crystal_delta_(pkt.crystal_ppm, local_now_us);
+    peer->map_valid = true;
+    peer->map_seen_us = local_now_us;
+    peer->tsf_base_us = pkt.tsf_base_us;
+    peer->tms_base_us = pkt.tsf_minus_server_us;
+    peer->drift_ppm = pkt.drift_ppm;
+  }
+}
+
+// Slot for a MAC, allocating or evicting the stalest entry. Never fails: a group larger than
+// MAX_PEERS thrashes the last slot rather than allocating on the network task, and a thrashing
+// slot still contributes a real estimate to the mean.
+TsfSync::Peer *TsfSync::find_peer_(const uint8_t mac[6], int64_t local_now_us) {
+  Peer *oldest = &this->peer_[0];
+  for (Peer &p : this->peer_) {
+    if (p.used && memcmp(p.mac, mac, 6) == 0) {
+      return &p;
+    }
+    if (!p.used) {
+      p = Peer{};
+      memcpy(p.mac, mac, 6);
+      p.used = true;
+      p.phase_us = RENDER_PHASE_UNKNOWN;
+      p.pipeline_us = PIPELINE_UNKNOWN;
+      p.crystal_ppm = NAN;
+      p.seen_us = local_now_us;
+      return &p;
+    }
+    if (p.seen_us < oldest->seen_us) {
+      oldest = &p;
+    }
+  }
+  *oldest = Peer{};
+  memcpy(oldest->mac, mac, 6);
+  oldest->used = true;
+  oldest->phase_us = RENDER_PHASE_UNKNOWN;
+  oldest->pipeline_us = PIPELINE_UNKNOWN;
+  oldest->crystal_ppm = NAN;
+  oldest->seen_us = local_now_us;
+  return oldest;
+}
+
+// ONE REWEIGHTING PASS AROUND THE MEAN -- the continuous stand-in for a median. See
+// CONSENSUS_REWEIGHT_K for why a median is not used and what the scale floor is protecting.
+// Values are passed pre-differenced against a reference so they stay small and exact in double.
+static double robust_mean(const double *vals, size_t n, double scale_floor) {
+  double sum = 0.0;
+  for (size_t i = 0; i < n; i++) {
+    sum += vals[i];
+  }
+  const double mean0 = sum / static_cast<double>(n);
+  if (n < 3) {
+    return mean0;  // with two values the weights are equal by construction; skip the arithmetic
+  }
+  double dev = 0.0;
+  for (size_t i = 0; i < n; i++) {
+    dev += std::fabs(vals[i] - mean0);
+  }
+  const double scale = std::max(dev / static_cast<double>(n), scale_floor) * CONSENSUS_REWEIGHT_K;
+  double wsum = 0.0, wvsum = 0.0;
+  for (size_t i = 0; i < n; i++) {
+    const double d = (vals[i] - mean0) / scale;
+    const double w = 1.0 / (1.0 + d * d);
+    wsum += w;
+    wvsum += w * vals[i];
+  }
+  return wvsum / wsum;
+}
+
+// THE CORE OF THE LEADERLESS DESIGN. Average every live raw estimate -- ours and every peer's --
+// and slew the adopted mapping toward the result.
+//
+// Estimates are LINES, not points: {tsf_base, tsf-server at base, drift}. That is what makes
+// averaging them well-defined without any of the sampling-instant machinery the render phase
+// needs -- each line is evaluated at one common TSF instant before they are combined, so peers
+// that beaconed at different times still contribute comparable numbers. The reference instant is
+// our own published base when we have one (no extrapolation on our own term) and otherwise the
+// freshest peer's.
+//
+// WHAT IS AVERAGED IS EVERY DEVICE'S RAW LINE, INCLUDING OURS. Our contribution is pub_*, the
+// line we put on the wire, which is derived from our own Kalman and nothing else. It is NOT
+// map_*, the consensus we adopted. Feeding the consensus back would be positive feedback with
+// gain 1: the group could then walk together indefinitely while every device agreed with every
+// other, and no on-device measurement could see it. This is the one failure mode of the design
+// and this is the line of code that prevents it.
+void TsfSync::update_consensus_(int64_t local_now_us) {
+  // Reference instant: our own base when we have one, else the freshest peer's.
+  int64_t ref_tsf = 0;
+  bool have_ref = this->pub_valid_;
+  if (have_ref) {
+    ref_tsf = this->pub_tsf_base_;
+  } else {
+    for (const Peer &p : this->peer_) {
+      if (!p.used || !p.map_valid || local_now_us - p.map_seen_us > PEER_MAP_STALE_US) {
+        continue;
+      }
+      if (!have_ref || p.tsf_base_us > ref_tsf) {
+        ref_tsf = p.tsf_base_us;
+        have_ref = true;
+      }
+    }
+  }
+  if (!have_ref) {
+    // Nothing to consense over: no estimate of our own and nothing audible. The held mapping
+    // expires on its own timer into the Kalman fallback; report zero contributors so the
+    // diagnostics say "inactive" rather than claiming a consensus that stopped being computed.
+    this->consensus_n_.store(0, std::memory_order_relaxed);
+    return;
+  }
+
+  // Evaluate every line at ref_tsf. Values are differenced against the first so the doubles
+  // carry microseconds of spread rather than the raw tsf-minus-server magnitude.
+  double dv[MAX_PEERS + 1];
+  double dr[MAX_PEERS + 1];
+  size_t n = 0;
+  int64_t base_tms = 0;
+  const auto add = [&](int64_t tsf_base, int64_t tms_base, float drift_ppm) {
+    const int64_t dt = ref_tsf - tsf_base;
+    const int64_t tms = tms_base + static_cast<int64_t>(static_cast<double>(drift_ppm) * 1e-6 *
+                                                        static_cast<double>(dt));
+    if (n == 0) {
+      base_tms = tms;
+    }
+    dv[n] = static_cast<double>(tms - base_tms);
+    dr[n] = static_cast<double>(drift_ppm);
+    n++;
+  };
+  if (this->pub_valid_) {
+    add(this->pub_tsf_base_, this->pub_tms_base_, this->pub_drift_ppm_);
+  }
+  for (const Peer &p : this->peer_) {
+    if (n >= MAX_PEERS + 1 || !p.used || !p.map_valid || local_now_us - p.map_seen_us > PEER_MAP_STALE_US) {
+      continue;
+    }
+    add(p.tsf_base_us, p.tms_base_us, p.drift_ppm);
+  }
+  if (n == 0) {
+    return;
+  }
+  this->consensus_n_.store(static_cast<uint8_t>(n), std::memory_order_relaxed);
+
+  const int64_t tms_target = base_tms + static_cast<int64_t>(llround(robust_mean(dv, n, CONSENSUS_SCALE_FLOOR_US)));
+  // Drift is a rate, so its spread is ppm rather than us; the same floor would swamp it. The
+  // reweighting is there for a broken peer, and a broken RATE shows up as tens of ppm.
+  const float drift_c = static_cast<float>(robust_mean(dr, n, 1.0));
+
+  int64_t tms_adopt = tms_target;
+  int64_t snap_delta = 0;
+  this->mapping_mutex_.lock();
+  const bool held = this->mapping_valid_;
+  const int64_t held_tsf_base = this->map_tsf_base_us_;
+  const int64_t held_tms_base = this->map_tsf_minus_server_us_;
+  const float held_drift = this->map_drift_ppm_;
+  const int64_t held_updated = this->map_updated_local_us_;
+  this->mapping_mutex_.unlock();
+  if (held) {
+    // Where the mapping we are already playing to says tsf-server should be at ref_tsf.
+    const int64_t expected =
+        held_tms_base + static_cast<int64_t>(static_cast<double>(held_drift) * 1e-6 *
+                                             static_cast<double>(ref_tsf - held_tsf_base));
+    const int64_t delta = tms_target - expected;
+    if (std::abs(delta) > MAP_SNAP_US) {
+      snap_delta = delta;
+    } else {
+      // Rate-limited, and scaled by the elapsed LOCAL interval so the tracking speed does not
+      // silently follow CONSENSUS_INTERVAL_US -- the same lesson the publish slew learned.
+      const int64_t elapsed_us = std::max<int64_t>(0, local_now_us - held_updated);
+      const int64_t rate_us_per_s =
+          std::abs(delta) > MAP_CATCHUP_THRESHOLD_US ? MAP_SLEW_CATCHUP_US_PER_S : MAP_SLEW_MAX_US_PER_S;
+      const int64_t slew = std::max<int64_t>(1, rate_us_per_s * elapsed_us / 1000000);
+      tms_adopt = expected + std::clamp<int64_t>(delta, -slew, slew);
+    }
+  }
+  if (snap_delta != 0) {
+    this->timebase_epoch_.fetch_add(1, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "Timebase re-anchor: consensus moved %+" PRId64 " us over %zu estimate(s)", snap_delta, n);
+  }
+  this->adopt_(ref_tsf, tms_adopt, drift_c, local_now_us);
+
+  if (local_now_us - this->last_consensus_log_us_ >= CONSENSUS_LOG_INTERVAL_US) {
+    this->last_consensus_log_us_ = local_now_us;
+    // The spread across the group is the diagnostic that matters: it is what the mean is
+    // averaging down, and if it grows the devices are disagreeing about server time.
+    double lo = dv[0], hi = dv[0];
+    for (size_t i = 1; i < n; i++) {
+      lo = std::min(lo, dv[i]);
+      hi = std::max(hi, dv[i]);
+    }
+    ESP_LOGD(TAG, "Consensus over %zu estimate(s): spread %.0f us, adopted %+" PRId64 " us from target, %+.3f ppm",
+             n, hi - lo, tms_adopt - tms_target, static_cast<double>(drift_c));
   }
 }
 
@@ -595,46 +789,28 @@ void TsfSync::log_phase_inputs(int64_t local_now_us) const {
   const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
   char buf[192];
   int n = snprintf(buf, sizeof(buf), "PHASEIN mine=%lld", static_cast<long long>(mine));
-  for (size_t i = 0; i < MAX_PHASE_PEERS && n > 0 && n < static_cast<int>(sizeof(buf)); i++) {
-    if (!this->peer_phase_[i].used) {
+  for (size_t i = 0; i < MAX_PEERS && n > 0 && n < static_cast<int>(sizeof(buf)); i++) {
+    if (!this->peer_[i].used || this->peer_[i].phase_us == RENDER_PHASE_UNKNOWN) {
       continue;
     }
     // Age matters as much as the value: an entry is accepted up to PHASE_STALE_US (15 s) old,
     // and a peer that reseeded its counters inside that window contributes a phase describing a
     // position it no longer holds.
     n += snprintf(buf + n, sizeof(buf) - n, " | %02X%02X d=%+lld age=%lldms",
-                  this->peer_phase_[i].mac[4], this->peer_phase_[i].mac[5],
-                  static_cast<long long>(this->peer_phase_[i].phase_us - mine),
-                  static_cast<long long>((local_now_us - this->peer_phase_[i].seen_us) / 1000));
+                  this->peer_[i].mac[4], this->peer_[i].mac[5],
+                  static_cast<long long>(this->peer_[i].phase_us - mine),
+                  static_cast<long long>((local_now_us - this->peer_[i].phase_seen_us) / 1000));
   }
   ESP_LOGD(TAG, "%s | group=%ld", buf,
            static_cast<long>(this->render_group_delta_us_.load(std::memory_order_relaxed)));
 }
 
-void TsfSync::record_peer_phase_(const uint8_t mac[6], int64_t phase_us, int64_t local_now_us) {
+void TsfSync::record_peer_phase_(Peer &peer, int64_t phase_us, int64_t local_now_us) {
   if (phase_us == RENDER_PHASE_UNKNOWN) {
-    return;
+    return;  // the peer has not rendered; keep whatever it last told us
   }
-  int slot = -1, oldest = 0;
-  for (size_t i = 0; i < MAX_PHASE_PEERS; i++) {
-    if (this->peer_phase_[i].used && memcmp(this->peer_phase_[i].mac, mac, 6) == 0) {
-      slot = static_cast<int>(i);
-      break;
-    }
-    if (!this->peer_phase_[i].used && slot < 0) {
-      slot = static_cast<int>(i);
-    }
-    if (this->peer_phase_[i].used && this->peer_phase_[i].seen_us < this->peer_phase_[oldest].seen_us) {
-      oldest = static_cast<int>(i);
-    }
-  }
-  if (slot < 0) {
-    slot = oldest;
-  }
-  memcpy(this->peer_phase_[slot].mac, mac, 6);
-  this->peer_phase_[slot].phase_us = phase_us;
-  this->peer_phase_[slot].seen_us = local_now_us;
-  this->peer_phase_[slot].used = true;
+  peer.phase_us = phase_us;
+  peer.phase_seen_us = local_now_us;
   this->recompute_group_delta_(local_now_us);
 }
 
@@ -654,20 +830,21 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   if (mine_at == 0) {
     return;  // no local instant yet; leave any previous delta alone
   }
-  // Our own phase is IN the group. With two devices that makes the median their mean, so each
-  // corrects half the gap and they meet in the middle rather than one chasing the other.
-  int64_t vals[MAX_PHASE_PEERS + 1];
+  // Our own phase is IN the group, so with two devices each corrects half the gap and they meet
+  // in the middle rather than one chasing the other.
+  double vals[MAX_PEERS + 1];
   size_t n = 0;
-  vals[n++] = mine;
-  for (size_t i = 0; i < MAX_PHASE_PEERS && n < MAX_PHASE_PEERS + 1; i++) {
-    if (!this->peer_phase_[i].used || local_now_us - this->peer_phase_[i].seen_us > PHASE_STALE_US) {
+  vals[n++] = 0.0;  // differenced against our own phase, so the doubles carry us of spread
+  for (size_t i = 0; i < MAX_PEERS && n < MAX_PEERS + 1; i++) {
+    if (!this->peer_[i].used || this->peer_[i].phase_us == RENDER_PHASE_UNKNOWN ||
+        local_now_us - this->peer_[i].phase_seen_us > PHASE_STALE_US) {
       continue;
     }
-    const int64_t pair_gap = this->peer_phase_[i].seen_us - mine_at;
+    const int64_t pair_gap = this->peer_[i].phase_seen_us - mine_at;
     if (pair_gap > PHASE_PAIR_WINDOW_US || pair_gap < -PHASE_PAIR_WINDOW_US) {
       continue;  // sampled too far apart to difference; wait for a fresher pairing
     }
-    vals[n++] = this->peer_phase_[i].phase_us;
+    vals[n++] = static_cast<double>(this->peer_[i].phase_us - mine);
   }
   if (n < 2) {
     // No peer paired closely enough THIS time. Keep the last valid delta rather than reporting
@@ -679,63 +856,50 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
     }
     return;
   }
-  for (size_t i = 1; i < n; i++) {  // insertion sort; n <= 9
-    const int64_t v = vals[i];
-    size_t j = i;
-    while (j > 0 && vals[j - 1] > v) {
-      vals[j] = vals[j - 1];
-      j--;
-    }
-    vals[j] = v;
-  }
-  const int64_t med = (n % 2) ? vals[n / 2] : (vals[n / 2 - 1] + vals[n / 2]) / 2;
-  const int64_t d = mine - med;
+  // MEAN, NOT MEDIAN -- see render_group_delta_us(). vals are already relative to our own phase,
+  // so the group average is at robust_mean() and our delta from it is the negation.
+  const int64_t d = -static_cast<int64_t>(llround(robust_mean(vals, n, CONSENSUS_PHASE_SCALE_FLOOR_US)));
   this->render_group_delta_us_.store(
       static_cast<int32_t>(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, d))),
       std::memory_order_relaxed);
   this->group_delta_at_us_ = local_now_us;
 }
 
-void TsfSync::check_render_phase_(int64_t leader_phase_us, int64_t local_now_us) {
-  const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
-  if (leader_phase_us == RENDER_PHASE_UNKNOWN || mine == RENDER_PHASE_UNKNOWN) {
-    this->render_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
-    return;
+// GROUP-RELATIVE DIAGNOSTICS. Depth, crystal rate and render phase against the MEAN of the peers
+// that reported them, computed on our own beacon cadence rather than on somebody else's arrival.
+//
+// These used to be differenced against the leader, which made every one of them referenced to
+// whoever held the crown -- and the crown moved six times in seventeen minutes. Against the peer
+// mean they move only when a device actually moves. Peers only, self excluded: these answer "how
+// do I compare with everyone else", so including our own value in the reference would shrink
+// every delta by 1/N and make a two-device pair read half its true disagreement.
+//
+// Diagnostics only. Nothing here touches the mapping.
+void TsfSync::update_group_diagnostics_(int64_t local_now_us) {
+  double pipeline_sum = 0.0, crystal_sum = 0.0, phase_sum = 0.0;
+  size_t pipeline_n = 0, crystal_n = 0, phase_n = 0;
+  for (const Peer &p : this->peer_) {
+    if (!p.used || local_now_us - p.seen_us > PHASE_STALE_US) {
+      continue;
+    }
+    if (p.pipeline_us != PIPELINE_UNKNOWN) {
+      pipeline_sum += static_cast<double>(p.pipeline_us);
+      pipeline_n++;
+    }
+    if (!std::isnan(p.crystal_ppm)) {
+      crystal_sum += static_cast<double>(p.crystal_ppm);
+      crystal_n++;
+    }
+    if (p.phase_us != RENDER_PHASE_UNKNOWN && local_now_us - p.phase_seen_us <= PHASE_STALE_US) {
+      phase_sum += static_cast<double>(p.phase_us);
+      phase_n++;
+    }
   }
-  // On its own line, throttled, because this is the ONLY instrument that can see an absolute
-  // inter-device offset -- the sync median compares each device against its own prediction, so an
-  // offset moves prediction and audio together and reads as zero there -- and in the sync report
-  // it sits behind tsf=, which the 256-byte formatting ceiling truncates away exactly when the
-  // report is at its most detailed. Two followers of the same leader can be differenced directly:
-  // delta(b) - delta(a) is what a logic analyser between them should read.
-  if (local_now_us - this->last_render_log_us_ >= RENDER_LOG_INTERVAL_US) {
-    this->last_render_log_us_ = local_now_us;
-    // t= is esp_timer microseconds since boot, the same clock the snapclient diagnostics stamp
-    // with, so both components' series land on one axis, and the SPACING between points is the
-    // device's own rather than the host's.
-    //
-    // Honest accounting of what this buys: once the stamp existed it became possible to measure
-    // the host prefix against it, and the prefix turns out to be good -- p50 0 ms, p90 7.7 ms,
-    // p99 28 ms over 139 lines, i.e. under 3% of a 1 s interval. An earlier claim of "200 ms
-    // typical, up to 1 s" was wrong; it came from a single truncated and interleaved line, n=1.
-    // So this is cheap insurance and a self-check, not a fix for a measured problem -- and it is
-    // still the right field to place points by, because it cannot degrade under log congestion
-    // the way a receive timestamp can.
-    ESP_LOGD(TAG, "Render phase mine %+" PRId64 " leader %+" PRId64 " delta %+" PRId64 " us t=%" PRId64, mine,
-             leader_phase_us, mine - leader_phase_us, local_now_us);
-  }
-  // Clamped into int32 for reporting: a delta beyond +-2 s is not a playout offset, it is a
-  // device that has not settled, and saturating is more honest than wrapping.
-  const int64_t delta = mine - leader_phase_us;
-  this->render_delta_us_.store(static_cast<int32_t>(std::clamp<int64_t>(delta, -2000000, 2000000)),
-                               std::memory_order_relaxed);
-}
 
-void TsfSync::check_crystal_delta_(float leader_crystal_ppm, int64_t local_now_us) {
-  // Our clock against the radio timebase, minus the leader's. Both sides measure themselves
+  // Our clock against the radio timebase, minus the group's. Both sides measure themselves
   // against the SAME AP TSF, so the AP's own crystal cancels and what is left is the difference
-  // between the two devices' crystals -- a hardware property, measured entirely outside the
-  // audio servo loop.
+  // between the devices' crystals -- a hardware property, measured entirely outside the audio
+  // servo loop.
   //
   // This is the term that stands between the differential trim and a usable rate reference.
   // With a logic analyser the differential trim sits -5.25..-5.40 ppm from the true
@@ -743,33 +907,53 @@ void TsfSync::check_crystal_delta_(float leader_crystal_ppm, int64_t local_now_u
   // exactly this quantity: subtracting it took the integrated error from 505 us per 100 s to 17.
   // Published so a device can compute the correction without an analyser on the bench.
   //
-  // NaN either side means unknown, not zero: a leader that predates the field, or either device
-  // before its first measurement. Storing zero would read as "the crystals match", which is the
-  // one answer that is never true.
-  const float mine = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
-  if (std::isnan(mine) || std::isnan(leader_crystal_ppm)) {
+  // NaN means unknown, not zero: either side before its first measurement. Storing zero would
+  // read as "the crystals match", which is the one answer that is never true.
+  const float mine_crystal = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
+  if (crystal_n == 0 || std::isnan(mine_crystal)) {
     this->crystal_delta_ppm_.store(std::numeric_limits<float>::quiet_NaN(), std::memory_order_relaxed);
-    return;
+  } else {
+    const float group = static_cast<float>(crystal_sum / static_cast<double>(crystal_n));
+    this->crystal_delta_ppm_.store(mine_crystal - group, std::memory_order_relaxed);
+    // Throttled to the render-phase cadence: it moves only with temperature, so this is already
+    // far faster than the quantity changes. t= is esp_timer us, matching the other series lines.
+    if (local_now_us - this->last_crystal_log_us_ >= RENDER_LOG_INTERVAL_US) {
+      this->last_crystal_log_us_ = local_now_us;
+      ESP_LOGD(TAG, "Crystal: mine %+.3f group %+.3f delta %+.3f ppm t=%" PRId64, mine_crystal, group,
+               mine_crystal - group, local_now_us);
+    }
   }
-  const float delta = mine - leader_crystal_ppm;
-  this->crystal_delta_ppm_.store(delta, std::memory_order_relaxed);
-  // Throttled to the render-phase cadence: it moves only with temperature, so this is already
-  // far faster than the quantity changes. t= is esp_timer us, matching the other series lines.
-  if (local_now_us - this->last_crystal_log_us_ >= RENDER_LOG_INTERVAL_US) {
-    this->last_crystal_log_us_ = local_now_us;
-    ESP_LOGD(TAG, "Crystal: mine %+.3f leader %+.3f delta %+.3f ppm t=%" PRId64, mine, leader_crystal_ppm,
-             delta, local_now_us);
-  }
-}
 
-void TsfSync::check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t local_now_us) {
-  const int32_t mine = this->pipeline_us_.load(std::memory_order_relaxed);
-  if (leader_pipeline_us == PIPELINE_UNKNOWN || mine == INT32_MIN) {
+  // Render phase against the peer mean, logged on its own line and throttled, because this is the
+  // ONLY instrument that can see an absolute inter-device offset -- the sync median compares each
+  // device against its own prediction, so an offset moves prediction and audio together and reads
+  // as zero there -- and in the sync report it sits behind tsf=, which the 256-byte formatting
+  // ceiling truncates away exactly when the report is at its most detailed.
+  //
+  // NOT the value anything corrects on: this one is not pairing-window gated, so it may be
+  // differencing phases sampled seconds apart and measuring drift instead of skew. It is here to
+  // be plotted. render_group_delta_us(), which IS window-gated, is what acts.
+  const int64_t mine_phase = this->render_phase_us_.load(std::memory_order_relaxed);
+  if (phase_n > 0 && mine_phase != RENDER_PHASE_UNKNOWN &&
+      local_now_us - this->last_render_log_us_ >= RENDER_LOG_INTERVAL_US) {
+    this->last_render_log_us_ = local_now_us;
+    const double group = phase_sum / static_cast<double>(phase_n);
+    // t= is esp_timer microseconds since boot, the same clock the snapclient diagnostics stamp
+    // with, so both components' series land on one axis, and the SPACING between points is the
+    // device's own rather than the host's.
+    ESP_LOGD(TAG, "Render phase mine %+" PRId64 " group(%zu) delta %+" PRId64 " us t=%" PRId64, mine_phase,
+             phase_n, mine_phase - static_cast<int64_t>(llround(group)), local_now_us);
+  }
+
+  // Playout depth against the peer mean, with a sustained-divergence alarm.
+  const int32_t mine_pipeline = this->pipeline_us_.load(std::memory_order_relaxed);
+  if (pipeline_n == 0 || mine_pipeline == PIPELINE_UNKNOWN) {
     this->pipeline_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
     this->pipeline_diverged_since_us_ = 0;
     return;
   }
-  const int32_t delta = mine - leader_pipeline_us;
+  const int32_t group_pipeline = static_cast<int32_t>(llround(pipeline_sum / static_cast<double>(pipeline_n)));
+  const int32_t delta = mine_pipeline - group_pipeline;
   this->pipeline_delta_us_.store(delta, std::memory_order_relaxed);
 
   if (std::abs(delta) < PIPELINE_DIVERGE_US) {
@@ -791,32 +975,25 @@ void TsfSync::check_pipeline_divergence_(int32_t leader_pipeline_us, int64_t loc
   this->last_diverge_log_us_ = local_now_us;
   // WARN, not DEBUG: this is inaudible to every other metric we have. The sync
   // report will look perfect while this device plays |delta| ms out from the group.
-  ESP_LOGW(TAG, "Playout depth %+" PRId32 " us vs leader (%" PRId32 " vs %" PRId32 " us) for %.0f s: "
+  ESP_LOGW(TAG, "Playout depth %+" PRId32 " us vs group (%" PRId32 " vs %" PRId32 " us) for %.0f s: "
                 "audio is likely offset by about this much, sync reports notwithstanding",
-           delta, mine, leader_pipeline_us,
+           delta, mine_pipeline, group_pipeline,
            (local_now_us - this->pipeline_diverged_since_us_) / 1e6);
 }
 
 void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_hash) {
-  // A FOLLOWER'S PHASE REPORT. Deliberately NOT broadcast_(), which does three things a follower
-  // must not: it opens with sample_tsf_() -- a TSF sandwich read costing 45-81 us, budgeted in
-  // its own comment as "nothing at 3.3 s intervals"; it mutates tsf_rate_ppm_ and the rate
-  // reference, which another comment states is "measured on the network task and only while
-  // leading"; and it unicasts to every peer and learned peer on top of the multicast.
+  // FOR A DEVICE WITH NO ESTIMATE TO POOL -- its Kalman has not settled, so it has nothing to
+  // contribute to the consensus, but it does have a render phase worth publishing.
   //
-  // MEASURED COST OF IGNORING THAT: publishing follower beacons through broadcast_() degraded
-  // skew stability from sd 5.4 us to sd 81.6 us -- a factor of ~15 -- with the correction
-  // DISABLED, i.e. from the beacons alone. Controlled against a build with stream scoping and no
-  // follower beacons, which reproduced sd 5.24 us.
-  //
-  // So: no TSF read, no rate state touched, multicast only. Mapping fields stay zero because a
-  // receiver seeing role != 0 records the phase and returns before reading them.
+  // Deliberately NOT broadcast_(): no TSF sandwich read (45-81 us), no rate state touched,
+  // multicast only. Mapping fields stay zero because a receiver seeing no_mapping != 0 records
+  // the phase and returns before reading them.
   TsfPacket pkt = {};
   pkt.magic = TSF_MAGIC;
   pkt.version = TSF_VERSION;
   memcpy(pkt.bssid, this->bssid_, 6);
   memcpy(pkt.sender_mac, this->my_mac_, 6);
-  pkt.role = 1;
+  pkt.no_mapping = 1;
   pkt.server_id_hash = server_id_hash;
   pkt.stream_id_hash = stream_id_hash;
   pkt.pipeline_us = this->pipeline_us_.load(std::memory_order_relaxed);
@@ -830,6 +1007,21 @@ void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_
   sendto(this->sock_, &pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
 }
 
+// PUBLISH OUR OWN RAW ESTIMATE. Every device does this, once a second, unconditionally on having
+// a mature Kalman -- there is no role to qualify for.
+//
+// THE MEASURED HAZARD AND WHY IT DOES NOT APPLY. Making followers beacon through this function
+// once degraded skew stability from sd 5.4 us to sd 81.6 us, a factor of ~15, with the
+// correction disabled. Three costs were blamed at the time (the TSF sandwich read, mutating the
+// rate state, the unicast fan-out) but the mechanism was almost certainly the LAST LINE of the
+// old version of this function: it called adopt_() on what it had just sent. A follower running
+// it therefore overwrote the shared mapping with its own private line every second, so the
+// group stopped sharing a timebase at all -- which is a far better explanation of a 15x
+// degradation than a few hundred microseconds of radio time.
+//
+// That line is gone. Nothing here adopts; adoption happens exactly once, in update_consensus_(),
+// from the average. If sd does worsen after this change, this is the first place to look and the
+// beacon rate is the first thing to halve.
 void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
                          uint32_t stream_id_hash) {
   int64_t tsf_now, local_mid;
@@ -838,7 +1030,8 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   }
 
   // Track our own TSF-vs-esp_timer rate: the published drift must be in TSF units,
-  // and the AP-vs-our-crystal difference usually dominates the Kalman drift
+  // and the AP-vs-our-crystal difference usually dominates the Kalman drift.
+  // Every device measures its own now, which is what publishing a raw estimate requires.
   if (this->rate_ref_local_us_ == 0) {
     this->rate_ref_tsf_us_ = tsf_now;
     this->rate_ref_local_us_ = local_mid;
@@ -890,12 +1083,12 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   memcpy(pkt.sender_mac, this->my_mac_, 6);
   pkt.server_id_hash = server_id_hash;
   pkt.stream_id_hash = stream_id_hash;
-  pkt.role = (this->role_.load(std::memory_order_relaxed) == Role::LEADER) ? 0 : 1;
+  pkt.no_mapping = 0;
   pkt.tsf_base_us = tsf_now;
   pkt.tsf_minus_server_us = tms_pub;
   pkt.drift_ppm = drift_ppm;
-  // From the player task's mirror: offset_rate_ppm_ is measured there, in every role, and
-  // must not be read directly from this task.
+  // From the player task's mirror: offset_rate_ppm_ is measured there and must not be read
+  // directly from this task.
   pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
   {
     // Only the sentinel is out of range. The bound used to be INT16's, and the cast used to be to
@@ -934,8 +1127,11 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     sendto(this->sock_, &pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
   }
   this->last_tx_us_ = local_now_us;
-  // The leader plays from its own published mapping so everyone quantizes alike
-  this->adopt_(pkt.tsf_base_us, pkt.tsf_minus_server_us, pkt.drift_ppm, local_now_us);
+  // DELIBERATELY NO adopt_() HERE. What we just published is our own raw opinion; what we play to
+  // is the group's average of everyone's, and update_consensus_() is the only place that decides
+  // it. Adopting here would make this device play to its own line while claiming to be part of a
+  // consensus -- which is what the old leader did, correctly for a leader and catastrophically
+  // for everyone else (see the note above this function).
 }
 
 void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
@@ -945,12 +1141,6 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
     return;
   }
   this->last_service_us_ = local_now_us;
-  if (since_last_service > 3 * BEACON_INTERVAL_US && this->last_rx_us_ != 0) {
-    // Resuming after an idle gap (service only runs while a stream is active):
-    // beacons were legitimately absent, so give the known leader a fresh timeout
-    // window instead of seizing leadership before its first resumed beacon lands
-    this->last_rx_us_ = local_now_us;
-  }
 
   if (!this->have_mac_) {
     this->have_mac_ = esp_wifi_get_mac(WIFI_IF_STA, this->my_mac_) == ESP_OK;
@@ -982,98 +1172,36 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
 
   this->receive_(local_now_us, est, server_id_hash, stream_id_hash);
 
-  const bool healthy = this->playout_healthy_.load(std::memory_order_relaxed);
-  const Role role = this->role_.load(std::memory_order_relaxed);
-  if (role == Role::LEADER) {
-    if (!est.valid || !est.mature) {
-      // Never publish an unsettled estimate (e.g. after a reconnect restarts the
-      // time-sync burst): a mature peer takes over, or leadership resumes once
-      // our estimate settles
-      this->reset_("estimate not settled");
-      return;
-    }
-    // Step down if our own playout has been off the timebase for a while: the
-    // group should not follow a mapping published by the device that is itself
-    // out of sync. Brief excursions are tolerated (a leader recovering from a
-    // hiccup would otherwise hand off constantly).
-    if (healthy) {
-      this->unhealthy_since_us_ = 0;
-    } else if (this->deadline_implausible_.load(std::memory_order_relaxed)) {
-      // Not evidence of a leader-side fault, so hold the timer rather than clear or
-      // advance it: an implausible deadline hits the whole group at once (measured:
-      // every device saw the same 6.9 h stale deadline within 61 ms), and this leader
-      // stepping down took the group's only timebase with it. Stepping down also
-      // means reset_(), which is the same teardown used when the network changes --
-      // mapping invalidated, TSF rate estimate dropped, peers forgotten -- so the
-      // ex-leader spent ~6 s on the raw Kalman fallback with medians at +-1 ms and
-      // trim swinging +543/-486 ppm before it could settle as somebody's follower.
-    } else {
-      if (this->unhealthy_since_us_ == 0) {
-        this->unhealthy_since_us_ = local_now_us;
-      } else if (local_now_us - this->unhealthy_since_us_ >= LEADER_UNHEALTHY_US) {
-        this->demote_("own playout unsynced");
-        this->no_lead_until_us_ = local_now_us + LEAD_COOLDOWN_US;
-        return;
-      }
-    }
+  // PUBLISH, UNCONDITIONALLY AND SYMMETRICALLY. There is nothing to qualify for: a device with a
+  // settled estimate contributes it, a device without one still reports its render phase. No
+  // election, no silence timer, no health gate -- a device's own playout being unhealthy says
+  // nothing about the validity of its server<->TSF estimate, and gating publication on it is what
+  // produced six leadership changes in seventeen minutes.
+  //
+  // Maturity IS still a gate, for the one reason that survives leaderlessness: an unsettled
+  // Kalman converges in 100+ ms steps, and averaging those in would drag the group's mean.
+  if (est.valid && est.mature) {
     if (local_now_us - this->last_tx_us_ >= BEACON_INTERVAL_US) {
       this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
+      this->update_group_diagnostics_(local_now_us);
     }
-    return;
-  }
-
-  // FOLLOWERS PUBLISH THEIR PHASE, cheaply -- see broadcast_phase_only_() for why not through
-  // broadcast_(). Quarter of the leader's rate: this feeds a correction that steps every ~10 s,
-  // so it need not be fast, and every transmit is radio time the audio path competes for.
-  // Tracked on its own timer, because last_tx_us_ paces LEADERSHIP.
-  if (this->role_.load(std::memory_order_relaxed) == Role::FOLLOWER &&
-      this->render_phase_us_.load(std::memory_order_relaxed) != RENDER_PHASE_UNKNOWN &&
-      local_now_us - this->last_phase_tx_us_ >= 4 * BEACON_INTERVAL_US) {
+  } else if (this->render_phase_us_.load(std::memory_order_relaxed) != RENDER_PHASE_UNKNOWN &&
+             local_now_us - this->last_phase_tx_us_ >= 4 * BEACON_INTERVAL_US) {
+    // Nothing to pool yet, but a phase worth publishing. Quarter rate: it feeds a correction that
+    // steps every ~10 s, so it need not be fast, and every transmit is radio time the audio path
+    // competes for.
     this->last_phase_tx_us_ = local_now_us;
     this->broadcast_phase_only_(server_id_hash, stream_id_hash);
+    this->update_group_diagnostics_(local_now_us);
   }
 
-  // Takeover: silence beyond the timeout plus a per-MAC stagger (lower MACs move
-  // first, so the winner usually claims before anyone else's timer fires). Only a
-  // settled estimate may lead: a raw one converges in 100+ ms steps that would be
-  // broadcast as mapping snaps, dragging every follower through hard resyncs.
-  const int64_t stagger = static_cast<int64_t>(this->my_mac_[5] & 0x0F) * STAGGER_STEP_US;
-  const bool silence =
-      this->last_rx_us_ == 0 || (local_now_us - this->last_rx_us_) > LEADER_TIMEOUT_US + stagger;
-  // Only a device whose own playout has been tracking for a while may publish the
-  // group timebase, and not immediately after having stepped down
-  if (healthy) {
-    if (this->healthy_since_us_ == 0) {
-      this->healthy_since_us_ = local_now_us;
-    }
-  } else {
-    this->healthy_since_us_ = 0;
+  // Average everything live and slew the adopted mapping toward it. Runs on its own cadence
+  // rather than off a beacon arrival, so a device alone in the group still keeps its mapping
+  // fresh and a device losing packets still walks toward whatever it can still hear.
+  if (local_now_us - this->last_consensus_us_ >= CONSENSUS_INTERVAL_US) {
+    this->last_consensus_us_ = local_now_us;
+    this->update_consensus_(local_now_us);
   }
-  const bool eligible = est.valid && est.mature && this->healthy_since_us_ != 0 &&
-                        local_now_us - this->healthy_since_us_ >= LEAD_HEALTHY_MIN_US &&
-                        local_now_us >= this->no_lead_until_us_;
-  if (silence && eligible) {
-    ESP_LOGI(TAG, "Assuming TSF leadership");
-    // Continuity: if we were following, keep publishing the line the group is
-    // ALREADY playing to and let the slew walk it toward our own estimate. A new
-    // leader that anchored to its own fresh estimate stepped every follower's
-    // deadline, which resynced them, which made them unhealthy -- observed as
-    // leadership bouncing d->c->b->b->c->a in 50 s with re-locks throughout.
-    this->seed_published_from_mapping_();
-    this->role_.store(Role::LEADER, std::memory_order_relaxed);
-    this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
-  }
-}
-
-void TsfSync::seed_published_from_mapping_() {
-  this->mapping_mutex_.lock();
-  if (this->mapping_valid_) {
-    this->pub_valid_ = true;
-    this->pub_tsf_base_ = this->map_tsf_base_us_;
-    this->pub_tms_base_ = this->map_tsf_minus_server_us_;
-    this->pub_drift_ppm_ = this->map_drift_ppm_;
-  }
-  this->mapping_mutex_.unlock();
 }
 
 void TsfSync::set_peers(std::vector<uint32_t> peer_addrs) {
@@ -1137,7 +1265,7 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   // Filtering costs almost no lag because the quantity is already drift-compensated: the
   // published mapping carries drift_ppm and evaluate_mapping_ extrapolates with it, so what
   // remains should be near-constant and any real movement is ppm-scale. Reset on a new mapping
-  // so a leader change or re-anchor steps through immediately instead of being smeared.
+  // so a re-anchor steps through immediately instead of being smeared.
   // Track this device's bracket floor over a bounded block, so the trust threshold below
   // is derived from reads that actually happened rather than assumed. The block bound lets
   // the floor rise if the device becomes genuinely busier instead of latching a lucky
@@ -1162,7 +1290,7 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   // tracker was not: the rate here is NOT estimated from the filter's own residuals -- there is
   // no feedback path, so no way for a rate error to be amplified by the loop it drives -- and it
   // is a pure hardware ratio between two oscillators, which is why it can be averaged over
-  // minutes. A leader change, a mapping re-anchor or a slew cannot corrupt it, because none of
+  // minutes. A mapping re-anchor or a slew cannot corrupt it, because neither of
   // those touch either clock. The residual is the rate ERROR times tau: sub-0.5 ppm gives ~3 us.
   //
   // Only trusted sandwiches are used as endpoints, for the same reason they are the only reads
@@ -1205,7 +1333,7 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   //   d(raw)/d(local) = d(tsf - local)/dt - d(tsf - server)/dt
   //
   // the first term measured above, the second read straight off the mapping (no differencing, so
-  // no step sensitivity). What is deliberately NOT predicted is the leader's slew of tms_base --
+  // no step sensitivity). What is deliberately NOT predicted is the adoption slew of tms_base --
   // up to TMS_SLEW_MAX_US_PER_S, and not knowable from the mapping alone -- so the filter still
   // lags that. That lag is shared: the slew is identical on every device and the lags differ only
   // by the crystal ratio, so it stays common-mode, which is the property that matters.
@@ -1219,11 +1347,13 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   // Snap on a genuine step, filter otherwise. NOT keyed on adopt_: that runs once per
   // beacon, so re-anchoring there would reset the filter every second and filter nothing.
   // Consecutive mappings differ by at most the slew rate times the interval, so anything
-  // this large is a leader change or a re-anchor, not slew and not read noise.
+  // this large is a genuine re-anchor, not slew and not read noise.
   //
   // "Not valid" is NOT the same as "nothing to carry over". The filter is invalidated whenever the
-  // mapping is momentarily unavailable -- expired, or a failed evaluation -- which happens around a
-  // leadership handover. Snapping then discards a filter that was perfectly good and jumps to raw by
+  // mapping is momentarily unavailable -- expired, or a failed evaluation. Under leader election
+  // that happened at every handover; leaderless it happens on a beacon outage or a TSF read
+  // failure, which is rarer but not rare. Snapping then discards a filter that was perfectly good
+  // and jumps to raw by
   // whatever LAG it had accumulated, and that lag is drift * tau: at the measured -50 ppm and a
   // 6.7 s constant it is ~340 us. So a routine handover between devices that already agreed
   // produced a ~500 us step in one device's deadline, landing entirely on the wire as differential
@@ -1266,9 +1396,9 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   // POSITION -- a rate error only shows up multiplied by tau, it cannot integrate.
   //
   // Carrying the filter across an invalidation is kept, and is separate from the above: the filter
-  // is invalidated whenever the mapping is momentarily unavailable, which happens around a
-  // leadership handover, and snapping then discarded a good filter and jumped to raw by its whole
-  // accumulated lag -- measured as tbjit 525 us and a ~500 us wire excursion at a handover.
+  // is invalidated whenever the mapping is momentarily unavailable, and snapping then discarded a
+  // good filter and jumped to raw by its whole accumulated lag -- measured as tbjit 525 us and a
+  // ~500 us wire excursion at what was then a leadership handover.
   // seeded_ is "have we ever had a value" and is never cleared, so only a genuine re-anchor beyond
   // OFFSET_SNAP_US still snaps.
   if (!this->offset_filter_seeded_ ||
