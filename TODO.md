@@ -38,8 +38,27 @@ adopted mapping is slewed rather than stepped, and `Role`/takeover/`last_rx_us_`
 `LEAD_COOLDOWN_US`/`always_healthy`/`set_playout_healthy` are deleted. `render_delta_us()`
 (leader-relative) is gone; depth and crystal deltas are against the peer mean.
 
+**RESOLVED (2026-08-28): removing the adoption slew recovered the sd. Final numbers first.**
+
+    build                          devices   median      sd     MAD    notes
+    leader-based (old baseline)       2       +4.5 us    3.6      -    six handovers / 17 min
+    leaderless, SLEWED adoption       3       +0.47     8.06    4.03   0 re-anchors
+    leaderless, SLEWED adoption       3       -1.79     9.50    5.48   reproduces
+    leaderless, SLEWED adoption       2      -25.39     9.72    6.19   group size NOT the cause
+    leaderless, DETERMINISTIC         3       -3.75     4.32    2.19   0 steps reported
+
+sd 9.50 -> 4.32 by deleting the slew: within 20% of the leader baseline, with THREE devices where
+the baseline had two, and with zero churn. See `75c01f4` and the note at `update_consensus_()`.
+The 20% that remains is unattributed -- candidates are the third device, the beacon rate (every
+device now publishes every second where only the leader did), and transient set-disagreement from
+lost beacons.
+
+The history below is kept because the wrong turn is the instructive part: the slew was step 4 of
+the plan, the plan predicted "if sd worsens, step 3 or 4 is wrong", and it took a two-device
+control to rule out the group-size explanation before the slew became the obvious suspect.
+
 FIRST MEASUREMENT (2026-08-28, one clean 4-minute window, correction OFF, preflight verified,
-n=10726). **Fails the sd bar; the churn goal is met outright.**
+n=10726). **Failed the sd bar; the churn goal met outright.**
 
     era                              median      sd     MAD    notes
     best sustained, leader-based      +4.5 µs    3.6      -     two-device group

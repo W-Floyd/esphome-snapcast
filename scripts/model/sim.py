@@ -300,7 +300,18 @@ class Device:
         played_reported = self.played_int + self.p.accounting_bias_frames
         render_tsf = self.played_ts + (tsf - tsf_local)
         render_server = s_ts - (self.pushed - played_reported) * P.FRAME_US
-        return render_tsf - render_server
+        phase = render_tsf - render_server
+        # HYPOTHESIS KNOBS, both zero by default, for experiments/inversion.py. The bench
+        # reads r = -0.92..-0.96 between this instrument's differential and the wire's, at
+        # comparable amplitude, and no term above can produce that: the arithmetic gives +1.
+        # phase_error_gain injects an error PROPORTIONAL TO THIS DEVICE'S OWN DISPLACEMENT,
+        # which is the only shape that can turn +1 into -1 (it takes g = -2), and
+        # phase_error_sd injects an independent one, which cannot (it takes r toward 0).
+        if self.p.phase_error_gain:
+            phase += self.p.phase_error_gain * self.truth_us(s)
+        if self.p.phase_error_sd:
+            phase += self.rng.normal(0.0, self.p.phase_error_sd)
+        return phase
 
 
 class Sim:

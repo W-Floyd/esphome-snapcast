@@ -35,8 +35,16 @@ Consensus averaging is also better, not merely simpler:
    back is positive feedback that lets the whole group drift together while every device agrees.
    This is the one failure mode that would look healthy from inside.
 
-4. **Rate-limit the adopted mapping.** A device joining or leaving moves the mean for everyone. A
-   stepped timebase IS a hard resync, which is the thing being avoided. Slew, do not step.
+4. ~~**Rate-limit the adopted mapping.** A device joining or leaving moves the mean for everyone.
+   A stepped timebase IS a hard resync, which is the thing being avoided. Slew, do not step.~~
+   **WRONG, AND MEASURED WRONG (2026-08-28): the slew cost 2.7x on sd.** The adopted mapping must
+   be a DETERMINISTIC function of the live estimate set, with no per-device history. What a leader
+   got right is that every device computed deadlines from ONE IDENTICAL line, so the mapping's own
+   error was exactly common-mode and cancelled between devices; any per-device path to the same
+   target destroys that. Stepping is safe precisely BECAUSE it is deterministic -- every device
+   holding the same set steps to the same value at once, and a common-mode step is inaudible,
+   which is the same argument this plan makes for group-wide drift. The danger was never the step;
+   it was the path-dependence. Removing the slew took sd 9.50 -> 4.32.
 
 5. **Delete the election machinery** once (1)-(4) hold: `Role`, takeover, `last_rx_us_`,
    `LEAD_COOLDOWN_US`, `always_healthy`, and the leader-relative diagnostics that referenced it.
@@ -57,6 +65,10 @@ Against the logic analyser, correction disabled, matched windows:
 
 Success is NOT a better median — it is the same or better sd with the churn gone. If sd worsens,
 the mean is being moved by membership or by a feedback path, and step 3 or 4 is wrong.
+
+    RESULT: sd worsened to 9.50, and step 4 was wrong — see step 4. After removing the slew:
+    median -3.75 us, sd 4.32, MAD 2.19, zero churn, three devices. This criterion did its job.
+    It named the two suspects before the measurement existed, and one of them was it.
 
 ## Risks
 

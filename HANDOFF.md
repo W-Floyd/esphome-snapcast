@@ -67,6 +67,14 @@ phase-only follower beacons (sd 81.6 → 4.62), CPU1 pinning (sd 6.24 → 3.58).
 understood reason: median-of-three is discontinuous — measured hopping ±96 µs while the
 underlying data sat at ±12. Fix is to average for small groups.
 
+**LEADERLESS IS IMPLEMENTED, FLASHED AND MEASURED (2026-08-28): median -3.75 us, sd 4.32,
+MAD 2.19, three devices, zero churn.** Against the old leader-based best of median +4.5 / sd 3.6
+on a TWO-device group. The one wrong turn was step 4 of the plan: a slew on the adopted mapping
+made it path-dependent, which destroyed the exact common-mode cancellation a single published line
+gave for free, and cost 2.7x on sd (9.72) until it was deleted. `TODO.md` has the full table.
+
+Older note, kept for the sequence:
+
 **`PLAN-leaderless.md` IS IMPLEMENTED AND UNFLASHED (2026-08-28).** Consensus averaging replaced
 the leader: every device beacons its own raw server↔TSF line, everyone adopts the robustly
 weighted mean, nobody publishes the consensus back, and the adopted mapping slews rather than

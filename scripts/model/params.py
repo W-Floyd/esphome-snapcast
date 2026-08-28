@@ -153,6 +153,9 @@ class DeviceParams:
     # feed-forwards with this rate, so the filter's standing lag is tau * this error, and
     # tau is 6.7 s -- 0.2 ppm of rate error is 1.3 us of standing displacement.
     offset_rate_err_ppm: float = 0.2
+    # Instrument-fault knobs (experiments/inversion.py). See render_phase_us().
+    phase_error_gain: float = 0.0
+    phase_error_sd: float = 0.0
     feedback_interval_us: float = FEEDBACK_INTERVAL_US
 
 
