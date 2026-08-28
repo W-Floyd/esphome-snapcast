@@ -711,6 +711,21 @@ static constexpr int64_t UNMUTE_ANCHOR_MAX_WAIT_US = 15000000;
 // DRIFT_REPAIR_HOLD_US to fire, which is the price of not swamping the measurement.
 static constexpr double SPLIT_RAMP_US_PER_S = 100.0;
 
+#if defined(CLOCK_SYNC_TSF_ACTIVE) && defined(USE_SNAPCLIENT_TIMING_DIAG)
+/// @brief Renders a render-phase value for a log line, printing the UNKNOWN sentinel as a word.
+///
+/// RENDER_PHASE_UNKNOWN is INT64_MIN. Printed as a number it reads as a measurement, and anything
+/// that then differences it against a real phase gets 2^63 of overflow that looks like a finding --
+/// which is exactly what happened while grading this signal on 2026-08-28.
+static void format_render_phase_(char *buf, size_t len, int64_t phase_us) {
+  if (phase_us == TsfSync::RENDER_PHASE_UNKNOWN) {
+    snprintf(buf, len, "unknown");
+  } else {
+    snprintf(buf, len, "%" PRId64, phase_us);
+  }
+}
+#endif  // CLOCK_SYNC_TSF_ACTIVE && USE_SNAPCLIENT_TIMING_DIAG
+
 static constexpr uint32_t RESYNC_STORM_COUNT = 8;
 static constexpr int64_t RESYNC_STORM_WINDOW_US = 2000000;
 
@@ -4305,11 +4320,22 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           this->playout_mutex_.unlock();
 
           // A tagged observation older than this describes a pipeline state that has since changed.
-          // Generous against the ~10 ms arrival cadence: anything approaching a second means tagged
-          // audio stopped flowing, which is a reason to publish nothing rather than to publish stale.
-          constexpr int64_t RENDER_TAG_MAX_AGE_US = 1000000;
+          //
+          // TEN DESCRIPTORS, not a second. Tagged renders arrive at the DMA cadence -- one per 441
+          // frames, ~10 ms -- for as long as tagged audio is reaching the DAC at all, so a reading
+          // even a tenth of a second old does not mean "slightly stale", it means tagged audio
+          // STOPPED. Measured on hardware 2026-08-28 during a pipeline disruption: at age 3.26 s the
+          // original one-second gate correctly refused, but at age 0.42 s it passed an observation
+          // that was wrong by 1.6 ms, in a report where only 13 tagged renders had arrived against a
+          // normal 335. Both of those publish nothing at this bound.
+          //
+          // Symmetric because the age can legitimately go slightly negative: the speaker callback may
+          // land between the TSF sandwich and this read. A LARGE negative age is not that, it is a
+          // timestamp from somewhere else, and is refused the same way.
+          constexpr int64_t RENDER_TAG_MAX_AGE_US = 100000;
+          const int64_t tag_age_us = phase_local - tr.adjusted_ts_us;
           const bool tag_fresh = tr.adjusted_ts_us > 0 && tr.sample_rate > 0 &&
-                                 (phase_local - tr.adjusted_ts_us) < RENDER_TAG_MAX_AGE_US;
+                                 tag_age_us < RENDER_TAG_MAX_AGE_US && tag_age_us > -RENDER_TAG_MAX_AGE_US;
 
           // MEASURED render phase. The descriptor's real audio finished at tr.adjusted_ts_us, so its
           // FIRST real frame -- the one the tag names -- rendered tr.frames earlier; the tag says what
@@ -4358,11 +4384,23 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // wire -- so log both phases and the tagged-render rate side by side and take the ratio
           // offline against an injected displacement. tags=0 means no tagged audio reached the DAC in
           // this window, which is a configuration answer (resampler, mixer blending), not a fault.
+          //
+          // RENDER_PHASE_UNKNOWN prints as `unknown`, never as its INT64_MIN value. Printing the
+          // sentinel as a number invites whatever reads this log to subtract it from something, and
+          // 2^63 of overflow then looks like a measurement: it cost a wrong diagnosis here before the
+          // line was changed.
+          char measured_str[24], inferred_str[24], age_str[24];
+          format_render_phase_(measured_str, sizeof(measured_str), measured_phase);
+          format_render_phase_(inferred_str, sizeof(inferred_str), inferred_phase);
+          if (tr.adjusted_ts_us > 0) {
+            snprintf(age_str, sizeof(age_str), "%" PRId64, tag_age_us);
+          } else {
+            snprintf(age_str, sizeof(age_str), "none");
+          }
           ESP_LOGD(TAG,
-                   "RENDERTAG measured=%" PRId64 " inferred=%" PRId64 " tags=%" PRIu32 " age=%" PRId64
-                   " frames=%" PRIu32 " off=%" PRIu32 " sup=%d",
-                   measured_phase, inferred_phase, tr_count,
-                   tr.adjusted_ts_us > 0 ? phase_local - tr.adjusted_ts_us : -1, tr.frames, tr.offset_frames,
+                   "RENDERTAG measured=%s inferred=%s tags=%" PRIu32 " age=%s frames=%" PRIu32 " off=%" PRIu32
+                   " sup=%d",
+                   measured_str, inferred_str, tr_count, age_str, tr.frames, tr.offset_frames,
                    this->audio_listener_ != nullptr && this->audio_listener_->on_supports_render_tags() ? 1 : 0);
 #else
           (void) tr_count;

@@ -136,10 +136,12 @@ if sd worsens.
 `TODO.md` carries the full record, including retractions. Two findings were reported and later
 overturned; both are struck through rather than deleted, because how they happened is useful.
 
-## `render_align`'s replacement signal — IMPLEMENTED, COMPILED, UNFLASHED, UNMEASURED (2026-08-28)
+## `render_align`'s replacement signal — IMPLEMENTED, FLASHED, GRADED, PASSES (2026-08-28)
 
-`PLAN-render-align-signal.md` is built. Both firmwares compile; **nothing has been measured, and
-`render_align_max` stays 0ms** until the ratio test below passes.
+`PLAN-render-align-signal.md` is built, on all five boards, and **it passes its ratio test: 0.94
+against a logic-analyser truth, where the signal it replaces reads 0.12.** `render_align_max` still
+stays 0ms -- passing the ratio test proves the signal SEES a displacement, which is not the same as
+being quiet enough to steer with. See "What is still open" at the end of this section.
 
 What it does: the client attaches an identity to the audio it hands down -- `(server_ts, frame
 offset into that chunk)` -- and the i2s sink hands that identity back when THAT audio renders,
@@ -162,16 +164,63 @@ Where it lives:
 | esphome fork | `speaker_source`, `media_source` | pass-through both ways |
 | this repo | `snapclient/snapcast_client.cpp` | tags every `push_chunk_` write, consumes `notify_audio_played_tagged` |
 
-**HOW TO GRADE IT — one test, and no downstream number means anything until it passes.**
+**THE GRADING RUN (2026-08-28 12:16, A perturbed, B untouched as control).**
 
-    inject_split(+1000) on ONE board, ramped, and read `RENDERTAG` in that board's log:
-      measured= should move ~1000        <- pass
-      inferred= will move ~3             <- the old signal, logged alongside for exactly this comparison
+`inject_split(+1000)` ramped onto A at 100 us/s, wire truth from the analyser:
 
-Both phases are on one line, so this is a single run on one firmware, not a two-firmware comparison.
-Remember `inject_split(0)` is not a restore -- reverse with `inject_split(-1000)`.
+    wire displacement of A (truth)     +1084 us
+    on-device gap change (measured)    -1020 us, sd 0.6, n=21   ->  RATIO 0.94   PASS
+    same statistic on B (control)             0 us             ->  flat, as it must be
 
-Secondary check: the resync-residual ratio should move from 0.13 toward 1.0.
+The statistic that matters is the WITHIN-BOARD gap `measured - inferred`, because it cancels every
+common-mode term -- group drift, board wander, TSF consensus motion -- and isolates exactly the one
+thing the two estimators disagree about. The gap also tracked the injection's own 100 us/s ramp
+(-578 us mid-ramp at +12 s), which is what makes it causation rather than coincidence.
+
+The differential-against-control form of the same test gave 1.14 / 0.12, but its pre-window
+straddled a reconnect on A, so prefer the gap statistic. `inject_split(0)` IS NOT A RESTORE --
+reverse with the negated value, and expect ~1 frame (22.7 us) of quantisation residual, which shows
+up as `split +22` on the board afterwards.
+
+To repeat it: ramp `inject_split(+1000)` on one board, read `measured=` and `inferred=` off the
+`RENDERTAG` line. Both are on one line, so it is one run on one firmware, not a two-firmware
+comparison.
+
+Secondary check, NOT YET DONE: the resync-residual ratio should move from 0.13 toward 1.0.
+
+**WHAT IS STILL OPEN — read this before enabling `render_align`.**
+
+Passing the ratio test proves the signal SEES a displacement. It does not prove it is quiet enough
+to steer with, and on today's evidence it is not. Quiet-bench group delta, 2026-08-28 12:52-13:05,
+five-device TSF consensus:
+
+    excluding outliers   A  n=50  median  +4  MAD 20  sd 87.5  p2p 461
+                         B  n=50  median +12  MAD 23  sd 82.3  p2p 383
+    including them       33 of 83 samples per board -- ONE 36-second group-wide burst
+
+MAD 20-23 us is better than the 32-34 measured in an outage aftermath, but it is still inside the
+band that disqualified `RECON drift` in the plan, the tails are heavy, and 40% of samples sat in the
+MILLISECONDS during one burst. That burst is common-mode across boards and coincides with the
+five-device consensus re-forming, so **a device re-locking drags the group median** -- which is the
+thing to understand before anything steers on this.
+
+**What a real disruption showed (13:00:15, unprovoked, caught in the quiet-bench window).**
+
+This is the useful half of that burst, because it is the case the signal exists for:
+
+    time      measured   inferred    age     tags   what happened
+    13:00:17  UNKNOWN    -...424363  3.26 s  168    gate fired; INFERRED returned a confident
+                                                    wrong number ~2 ms out in the same report
+    13:00:19  -...837659 -...086550  0.42 s   13    gate PASSED a stale reading, wrong by 1.6 ms
+    13:00:21  -...378754 -...386101  3 ms    206    fresh; both ~40 ms out -- a REAL excursion
+
+So `measured` never fabricated: where it had nothing trustworthy it published
+RENDER_PHASE_UNKNOWN while the old signal published a plausible wrong number. That is the intended
+difference between the two, observed in the wild rather than argued.
+
+It also found the freshness gate was too loose at 1 s, since fixed to 100 ms (ten DMA descriptors --
+tagged renders arrive every ~10 ms while tagged audio flows at all, so 0.42 s does not mean "a bit
+stale", it means STOPPED). Both bad samples above publish nothing at the new bound.
 
 Things to know before debugging it:
 
