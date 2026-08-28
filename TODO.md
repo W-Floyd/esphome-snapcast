@@ -133,7 +133,37 @@ untouched on Spotify; `scratchpad/group-orig.json` restores the original groupin
 on music the analyser cannot resolve this at all. `timing_diagnostics: true` is still set in
 `example/snapclient-base.yaml`.
 
-**CORRECTION TO THE BELOW: THE DESTABILISER IS FOLLOWER BEACONING, NOT THE CORRECTION.**
+**FOLLOWER BEACONING FIXED; THE REMAINING BLOCKER IS THAT `render_group_delta_us` IS WRONG.**
+Sending follower phase reports through `broadcast_()` was the destabiliser — it does a 45-81 µs
+TSF sandwich read, mutates leader-only rate state, and unicasts to every peer. Replaced with
+`broadcast_phase_only_()` (no TSF read, no rate state, multicast only, quarter rate), `a0f624c`:
+
+    control, no follower beacons        sd  5.24 µs
+    follower beacons via broadcast_()   sd 81.6 µs
+    follower beacons, phase-only        sd  4.62 µs   <- fixed
+
+With that fixed, the correction was measured on a stable base for the first time and is NOT
+harmful — settled, it is BETTER than off:
+
+    correction OFF, phase-only beacons  sd 4.62 µs
+    correction ON,  settled             sd 1.84 µs   (median +107)
+
+But it does NOT null the offset: it crawled 126 → 105 µs at 0.08 µs/s and stalled. The reason
+is that THE SIGNAL IS WRONG. `render_group_delta_us` compared against the analyser:
+
+    A group   skew B-A   predicted (-2 x group)
+      +48      +109.5      -96      <- sign INVERTED
+      +49      +106.3      -98
+      +20      +113.3      -40
+     -266      +106.2     +532      <- jumped 286 µs in 10 s while true skew moved 20
+
+So it is sign-inverted AND it steps hundreds of µs while reality holds still — most likely a
+phase re-seed on one side entering the median, since `record_peer_phase_` accepts entries up to
+PHASE_STALE_US (15 s) old and does not notice a counter reset. Fix the signal before touching
+the controller again; the gain, deadband and rate are all fine and were tuned against measured
+loop dynamics.
+
+**~~CORRECTION TO THE BELOW: THE DESTABILISER IS FOLLOWER BEACONING, NOT THE CORRECTION.~~**
 `render_align_max: 0ms` gates only the CORRECTION; follower beaconing runs regardless. So the
 "OFF" arm below was not the same firmware as the original baseline, and every number in that
 table is confounded. Controlled properly by flashing `3c4356c` (stream scoping, NO follower
