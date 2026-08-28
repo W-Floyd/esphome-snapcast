@@ -124,7 +124,20 @@ class TsfSync {
   /// @brief Publish this device's RENDER PHASE: the TSF instant at which it renders server
   /// audio time zero. See TsfPacket::render_phase_us for the derivation. Pass
   /// RENDER_PHASE_UNKNOWN before anything has rendered.
-  void set_render_phase_us(int64_t phase_us) { this->render_phase_us_.store(phase_us, std::memory_order_relaxed); }
+  /// @param at_us local time the phase describes. REQUIRED for the group median: the phase is an
+  ///        absolute TSF-vs-server offset that drifts continuously, so differencing a fresh peer
+  ///        phase against a stale local one injects (drift x staleness) of pure error. This is
+  ///        written once per sync report (~3.3 s) while peer beacons arrive up to 4x faster, and
+  ///        at ~50 ppm relative drift 3.3 s of staleness is ~165 us -- which is the entire signal.
+  ///        Same lesson as AudioDepth::as_of_us: evaluate the comparison AT the instant, not at
+  ///        read time.
+  void set_render_phase_us(int64_t phase_us, int64_t at_us = 0) {
+    this->render_phase_us_.store(phase_us, std::memory_order_relaxed);
+    this->render_phase_at_us_.store(at_us, std::memory_order_relaxed);
+    if (at_us != 0) {
+      this->recompute_group_delta_(at_us);
+    }
+  }
   /// @brief This device's render phase minus the leader's, us; INT32_MIN when either side has
   /// not published one. THE true relative playout offset: two devices playing the same stream
   /// must map a given server frame to the same TSF instant, so a non-zero difference is real
@@ -236,6 +249,8 @@ class TsfSync {
   std::atomic<int32_t> pipeline_us_{INT32_MIN};
   std::atomic<int32_t> pipeline_delta_us_{INT32_MIN};
   std::atomic<int64_t> render_phase_us_{INT64_MIN};
+  /// Local time render_phase_us_ describes; 0 when unknown. See set_render_phase_us().
+  std::atomic<int64_t> render_phase_at_us_{0};
   std::atomic<int32_t> render_delta_us_{INT32_MIN};
   int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance
   int64_t last_diverge_log_us_{0};
@@ -259,6 +274,11 @@ class TsfSync {
   static constexpr size_t MAX_PHASE_PEERS = 8;
   /// A phase older than this says nothing about where that device is now.
   static constexpr int64_t PHASE_STALE_US = 15000000;
+  /// How far apart two phases may have been sampled and still be worth differencing. They are
+  /// absolute offsets drifting at ~50 ppm between devices, so the pairing error is
+  /// window x drift: 300 ms bounds it at ~15 us, against a signal of order 100 us. Anything
+  /// wider and the comparison measures drift rather than skew -- which is what it was doing.
+  static constexpr int64_t PHASE_PAIR_WINDOW_US = 300000;
   struct PeerPhase {
     uint8_t mac[6];
     int64_t phase_us;

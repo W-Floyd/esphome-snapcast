@@ -644,15 +644,31 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
     this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
     return;
   }
+  // PAIR ONLY PHASES SAMPLED AT ROUGHLY THE SAME INSTANT. These are absolute TSF-vs-server
+  // offsets that drift continuously, so differencing a fresh peer phase against a stale local one
+  // measures drift, not skew. Our phase is written once per sync report (~3.3 s) while beacons
+  // arrive up to 4x faster; at ~50 ppm relative drift that mismatch is ~165 us of pure error,
+  // which is the whole signal. Observed directly once the observer logged the inputs: `group`
+  // disagreed with -d/2 by hundreds of us on the same line.
+  const int64_t mine_at = this->render_phase_at_us_.load(std::memory_order_relaxed);
+  if (mine_at == 0) {
+    this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
+    return;
+  }
   // Our own phase is IN the group. With two devices that makes the median their mean, so each
   // corrects half the gap and they meet in the middle rather than one chasing the other.
   int64_t vals[MAX_PHASE_PEERS + 1];
   size_t n = 0;
   vals[n++] = mine;
   for (size_t i = 0; i < MAX_PHASE_PEERS && n < MAX_PHASE_PEERS + 1; i++) {
-    if (this->peer_phase_[i].used && local_now_us - this->peer_phase_[i].seen_us <= PHASE_STALE_US) {
-      vals[n++] = this->peer_phase_[i].phase_us;
+    if (!this->peer_phase_[i].used || local_now_us - this->peer_phase_[i].seen_us > PHASE_STALE_US) {
+      continue;
     }
+    const int64_t pair_gap = this->peer_phase_[i].seen_us - mine_at;
+    if (pair_gap > PHASE_PAIR_WINDOW_US || pair_gap < -PHASE_PAIR_WINDOW_US) {
+      continue;  // sampled too far apart to difference; wait for a fresher pairing
+    }
+    vals[n++] = this->peer_phase_[i].phase_us;
   }
   if (n < 2) {
     this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);

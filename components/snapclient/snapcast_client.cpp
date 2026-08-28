@@ -4217,7 +4217,9 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int64_t render_tsf = p_played_ts + (phase_tsf - phase_local);
             const int64_t render_server = rec.server_ts_us - (p_pushed - p_played) * 1000000 /
                                                                  static_cast<int64_t>(rec.params.sample_rate);
-            this->tsf_sync_->set_render_phase_us(render_tsf - render_server);
+            // phase_local is the local instant of the TSF sandwich this phase was built from --
+            // pass it so the group median only differences phases sampled close together.
+            this->tsf_sync_->set_render_phase_us(render_tsf - render_server, phase_local);
           } else {
             this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
           }
