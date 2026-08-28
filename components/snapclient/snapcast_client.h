@@ -241,6 +241,27 @@ class SnapcastAudioListener {
   /// their current values -- see accounted_at_() and the drift column.
   /// @return false when unavailable -- distinct from a reported zero.
   virtual bool on_query_audio(audio::AudioDepth & /*depth*/) { return false; }
+
+  /// @brief Attach an identity to the audio the NEXT on_audio_write() hands over, so the sink can say
+  /// when THAT audio rendered rather than merely how much did.
+  ///
+  /// This is what makes render phase an observation instead of an inference. The inferred form,
+  ///   (played_ts + tsf_offset) - (chunk_ts - (pushed - played)/rate),
+  /// consumes our own frame ledger, and a device cannot detect that its own counter is biased by
+  /// consulting that counter: once the servo repairs a ledger bias, the bias and the audio
+  /// displacement it caused are equal and opposite inside that subtraction and cancel exactly.
+  /// Measured 2026-08-28 against a known displacement -- inject_split(+1000 us) moved it by 0.003 of
+  /// the truth, a re-baseline residual by 0.13, while an externally planted latency step moved it by
+  /// 1.000. No gain or filter setting fixes an identity problem with arithmetic on quantities.
+  ///
+  /// @param tag Identity of the first frame of the next payload. See audio::RenderTag.
+  virtual void on_set_render_tag(const audio::RenderTag & /*tag*/) {}
+
+  /// @brief Whether tags actually survive to the DAC and come back. False through a resampler, and
+  /// false while a mixer is blending a second source, both of which change or destroy the identity.
+  /// Changes at runtime -- an announcement starting is exactly such a change -- so it must be read
+  /// each time, never cached.
+  virtual bool on_supports_render_tags() const { return false; }
 };
 
 /// @brief Native Snapcast client core.
@@ -337,6 +358,17 @@ class SnapcastClient {
   /// @brief Feed DAC-write feedback from the speaker's audio output callback.
   /// THREAD CONTEXT: speaker task; internally synchronized.
   void notify_audio_played(uint32_t frames, int64_t timestamp_us);
+
+  /// @brief Feed a TAGGED render: audio we identified on the way down, handed back with the instant
+  /// it rendered. Fires alongside notify_audio_played(), never instead of it, and only for audio
+  /// whose identity survived the whole path -- so it is silent through a resampler, while a mixer is
+  /// blending an announcement, and for the silence and splices we insert ourselves.
+  ///
+  /// This is the ONLY input from which render phase can be measured rather than inferred. See
+  /// SnapcastAudioListener::on_set_render_tag() for why the inferred form cannot work.
+  ///
+  /// THREAD CONTEXT: speaker task; internally synchronized.
+  void notify_audio_played_tagged(uint32_t frames, int64_t adjusted_ts, const audio::RenderTag &tag);
 
   /// @brief TEST HOOK: stop handing audio downstream for `ms`, so the pipeline drains and starves
   /// exactly as it does under an upstream stall.
@@ -1092,6 +1124,33 @@ class SnapcastClient {
   // Set by the feedback clamp when the pipeline fully drains (source starvation);
   // consumed by the player task, which re-baselines playout from scratch. The latch
   // (playout_mutex_) fires it once per drain, not per zero-clamped callback.
+  /// @brief The most recent CAPTURED render observation: a descriptor's real audio, the instant it
+  /// finished rendering, and the identity of its first real frame.
+  ///
+  /// Held under playout_mutex_ with the ledger it exists to replace, so the report path can take both
+  /// in one lock and never mix an observation with counters from a different instant.
+  struct TaggedRender {
+    /// Local (esp_timer) time the descriptor's real audio FINISHED. 0 until the first observation.
+    int64_t adjusted_ts_us{0};
+    /// Real frames in that descriptor, i.e. how far back its FIRST real frame was.
+    uint32_t frames{0};
+    /// Server audio time of the frame the tag names, already advanced to the descriptor's first frame.
+    int64_t server_ts_us{0};
+    /// Frames from that server timestamp to the frame the tag names.
+    uint32_t offset_frames{0};
+    /// Sample rate the offsets are counted in, 0 when unknown -- a tag from a stream that has since
+    /// changed rate must not be converted with the new one.
+    uint32_t sample_rate{0};
+  };
+  TaggedRender tagged_render_{};
+  /// Tagged renders seen since the last sync report, so the report can say whether the signal is live
+  /// at all rather than leaving a silent fallback to the inferred phase looking like a measurement.
+  uint32_t tagged_render_count_{0};
+  /// Sample rate the tag offsets are counted in, published by the player task when it tags and read
+  /// on the speaker callback. Atomic because those are different threads and this is the one term of
+  /// a tagged observation that does not travel with the tag.
+  std::atomic<uint32_t> tag_sample_rate_{0};
+
   std::atomic<bool> pipeline_starved_{false};
   bool starved_latched_{false};
   /// Until when a re-baseline's own aftermath is barred from re-arming the starvation latch.

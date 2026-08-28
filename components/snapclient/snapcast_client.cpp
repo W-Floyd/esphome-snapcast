@@ -1006,6 +1006,30 @@ bool SnapcastClient::accounted_at_(int64_t as_of_us, int64_t &frames) const {
 }
 
 // THREAD CONTEXT: Speaker playback callback thread
+//
+// The captured half of the playout picture. notify_audio_played() says HOW MUCH rendered and when;
+// this says WHICH audio did. Only the second can see a bias in our own frame ledger, because it does
+// not consult that ledger: `pushed` and `played` appear nowhere in it.
+//
+// Cheap on purpose -- it runs at the DMA cadence (~100/s) on the speaker's callback thread, so it
+// only records the newest observation and lets the 3.3 s report do the arithmetic.
+void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjusted_ts, const audio::RenderTag &tag) {
+  if (frames == 0 || !tag.valid()) {
+    // Not an error: audio we inserted ourselves (silence, splices, repeated frames) and audio blended
+    // with an announcement both arrive untagged by design. There is simply nothing to measure.
+    return;
+  }
+  const uint32_t rate = this->tag_sample_rate_.load(std::memory_order_relaxed);
+  if (rate == 0) {
+    return;
+  }
+  this->playout_mutex_.lock();
+  this->tagged_render_ = TaggedRender{adjusted_ts, frames, static_cast<int64_t>(tag.server_ts), tag.offset_frames, rate};
+  this->tagged_render_count_++;
+  this->playout_mutex_.unlock();
+}
+
+// THREAD CONTEXT: Speaker playback callback thread
 void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
   bool rebaselined = false;
   this->playout_mutex_.lock();
@@ -4275,17 +4299,75 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           const int64_t p_pushed = this->pushed_frames_total_;
           const int64_t p_played_ts = this->played_last_ts_us_;
           const bool p_valid = this->playout_valid_;
+          const TaggedRender tr = this->tagged_render_;
+          const uint32_t tr_count = this->tagged_render_count_;
+          this->tagged_render_count_ = 0;
           this->playout_mutex_.unlock();
+
+          // A tagged observation older than this describes a pipeline state that has since changed.
+          // Generous against the ~10 ms arrival cadence: anything approaching a second means tagged
+          // audio stopped flowing, which is a reason to publish nothing rather than to publish stale.
+          constexpr int64_t RENDER_TAG_MAX_AGE_US = 1000000;
+          const bool tag_fresh = tr.adjusted_ts_us > 0 && tr.sample_rate > 0 &&
+                                 (phase_local - tr.adjusted_ts_us) < RENDER_TAG_MAX_AGE_US;
+
+          // MEASURED render phase. The descriptor's real audio finished at tr.adjusted_ts_us, so its
+          // FIRST real frame -- the one the tag names -- rendered tr.frames earlier; the tag says what
+          // that frame's server time is. Both terms are observations of the same frame.
+          //
+          //   phase = TSF(first frame rendered) - (that frame's server audio time)
+          //
+          // `pushed` and `played` appear nowhere in it, which is the entire point: a bias in our own
+          // frame ledger is then visible IN this number rather than invisible TO it.
+          int64_t measured_phase = TsfSync::RENDER_PHASE_UNKNOWN;
+          if (tag_fresh) {
+            const int64_t rate = static_cast<int64_t>(tr.sample_rate);
+            const int64_t first_frame_local = tr.adjusted_ts_us - static_cast<int64_t>(tr.frames) * 1000000 / rate;
+            const int64_t render_tsf = first_frame_local + (phase_tsf - phase_local);
+            const int64_t render_server = tr.server_ts_us + static_cast<int64_t>(tr.offset_frames) * 1000000 / rate;
+            measured_phase = render_tsf - render_server;
+          }
+
+          // INFERRED render phase, kept for one purpose: so a single run can compare the two against a
+          // known displacement rather than needing two firmwares. It reconstructs the rendering frame's
+          // server time from (s_ts, pushed - played), so it is blind to the class of offset it exists to
+          // remove -- measured 2026-08-28 at a ratio of 0.003 against inject_split(+1000 us), where a
+          // truly external displacement read 1.000. DIAGNOSTIC ONLY. Nothing may act on it.
+          int64_t inferred_phase = TsfSync::RENDER_PHASE_UNKNOWN;
           if (p_valid && p_played_ts > 0) {
             const int64_t render_tsf = p_played_ts + (phase_tsf - phase_local);
             const int64_t render_server = rec.server_ts_us - (p_pushed - p_played) * 1000000 /
                                                                  static_cast<int64_t>(rec.params.sample_rate);
-            // phase_local is the local instant of the TSF sandwich this phase was built from --
-            // pass it so the group median only differences phases sampled close together.
-            this->tsf_sync_->set_render_phase_us(render_tsf - render_server, phase_local);
+            inferred_phase = render_tsf - render_server;
+          }
+
+          // Publish the measured one or nothing at all. Falling back to the inferred value would hand
+          // render_align a signal that cannot see the displacement it is correcting, dressed as one
+          // that can -- and the fallback conditions (a resampler, an announcement mixing over the top)
+          // are exactly the moments a wrong correction would be hardest to attribute afterwards.
+          // phase_local is the local instant of the TSF sandwich this phase was built from -- pass it
+          // so the group only differences phases sampled close together.
+          if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN) {
+            this->tsf_sync_->set_render_phase_us(measured_phase, phase_local);
           } else {
             this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
           }
+
+#ifdef USE_SNAPCLIENT_TIMING_DIAG
+          // The grading line for this signal. `ratio` cannot be computed on-device -- it needs the
+          // wire -- so log both phases and the tagged-render rate side by side and take the ratio
+          // offline against an injected displacement. tags=0 means no tagged audio reached the DAC in
+          // this window, which is a configuration answer (resampler, mixer blending), not a fault.
+          ESP_LOGD(TAG,
+                   "RENDERTAG measured=%" PRId64 " inferred=%" PRId64 " tags=%" PRIu32 " age=%" PRId64
+                   " frames=%" PRIu32 " off=%" PRIu32 " sup=%d",
+                   measured_phase, inferred_phase, tr_count,
+                   tr.adjusted_ts_us > 0 ? phase_local - tr.adjusted_ts_us : -1, tr.frames, tr.offset_frames,
+                   this->audio_listener_ != nullptr && this->audio_listener_->on_supports_render_tags() ? 1 : 0);
+#else
+          (void) tr_count;
+          (void) inferred_phase;
+#endif
         }
         // tsf= now reports the CONSENSUS, not a role. n is how many raw estimates the adopted
         // mapping averages, our own included: 1 means nobody else is audible and we are playing
@@ -4522,6 +4604,10 @@ uint32_t SnapcastClient::push_silence_(uint32_t frames, const StreamParams &para
   while (pushed < frames && this->output_active_.load(std::memory_order_relaxed) &&
          !this->shutdown_.load(std::memory_order_relaxed)) {
     const uint32_t batch = std::min<uint32_t>(frames - pushed, SLICE_BUFFER_SIZE / frame_bytes);
+    // Explicitly untagged. This silence is ours, not the server's, so it corresponds to no server
+    // time -- and the sink must skip a descriptor that starts in it rather than extrapolate the
+    // previous chunk's identity across it, which would read the insertion as audio arriving late.
+    this->audio_listener_->on_set_render_tag(audio::RenderTag{});
     size_t written = this->audio_listener_->on_audio_write(this->slice_buffer_.get(), batch * frame_bytes, 100, params);
     if (written == 0) {
       break;
@@ -4612,6 +4698,9 @@ void SnapcastClient::push_repeat_frame_(const StreamParams &params) {
   size_t offset = 0;
   while (offset < frame_bytes && this->output_active_.load(std::memory_order_relaxed) &&
          !this->shutdown_.load(std::memory_order_relaxed)) {
+    // Untagged for the same reason as inserted silence: a repeated frame is the servo's, not the
+    // server's, and giving it the neighbouring chunk's identity would hide the very splice it is.
+    this->audio_listener_->on_set_render_tag(audio::RenderTag{});
     const size_t written =
         this->audio_listener_->on_audio_write(this->last_frame_ + offset, frame_bytes - offset, 100, params);
     if (written == 0) {
@@ -4628,6 +4717,13 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
   const uint32_t frame_bytes = rec.params.frame_bytes();
   size_t remaining = rec.bytes;
   size_t skip = std::min<size_t>(static_cast<size_t>(drop_frames) * frame_bytes, remaining);
+  // Bytes of THIS CHUNK already taken out of the ring, so the frame index of anything in the current
+  // slice is (chunk_bytes_done + offset) / frame_bytes. Dropped frames count here: a drop moves the
+  // audio that follows it earlier in the chunk, and the identity has to say so.
+  size_t chunk_bytes_done = 0;
+  // The rate the tag's frame offsets are counted in. Published rather than assumed, because the
+  // observation comes back on another thread after this chunk's params are out of scope.
+  this->tag_sample_rate_.store(rec.params.sample_rate, std::memory_order_relaxed);
 
   while (remaining > 0 && !this->shutdown_.load(std::memory_order_relaxed)) {
     const size_t want = std::min(remaining, SLICE_BUFFER_SIZE);
@@ -4685,6 +4781,22 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
         this->discard_ring_bytes_(remaining);
         return;
       }
+      // Identify this payload's FIRST frame: which chunk it belongs to, and how far into that chunk
+      // it sits. Both halves are needed -- a DMA descriptor is 441 frames against a chunk's 1152, so
+      // descriptors straddle chunks and a bare chunk id could not place the boundary.
+      //
+      // Re-stated on every write rather than once per chunk. That is not redundant: a write may be
+      // short, and the position the audio actually landed at is the only one worth recording. Runs
+      // that do turn out contiguous are collapsed downstream (audio::RenderTagTrack), so restating
+      // costs nothing.
+      //
+      // A non-positive server timestamp cannot be a tag: zero is the untagged marker, and a negative
+      // one would cast to an enormous positive and read as valid. Leaving such a chunk untagged costs
+      // one reading; letting it through would cost a wrong one.
+      this->audio_listener_->on_set_render_tag(
+          rec.server_ts_us > 0 ? audio::RenderTag{static_cast<uint64_t>(rec.server_ts_us),
+                                                 static_cast<uint32_t>((chunk_bytes_done + offset) / frame_bytes)}
+                               : audio::RenderTag{});
       size_t written = this->audio_listener_->on_audio_write(this->slice_buffer_.get() + offset, got - offset, 100,
                                                              rec.params);
       offset += written;
@@ -4706,6 +4818,7 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
         return;
       }
     }
+    chunk_bytes_done += got;
   }
 }
 

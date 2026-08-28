@@ -258,6 +258,10 @@ void SnapclientMediaSource::notify_audio_played(uint32_t frames, int64_t timesta
   this->parent_->notify_audio_played(frames, timestamp);
 }
 
+void SnapclientMediaSource::notify_audio_played_tagged(uint32_t frames, int64_t adjusted_ts, audio::RenderTag tag) {
+  this->parent_->notify_audio_played_tagged(frames, adjusted_ts, tag);
+}
+
 // --- SnapcastAudioListener override ---
 
 // THREAD CONTEXT: Snapclient player task. May block up to timeout_ms.
@@ -275,6 +279,10 @@ bool SnapclientMediaSource::on_query_latency(audio::AudioDepth &depth) {
 }
 
 bool SnapclientMediaSource::on_query_audio(audio::AudioDepth &depth) { return this->output_buffered_audio(depth); }
+
+void SnapclientMediaSource::on_set_render_tag(const audio::RenderTag &tag) { this->output_set_next_render_tag(tag); }
+
+bool SnapclientMediaSource::on_supports_render_tags() const { return this->output_supports_render_tags(); }
 
 }  // namespace esphome::snapclient
 

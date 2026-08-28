@@ -190,6 +190,12 @@ void SnapclientHub::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
   }
 }
 
+void SnapclientHub::notify_audio_played_tagged(uint32_t frames, int64_t adjusted_ts, const audio::RenderTag &tag) {
+  if (this->client_ != nullptr) {
+    this->client_->notify_audio_played_tagged(frames, adjusted_ts, tag);
+  }
+}
+
 void SnapclientHub::set_server_manual(const std::string &host, uint16_t port) {
   this->manual_host_ = host;
   this->manual_port_ = port;

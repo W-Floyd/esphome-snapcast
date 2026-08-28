@@ -32,6 +32,7 @@ class SnapclientMediaSource final : public SnapclientChild,
   void notify_volume_changed(float volume) override;
   void notify_mute_changed(bool is_muted) override;
   void notify_audio_played(uint32_t frames, int64_t timestamp) override;
+  void notify_audio_played_tagged(uint32_t frames, int64_t adjusted_ts, audio::RenderTag tag) override;
 
   // --- SnapcastAudioListener override ---
 
@@ -44,6 +45,13 @@ class SnapclientMediaSource final : public SnapclientChild,
   /// THREAD CONTEXT: the client's player task, same as on_audio_write().
   bool on_query_latency(audio::AudioDepth &depth) override;
   bool on_query_audio(audio::AudioDepth &depth) override;
+
+  /// @brief Tags the audio the next on_audio_write() hands to the pipeline, and reports whether that
+  /// tag can survive it. Both are pure pass-throughs: this adapter carries identity, it never
+  /// interprets it.
+  /// THREAD CONTEXT: the client's player task, same as on_audio_write().
+  void on_set_render_tag(const audio::RenderTag &tag) override;
+  bool on_supports_render_tags() const override;
 
  protected:
   /// @brief Updates the source state and keeps the client's output-active flag in step.

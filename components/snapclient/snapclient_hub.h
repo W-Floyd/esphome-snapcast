@@ -119,6 +119,11 @@ class SnapclientHub final : public Component,
   /// THREAD CONTEXT: speaker task; safe to call from any thread.
   void notify_audio_played(uint32_t frames, int64_t timestamp_us);
 
+  /// @brief Feed a TAGGED render -- audio we identified on the way down, handed back with the instant
+  /// it rendered -- into the sync engine. Fires alongside notify_audio_played(), not instead of it.
+  /// THREAD CONTEXT: speaker task; safe to call from any thread.
+  void notify_audio_played_tagged(uint32_t frames, int64_t adjusted_ts, const audio::RenderTag &tag);
+
   /// @brief TEST HOOK: forwards to SnapcastClient::inject_starvation(); see there for why it exists
   /// and why it drains through the real path rather than setting the latch directly.
   void inject_starvation(uint32_t ms);

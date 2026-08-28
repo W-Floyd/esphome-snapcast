@@ -136,6 +136,57 @@ if sd worsens.
 `TODO.md` carries the full record, including retractions. Two findings were reported and later
 overturned; both are struck through rather than deleted, because how they happened is useful.
 
+## `render_align`'s replacement signal — IMPLEMENTED, COMPILED, UNFLASHED, UNMEASURED (2026-08-28)
+
+`PLAN-render-align-signal.md` is built. Both firmwares compile; **nothing has been measured, and
+`render_align_max` stays 0ms** until the ratio test below passes.
+
+What it does: the client attaches an identity to the audio it hands down -- `(server_ts, frame
+offset into that chunk)` -- and the i2s sink hands that identity back when THAT audio renders,
+paired with the instant it did. Render phase is then
+
+    phase = TSF(adjusted_ts - real_frames/rate) - (tag.server_ts + tag.offset/rate)
+
+with `pushed` and `played` appearing nowhere in it. That is the whole point: the old form inferred
+the rendering frame's server time from the frame ledger, and a device cannot detect that its own
+counter is biased by consulting that counter.
+
+Where it lives:
+
+| repo | file | role |
+|---|---|---|
+| esphome fork | `audio/audio.h` | `RenderTag`, `RenderTagTrack` (tags bound to frame positions in one queue) |
+| esphome fork | `speaker/speaker.h` | `set_next_render_tag`, `supports_render_tags`, `add_tagged_output_callback` |
+| esphome fork | `i2s_audio/speaker/*` | `WriteRecord` carries the tag per DMA descriptor; standard writer reports |
+| esphome fork | `mixer/speaker/*` | forwards a tag only while ONE source contributes; marks blended runs untagged |
+| esphome fork | `speaker_source`, `media_source` | pass-through both ways |
+| this repo | `snapclient/snapcast_client.cpp` | tags every `push_chunk_` write, consumes `notify_audio_played_tagged` |
+
+**HOW TO GRADE IT — one test, and no downstream number means anything until it passes.**
+
+    inject_split(+1000) on ONE board, ramped, and read `RENDERTAG` in that board's log:
+      measured= should move ~1000        <- pass
+      inferred= will move ~3             <- the old signal, logged alongside for exactly this comparison
+
+Both phases are on one line, so this is a single run on one firmware, not a two-firmware comparison.
+Remember `inject_split(0)` is not a restore -- reverse with `inject_split(-1000)`.
+
+Secondary check: the resync-residual ratio should move from 0.13 toward 1.0.
+
+Things to know before debugging it:
+
+* **`tags=0` on the RENDERTAG line is a configuration answer, not a fault.** Tags are deliberately
+  suppressed through a resampler, while the mixer is blending an announcement, and for audio the
+  client inserts itself (silence, splices, repeated frames). `sup=` on the same line says whether
+  the path claims to support them at all.
+* **When there is no fresh tagged observation the client publishes `RENDER_PHASE_UNKNOWN`, not the
+  old inferred value.** That is deliberate: a silent fallback to a signal blind to ledger bias,
+  dressed as one that is not, is exactly how this failure was missed for a whole measurement
+  history. `inferred=` is logged but nothing acts on it.
+* Tag entries are collapsed when contiguous (`RenderTagTrack::continues_last_`), so a producer
+  re-stating identity on every write costs one entry per chunk, not one per write. An evicted tag
+  yields a SKIPPED reading, never a fabricated one.
+
 ## Traps that cost real time
 
 * **`a.log`/`b.log` span days and carry no date.** `grep "^\[13:5"` matches a previous day's build.

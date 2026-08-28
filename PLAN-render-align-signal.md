@@ -1,5 +1,11 @@
 # PLAN — a render_align signal independent of the local frame ledger
 
+> **STATUS: IMPLEMENTED, COMPILED, UNFLASHED, UNMEASURED (2026-08-28).** Both firmwares build;
+> `render_align_max` stays 0ms until the ratio test in "How it gets judged" passes. The on-device
+> grading line is `RENDERTAG`, which carries `measured=` and `inferred=` side by side so one run on
+> one firmware settles it. See the matching section of `HANDOFF.md` for where each piece lives and
+> what `tags=0` means.
+
 `render_align` cannot work with the signal it has, for a structural reason rather than a tuning one.
 This is the replacement signal, specified to the point where building it is mechanical.
 
