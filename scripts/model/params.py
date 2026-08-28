@@ -163,6 +163,7 @@ class SimParams:
     duration_s: float = 240.0            # a bench window
     seed: int = 1
     leaderless: bool = True              # False = one device publishes, others adopt verbatim
+    map_adopt: str = "step"              # 'step' (deterministic, current firmware) or 'slew'
     beacon_loss: float = 0.05            # per-peer beacon loss; client-to-client multicast is
                                          # unreliable on real APs (tsf_sync.h on unicast)
     render_align_gain: float = 0.0       # 0 = correction disabled, as on the bench

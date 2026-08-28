@@ -187,14 +187,16 @@ static constexpr int64_t TMS_SNAP_US = 20000;
 // a real correction over minutes is worse than one step. A snap bumps timebase_epoch_ so the
 // consumer's servo is told, which is the leaderless replacement for watching the role change.
 //
-// TWICE the publish rate, and that factor is not a taste. Every contributor's line already moves
-// at up to TMS_SLEW_MAX_US_PER_S, so their mean does too; an adoption limit equal to it would
-// leave zero margin and the adopted mapping would lag its own target indefinitely under nothing
-// worse than steady tracking. Double gives the follower authority to catch its input.
-static constexpr int64_t MAP_SLEW_MAX_US_PER_S = 2 * TMS_SLEW_MAX_US_PER_S;
-static constexpr int64_t MAP_SLEW_CATCHUP_US_PER_S = 2 * TMS_SLEW_CATCHUP_US_PER_S;
-static constexpr int64_t MAP_CATCHUP_THRESHOLD_US = TMS_CATCHUP_THRESHOLD_US;
-static constexpr int64_t MAP_SNAP_US = TMS_SNAP_US;
+// REVERTED, MEASURED: the adoption slew cost 2.7x on sd and has been removed. The reasoning below
+// was sound for a per-device correction and wrong for a shared timebase -- see the long note at
+// update_consensus_(). The publish slew above STAYS: it low-passes this device's own Kalman jitter
+// before the number goes on the wire, which is a different job, and every device's contribution
+// being individually smooth is what makes their mean smooth.
+//
+// What replaced it: adopt the mean exactly, and merely REPORT a move larger than this so the
+// consumer's servo is told the timebase stepped. Sized at the old snap threshold, since that was
+// the point past which a move stopped being explicable as membership or slew.
+static constexpr int64_t MAP_STEP_REPORT_US = TMS_SNAP_US;
 
 // OUTLIER ROBUSTNESS WITHOUT A MEDIAN. A median is robust and DISCONTINUOUS: over three values it
 // is the middle one, so it steps whenever the ordering changes even though nothing moved.
@@ -738,36 +740,63 @@ void TsfSync::update_consensus_(int64_t local_now_us) {
   // reweighting is there for a broken peer, and a broken RATE shows up as tens of ppm.
   const float drift_c = static_cast<float>(robust_mean(dr, n, 1.0));
 
-  int64_t tms_adopt = tms_target;
-  int64_t snap_delta = 0;
+  // ADOPT THE MEAN EXACTLY. NO SLEW. This inverts step 4 of PLAN-leaderless.md ("Slew, do not
+  // step") on the strength of the measurement that plan asked for, and the plan named this as the
+  // thing to suspect: "if sd worsens, step 3 or 4 is wrong".
+  //
+  // MEASURED 2026-08-28, matched 4-minute windows against the analyser, correction disabled:
+  //
+  //     2-device, leader-based        sd 3.6 us
+  //     3-device, leaderless, slewed  sd 8.06, 9.50
+  //     2-device, leaderless, slewed  sd 9.72        <- group size was NOT the confound
+  //
+  // WHY THE SLEW WAS THE COST. A leader published ONE line and every device computed deadlines
+  // from that identical line, so the mapping's own error was EXACTLY common-mode and cancelled
+  // between devices -- which is how a design whose inputs wander +-100-300 us held 3.6 us on the
+  // wire. A slew destroys that: two devices given the SAME estimates but different histories walk
+  // different paths to the same target, so their adopted mappings differ by a wandering fraction
+  // of the group's spread (measured live at 40-934 us between just two devices). That difference
+  // is differential by construction and lands directly on the wire.
+  //
+  // WHY STEPPING IS SAFE HERE, WHICH IS WHAT THE PLAN GOT WRONG. The plan reasoned "a stepped
+  // timebase IS a hard resync". True of a step that hits one device. But the mean of the live
+  // estimate set is a DETERMINISTIC function of that set, so every device holding the same set
+  // steps to the same value at the same time: the step is common-mode, and common-mode timebase
+  // motion is inaudible -- the same argument the plan itself makes for group-wide drift. The
+  // danger was never the step, it was the PATH-DEPENDENCE.
+  //
+  // AND THE LINE IS INDEPENDENT OF WHERE IT IS EVALUATED, which is what makes "same set -> same
+  // mapping" true even though each device samples TSF at its own instant:
+  //
+  //     tms_X(t) = mean_i[tms_i + drift_i*(ref_X - base_i)] + mean(drift)*(t - ref_X)
+  //              = mean_i[tms_i - drift_i*base_i] + mean(drift)*t          <- ref_X cancels
+  //
+  // So ref_tsf below is free: it sets the anchor the line is stored against, not the line.
+  //
+  // WHAT IS LEFT PATH-DEPENDENT, and it is bounded rather than removed: devices do not hold
+  // identical sets at the same instant, because a beacon lost by one and not the other changes
+  // that device's set for up to PEER_MAP_STALE_US. That is a transient disagreement of order
+  // (spread / n), not an accumulating one, and it self-heals on the next beacon.
+  const int64_t tms_adopt = tms_target;
   this->mapping_mutex_.lock();
   const bool held = this->mapping_valid_;
   const int64_t held_tsf_base = this->map_tsf_base_us_;
   const int64_t held_tms_base = this->map_tsf_minus_server_us_;
   const float held_drift = this->map_drift_ppm_;
-  const int64_t held_updated = this->map_updated_local_us_;
   this->mapping_mutex_.unlock();
   if (held) {
-    // Where the mapping we are already playing to says tsf-server should be at ref_tsf.
+    // Diagnostics only now: report how far the timebase actually moved, so a membership change or
+    // a genuine re-anchor is still visible and still tells the consumer's servo. Nothing is
+    // clamped on the strength of it.
     const int64_t expected =
         held_tms_base + static_cast<int64_t>(static_cast<double>(held_drift) * 1e-6 *
                                              static_cast<double>(ref_tsf - held_tsf_base));
-    const int64_t delta = tms_target - expected;
-    if (std::abs(delta) > MAP_SNAP_US) {
-      snap_delta = delta;
-    } else {
-      // Rate-limited, and scaled by the elapsed LOCAL interval so the tracking speed does not
-      // silently follow CONSENSUS_INTERVAL_US -- the same lesson the publish slew learned.
-      const int64_t elapsed_us = std::max<int64_t>(0, local_now_us - held_updated);
-      const int64_t rate_us_per_s =
-          std::abs(delta) > MAP_CATCHUP_THRESHOLD_US ? MAP_SLEW_CATCHUP_US_PER_S : MAP_SLEW_MAX_US_PER_S;
-      const int64_t slew = std::max<int64_t>(1, rate_us_per_s * elapsed_us / 1000000);
-      tms_adopt = expected + std::clamp<int64_t>(delta, -slew, slew);
+    const int64_t delta = tms_adopt - expected;
+    if (std::abs(delta) > MAP_STEP_REPORT_US) {
+      this->timebase_epoch_.fetch_add(1, std::memory_order_relaxed);
+      ESP_LOGI(TAG, "Timebase step %+" PRId64 " us over %zu estimate(s) (common-mode: every device "
+                    "holding this set steps identically)", delta, n);
     }
-  }
-  if (snap_delta != 0) {
-    this->timebase_epoch_.fetch_add(1, std::memory_order_relaxed);
-    ESP_LOGI(TAG, "Timebase re-anchor: consensus moved %+" PRId64 " us over %zu estimate(s)", snap_delta, n);
   }
   this->adopt_(ref_tsf, tms_adopt, drift_c, local_now_us);
 

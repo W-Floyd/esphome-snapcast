@@ -193,6 +193,24 @@ class Device:
         return stats.robust_mean(vals, P.CONSENSUS_SCALE_FLOOR_US, P.CONSENSUS_REWEIGHT_K)
 
     def adopt_consensus(self, s: float, target: float):
+        """Take up the consensus. Two modes, and the choice is measured, not stylistic:
+
+        'step' -- assign the target outright. The adopted mapping is then a DETERMINISTIC
+                  function of the live estimate set, so every device holding the same set
+                  holds the same mapping and the mapping's own error is exactly common-mode.
+        'slew' -- rate-limit toward it. Smooth, but it gives every device its own history, so
+                  two devices converging on the same target from different places disagree
+                  while they get there -- and that disagreement is differential, i.e. audible.
+                  Measured on the bench 2026-08-28: sd 9.72 us against 3.6 stepping.
+        """
+        if self.sp.map_adopt == "step":
+            stepped = abs(target - self.map_err) > P.MAP_SNAP_US
+            self.map_err = target
+            self.map_last_s = s
+            return stepped
+        return self._adopt_slew(s, target)
+
+    def _adopt_slew(self, s: float, target: float):
         dt_s = (s - self.map_last_s) / 1e6
         self.map_last_s = s
         d = target - self.map_err

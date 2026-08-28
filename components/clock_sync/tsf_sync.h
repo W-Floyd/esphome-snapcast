@@ -48,8 +48,13 @@ namespace esphome::clock_sync {
 ///      (slew-limited against its own Kalman, nothing else). Feeding the adopted mean back into
 ///      the beacon is positive feedback: the whole group can then drift together while every
 ///      device agrees with every other. Only an outside reference could see it.
-///   2. SLEW THE ADOPTED MAPPING, NEVER STEP IT. A device joining or leaving moves the mean for
-///      everyone, and a stepped timebase IS a hard resync -- the thing this exists to avoid.
+///   2. THE ADOPTED MAPPING MUST BE A DETERMINISTIC FUNCTION OF THE LIVE ESTIMATE SET -- no
+///      per-device history, no slew. What a leader got right, and the only thing it got right, is
+///      that every device computed deadlines from ONE IDENTICAL line, so the mapping's own error
+///      was exactly common-mode and cancelled between devices. Any per-device path to the same
+///      target destroys that: measured, an adoption slew cost 2.7x on sd (9.72 vs 3.6). Stepping
+///      is safe BECAUSE it is deterministic -- every device holding the same set steps to the same
+///      value at once, and common-mode timebase motion is inaudible.
 ///
 /// Any failure (no packets, client isolation, roam, AP reboot, no wifi) falls back to the
 /// caller's own Kalman offset: never worse than the non-TSF behavior. A lone device consenses
