@@ -31,7 +31,24 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-**FIXED IN THE FORK (`56601e6bc6`), VERIFIED LIVE, EFFECT ON PLANTING NOT YET MEASURED.**
+**MEASURED: THE RATCHET IS GONE (2026-08-28). 8 forced starvations, post-fix:**
+
+    plants: +13.4  -105.0  -6.0  +89.6  -44.8  +75.3  -45.5  +62.6   us
+    median +3.69   mean +4.96 (+-24 SE)   |median| 54.07   POSITIVE 4/8
+
+Against the pre-fix record of **10/10 positive at +15.7 us per resync** (p = 0.001 one-sided,
+accumulating +157.3 us over 10 resyncs). The sign split is the test and it is unambiguous: signs are
+balanced, so a resync-planted offset now RANDOM-WALKS (growing as sqrt(N)) where it used to RATCHET
+(growing as N). Over a session that is the difference between unbounded drift and a bounded wander.
+
+CAVEATS, both real. The SIGN evidence is strong (4/8 against a prior 10/10); the MEAN is +4.96 +- 24
+us, consistent with zero but at n=8 unable to exclude the old +15.7 either. Two windows were noisy
+-- window 1 at `sd 100.57 corr_min 0.8133` is genuinely poor, so its +13.4 is the weakest point in
+the set. And the SPREAD is unchanged (|median| 54 us), exactly as predicted: the fix removes the
+bias, not the variance, because the consumer still reads the snapshot ~20 ms stale and samples the
+sawtooth at random phase.
+
+**FIXED IN THE FORK (`56601e6bc6`), VERIFIED LIVE.**
 `held=` now reports **49600** where it was invariably **50000** across all 52 prior seeds, so the
 mechanism is confirmed and the fix does what it claims. The remaining term is STALENESS, and the
 same seed line quantifies it: `SEEDANCHOR ... age=20483` -- the consumer reads the snapshot 20.5 ms
@@ -132,6 +149,29 @@ ALREADY DEAD on this thread, so it is not re-proposed: snapshot ageing (three va
 measured worse), refusing a seed onto a non-drained pipeline (measured far worse), and DMA silence
 padding (an in-code note at PADDISP: "pad= is a diagnostic, not a displacement term ... Whatever
 plants the hundreds-of-us offsets, it is not this", because the repayment path removes it).
+
+ESPHOME-SIDE READ, COMPLETED. One real bug, two candidates exonerated with numbers:
+
+    render_latency reporting CAPACITY not remaining   REAL BUG, fixed 56601e6bc6 (+5 ms at seeds)
+    played_ts ISR stamps                              CLEAN: MAD 1.00 us over n>=13695 steps,
+                                                      esp_timer_get_time() is the first statement
+                                                      of an IRAM_ATTR ISR, zero-mean, and the
+                                                      consumer median-filters it
+    queued_us quantisation                            CLEAN: <1 us, since the ring is written in
+                                                      whole frames so bytes_to_frames loses nothing
+                                                      and only frames_to_microseconds rounds
+
+So the RESIDUAL (tens of us, distinct from the ms-scale seed error) is NOT an esphome measurement
+problem. The seed error is milliseconds and the residual is tens of us, so something removes most of
+it -- the accounting cross-check whose output is `RECON drift=` (22 us in a sampled line, against an
+88 us standing offset). The residual is that repair loop's FLOOR, and it is local code, not the
+fork. That is the next place to dig.
+
+Also worth noting the played_ts measurement method, since it is reusable: completion events are
+clocked by I2S and therefore exactly one buffer period apart, so the deviation of consecutive
+`played_ts` from that period IS the ISR-entry jitter, measurable from the existing RAW lines with no
+instrumentation. Caveat on the tail: RAW is ~38/s against callbacks at 100/s, so filtering to
+single-buffer steps takes a biased subsample -- MAD is trustworthy, the tail shape is not.
 
 WHY THIS IS THE ONE LEVER WORTH PULLING: three separate threads terminate here.
   1. `TRIM_KP_RUN` cannot be lowered to kill the ~77 ppm common-mode rate oscillation (12.5 us p2p
