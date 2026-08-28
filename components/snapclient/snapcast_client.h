@@ -549,6 +549,15 @@ class SnapcastClient {
     float trim_min_ppm{0.0f};
     float trim_max_ppm{0.0f};
     uint32_t trim_samples{0};
+    /// @brief Chunks in this report window where the trim was HELD by a pending drift split.
+    ///
+    /// The hold is deliberate -- steering on a prediction about to be declared wrong plants a
+    /// permanent displacement, since the servo has no position feedback -- but it was
+    /// indistinguishable in the log from the trim simply not running, both printing "(idle)".
+    /// That ambiguity cost real time: a flat frame-rate plateau on the wire, against a peer still
+    /// steering, reads as a board that stopped updating its clock. It is a board that froze it on
+    /// purpose, and the two need telling apart because only one of them is a bug.
+    uint32_t trim_split_holds{0};
     uint32_t trim_railed{0};
     // TIME-INTEGRAL of the applied trim over the report window, its audio time, and the
     // audio time actually covered by a programmed trim.

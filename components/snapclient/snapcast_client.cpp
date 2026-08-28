@@ -2744,6 +2744,8 @@ void SnapcastClient::player_task_() {
           // transfer.
           st.trim_kp_last = kp;
         }
+        // Counted whether or not the hold fires below, so the report can say how much of the
+        // window was spent holding rather than steering. See ServoState::trim_split_holds.
         // SPLIT PENDING: hold the trim instead of steering on a prediction we already suspect.
         //
         // drift_excess_since_us is non-zero exactly while a sustained accounted-vs-measured split
@@ -2780,6 +2782,7 @@ void SnapcastClient::player_task_() {
         // time, and this branch is about not accumulating any.
         const bool split_pending = st.drift_excess_since_us != 0;
         if (split_pending) {
+          st.trim_split_holds++;
           const float held_ppm = std::clamp(st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
           if (!st.trim_split_held) {
             st.trim_split_held = true;
@@ -4267,7 +4270,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                    ", trim %+.2f ppm (span %+.0f..%+.0f, railed %" PRIu32 "/%" PRIu32 ")",
                    this->rate_lock_->applied_ppm(), st.trim_min_ppm, st.trim_max_ppm, st.trim_railed, st.trim_samples);
         } else {
-          snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (idle)", this->rate_lock_->applied_ppm());
+          // Say WHY there was no trim this window. "(idle)" alone is ambiguous between "the loop
+          // had nothing to do" and "the loop deliberately froze the clock for a pending split",
+          // and only the second explains a flat frame-rate plateau while a peer keeps steering --
+          // which is a differential rate excursion of tens of ppm, measured on the wire.
+          if (st.trim_split_holds > 0) {
+            snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (split-hold x%" PRIu32 ")",
+                     this->rate_lock_->applied_ppm(), st.trim_split_holds);
+          } else {
+            snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (idle)", this->rate_lock_->applied_ppm());
+          }
         }
 #else
         // span/railed are accumulated under timing diagnostics only, so with them off
@@ -4507,6 +4519,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       st.hard_resyncs = 0;
   #ifdef USE_I2S_RATE_LOCK
       st.trim_samples = 0;
+      st.trim_split_holds = 0;
       st.trim_railed = 0;
   #endif
     }
