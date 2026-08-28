@@ -31,8 +31,39 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-**LEAD ON THE OFFSET PLANTING (2026-08-28), code-supported, NOT yet measured. The most promising
-hypothesis on this thread and the first one that is not a subtraction.**
+**ROOT CAUSE OF THE OFFSET PLANTING, CONFIRMED QUANTITATIVELY (2026-08-28). The render latency
+reports DMA CAPACITY where it must report REMAINING TIME, and the error is bounded by one
+descriptor = 10 ms.**
+
+Two independent confirmations of the same number:
+
+    from the logs    every dry seed reports latency=50000 EXACTLY, zero variance
+                     (13 such seeds on A, 4 on B; every other value is 50000 + queued)
+    from the source  DMA_BUFFER_DURATION_MS 10 x DMA_BUFFERS_COUNT 5 = 50 ms span,
+                     one descriptor = 10 ms
+
+    predicted planted offset   uniform (0, 10] ms, mean 5 ms
+    observed planted offsets   3.7-13 ms
+
+`dma_resident_bytes_` is written exactly twice -- set to `total_dma_bytes` at task start, zeroed on
+stop -- and NEVER decremented as descriptors complete. So the published `dma_span_us` is the full
+50 ms whatever the true remaining wait is, and the seed (`pushed = played + latency`) converts the
+over-statement directly into a planted accounting offset.
+
+A STALE COMMENT THAT PROBABLY CAUSED THIS TO BE MISPRICED: the note at the seed says "a fully dry
+pipeline anchors at one DMA buffer". It does not -- it anchors at all five (50000 us, never 10000),
+which the seed log shows unambiguously. Priced at one buffer the error looks like 10 ms of ceiling;
+priced correctly it is 10 ms of FREE PHASE on a 50 ms floor.
+
+THE FIX: derive the span from remaining rather than capacity. The bookkeeping already exists in the
+same loop -- `dbg_written_real`/`dbg_completed_real` maintain `dma_real_frames` as their difference,
+which IS live -- so the change is to stop reading the one-time capacity store. Upstream-shaped;
+belongs with the buffered-audio API work at the top of this file.
+
+Original framing kept below, because the reasoning that got here is the reusable part.
+
+**LEAD ON THE OFFSET PLANTING (2026-08-28), code-supported. The first hypothesis on this thread
+that is not a subtraction.**
 
 `I2SAudioSpeakerBase::dma_resident_bytes_` (esphome fork, i2s_audio speaker) is written exactly
 twice: set to `total_dma_bytes` once at task start, and zeroed on stop. **It is never decremented as
