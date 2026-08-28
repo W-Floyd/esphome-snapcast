@@ -1066,6 +1066,14 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
   const double d1 = delay_us - this->delay_mean_us_;
   this->delay_mean_us_ += d1 / static_cast<double>(this->delay_n_);
   this->delay_m2_us_ += d1 * (delay_us - this->delay_mean_us_);
+  // Interleaved halves for the independence check; see delay_n_odd_.
+  if (this->delay_n_ & 1u) {
+    this->delay_n_odd_++;
+    this->delay_mean_odd_ += (delay_us - this->delay_mean_odd_) / static_cast<double>(this->delay_n_odd_);
+  } else {
+    this->delay_n_even_++;
+    this->delay_mean_even_ += (delay_us - this->delay_mean_even_) / static_cast<double>(this->delay_n_even_);
+  }
   this->playout_mutex_.unlock();
 }
 
@@ -4392,9 +4400,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           const uint32_t d_n = this->delay_n_;
           const double d_mean = this->delay_mean_us_;
           const double d_sd = d_n > 1 ? std::sqrt(this->delay_m2_us_ / static_cast<double>(d_n - 1)) : 0.0;
+          const double d_split = (this->delay_n_odd_ > 0 && this->delay_n_even_ > 0)
+                                     ? this->delay_mean_odd_ - this->delay_mean_even_
+                                     : 0.0;
           this->delay_n_ = 0;
           this->delay_mean_us_ = 0.0;
           this->delay_m2_us_ = 0.0;
+          this->delay_n_odd_ = 0;
+          this->delay_mean_odd_ = 0.0;
+          this->delay_n_even_ = 0;
+          this->delay_mean_even_ = 0.0;
           this->playout_mutex_.unlock();
 
           // DELAY: the measured transport delay averaged over the whole report window, with the
@@ -4404,8 +4419,11 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // If sem does NOT shrink with n, the jitter is real phase movement and no amount of
           // averaging will help -- which is the same answer, arrived at honestly.
           if (d_n > 1) {
-            ESP_LOGD(TAG, "DELAY mean=%.1f us sd=%.1f n=%" PRIu32 " sem=%.2f us", d_mean, d_sd, d_n,
-                     d_sd / std::sqrt(static_cast<double>(d_n)));
+            const double sem = d_sd / std::sqrt(static_cast<double>(d_n));
+            // split/(2*sem) is the honesty ratio: ~1 means the samples are independent and sem can
+            // be believed, >>1 means they are correlated and sem is optimistic by that factor.
+            ESP_LOGD(TAG, "DELAY mean=%.1f us sd=%.1f n=%" PRIu32 " sem=%.2f split=%+.2f ratio=%.2f", d_mean,
+                     d_sd, d_n, sem, d_split, sem > 0.0 ? std::fabs(d_split) / (2.0 * sem) : 0.0);
           }
 
           // A tagged observation older than this describes a pipeline state that has since changed.

@@ -1194,6 +1194,23 @@ class SnapcastClient {
   uint32_t delay_n_{0};
   double delay_mean_us_{0.0};
   double delay_m2_us_{0.0};
+  /// @brief The same mean, computed over ODD and EVEN arrivals separately.
+  ///
+  /// sem = sd/sqrt(n) is only the true standard error if the samples are INDEPENDENT, and
+  /// consecutive DMA descriptors share pipeline state, so they plausibly are not. That matters: an
+  /// optimistic sem would make the delay look controllable when it is not.
+  ///
+  /// Report-to-report scatter cannot settle it, because the delay genuinely moves 35-222 us per
+  /// report while the servo steers, which swamps a 3 us effect. Interleaving does: both halves span
+  /// the SAME window, so any drift -- linear or not -- affects them equally and cancels in the
+  /// difference. What is left is noise alone.
+  ///
+  ///   |mean_odd - mean_even| ~ 2*sem   -> independent, sem is honest
+  ///   |mean_odd - mean_even| >> 2*sem  -> correlated, sem is optimistic by that ratio
+  uint32_t delay_n_odd_{0};
+  double delay_mean_odd_{0.0};
+  uint32_t delay_n_even_{0};
+  double delay_mean_even_{0.0};
   /// Sample rate the tag offsets are counted in, published by the player task when it tags and read
   /// on the speaker callback. Atomic because those are different threads and this is the one term of
   /// a tagged observation that does not travel with the tag.
