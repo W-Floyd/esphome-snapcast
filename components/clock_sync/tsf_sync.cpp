@@ -652,8 +652,7 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   // disagreed with -d/2 by hundreds of us on the same line.
   const int64_t mine_at = this->render_phase_at_us_.load(std::memory_order_relaxed);
   if (mine_at == 0) {
-    this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
-    return;
+    return;  // no local instant yet; leave any previous delta alone
   }
   // Our own phase is IN the group. With two devices that makes the median their mean, so each
   // corrects half the gap and they meet in the middle rather than one chasing the other.
@@ -671,7 +670,13 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
     vals[n++] = this->peer_phase_[i].phase_us;
   }
   if (n < 2) {
-    this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
+    // No peer paired closely enough THIS time. Keep the last valid delta rather than reporting
+    // unknown -- see group_delta_at_us_. Only give up once it is genuinely stale.
+    if (this->group_delta_at_us_ != 0 &&
+        local_now_us - this->group_delta_at_us_ > GROUP_DELTA_STALE_US) {
+      this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
+      this->group_delta_at_us_ = 0;
+    }
     return;
   }
   for (size_t i = 1; i < n; i++) {  // insertion sort; n <= 9
@@ -688,6 +693,7 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   this->render_group_delta_us_.store(
       static_cast<int32_t>(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, d))),
       std::memory_order_relaxed);
+  this->group_delta_at_us_ = local_now_us;
 }
 
 void TsfSync::check_render_phase_(int64_t leader_phase_us, int64_t local_now_us) {

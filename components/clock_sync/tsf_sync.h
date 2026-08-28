@@ -287,6 +287,15 @@ class TsfSync {
   };
   PeerPhase peer_phase_[MAX_PHASE_PEERS]{};
   std::atomic<int32_t> render_group_delta_us_{INT32_MIN};
+  /// Local time render_group_delta_us_ was last computed from a VALID pairing.
+  ///
+  /// A failed pairing must not wipe a good delta. recompute runs on every beacon arrival, but
+  /// only ~25% of arrivals land inside PHASE_PAIR_WINDOW_US of our own phase instant, so
+  /// clearing on failure destroyed the value four times out of five -- and the consumer, which
+  /// checks once every three reports, then almost never saw one. Measured: zero corrections ran.
+  int64_t group_delta_at_us_{0};
+  /// A delta older than this is stale even if it was valid when computed.
+  static constexpr int64_t GROUP_DELTA_STALE_US = 10000000;
   /// Cheap follower phase report: no TSF read, no rate state, multicast only. See its definition.
   void broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_hash);
   /// Separate from last_tx_us_, which paces LEADERSHIP rather than phase reporting.
