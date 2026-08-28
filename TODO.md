@@ -31,6 +31,66 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**LEAD ON THE OFFSET PLANTING (2026-08-28), code-supported, NOT yet measured. The most promising
+hypothesis on this thread and the first one that is not a subtraction.**
+
+`I2SAudioSpeakerBase::dma_resident_bytes_` (esphome fork, i2s_audio speaker) is written exactly
+twice: set to `total_dma_bytes` once at task start, and zeroed on stop. **It is never decremented as
+descriptors complete.** So `dma_span_us` in the published render latency is a CONSTANT -- the full
+DMA span -- while the true wait for a frame handed over now is that span MINUS however much of the
+currently-playing descriptor has already been clocked out.
+
+    reported latency = queued_us + FULL dma span        (constant)
+    true latency     = queued_us + span - (already-played part of current descriptor)
+    over-statement   = bounded by ONE DESCRIPTOR
+    observed plants  = 3.7-13 ms   (whole span measured at 50 ms via I2SDBG dma_real=2205)
+
+WHY THIS FITS WHERE THE OTHERS DID NOT:
+
+  * MAGNITUDE. 3.7-13 ms is one descriptor's worth of a 50 ms span.
+  * IT IS DIFFERENTIAL, which is the property that matters and which nothing else explained. Each
+    board's phase within the descriptor cycle at seed time is independent, so two identical boards
+    plant DIFFERENT offsets. An absolute error in the latency report would be common-mode across
+    the group and therefore inaudible -- see the reframing below.
+  * IT EXPLAINS WHY ALL THREE AGEING ATTEMPTS FAILED. The fault is not snapshot staleness; it is
+    that one term of the snapshot is a CONSTANT where it should be a live remaining-time. No
+    subtraction of elapsed time can correct a term that never moves. That also retires the
+    "SNAPSHOT AGE DOES NOT IMPLY DRAINAGE" puzzle: the span genuinely does not drain, and the
+    published value is genuinely wrong anyway, for an unrelated reason.
+  * The fork agrees something is unexplained there: the diagnostic block immediately above carries
+    "TEMPORARY DIAGNOSTIC ... Remove once the offset is explained."
+
+THE REFRAMING, which is worth more than the hypothesis: every attempt so far has asked "why is the
+latency report wrong?", i.e. hunted an ABSOLUTE error. An absolute error is common-mode and
+inaudible. The quantity that matters is the DIFFERENCE between two identical boards, so the only
+admissible mechanisms are ones with a per-device degree of freedom. Descriptor phase is one;
+snapshot staleness, padding and drain semantics are not, which is why they all failed.
+
+CANDIDATE FIX: decrement `dma_resident_bytes_` as descriptors complete, or derive the span from the
+descriptor read position, so it reports REMAINING TIME rather than CAPACITY. Upstream-shaped, and it
+belongs with the buffered-audio API work at the top of this file.
+
+TEST BEFORE FIXING: `SEEDANCHOR` already logs `latency=` and `age=`. Add the sub-descriptor position
+at seed time and check whether the planted offset correlates with it. If it does, this is it; if the
+planted offset is instead constant per board, the phase is not free and this is wrong too.
+
+ALREADY DEAD on this thread, so it is not re-proposed: snapshot ageing (three variants, all
+measured worse), refusing a seed onto a non-drained pipeline (measured far worse), and DMA silence
+padding (an in-code note at PADDISP: "pad= is a diagnostic, not a displacement term ... Whatever
+plants the hundreds-of-us offsets, it is not this", because the repayment path removes it).
+
+WHY THIS IS THE ONE LEVER WORTH PULLING: three separate threads terminate here.
+  1. `TRIM_KP_RUN` cannot be lowered to kill the ~77 ppm common-mode rate oscillation (12.5 us p2p
+     on the wire) until re-baselines stop planting offsets -- the note at that constant says so
+     explicitly, and 0.1 was tried and reverted because a slower null lets the differential-rate
+     integral run longer and LANDS A BIGGER offset (-155 us against a +-130 us band).
+  2. `render_align` cannot correct what a re-baseline plants, because `render_phase` is
+     structurally blind to a repaired ledger bias (measured: ratio 0.003 on a ledger perturbation,
+     1.0000 on an external one).
+  3. The resync ratchet (+15.7 us per resync before stream scoping, +1.6 after) is the same
+     planting.
+Fix the planting and all three improve; fix any of the three directly and none of them do.
+
 **LEADERLESS TIMEBASE IS IMPLEMENTED AND UNMEASURED (2026-08-28).** `PLAN-leaderless.md`, all
 five steps: every device beacons its own raw server↔TSF line, everyone adopts the robustly
 weighted MEAN of all of them (its own included), nobody ever publishes the consensus, the
