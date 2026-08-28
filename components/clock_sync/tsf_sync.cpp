@@ -72,14 +72,43 @@ static constexpr int64_t PIPELINE_DIVERGE_MIN_US = 5000000;
 static constexpr int64_t PIPELINE_DIVERGE_LOG_US = 30000000;
 static constexpr int32_t PIPELINE_UNKNOWN = INT32_MIN;
 
-static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // every device publishes at this rate
+// EXPERIMENT (2026-08-28): 1 Hz -> 30 Hz, deliberately extreme, to see what the beacon rate is
+// worth and to settle a question open since the leaderless work started. WALK THIS BACK unless it
+// measures better; 1 Hz is the value everything else was measured at.
+//
+// WHAT IT SHOULD AND SHOULD NOT BUY. The consensus averages LINES carrying drift_ppm, so a stale
+// peer line is extrapolated rather than stale-valued, and 1 s of staleness costs only
+// (drift error x 1 s) ~= 1 us. Against that, the measured spread between the three devices' raw
+// estimates is 137-920 us. So the beacon rate is NOT the limiting term for the timebase and 30x
+// cannot make it one. What it should buy is elsewhere:
+//   * RENDER-PHASE PAIRING. PHASE_PAIR_WINDOW_US is 300 ms and our own phase is written once per
+//     sync report (~3.3 s), and only ~25% of arrivals currently land inside the window -- measured
+//     as "the consumer essentially never saw one; zero corrections ran". 30x the arrivals is 30x
+//     the pairing chances, and that is the signal render_align needs.
+//   * The one residual path-dependence in the deterministic consensus: devices differ only while
+//     they hold different estimate SETS, which is bounded by this interval.
+// It also settles whether the 15x sd regression once measured from follower beaconing was really
+// the trailing adopt_() (removed) or radio-time contention (never excluded). If sd degrades at
+// 30 Hz, contention was real.
+//
+// THE RISK, stated because it is specific: B currently sits at -42 dBm against -31/-30 for the
+// other two and is the board that starves, so 30x the multicast+unicast traffic is most likely to
+// hurt exactly the weakest link.
+static constexpr int64_t BEACON_INTERVAL_US = 33333;     // every device publishes at this rate
 static constexpr int64_t MAPPING_EXPIRY_US = 5000000;    // stale mapping → Kalman fallback
-static constexpr int64_t SERVICE_MIN_INTERVAL_US = 200000;
+// MUST TRACK THE BEACON RATE. service() returns early inside this interval, so it is a hard ceiling
+// on the beacon rate no matter what BEACON_INTERVAL_US says -- at 200 ms the beacons would cap at
+// 5 Hz and the experiment would silently not happen. service() is called per arriving message
+// (~38/s), so 20 ms is reachable.
+static constexpr int64_t SERVICE_MIN_INTERVAL_US = 20000;
 // How often the consensus is recomputed and re-adopted. Faster than the beacon rate on purpose:
 // the slew below is expressed per second, so a coarse cadence would make each adoption step
 // bigger for the same tracking speed, and a fresh adoption is also what keeps the mapping inside
 // MAPPING_EXPIRY_US when beacons are lost.
-static constexpr int64_t CONSENSUS_INTERVAL_US = 500000;
+// Also tracks the beacon rate: adopting at 2 Hz while beacons arrive at 30 Hz would throw away
+// most of what the experiment is buying. Still slower than the beacon rate, since adoption is a
+// pure function of the live set and gains nothing from running faster than the set changes.
+static constexpr int64_t CONSENSUS_INTERVAL_US = 100000;
 static constexpr int64_t CONSENSUS_LOG_INTERVAL_US = 10000000;
 // Age clamp on TSF extrapolation: an AP reboot resets TSF to ~zero with the BSSID
 // unchanged, leaving tsf_base "hours in the future" — evaluating that mapping would
