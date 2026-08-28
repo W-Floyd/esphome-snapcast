@@ -75,6 +75,7 @@ TMS_SLEW_CATCHUP_US_PER_S = 300.0
 TMS_CATCHUP_THRESHOLD_US = 1_000.0
 MAP_SLEW_US_PER_S = 2 * TMS_SLEW_US_PER_S            # adoption slew, tsf_sync.cpp:194
 MAP_SLEW_CATCHUP_US_PER_S = 2 * TMS_SLEW_CATCHUP_US_PER_S
+MAP_CATCHUP_THRESHOLD_US = TMS_CATCHUP_THRESHOLD_US
 MAP_SNAP_US = 20_000.0                   # above this the timebase re-anchors (steps)
 PEER_MAP_STALE_US = 5_000_000.0
 CONSENSUS_REWEIGHT_K = 2.0               # w = 1/(1+(d/(k*scale))^2)
@@ -82,6 +83,7 @@ CONSENSUS_SCALE_FLOOR_US = 50.0
 CONSENSUS_PHASE_SCALE_FLOOR_US = 20.0
 OFFSET_EWMA_ALPHA = 1.0 / 256.0          # shared_server_offset_us low-pass
 OFFSET_SNAP_US = 2_000.0
+OFFSET_FF_MAX_GAP_US = 2_000_000.0       # feed-forward extrapolation cap, tsf_sync.cpp:152
 PHASE_PAIR_WINDOW_US = 300_000.0
 PHASE_STALE_US = 15_000_000.0
 
@@ -147,6 +149,10 @@ class DeviceParams:
     static_delay_us: float = 0.0
     # Deliberate, per-device model faults, for the experiments:
     accounting_bias_frames: float = 0.0  # persistent +-N frame miscount (the 22.7 us candidate)
+    # Error in the board's own measurement of its TSF-vs-esp_timer rate. The offset filter
+    # feed-forwards with this rate, so the filter's standing lag is tau * this error, and
+    # tau is 6.7 s -- 0.2 ppm of rate error is 1.3 us of standing displacement.
+    offset_rate_err_ppm: float = 0.2
     feedback_interval_us: float = FEEDBACK_INTERVAL_US
 
 
@@ -157,4 +163,6 @@ class SimParams:
     duration_s: float = 240.0            # a bench window
     seed: int = 1
     leaderless: bool = True              # False = one device publishes, others adopt verbatim
+    beacon_loss: float = 0.05            # per-peer beacon loss; client-to-client multicast is
+                                         # unreliable on real APs (tsf_sync.h on unicast)
     render_align_gain: float = 0.0       # 0 = correction disabled, as on the bench

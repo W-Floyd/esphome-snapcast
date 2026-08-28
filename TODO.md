@@ -54,12 +54,44 @@ broadband noise -- hence MAD 4.03 against sd 8.06. Under a leader that wander wa
 (one publisher, one mapping) and cancelled; under consensus each device computes and slews toward
 its own mean, so the two adopted mappings can differ slightly and that difference is free to move.
 
-CONFOUNDED BY GROUP SIZE, and this is not a small caveat: the 3.6 µs baseline was a TWO-device
-group (n=4871, the CPU-pinning window) and this window is THREE -- the observer now contributes an
-estimate and renders. The plan's own risk list flags exactly this ("a device joining or leaving
-moves the mean for everyone"). The discriminating test is one RPC: move the observer off MLS44 and
-re-measure the pair alone against the two-device baseline. Until that is run, "consensus is worse
-than a leader" is NOT established.
+**NOT CONFOUNDED BY GROUP SIZE -- TESTED.** The observer was taken out of the TSF consensus and the
+pair re-measured over a matched 4-minute window:
+
+    2-device, leader-based (baseline)   sd 3.6
+    3-device, leaderless               sd 8.06, 9.50
+    2-device, leaderless               sd 9.72   MAD 6.19   n=5748   median -25.39 us
+
+Group size is not the explanation. **The consensus genuinely costs ~2.7x on sd**, and by the plan's
+own judging rule that means "step 3 or 4 is wrong".
+
+IT IS STEP 4, THE ADOPTION SLEW, AND THE MECHANISM IS STRUCTURAL RATHER THAN A BUG. With a leader
+every device computed deadlines from ONE IDENTICAL PUBLISHED LINE, so the mapping's own error was
+EXACTLY common-mode and cancelled perfectly between devices -- which is why the leader design held
+3.6 us while each device's Kalman wandered +-100-300 us. Under consensus each device computes its
+own mean and SLEWS TOWARD IT ALONG ITS OWN PATH: same inputs, different history, so the adopted
+mappings are only approximately equal. The live spread between two devices' raw estimates is
+40-934 us, and whatever fraction of that fails to cancel lands directly on the wire.
+
+So leaderless traded EXACT COMMON-MODE for freedom from churn. The churn win is real and complete
+(zero re-anchors across the whole night); the cost is that the mapping is no longer bit-identical.
+
+THE FIX INVERTS STEP 4 RATHER THAN TUNING IT. A common-mode STEP is harmless -- the plan itself
+argues group-wide drift is inaudible -- while a differential SLEW is not. So make the adopted
+mapping a PURE DETERMINISTIC FUNCTION of the live estimate set, with no per-device slew history:
+devices holding the same set then agree exactly, and a membership change steps everyone
+simultaneously and identically, which cancels. The slew was protecting against a step, but the step
+was never the problem; the PATH-DEPENDENCE was. Open question for that design: devices do not hold
+identical sets at the same instant (a beacon lost by one and not the other), so "same set" needs
+either a shared epoch to evaluate at or tolerance of brief disagreement.
+
+NEXT-BEST SUSPECT if the above does not recover the sd: the beacon rate. Every device now publishes
+a mapping every second where only the leader used to, and the 15x follower-beacon regression was
+attributed to `broadcast_()`'s trailing `adopt_()` -- which may have had a real radio-time
+component as well. Halving the rate is the cheap test.
+
+Corroboration from the same window: the median reads -25.39 us, still carrying the residual the
+forced resyncs planted (-2.92 before, -27.95 after, -25.39 here). The ratchet is real and nothing
+removes it.
 
 Corroboration that the mean position itself is sound: `raw-sync.py` over the same window puts
 A - B at **-2.2 ± 2.1 µs, not significant**, agreeing with the wire's +0.47 µs median.
