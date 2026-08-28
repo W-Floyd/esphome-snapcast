@@ -2707,6 +2707,14 @@ void SnapcastClient::player_task_() {
       // convergence uses hard splices while far out (much faster than the trim
       // slew), handing off to the PI for the end-game so the error actually
       // settles inside the band instead of splice-limit-cycling around it.
+      if (!(st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us))) {
+        // The refusal, with the terms that caused it. Overwritten per refusing chunk so the report
+        // carries the most recent one; see ServoState::gate_seen.
+        st.gate_seen = true;
+        st.gate_rate_lock_ok = st.rate_lock_ok;
+        st.gate_converged = st.converged;
+        st.gate_median_err_us = static_cast<int32_t>(median_err_us);
+      }
       if (st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
         const float dt_s = static_cast<float>(frames) / rec.params.sample_rate;
         const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
@@ -4277,8 +4285,13 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           if (st.trim_split_holds > 0) {
             snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (split-hold x%" PRIu32 ")",
                      this->rate_lock_->applied_ppm(), st.trim_split_holds);
+          } else if (st.gate_seen) {
+            snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (gate: lock=%d conv=%d err=%" PRId32 " us)",
+                     this->rate_lock_->applied_ppm(), st.gate_rate_lock_ok ? 1 : 0, st.gate_converged ? 1 : 0,
+                     st.gate_median_err_us);
           } else {
-            snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (idle)", this->rate_lock_->applied_ppm());
+            snprintf(trim_str, sizeof(trim_str), ", trim %+.2f ppm (idle, no chunks)",
+                     this->rate_lock_->applied_ppm());
           }
         }
 #else
@@ -4520,6 +4533,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
   #ifdef USE_I2S_RATE_LOCK
       st.trim_samples = 0;
       st.trim_split_holds = 0;
+      st.gate_seen = false;
       st.trim_railed = 0;
   #endif
     }

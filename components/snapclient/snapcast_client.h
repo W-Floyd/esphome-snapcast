@@ -558,6 +558,17 @@ class SnapcastClient {
     /// steering, reads as a board that stopped updating its clock. It is a board that froze it on
     /// purpose, and the two need telling apart because only one of them is a bug.
     uint32_t trim_split_holds{0};
+    /// @brief Why the steering gate refused, sampled on the LAST chunk that it refused.
+    ///
+    /// Recorded rather than inferred, after three plausible explanations for a frozen clock were
+    /// each falsified by the log: rate_lock_ok never went false, the reported error sat an order of
+    /// magnitude inside converge_fine, and the split-pending hold never fired. The gate tests a
+    /// PER-CHUNK median error while the report prints a per-report summary, so the number that
+    /// actually decided this was never in the log at all.
+    bool gate_seen{false};
+    bool gate_rate_lock_ok{false};
+    bool gate_converged{false};
+    int32_t gate_median_err_us{0};
     uint32_t trim_railed{0};
     // TIME-INTEGRAL of the applied trim over the report window, its audio time, and the
     // audio time actually covered by a programmed trim.
