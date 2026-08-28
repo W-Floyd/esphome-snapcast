@@ -31,6 +31,29 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**FIXED IN THE FORK (`56601e6bc6`), VERIFIED LIVE, EFFECT ON PLANTING NOT YET MEASURED.**
+`held=` now reports **49600** where it was invariably **50000** across all 52 prior seeds, so the
+mechanism is confirmed and the fix does what it claims. The remaining term is STALENESS, and the
+same seed line quantifies it: `SEEDANCHOR ... age=20483` -- the consumer reads the snapshot 20.5 ms
+old, which is TWO descriptor periods, so it samples the sawtooth at effectively random phase.
+
+    before   span a constant 50000  -> systematic +5 ms bias, one-sided (hence 3.7-13 ms, hence a ratchet)
+    after    span = instantaneous remaining, read at random phase -> ZERO-MEAN +-5 ms
+
+So the fix converts a systematic bias into zero-mean noise. That kills the ratchet and does NOT
+remove the spread. n=1 seed so far; per this file's own rule, one point establishes the effect
+exists and does not size it.
+
+IT ALSO EXPLAINS "SNAPSHOT AGE DOES NOT IMPLY DRAINAGE" PROPERLY, which was left as a puzzle above:
+the span is a SAWTOOTH -- it drains within a descriptor and is refilled at each boundary -- so over
+20 ms of staleness it is back near full, and subtracting elapsed time over-corrects. All three
+ageing attempts failed for that reason, not because the split between draining and non-draining
+terms was wrong.
+
+FOLLOW-UP WORTH CONSIDERING, a contract question for `AudioDepth` rather than a bug: for a reader
+this stale, publishing the sawtooth MEAN (`capacity - buffer/2`, i.e. 45000) gives zero bias AND
+zero variance from this term, where the instantaneous value gives zero bias and +-5 ms.
+
 **ROOT CAUSE OF THE OFFSET PLANTING, CONFIRMED QUANTITATIVELY (2026-08-28). The render latency
 reports DMA CAPACITY where it must report REMAINING TIME, and the error is bounded by one
 descriptor = 10 ms.**
