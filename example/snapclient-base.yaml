@@ -103,7 +103,24 @@ snapclient:
   # needs ~40 s to integrate a millisecond away; 43 single-frame splices (~23 µs each,
   # inaudible) do it in about a second. 0ms disables. On here to measure it.
   fast_splice_threshold: 1ms
-  timing_diagnostics: false     # ~38 log lines/s/device; on to measure, off to listen
+  # INTER-DEVICE alignment, the one thing the per-device servo cannot do: each device nulls its
+  # OWN error against server time, so nothing nulls the DIFFERENCE between two of them and a
+  # standing offset persists forever. A follower nudges its DEADLINE toward the leader's render
+  # phase -- the target moves, the existing servo does the work, no second splicer competing for
+  # the same frames. 0ms disables.
+  #
+  # 5ms of authority. Measured 2026-08-27: a resync plants ~130 µs and a reboot ~2.5 ms, so this
+  # covers both with margin while still bounding a bad signal. Correction is capped at 50 µs per
+  # report (~15 µs/s), which walks 2.5 ms out in about 2.5 minutes -- deliberately unhurried,
+  # since a target that jumps IS a hard resync.
+  #
+  # Only defensible because the signal was validated in-contract first: with TSF leadership
+  # scoped to the snapcast stream, render_delta tracked true displacement with a residual of
+  # 1.6 ± 6.0 µs against displacements of 20-235 µs. Measured cross-stream beforehand it looked
+  # like a biased, sometimes-inverting signal, and acting on THAT would have driven the pair
+  # apart. Re-validate before widening this.
+  render_align_max: 0ms
+  timing_diagnostics: true      # ~38 log lines/s/device; on to measure, off to listen
 
 media_source:
   - platform: snapclient        # synchronized multiroom audio

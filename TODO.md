@@ -133,6 +133,37 @@ untouched on Spotify; `scratchpad/group-orig.json` restores the original groupin
 on music the analyser cannot resolve this at all. `timing_diagnostics: true` is still set in
 `example/snapclient-base.yaml`.
 
+**`render_align` DOES NOT WORK YET — 10x WORSE THAN OFF. Left disabled (`render_align_max: 0ms`).**
+Measured 2026-08-27, same analyser, four configurations:
+
+    era                              sd(d fs_a)  sd(d fs_b)   skew sd
+    correction OFF (baseline)           0.0333      0.0313       5.4 µs
+    ON, leader-referenced, gain 0.25    1.8041      0.0740    1150.1
+    ON, group-median,      gain 0.25    0.0789      0.0651     117.6
+    ON, group-median, gain 0.05 + 1/3   0.1003      0.0428      58.0
+
+Three real bugs were found and fixed, each with a measured improvement (1150 -> 118 -> 58), and
+all are committed — but the result is still an order of magnitude worse than not correcting at
+all, so the feature stays off:
+
+1. **Leader-referenced correction.** Leadership changed SIX TIMES IN SEVENTEEN MINUTES on a
+   two-device group (it requires a healthy device; every resync disqualifies the incumbent), so
+   the reference moved constantly. Fixed by correcting toward the group median. `352a9f7`
+2. **Followers published no phase**, so there was no group to take a median of. Adding follower
+   beacons WEDGED BOTH BOARDS first: they fell through into the election block and refreshed
+   `last_rx_us_` — "last valid packet from another LEADER", which takeover uses to detect
+   silence — so no device could ever take over, the group lost its leader and mapping, and both
+   players stalled with only `wifi_diag` logging. Fixed by handling follower beacons BEFORE
+   election. `352a9f7`
+3. **Gain set by feel.** Sustained limit cycle, period 26.2 s (7.8 reports), 207 µs p2p. Period
+   ≈ 4× loop delay gives ~6.5 s ≈ 2 reports of delay, so gain 0.25 was at or above ultimate.
+   Retuned to 0.05 and one correction per three reports. `ac08968`
+
+**THE OPEN THREAD:** the remaining instability is on the LEADER, which does not correct at all
+(`sd(d fs_a)` 0.10 against a 0.033 baseline, while the correcting follower sits at 0.043). If a
+follower's correction destabilises the leader, the coupling is not through the code path built
+here, and it is not yet understood. That is where to start.
+
 **THE PAIR IS ALIGNED TO SUB-MICROSECOND WHEN QUIET.** Per-frame skew (`--dump-skew`, ~44100
 rows/s) across a forced resync, 2026-08-27:
 
