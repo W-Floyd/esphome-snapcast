@@ -4245,18 +4245,27 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
               // frames would fight the first for the same audio. Gain is deliberately low and
               // the step is clamped: this runs once per report, and the failure mode to avoid
               // is two devices chasing each other.
-              if (this->config_.render_align_max_us > 0) {
+              // TOWARD THE GROUP MEDIAN, NOT THE LEADER: the leader-relative delta is referenced
+              // to whoever holds the crown, and leadership changed six times in seventeen minutes
+              // on this pair. ONLY WHILE CONVERGED: during a forced 500 ms displacement the loop
+              // spent ten reports walking its bias toward a delta that vanished when the
+              // displacement was removed. The servo owns the transient; this owns the standing
+              // offset the servo cannot see.
+              const int32_t group_delta = this->tsf_sync_->render_group_delta_us();
+              if (this->config_.render_align_max_us > 0 && st.converged && group_delta != INT32_MIN) {
                 const int32_t cap = static_cast<int32_t>(this->config_.render_align_max_us);
                 int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
-                if (std::abs(render_delta) > RENDER_ALIGN_DEADBAND_US) {
+                if (std::abs(group_delta) > RENDER_ALIGN_DEADBAND_US) {
                   const int32_t step = std::clamp<int32_t>(
-                      static_cast<int32_t>(-render_delta * RENDER_ALIGN_GAIN),
+                      static_cast<int32_t>(-group_delta * RENDER_ALIGN_GAIN),
                       -RENDER_ALIGN_MAX_STEP_US, RENDER_ALIGN_MAX_STEP_US);
                   bias = std::clamp<int32_t>(bias + step, -cap, cap);
                   this->render_bias_us_.store(bias, std::memory_order_relaxed);
                 }
-                ESP_LOGD(TAG, "RALIGN render %+" PRId32 " us -> bias %+" PRId32 " us (cap %" PRId32 ")",
-                         render_delta, bias, cap);
+                ESP_LOGD(TAG,
+                         "RALIGN group %+" PRId32 " (leader %+" PRId32 ") -> bias %+" PRId32
+                         " us (cap %" PRId32 ")",
+                         group_delta, render_delta, bias, cap);
               }
             }
           }
