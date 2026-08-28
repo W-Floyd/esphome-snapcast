@@ -157,11 +157,23 @@ is that THE SIGNAL IS WRONG. `render_group_delta_us` compared against the analys
       +20      +113.3      -40
      -266      +106.2     +532      <- jumped 286 µs in 10 s while true skew moved 20
 
-So it is sign-inverted AND it steps hundreds of µs while reality holds still — most likely a
-phase re-seed on one side entering the median, since `record_peer_phase_` accepts entries up to
-PHASE_STALE_US (15 s) old and does not notice a counter reset. Fix the signal before touching
-the controller again; the gain, deadband and rate are all fine and were tuned against measured
-loop dynamics.
+Regressed properly against the analyser rather than read off a few samples — the signal is not
+merely sign-inverted, it is largely DISCONNECTED from reality:
+
+    board A: n=42  r=-0.153  slope=-0.10      expected slope -2.0
+    board B: n=29  r=-0.688  slope=-0.09      (group should equal -skew/2)
+
+The slope is ~20x too small and on A the correlation is near zero. So the loop was being fed
+mostly noise, which is why it crawled and stalled, and why it appeared to converge while the
+arithmetic said it should not.
+
+WHERE TO START: instrument the inputs, not the output — log this device's own `render_phase_us`,
+each peer phase in the table with its age, and the computed median, on one line. The candidates
+are a stale or re-seeded peer entry surviving in the table (`record_peer_phase_` accepts entries
+up to PHASE_STALE_US = 15 s old and cannot see a peer counter reset), and the median being taken
+over ABSOLUTE phases whose own doc warns "absolute value is meaningless... only differences
+between devices mean anything". Do not touch the controller: its gain, deadband and rate were
+tuned against measured loop dynamics and it is provably benign (sd 1.84 vs 4.62 with it off).
 
 **~~CORRECTION TO THE BELOW: THE DESTABILISER IS FOLLOWER BEACONING, NOT THE CORRECTION.~~**
 `render_align_max: 0ms` gates only the CORRECTION; follower beaconing runs regardless. So the
