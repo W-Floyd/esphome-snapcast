@@ -47,7 +47,44 @@ metrics (2026-08-27, MLS stimulus, analyser at sd 5.8 µs):
 - **Within a fixed disturbance, nothing measured predicts the displacement.** It is 73 ± 45 µs
   and apparently random.
 
-**THE ACCOUNTING ERROR RATCHETS: ~8.5 µs PER RESYNC, ALWAYS THE SAME DIRECTION.** n=10 forced
+**THE RATCHET WAS THE CROSS-STREAM COMPARISON, AND STREAM SCOPING REMOVED IT.** Same campaign
+re-run 2026-08-27 after flashing stream-scoped TSF leadership, with the pair verified in-contract
+(both reporting `TSF stream scope: 'MLS44' (a6ed0c3d)`, B elected leader between them, and both
+logging `Ignoring TSF packets for a different stream`):
+
+    PRE  (leader on another stream)  n=10  mean +15.7  sd 16.1   positives 10/10  (p = 0.002)
+    PRE, excluding two outliers      n= 8  mean  +8.5  sd  3.3   positives  8/8
+    POST (stream-scoped)             n= 7  mean  +1.6  sd  6.0   positives  5/7   (chance)
+
+    accumulated: PRE +157.3 µs over 10 resyncs;  POST +10.9 µs over 7
+
+So the residual fell 8.5 → 1.6 µs, the sign bias vanished, and the standing error stopped
+climbing (it held at ~+225 µs across the post-flash run against −28 → +192 before). The
+"systematic ratchet" recorded above was an artefact of comparing render phases across two
+snapcast streams — self-inflicted by splitting the probed pair onto their own stream — not a
+firmware bias. That is worth knowing precisely because it was significant at p = 0.002 and
+completely wrong.
+
+CONSEQUENCE: `render_delta` is now a good correction signal in-contract (residual 1.6 ± 6.0 µs
+against displacements of 20–235 µs), which is what `render_align_max` needs to be worth
+enabling. Two of nine cycles were contaminated and excluded — one by a B reseed, one by the A
+stall below.
+
+**BOARD A STALLED MID-CAMPAIGN, CAUGHT LIVE.** After a mute at 19:04:00 the player task stopped
+iterating entirely while work piled up:
+
+    ring=0 -> 78 KB -> 520 KB     records=0 -> 16 -> 112     iters=+73334 -> +50 -> +0
+    phase=idle(record queue), output_active=1, heap free 176 KB (not exhaustion)
+
+Records available and the task not iterating is a lost wakeup or a blocked mutex, not
+starvation. It recovered only on restart. This is the known wedge (~1-in-11 on reconnects) that
+`PLAYER STALLED` was added to catch, and this is the fullest capture of it so far. NOT excluded:
+the boards had just been flashed with the TSF change, so a contribution from it is unproven
+either way — the stalled task is the player, and the change touches the net task and the
+deadline.
+
+**~~THE ACCOUNTING ERROR RATCHETS: ~8.5 µs PER RESYNC, ALWAYS THE SAME DIRECTION.~~ (superseded
+by the above — kept because it was significant at p=0.002 and still wrong.)** n=10 forced
 resyncs, 2026-08-27, MLS stimulus:
 
     d_err: +2.9 +9.7 +7.4 +31.0 +58.6 +14.5 +7.4 +7.2 +12.0 +6.6   -- ALL POSITIVE
