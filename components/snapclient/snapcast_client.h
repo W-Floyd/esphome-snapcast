@@ -1191,6 +1191,16 @@ class SnapcastClient {
   ///
   /// Welford, so the variance is stable without keeping the samples. Reset each report.
   /// Written on the speaker callback thread under playout_mutex_, read by the player task.
+  /// @brief The deadline anchor, published for the SPEAKER CALLBACK thread.
+  ///
+  /// ServoState is a player-task local, so the tagged-render callback cannot read it. These two
+  /// carry the same pair across the thread boundary under playout_mutex_, letting the callback
+  /// evaluate the deadline-corrected error at the instant each tag arrives rather than once per
+  /// report. deadline() is linear in server time for fixed buffer and offset, so
+  /// deadline(T) == anchor_deadline + (T - anchor_server_ts).
+  int64_t tag_anchor_deadline_us_{0};
+  int64_t tag_anchor_server_ts_{0};
+
   uint32_t delay_n_{0};
   double delay_mean_us_{0.0};
   double delay_m2_us_{0.0};

@@ -1056,9 +1056,26 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
   const int64_t first_frame_local = adjusted_ts - static_cast<int64_t>(frames) * 1000000 / rate_i;
   const int64_t frame_server_us =
       static_cast<int64_t>(tag.server_ts) + static_cast<int64_t>(tag.offset_frames) * 1000000 / rate_i;
+  // RAW delay: local render instant minus server time. Carries the local-vs-server CLOCK OFFSET,
+  // which is unbounded and drifts at the crystal difference -- measured walking ~90 ppm, i.e. ~300 us
+  // per 3.35 s report. That term dominated the first block sweep and made it unreadable: a linear
+  // ramp inside every window gives block means that spread the same at every width, which was
+  // misread as "no measurement noise". Kept only for the mean, where the drift is the point.
   const double delay_us = static_cast<double>(first_frame_local - frame_server_us);
-
+  // DEADLINE-CORRECTED: the same subtraction the servo's target uses, so the clock offset cancels
+  // and what is left is the render error itself. This is the quantity whose precision decides
+  // whether a tag-derived signal can close a loop -- accuracy is already proven (inject_split moved
+  // it 1.02-1.05 of the truth while the ledger-based error, servo-nulled, could not see it at all).
+  //
+  // deadline() is linear in server time for fixed buffer and offset, so the tagged frame's target is
+  // the last chunk's target plus their server-time difference. Zero until the first chunk of a
+  // session sets the anchor, and skipped rather than fed a bogus zero.
   this->playout_mutex_.lock();
+  const bool err_tag_valid = this->tag_anchor_server_ts_ != 0;
+  const double err_tag_us =
+      err_tag_valid ? static_cast<double>(first_frame_local - (this->tag_anchor_deadline_us_ +
+                                                              (frame_server_us - this->tag_anchor_server_ts_)))
+                    : 0.0;
   this->tagged_render_ = TaggedRender{adjusted_ts, frames, static_cast<int64_t>(tag.server_ts), tag.offset_frames, rate};
   this->tagged_render_count_++;
   // Welford: mean and M2 without retaining samples.
@@ -1068,9 +1085,9 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
   this->delay_m2_us_ += d1 * (delay_us - this->delay_mean_us_);
   // Block-means sweep; see delay_blocks_. Each level accumulates B consecutive arrivals, and on
   // completion folds that block's MEAN into a Welford over block means.
-  for (size_t lvl = 0; lvl < DELAY_BLOCK_LEVELS; lvl++) {
+  for (size_t lvl = 0; lvl < DELAY_BLOCK_LEVELS && err_tag_valid; lvl++) {
     DelayBlock &blk = this->delay_blocks_[lvl];
-    blk.sum += delay_us;
+    blk.sum += err_tag_us;
     blk.fill++;
     const uint32_t width = 1u << lvl;
     if (blk.fill >= width) {
@@ -2482,6 +2499,11 @@ void SnapcastClient::player_task_() {
     // Anchor for the SHADOW error (see the SHADOW log line). Stored, not recomputed.
     st.last_deadline_us = deadline;
     st.last_deadline_server_ts = rec.server_ts_us;
+    // Published for the speaker callback, which cannot see this player-task local.
+    this->playout_mutex_.lock();
+    this->tag_anchor_deadline_us_ = deadline;
+    this->tag_anchor_server_ts_ = rec.server_ts_us;
+    this->playout_mutex_.unlock();
 
 #ifdef CLOCK_SYNC_TSF_ACTIVE
     // RAW timing sample, for offline cross-device analysis. Deliberately built from
