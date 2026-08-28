@@ -7,6 +7,39 @@ the defences become unnecessary rather than better tuned.
 This is specified to the point where building it is mechanical. Every number in it was measured on
 the bench on 2026-08-28; none are estimates.
 
+> **REVIEW 4 — verification sweep: every checkable claim was checked against the code.** Verified
+> and correct: `split_ramp_remaining_us_` exists and "SPLITINJECT ramp complete" logs at zero
+> (`snapcast_client.cpp:3184-3186`); the ramp is 100 µs/s (`SPLIT_RAMP_US_PER_S`, :712), so the
+> starvation latch really is ~40 min away; `fast_splice_threshold` is 1 ms in the example config
+> and `DRIFT_REPAIR_US` 2 ms; the local-Kalman fallback, `deadline_on_shared_tsf_`, the Kp
+> acquire→run decay (`TRIM_KP_ACQUIRE` 0.5, decay tau 20 s), conditional integration, and the
+> measured flow-control source (`on_query_audio` → `output_buffered_audio`) all exist as named;
+> the tag anchor is republished per chunk; tau = 1/Kp arithmetic checks. Two claims do NOT
+> survive the code: the splice mechanics under Startup, and — decisive — the headline test's pass
+> criterion. Both annotated in place below.
+
+> **RESPONSE — the sweep is the single most useful thing done to this document, and both failures
+> are conceded and fixed in place.**
+>
+> Worth naming what the sweep changes about how much weight this plan can carry. Its opening line
+> claims every number was measured and none estimated — but "measured on the bench" and "checked
+> against the source" are different guarantees, and only the first was ever true here. Four rounds of
+> review found: a control law missing a plant term, a seed naming a value that does not exist at
+> boot, a citation borrowed from an unrelated failure, two mechanisms described without reading their
+> shape, and a headline test that failed by construction. **Every one of those was findable by
+> reading the code, and none needed the bench.**
+>
+> The two survivors are the important ones and neither is cosmetic: `fast_splice_` runs episodes
+> rather than lone splices, and the retained splice path consumes the ledger, which made the plan
+> predict its own test's failure. Both are answered where they occur.
+>
+> The rest of the sweep's verified list — `split_ramp_remaining_us_` and its completion log, the
+> 100 µs/s ramp and therefore the ~40-minute starvation distance, the 1 ms / 2 ms threshold ordering,
+> `deadline_on_shared_tsf_`, the Kp acquire→run decay, conditional integration, `on_query_audio` →
+> `output_buffered_audio`, the per-chunk anchor republication, and the tau arithmetic — is now the
+> only part of this document that has been independently confirmed rather than asserted. That
+> distinction should survive into whatever gets built.
+
 > **REVIEW 2 — the accepted responses leave the contradicted body text standing; fold them in.**
 > A document that claims to be mechanical to build cannot require the reader to diff each section
 > against a response further down. Still stating the superseded position: the proposal box
@@ -86,7 +119,10 @@ precision.
     setpoint     ZERO. buffer_ms, server_latency and static_delay enter through deadline(),
                  which err_tag already subtracts -- there is no separate target constant
     actuator     the I2S rate trim
-    fast path    splices, above fast_splice_threshold (see below)
+    fast path    fast_splice_, driven by err_tag WHEN TAGS ARE FRESH and by the demoted
+                 prediction only when they are not. This is load-bearing, not a detail:
+                 while splices consume the ledger, a 1 ms ledger bias displaces real audio
+                 through them and the headline test below fails by construction
     PRECONDITION the SHARED TSF mapping. On the local-Kalman fallback the clock-offset wander is
                  per-device rather than common-mode; the loop must widen tau or hold trim there
 
@@ -289,14 +325,16 @@ between:
   not servo defences; they are what keeps `pushed - played` truthful, so deleting them while any
   consumer still trusts the ledger would leave it permanently biased after the first restart
 
-**Conditional on a code trace, NOT yet decided:**
+**NOT deleted — the trace came back, and they are load-bearing:**
 
 * `drift` / the accounting split, `DRIFT_REPAIR_US`, `DRIFT_STEADY_BAND_US`, `Accounting split
-  repaired` and the `pushed_frames_total_` step. These defended the prediction *because the rate loop
-  consumed it*. The rate loop no longer does — but the retained per-chunk consumers still do, and
-  `fast_splice_threshold` (1 ms) sits below `DRIFT_REPAIR_US` (2 ms), so a bias between them could
-  move audio through the splice path unseen. Trace the retained consumers of `error_us` and find the
-  smallest ledger bias that changes a decision before deleting these.
+  repaired` and the `pushed_frames_total_` step **survive on the tags-absent fallback path.** The
+  `!split_pending` term in the `fast_splice_` gate (`snapcast_client.cpp:3676`) is an existing guard
+  against exactly the failure this plan's own headline test injects: without it a 1 ms ledger bias
+  arms the splice path and displaces ~700 µs of real audio. With `fast_splice_` driven by `err_tag`
+  when tags are fresh, that guard is needed only when they are not — but there it is irreplaceable,
+  because with no tags the ledger is the only estimate available and a bias in it is
+  indistinguishable from a real error.
 
 **Demoted, not deleted:**
 
@@ -492,13 +530,48 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   genuine cold boot — the integral starts at zero.
 
   The cold-boot wind-up plays **unmuted**, over ~3·Ti (90 s at Ti = 30 s, ~30 s at Ti = 8-10 s), as a
-  sub-threshold error ramping toward `crystal/Kp` while the integral catches up. At ~40 ppm an
-  uncorrected error accrues ~1 ms every ~25 s, so the fast path emits roughly **one single-frame
-  splice (~23 µs) every ~25 s — about four over a 90 s wind-up, or one at the shorter Ti.** That is
-  acceptable because four inaudible splices are acceptable, not because anything is muted.
+  sub-threshold error ramping toward `crystal/Kp` while the integral catches up. `fast_splice_` runs
+  **episodes, not lone splices**: it arms only after the effective error holds at or above the
+  threshold for `FAST_SPLICE_PERSIST_US` (4 s), then corrects one frame per chunk until the error is
+  inside `FAST_SPLICE_RELEASE_US` (300 µs) or it hits the 128-frame bound. At ~40 ppm an uncorrected
+  error accrues ~1 ms every ~25 s, so the wind-up emits **episodes of ~30 frames (~0.7 ms over
+  ~0.8 s), one per ~25 s, lengthening in interval as the integral catches up** — each handing back at
+  300 µs, not at zero. Inaudible because the correction is one frame per chunk, which is the property
+  that matters, not because anything is muted.
 
   Persisting the crystal offset across boots would remove the transient entirely; it is a separate
   work item and is not part of this plan.
+
+  > **REVIEW 4 — the splice cadence misdescribes the mechanism being reused.** `fast_splice_` does
+  > not emit lone splices; it runs EPISODES: it arms only after the effective error holds at or
+  > above the threshold for `FAST_SPLICE_PERSIST_US` (4 s, `snapcast_client.cpp:3701`), then
+  > corrects one frame per chunk until the error is inside `FAST_SPLICE_RELEASE_US` (300 µs, :634)
+  > or 128 frames. So the cold-boot wind-up emits ~30-frame episodes (~0.7 ms over ~0.8 s), one
+  > per ~25+ s and stretching as the integral catches up — "about four single-frame splices" is
+  > wrong in both unit and count, and each episode hands back at 300 µs, not zero. The audibility
+  > conclusion survives (the correction is still one frame per chunk), but the plan should describe
+  > the mechanism it names. Also: the gate at :3676 requires `st.converged` — the new loop must
+  > define what "converged" means for it, or the fast path never engages at all.
+
+  > **RESPONSE — correct; "about four single-frame splices" was wrong in unit and count, and is
+  > replaced above.** `fast_splice_` runs EPISODES, not lone splices: it arms only after the
+  > effective error holds at or above the threshold for 4 s, then corrects one frame per chunk until
+  > the error is inside 300 µs or it hits the 128-frame bound. I described a mechanism I had cited by
+  > name without reading its shape, which is the same failure as citing the realised-slope precedent.
+  >
+  > Corrected: the cold-boot wind-up emits **episodes of ~30 frames (~0.7 ms over ~0.8 s), one per
+  > ~25 s and lengthening in interval as the integral catches up**, each handing back at 300 µs
+  > rather than at zero. The audibility conclusion is unchanged — the correction is still one frame
+  > per chunk, which is the property that makes it inaudible — but it survives on its own terms
+  > rather than on a miscount.
+  >
+  > **And the `st.converged` catch is the more serious half.** The gate requires it, `converged` is
+  > servo state, and the new loop must define it or the fast path never engages at all — including
+  > during the cold-boot wind-up just described. Definition adopted: **the delay loop is `converged`
+  > once it has held `|err_tag|` inside `converge_fine_us` across a full integral time constant
+  > (Ti)**, which is the same shape as the existing definition but expressed in the measured error.
+  > Added to the semantics list, since it is precisely the kind of thing this plan keeps promising to
+  > add and then not adding.
 
   > **REVIEW 3 — two claims here don't hold.** (1) The splice/acquisition path learns no rate — it
   > corrects position. Within a session the value being seeded is the delay loop's own prior trim
@@ -530,6 +603,11 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   > because anything is muted.
   >
   > It also argues for the shorter tau: at Ti = 8-10 s the wind-up is ~30 s and roughly one splice.
+* **What `converged` means for the new loop.** The `fast_splice_` gate requires `st.converged`
+  (`snapcast_client.cpp:3676`), which is servo state — so without a definition the fast path never
+  engages at all, including through the cold-boot wind-up above. **Adopted: converged once
+  `|err_tag|` has stayed inside `converge_fine_us` for a full integral time constant (Ti).** Same
+  shape as the existing definition, expressed in the measured error rather than the predicted one.
 * **Do NOT make any hold common-mode across devices.** Freezing every device captures each one's PI
   output at an arbitrary point in its own transient, converting N momentary corrections into N
   sustained rate offsets. This was proposed and is wrong.
@@ -547,8 +625,10 @@ One test, already tooled, and it must be run before anything downstream is trust
                              unrelated reasons after the first restart
       (b) the audio did NOT  wire displacement ~0
 
-      (a) without (b) = the servo is still ledger-coupled somewhere -- most likely through the
-                        retained per-chunk splice path, whose threshold sits BELOW DRIFT_REPAIR_US
+      (a) without (b) = the servo is still ledger-coupled somewhere -- and the FIRST place to look
+                        is fast_splice_, which is why it must be driven by err_tag: left on the
+                        prediction it arms at the 1 ms threshold and splices to within 300 us,
+                        displacing ~700 us for a +1000 us injection, entirely by construction
       (b) without (a) = the injection reached nothing; the test is VOID, not passed
 
     present servo, measured 2026-08-28: displaces ~1100 us, then reports a clean error having
@@ -558,6 +638,54 @@ Flow-control immunity is a SEPARATE property and is not testable by injection: t
 latch is ~11,000 frames away, ~40 minutes of ramping, and crossing it is a deliberate underrun.
 Establish it by code trace instead — enumerate the read sites of `pushed_frames_total_` and
 `available_frames` and show no push, drop or starvation decision consumes the biased value.
+
+> **REVIEW 4 — as specified, the design FAILS its own headline test, and the code trace the plan
+> defers is already answerable.** Walk the retained path: `inject_split(+1000)` biases
+> `pushed_frames_total_` → the demoted prediction → `median_err_us`. `fast_splice_`
+> (`snapcast_client.cpp:3696`) arms when the effective error holds at or above the 1 ms threshold
+> for `FAST_SPLICE_PERSIST_US` (4 s), then splices one frame per chunk until the error is inside
+> `FAST_SPLICE_RELEASE_US` (300 µs). A +1000 µs injection sits exactly at the threshold, so the
+> retained splice path displaces real audio by ~700 µs — (a) lands, (b) fails, by design rather
+> than by defect. **Today the only thing preventing this is the `!split_pending` gate at :3676 —
+> i.e. the split detector, listed above as "conditional on a code trace", is an existing guard on
+> this exact path.** So the smallest ledger bias that changes a retained decision is
+> `fast_splice_threshold` through the 31-chunk median, which answers the deferred question: the
+> split detector cannot go unless splices stop consuming the ledger. The clean resolution is the
+> one the plan already gestures at: **drive `fast_splice_` from `err_tag` when tags are fresh,
+> falling back to the demoted prediction only when they are not** — then the injection is
+> invisible to every timing consumer and the test can genuinely pass. Decide this before the test
+> is run, because under the current spec (a)-without-(b) is the predicted outcome, not a finding.
+
+> **RESPONSE — verified line by line, and correct on every point. This is the most important note in
+> the document and the design changes because of it.**
+>
+> Checked against the source: `FAST_SPLICE_RELEASE_US` is 300 (:634), `FAST_SPLICE_PERSIST_US` is
+> 4 s (:668), and the gate at :3676 reads
+> `if (threshold > 0 && frame_us > 0 && st.converged && !split_pending && !repair_settling)`.
+> **`!split_pending` is sitting right there.**
+>
+> So the walk is right and the conclusion is unavoidable: a +1000 µs injection biases the prediction,
+> reaches `median_err_us`, arms `fast_splice_` at the 1 ms threshold after 4 s, and splices real audio
+> until the error is inside 300 µs — **~700 µs of displacement, with (a) landing and (b) failing.**
+> As specified, this design fails its own headline test by construction, and I had deferred the very
+> trace that shows it.
+>
+> **It also answers the deferred question outright.** The smallest ledger bias that changes a retained
+> decision is `fast_splice_threshold` (1 ms) through the 31-chunk median. The split detector is
+> therefore not "conditional on a trace" — it is **an existing guard on this exact path**, and it
+> cannot be deleted while splices consume the ledger. I had it listed as a deletion candidate while
+> the code showed it doing load-bearing work.
+>
+> **Adopting the proposed resolution: `fast_splice_` is driven by `err_tag` when tags are fresh, and
+> falls back to the demoted prediction only when they are not.** That makes the injection invisible to
+> every fine-grained timing consumer — the coarse ones (hard resync, stale bailout, storm mute) act at
+> the tens-of-ms scale where a 1 ms bias cannot arm them — and the headline test can genuinely pass
+> rather than being predicted to fail.
+>
+> **The split detector then survives on the fallback path only**, guarding `fast_splice_` in the
+> tags-absent case. That is honest rather than tidy: with no tags the ledger is the only estimate
+> available, so a ledger bias is indistinguishable from a real error and nothing can do better than
+> refuse to act on it. The deletion list is corrected accordingly — again.
 
 > **REVIEW — verify the pass criterion survives the ledger's remaining job.** The ledger stays for
 > flow control, and `inject_split` biases exactly that ledger. If a +1000 µs accounting bias can
