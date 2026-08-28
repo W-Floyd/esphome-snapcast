@@ -564,6 +564,12 @@ static constexpr int64_t DRIFT_REPAIR_HOLD_US = 3000000;
 // The bias must exceed DRIFT_REPAIR_US to be detected at all; 2500 us is what every measured point
 // used. It is ramped by the same machinery as the test hook, so nothing is stepped.
 static constexpr int32_t REANCHOR_BIAS_US = 2500;
+// Longest AudioDepth snapshot age whose composite total is still coherent enough to difference
+// against our own accounting. The mixer stamps the total with the sink's instant but reads its own
+// terms now, so once the sink has rendered a descriptor's worth since that stamp the total
+// over-states the present pipeline by the age. One DMA span (5 x 10 ms on the i2s std speaker) is
+// where that becomes certain. See the gate in the fill cross-check for the measurement.
+static constexpr int64_t DEPTH_SNAPSHOT_COHERENT_US = 50000;
 // How long after the unmute to wait before perturbing. Long enough that the servo has finished the
 // fine settling the re-lock ends with -- perturbing into that would measure the settling, not the
 // anchor -- and short enough to be over before a listener has settled in.
@@ -3847,7 +3853,45 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           if (fill_comparable) {
             const int64_t accounted_us =
                 accounted_then_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+            // REJECT AN INCOHERENT SNAPSHOT RATHER THAN CORRECT IT. Measured 2026-08-28: this
+            // check read a steady drift=-52041 on A and -52223 on B against +22 us on the samples
+            // either side, 151 times on A alone, and the discriminator is in the same log line --
+            // the bad samples carry age=48116 where the good ones carry age=25105.
+            //
+            // WHY THOSE SAMPLES ARE MEANINGLESS. The mixer stamps the composite with the SINK's
+            // snapshot instant (its oldest term) but reads its own ring and transfer buffer NOW.
+            // Between the two instants the sink renders R frames, and the stale sink terms still
+            // count them, so the total over-states the T_now pipeline by R = the snapshot age
+            // (audio renders in real time). The comment at the mixer's publish argues a mixed-age
+            // sum is safe because "only what enters at the top or renders at the bottom moves the
+            // number" -- but rendering at the bottom is exactly what happens across 48 ms, so the
+            // argument holds only while the age is small.
+            //
+            // WHY NOT SIMPLY SUBTRACT THE AGE, which is what the arithmetic above suggests: the
+            // accounting side is brought to `measured.as_of_us` by accounted_at_(), so subtracting
+            // the age from the measurement would compare T_sink accounting against a T_now
+            // measurement -- one mismatch traded for another. Making both coherent means either
+            // ageing the accounting to now as well, or ageing the mixer's own terms backwards,
+            // which is not possible from here. And ageing this data has three measured failures
+            // behind it (see the DISPROVEN notes in the seed path), so a speculative correction is
+            // the wrong instinct in this file specifically.
+            //
+            // A GATE COSTS NOTHING. This check runs per report and only ever needs to spot a
+            // SUSTAINED discrepancy, so discarding the incoherent minority loses no sensitivity --
+            // whereas feeding them in puts a -52 ms outlier into a signal whose real magnitude is
+            // tens of microseconds. Bound set at one DMA span: past that the sink has certainly
+            // rendered a descriptor's worth since the snapshot, which is where the mixed-age
+            // argument breaks.
+            // Computed EITHER WAY, so the RECON diagnostic below still carries the real number
+            // next to the age that condemns it -- that pairing is what identified this in the first
+            // place, and zeroing the field would have hidden it. Only `fill_comparable` is
+            // withheld, and that is the flag which authorises action: it gates the self-repair and
+            // the sync report's fill= field, and nothing else consumes the drift.
             fill_drift_us = static_cast<int32_t>(accounted_us - static_cast<int64_t>(measured.microseconds));
+            const int64_t snapshot_age_us = now_us() - measured.as_of_us;
+            if (snapshot_age_us < 0 || snapshot_age_us > DEPTH_SNAPSHOT_COHERENT_US) {
+              fill_comparable = false;
+            }
             // Conservation across the mixer, at the same instant and from the same snapshot as the
             // drift itself. src_consumed and sink_received are CUMULATIVE while xfer is a level, which
             // is what makes this worth computing: frames merely in flight inside the mixer show up
