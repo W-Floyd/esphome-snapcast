@@ -204,7 +204,44 @@ static constexpr int64_t UNMUTE_BAND_DEADBANDS = 2;
 // takes over once unmuted, where the error is mostly differential measurement noise and the
 // gain is the multiplier turning that noise into audible inter-device skew.
 static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
-static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.25f;
+// 0.25 -> 0.125 (2026-08-28), on three independent measurements that agree on the mechanism, and
+// only after the objection that reverted the last attempt was shown not to apply any more.
+//
+// THE JITTER IS THIS LOOP'S LIMIT CYCLE. Measured against the analyser over 1.5 h of event-free
+// data (n=60506, SNR 235x over the instrument's 0.027 us floor):
+//
+//   structure function   sd of skew differences 0.30 us at tau 0.1 s, rising to a PLATEAU of
+//                        9.0 us for tau >= 30 s -- a bounded wander, not white noise (which would
+//                        be flat at sqrt(2)*sigma from the shortest lag) and not a random walk
+//                        (which would keep growing). Corner at 10-30 s.
+//   trim oscillation     ~24 s period (5 zero crossings per 60 s), 73 ppm p2p, present CONTINUOUSLY
+//                        in windows with no disturbance within 180 s.
+//   loop gain            KP x 3.15 us/ppm = 0.79, so amplification 1/(1-G) = 4.8x.
+//
+// Same timescale from three directions, so the 9 us plateau IS the lightly-damped loop cycle.
+// At 0.125 the gain is 0.39 and the amplification 1.6x, predicting a plateau near 3 us -- a 3x
+// reduction, which is more than the linear factor because the loop-gain term pays as well.
+//
+// WHY THE 0.1 REVERT DOES NOT APPLY. That test predates the gain schedule by 27 commits
+// (4393039 vs 5b751f9), so 0.1 was applied during RECOVERY too, and both objections it raised are
+// recovery-phase effects: 295 s to settle, and a -155 us landing offset (the wire offset is the
+// integral of the differential rate, so a slower null lets the integral run longer). Under the
+// schedule recovery runs at ACQUIRE 0.5 and decays to RUN over 60 s, so RUN no longer governs it.
+//
+// AND RECOVERY HAS ENORMOUS MARGIN, measured under the schedule across 32 real hard resyncs --
+// nobody had re-measured it, and the 54 s figure quoted above predates the schedule and every
+// other fix since: |median| back within 60 us in 2.3 s median, within 30 us in 6.0 s (tail to
+// 51-71 s). Even a 4x slowdown leaves it under 10 s. CAVEAT: that is the SERVO's median returning
+// to band, which this file's central lesson says can read clean while the wire is displaced -- so
+// the landing offset is a separate quantity and is still the bar this change has to clear.
+//
+// ACQUIRE IS DELIBERATELY UNCHANGED. At 0.5 its loop gain is 1.58, above the ultimate 0.317, and
+// that is safe only because the schedule decays it: gain(t) = 0.25 + 0.25*e^(-t/20) crosses 0.317
+// at t = 26 s, about ONE oscillation period, so the ring grows once and then damps. Measured
+// confirmation: post-event and quiet 60 s windows show the SAME 5.0 zero crossings, i.e. ACQUIRE
+// adds amplitude (92 vs 73 ppm p2p) but no extra ringing. Lowering it would cost recovery speed to
+// fix something the decay already handles; raising it buys ringing rather than settling.
+static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.125f;
 // DECAY between them, keyed on TIME SINCE THE LAST DISTURBANCE EVENT rather than on a single step
 // at convergence. See trim_kp_() for the schedule and mark_kp_event_() for what counts as an event.
 //
