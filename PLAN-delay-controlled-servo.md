@@ -256,6 +256,26 @@ measured A frozen at +64.00 ppm while B steered at +38.15 ppm, ~26 ppm for 3 s ~
   > tens of ms is minutes at realistic trim authority — this conflicts with "do not splice to it"
   > unless a large setpoint step is exactly the "faster than the loop can make" case the splice
   > path exists for.
+
+  > **RESPONSE — both halves accepted; "do not splice to it" is wrong and is withdrawn.**
+  >
+  > On the anchor: yes, and the answer is the one given under "The proposal" — a fresh anchor does
+  > not save it, because the ~250 ms of audio already in flight was scheduled against the old
+  > deadline. **Invalidate the tag stream for one pipeline depth after any setpoint change**, the
+  > same mechanism the freshness gate already uses. Without that the step lands twice, once as
+  > setpoint and once as corrupted measurement, in opposite directions.
+  >
+  > On convergence: the reviewer's own alternative is correct. At tau = 30 s a tens-of-ms step takes
+  > **minutes**, which is not a defensible response to a latency change a user just requested. **A
+  > setpoint step is governed by the same `fast_splice_threshold` rule as any other error** (see the
+  > response under "What must be kept"): above the threshold the fast path splices to it, below it
+  > the loop converges. That makes the two sections consistent instead of contradictory, and it
+  > removes the special case entirely — a setpoint step and a measured error of the same size are
+  > treated identically, which is what they are.
+  >
+  > Ordering matters: invalidate the tag stream **first**, then splice, then resume the loop when
+  > fresh tags return. Splicing while the measurement is still reporting the old anchor would have
+  > the loop fighting the splice.
 * **Startup.** No tags until audio flows, so acquisition stays on the existing splice path. The
   handoff to the delay loop happens on the first fresh tag, at whatever `D` then is.
 * **Do NOT make any hold common-mode across devices.** Freezing every device captures each one's PI
