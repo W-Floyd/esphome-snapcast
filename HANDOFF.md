@@ -198,9 +198,23 @@ five-device TSF consensus:
                          B  n=50  median +12  MAD 23  sd 82.3  p2p 383
     including them       33 of 83 samples per board -- ONE 36-second group-wide burst
 
-MAD 20-23 us is better than the 32-34 measured in an outage aftermath, but it is still inside the
-band that disqualified `RECON drift` in the plan, the tails are heavy, and 40% of samples sat in the
-MILLISECONDS during one burst. That burst is common-mode across boards and coincides with the
+Re-measured after the 100 ms freshness gate went on (13:16, same bench, group of 4):
+
+                         outliers    median   MAD    sd    p2p
+    A  before            33/83          +4     20   87.5   461
+       after              0/104        -24     34   68.8   408
+    B  before            33/83         +12     23   82.3   383
+       after              0/103        -21     27   61.0   399
+
+The multi-millisecond burst samples are GONE -- zero outliers in 207 samples across both boards --
+and sd fell ~25%. **Do not read the MAD columns as a regression.** The "before" core of 50 was what
+survived discarding 40% of samples as outliers, i.e. conditioned on sitting outside a disruption
+burst; the "after" core discards nothing. They are not like-for-like populations. The gate is also
+provably not the cause: in the whole post-fix window there were ZERO `measured=unknown` publications,
+so on a healthy bench it rejects nothing and cannot have moved the MAD.
+
+MAD 27-34 us is still inside the band that disqualified `RECON drift` in the plan, the tails are
+still heavy, and before the gate 40% of samples sat in the MILLISECONDS during one burst. That burst is common-mode across boards and coincides with the
 five-device consensus re-forming, so **a device re-locking drags the group median** -- which is the
 thing to understand before anything steers on this.
 
