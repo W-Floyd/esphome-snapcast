@@ -241,7 +241,17 @@ static constexpr float TRIM_KP_ACQUIRE_PPM_PER_US = 0.5f;
 // confirmation: post-event and quiet 60 s windows show the SAME 5.0 zero crossings, i.e. ACQUIRE
 // adds amplitude (92 vs 73 ppm p2p) but no extra ringing. Lowering it would cost recovery speed to
 // fix something the decay already handles; raising it buys ringing rather than settling.
-static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.125f;
+// REVERTED to 0.25 (2026-08-28). The loop-gain reasoning below is unchanged and still looks right,
+// but after five 5-minute windows aborted on bench events it was never graded, while its COST was
+// measured immediately: per-board median error ran 1-217 us against +-30-60 at 0.25, because a lower
+// gain nulls each board's own error against server time more slowly. Inter-device skew -- what
+// imaging needs -- looked fine, but the unmute gate and st.converged both read those medians.
+//
+// A measured cost against an unmeasured benefit decides it. Re-attempt when the bench is quiet
+// enough to hold a 5-minute window, and grade it on the STRUCTURE FUNCTION plateau (9.0 us at
+// tau >= 30 s pre-change, predicted ~3 us at 0.125) rather than on sd, plus the landing offset
+// against the +-130 us band.
+static constexpr float TRIM_KP_RUN_PPM_PER_US = 0.25f;
 // DECAY between them, keyed on TIME SINCE THE LAST DISTURBANCE EVENT rather than on a single step
 // at convergence. See trim_kp_() for the schedule and mark_kp_event_() for what counts as an event.
 //
