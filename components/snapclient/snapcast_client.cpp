@@ -4544,11 +4544,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       //
       // The first line carries what must never be lost: the error summary and the correction
       // counts. Everything derived or diagnostic goes on SYNCX, which is short enough to survive.
+      //
+      // trim_str is deliberately NOT here. Keeping it produced a 311-byte line again as soon as the
+      // error fields widened -- measured post-split at 14:40:26 -- because a bounded-looking field
+      // plus unbounded numbers still reaches the ceiling. TRIMDBG carries the trim series, and the
+      // analyser now reads it from there, so this line has no unbounded tail left to lose.
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
-               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs%s over %" PRIu32 " chunks",
+               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs over %" PRIu32 " chunks",
                st.err_accum_us / st.err_count, st.err_peak_us, median_err_us, st.soft_dropped_frames,
-               st.soft_inserted_frames, st.hard_resyncs, trim_str, st.err_count);
+               st.soft_inserted_frames, st.hard_resyncs, st.err_count);
       ESP_LOGD(TAG, "SYNCX feedback %" PRId64 " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32
                     " ms%s%s%s%s",
                fb_mean_gap_us, max_gap_us / 1000, buffered_ms, pipeline_ms, fill_str, drift_str, dl_str, tsf_str);
