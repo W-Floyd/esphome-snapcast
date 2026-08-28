@@ -1066,13 +1066,22 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
   const double d1 = delay_us - this->delay_mean_us_;
   this->delay_mean_us_ += d1 / static_cast<double>(this->delay_n_);
   this->delay_m2_us_ += d1 * (delay_us - this->delay_mean_us_);
-  // Interleaved halves for the independence check; see delay_n_odd_.
-  if (this->delay_n_ & 1u) {
-    this->delay_n_odd_++;
-    this->delay_mean_odd_ += (delay_us - this->delay_mean_odd_) / static_cast<double>(this->delay_n_odd_);
-  } else {
-    this->delay_n_even_++;
-    this->delay_mean_even_ += (delay_us - this->delay_mean_even_) / static_cast<double>(this->delay_n_even_);
+  // Block-means sweep; see delay_blocks_. Each level accumulates B consecutive arrivals, and on
+  // completion folds that block's MEAN into a Welford over block means.
+  for (size_t lvl = 0; lvl < DELAY_BLOCK_LEVELS; lvl++) {
+    DelayBlock &blk = this->delay_blocks_[lvl];
+    blk.sum += delay_us;
+    blk.fill++;
+    const uint32_t width = 1u << lvl;
+    if (blk.fill >= width) {
+      const double bmean = blk.sum / static_cast<double>(width);
+      blk.n++;
+      const double db = bmean - blk.mean;
+      blk.mean += db / static_cast<double>(blk.n);
+      blk.m2 += db * (bmean - blk.mean);
+      blk.sum = 0.0;
+      blk.fill = 0;
+    }
   }
   this->playout_mutex_.unlock();
 }
@@ -4400,16 +4409,17 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           const uint32_t d_n = this->delay_n_;
           const double d_mean = this->delay_mean_us_;
           const double d_sd = d_n > 1 ? std::sqrt(this->delay_m2_us_ / static_cast<double>(d_n - 1)) : 0.0;
-          const double d_split = (this->delay_n_odd_ > 0 && this->delay_n_even_ > 0)
-                                     ? this->delay_mean_odd_ - this->delay_mean_even_
-                                     : 0.0;
+          double blk_sd[DELAY_BLOCK_LEVELS];
+          uint32_t blk_n[DELAY_BLOCK_LEVELS];
+          for (size_t lvl = 0; lvl < DELAY_BLOCK_LEVELS; lvl++) {
+            DelayBlock &blk = this->delay_blocks_[lvl];
+            blk_n[lvl] = blk.n;
+            blk_sd[lvl] = blk.n > 1 ? std::sqrt(blk.m2 / static_cast<double>(blk.n - 1)) : 0.0;
+            blk = DelayBlock{};
+          }
           this->delay_n_ = 0;
           this->delay_mean_us_ = 0.0;
           this->delay_m2_us_ = 0.0;
-          this->delay_n_odd_ = 0;
-          this->delay_mean_odd_ = 0.0;
-          this->delay_n_even_ = 0;
-          this->delay_mean_even_ = 0.0;
           this->playout_mutex_.unlock();
 
           // DELAY: the measured transport delay averaged over the whole report window, with the
@@ -4420,10 +4430,19 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // averaging will help -- which is the same answer, arrived at honestly.
           if (d_n > 1) {
             const double sem = d_sd / std::sqrt(static_cast<double>(d_n));
-            // split/(2*sem) is the honesty ratio: ~1 means the samples are independent and sem can
-            // be believed, >>1 means they are correlated and sem is optimistic by that factor.
-            ESP_LOGD(TAG, "DELAY mean=%.1f us sd=%.1f n=%" PRIu32 " sem=%.2f split=%+.2f ratio=%.2f", d_mean,
-                     d_sd, d_n, sem, d_split, sem > 0.0 ? std::fabs(d_split) / (2.0 * sem) : 0.0);
+            // sem assumes independence and is therefore a LOWER BOUND. DELAYBLK below is what says
+            // whether it can be believed: read the sd column across block widths. Falling as
+            // 1/sqrt(B) means independent and sem is honest; flattening at width B means the
+            // effective sample size is n/B and the true standard error is sem*sqrt(B).
+            ESP_LOGD(TAG, "DELAY mean=%.1f us sd=%.1f n=%" PRIu32 " sem=%.2f (lower bound)", d_mean, d_sd, d_n,
+                     sem);
+            char blkbuf[160];
+            int bn = snprintf(blkbuf, sizeof(blkbuf), "DELAYBLK");
+            for (size_t lvl = 0; lvl < DELAY_BLOCK_LEVELS && bn > 0 && bn < static_cast<int>(sizeof(blkbuf)); lvl++) {
+              bn += snprintf(blkbuf + bn, sizeof(blkbuf) - bn, " %u:%.1f/%" PRIu32, 1u << lvl, blk_sd[lvl],
+                             blk_n[lvl]);
+            }
+            ESP_LOGD(TAG, "%s", blkbuf);
           }
 
           // A tagged observation older than this describes a pipeline state that has since changed.
@@ -4544,6 +4563,22 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           (void) tr_count;
           (void) inferred_phase;
 #endif
+        } else {
+          // THE TSF SAMPLE FAILED, and the delay accumulators must still be cleared.
+          //
+          // They were reset only on the success path, so a failed sample left them accumulating
+          // across reports: n reached 668, 1002, 1336 and 1673 on one board -- exact multiples of
+          // the ~334 per report -- and sd inflated with the extra drift each spanned. Every
+          // statistic from such a report described a window of unknown, unreported length. An
+          // accumulator whose reset is conditional on an unrelated success is a silent one.
+          this->playout_mutex_.lock();
+          this->delay_n_ = 0;
+          this->delay_mean_us_ = 0.0;
+          this->delay_m2_us_ = 0.0;
+          for (auto &blk : this->delay_blocks_) {
+            blk = DelayBlock{};
+          }
+          this->playout_mutex_.unlock();
         }
         // tsf= now reports the CONSENSUS, not a role. n is how many raw estimates the adopted
         // mapping averages, our own included: 1 means nobody else is audible and we are playing

@@ -1207,10 +1207,32 @@ class SnapcastClient {
   ///
   ///   |mean_odd - mean_even| ~ 2*sem   -> independent, sem is honest
   ///   |mean_odd - mean_even| >> 2*sem  -> correlated, sem is optimistic by that ratio
-  uint32_t delay_n_odd_{0};
-  double delay_mean_odd_{0.0};
-  uint32_t delay_n_even_{0};
-  double delay_mean_even_{0.0};
+  /// @brief Block-means variance sweep, for the EFFECTIVE sample size.
+  ///
+  /// Replaces an interleaved odd/even test that was mis-designed: interleaving cancels the
+  /// correlated component it is trying to size, so it can detect correlation but never measure its
+  /// cost. It also had its sense inverted in the reporting -- positive autocorrelation makes the two
+  /// halves MORE alike, so the ratio falls below the independence expectation rather than rising
+  /// above it. Measured 0.03-0.73 against ~0.8, i.e. correlated, by a factor that test could not
+  /// give.
+  ///
+  /// This measures it directly. Accumulate the mean over blocks of B consecutive arrivals for
+  /// several B, and track the variance of those block means. For INDEPENDENT samples the variance of
+  /// a block mean falls as 1/B; for correlated samples it flattens, and where it stops falling is
+  /// the effective sample size. The true standard error of the window mean is then sd/sqrt(n_eff),
+  /// not sd/sqrt(n).
+  ///
+  /// Powers of two from 1 to 64: enough range to see the knee at the ~10 ms descriptor cadence
+  /// against a 3.35 s window, and cheap -- one add and one compare per level per arrival.
+  static constexpr size_t DELAY_BLOCK_LEVELS = 7;  // B = 1,2,4,8,16,32,64
+  struct DelayBlock {
+    uint32_t fill;      ///< arrivals accumulated into the block currently being built
+    double sum;         ///< their sum
+    uint32_t n;         ///< completed blocks this window
+    double mean;        ///< running mean of completed block means (Welford)
+    double m2;          ///< their M2
+  };
+  DelayBlock delay_blocks_[DELAY_BLOCK_LEVELS]{};
   /// Sample rate the tag offsets are counted in, published by the player task when it tags and read
   /// on the speaker callback. Atomic because those are different threads and this is the one term of
   /// a tagged observation that does not travel with the tag.
