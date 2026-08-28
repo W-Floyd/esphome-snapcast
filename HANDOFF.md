@@ -87,6 +87,15 @@ overturned; both are struck through rather than deleted, because how they happen
 * **Verify the perturbation happened.** Three campaigns measured nothing: `execute_service` is a
   coroutine and silently did nothing unawaited; 1/5/100 ms latency steps are absorbed without a
   resync; `inject_starvation` never trips the storm. Only a **500 ms** step forces a mute.
+* **`inject_split(0)` IS NOT A RESTORE.** The field means "no request pending" (`0 when none`), so
+  zero does nothing and the board stays displaced. Reverse with the NEGATED value
+  (`inject_split(-1000)`) and confirm on the wire that it came back. A restore that silently
+  no-ops is the same contamination class as the stray `latency=500 ms` above — B sat +1017 µs out
+  before this was noticed (2026-08-28).
+* **A STEP perturbation reads as `nan`, not as movement.** `frame_lag`'s continuity guard rejects a
+  lag jump that cannot physically happen between captures, so a 5 ms latency step produced 100%
+  `nan` while a ramped 1 ms `inject_split` tracked to within 2%. Perturb by RAMP, or expect no wire
+  measurement across the step itself.
 * **`esphome` lives at a versioned Cellar path** — resolve it as
   `$(head -1 "$(command -v esphome)" | sed 's|^#!||')`; a brew upgrade broke it mid-session.
 * **`./reflash.sh` exits 0 even when every build failed.** With Docker Desktop not running,

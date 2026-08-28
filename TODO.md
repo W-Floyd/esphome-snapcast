@@ -370,10 +370,55 @@ MECHANISM: TWO CANDIDATES DEAD, both killed cheaply, neither by argument.
    over 30 s is ~78 us against the 7.9 us observed, correlating at `+0.068` / `expl 0%`. It
    predicts an order of magnitude too much and explains none of it.
 
-NEXT, and it tests the instrument END-TO-END rather than term-by-term, which is where three
-term-by-term guesses have now gone: step one board's server-side latency by a known +5 ms and see
-which way each instrument moves. That is ~500x the noise floor, settles the DC sign outright, and
-HANDOFF records 5 ms steps as absorbed without a resync. Restore under a trap.
+KNOWN-DISPLACEMENT TESTS RUN, AND THE SIGN IS STILL OPEN. Two attempts, both instructive, neither
+decisive.
+
+1. **Server-side latency, +5 ms on B.** Snapserver accepted and read back `latency=5` twice. The
+   wire went 100% `nan` -- NOT because nothing moved, but because `frame_lag`'s continuity guard
+   rejects a lag jump that cannot physically happen between captures, which is what a step is. So
+   server-side latency steps are unmeasurable on this analyser unless ramped.
+
+2. **`inject_split(+1000)` on B**, which ramps at `SPLIT_RAMP_US_PER_S` = 100 us/s and therefore
+   keeps the continuity guard satisfied. The wire tracked it cleanly:
+
+        BASELINE   wire  -19.9 us     on-device  -2.5 us
+        STEP       wire +996.9 us     on-device  +0.9 us
+        SHIFT      wire +1016.9 us    on-device  +3.4 us     ratio +0.003
+
+   The device saw **0.3%** of a displacement the wire resolved to within 2%.
+
+WHY THAT IS NOT PROOF OF BLINDNESS, and why it does not settle the sign: `inject_split` moves the
+device's own DEADLINE, so the audio and the device's model of the audio move TOGETHER -- and that
+coherent pair is exactly the quantity `render_phase` differences out. This displacement is very
+likely invisible to it BY CONSTRUCTION, which makes the test uninformative rather than damning.
+
+RETRACTED, same reason: the conclusion above that the 5 ms latency step "never reached the client"
+because B's render phase did not move. If render phase cannot see a model-coherent displacement,
+a step that DID apply looks identical to one that did not. That claim was unsupported.
+
+WHAT IT DOES ESTABLISH: `render_phase` documents itself as having "the servo, the prediction model
+and the pipeline depth all outside the measurement". A model-coherent 1 ms displacement producing
+0.3% says that contract is not met -- it inherits the same blind spot TIMING.md names for the sync
+median ("an accounting offset shifts prediction and audio together and reads as zero error"),
+which is the specific flaw it was built to avoid.
+
+AND IT RECONCILES THE PICTURE. The n=9 campaign above found `render_delta` tracking
+RESYNC-PLANTED displacements at ~94% with an 8.7 +- 3.4 us residual. So the instrument sees
+EXTERNALLY planted offsets and is blind to model-coherent ones. Which means the +-4 us wander it
+reports at r = -0.98 is not displacement at all -- it is a different quantity that happens to
+anti-correlate with the wire's wander, and that is the thing to identify.
+
+NEXT: a **500 ms latency step**, which TODO already records as the only magnitude that forces a
+mute, and which is the perturbation the 94%-tracking campaign used. It plants the offset
+EXTERNALLY -- the class the instrument demonstrably can see -- so it can settle the sign where a
+deadline shift cannot. Expect the wire to go nan across the step itself and read it after the
+resync settles.
+
+TRAP, LIVE, COST REAL TIME TONIGHT: **`inject_split(0)` IS NOT A RESTORE.** The field is documented
+"REQUEST in us, consumed once by the player task; 0 when none" -- 0 means no request pending, so
+zero does nothing and the board is left permanently displaced. A campaign must reverse with the
+NEGATED value (`inject_split(-1000)`) and then verify on the wire that it came back. Mine did not,
+and B sat +1017 us out until it was reversed by hand.
 
 **MEDIAN-OF-THREE IS DISCONTINUOUS — the reason the observer made the correction WORSE.** With
 two devices the median IS the mean: smooth, and each device moves half the gap. With three it is
