@@ -666,6 +666,29 @@
 > serial is a board that cannot be iterated on** — B's replug is the precondition for the next
 > round. Open question to answer once B logs again: what holds a board 60 ms late with tags and
 > ledger agreeing (the coarse path should have taken it: hard resync > 50 ms, catch-up below).
+ After the 16:48:51 restart B re-locked in ~25 s (wire −56 µs at
+> 16:49:15, observer B−A phase +21…+88 µs) — the 58 ms state does not recur on a clean boot, which
+> points at the fleet-flash boot (three boards rebooting into each other's consensus churn) rather
+> than at B's hardware. B's runtime params re-applied 16:51 (the restart had wiped them).
+>
+> **Applied align, both boards, cap 60 (16:48–17:03):** A's group delta +57…+77, bias railed at
+> +60 within minutes; the wire went from −33 µs (16:50) to +140…+173 and STAYED — the applied bias
+> moved the wire ~+170 µs and did not reduce the delta (r(delta, wire) = +0.96: the delta faithfully
+> reports the wire, the correction just goes the wrong way in effect). Both boards were applying
+> (B blind, params re-applied 16:51:50), so two-board runs cannot separate sign from symmetry.
+> **Single-board step test (17:03–17:10):** B's align off (bias → 0), then A's +60 µs bias removed,
+> wire medians before/after each step — the sign of "bias → wire" measured directly. Cycle time
+> build 28: wire ≤ 20 µs from +311 s (B's 58 ms post-flash state and restart inside the window;
+> not a fair number).
+>
+> **Align sign, settled from the definitions (not from a contaminated run):** `phase = render_tsf −
+> render_server` (later render = larger phase); `delta = mine − robust_mean(peers)` → positive =
+> LATE → deadline must move earlier → `bias −= delta·gain` — the ORIGINAL code. The build-23 flip
+> was wrong; the 14:21 run it was read from still had a polluted group phase. Both applied runs
+> since the flip (15:25–15:56 runaway; 16:48–17:03 wire +140…+173 with A railed at +60) are what an
+> inverted correction looks like, and r(delta, wire) = +0.96 in the second says the *measurement*
+> was right throughout. **Build 29 reverts the sign.** Shadow-only remains the default; the
+> single-board step test (17:03–17:10) is the empirical check of "bias → wire" direction.
 >
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this

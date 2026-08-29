@@ -5308,20 +5308,23 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         if (align_cap > 0 && st.converged && align_due && group_delta != INT32_MIN) {
           const int32_t cap = align_cap;
           int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
-          // SIGN, MEASURED NOT ASSUMED (2026-08-29 14:21-14:24, first live run with a clean group
-          // phase): A's group delta read -60 us while the wire had A LATE by 60-90 us; stepping the
-          // bias by -delta*gain (+3 us per due report) delayed A further and the wire fell at the
-          // same 0.3-0.4 ppm; B's mirror image did the same. A negative delta means this device is
-          // LATE, so the bias must move WITH the delta. And a single bad pairing (+1717 us) moved
-          // the bias 41 us in one step: pairs beyond align_reject_us are ignored and the step is
-          // capped at align_step_us (default 5) -- this channel removes a standing offset slowly,
-          // it must never be able to create one quickly.
+          // SIGN, from the definitions this time. phase = render_tsf - render_server: a board that
+          // renders the same server frame at a later TSF instant has the LARGER phase. group delta =
+          // mine - robust_mean(peers) (TsfSync::recompute_group_delta_), so a POSITIVE delta means
+          // this device rendered LATE and its deadline must move EARLIER: bias -= delta*gain. That is
+          // the original code. The 2026-08-29 build-23 flip (bias += delta*gain) was read off a
+          // 14:21 run whose group phase was still polluted; both applied runs after the flip drove
+          // the wire away from zero (A bias +60 -> wire +140..+173 us, 16:48-17:03) while the delta
+          // tracked the wire at r = +0.96 -- the measurement was right, the correction inverted.
+          // Pairs beyond align_reject_us are ignored (a single +1717 us pair once moved the bias
+          // 41 us) and the step is capped at align_step_us: this channel removes a standing offset
+          // slowly and must never be able to create one quickly.
           const int32_t reject = this->tune_align_reject_us_.load(std::memory_order_relaxed);
           const int32_t max_step = this->tune_align_step_us_.load(std::memory_order_relaxed);
           if (std::abs(group_delta) > this->tune_align_deadband_us_.load(std::memory_order_relaxed) &&
               std::abs(group_delta) <= reject) {
             const int32_t step =
-                std::clamp<int32_t>(static_cast<int32_t>(group_delta * this->tune_align_gain_.load(std::memory_order_relaxed)),
+                std::clamp<int32_t>(static_cast<int32_t>(-group_delta * this->tune_align_gain_.load(std::memory_order_relaxed)),
                                     -max_step, max_step);
             if (this->tune_align_apply_.load(std::memory_order_relaxed)) {
               bias = std::clamp<int32_t>(bias + step, -cap, cap);
