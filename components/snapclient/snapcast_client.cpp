@@ -3994,18 +3994,24 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     // and sawtoothed through splice/resync cycles -- the audible flutter. At a genuine cold boot
     // the integral is 0 anyway, and that wind-up is the closed-loop PI response to a ~40 ppm rate
     // step: peak ~0.5*crystal/Kp ~ 200 us at tau = 10 s, under the splice threshold.
-    st.dl_kp_last = kp;
+    st.dl_kp_last = 1.0f / tau_tuned;
     st.dl_active = true;
     st.dl_engaged_since_us = now;
     ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
              st.trim_integral_ppm, st.dl_err_us, now);
   }
 
-  // Bumpless transfer across the gain schedule: move the output step (kp_old - kp_new) * e into
-  // the integrator so the commanded trim is continuous; only future responsiveness changes.
-  if (st.dl_kp_last != kp) {
-    st.trim_integral_ppm = std::clamp(st.trim_integral_ppm + (st.dl_kp_last - kp) * e, -clamp_ppm, clamp_ppm);
-    st.dl_kp_last = kp;
+  // Bumpless transfer for TUNABLE changes only (tau_s over the API): move the output step
+  // (kp_old - kp_new) * e into the integrator so the commanded trim is continuous. Keyed on the
+  // tuned 1/tau, NOT on the error-proportional kp: that one changes every block, and folding its
+  // change into the integral made a hidden integrator of (dkp * e) -- measured build 20, B at
+  // 13:45:49-53: integral 54.2 -> 61.5 ppm in four blocks as err crossed +232 -> -189 us, then the
+  // wire diverged from zero as the loop chased its own integral. The proportional boost is meant
+  // to step the output; that step IS the acquisition.
+  const float kp_tuned = 1.0f / tau_tuned;
+  if (st.dl_kp_last != kp_tuned) {
+    st.trim_integral_ppm = std::clamp(st.trim_integral_ppm + (st.dl_kp_last - kp_tuned) * e, -clamp_ppm, clamp_ppm);
+    st.dl_kp_last = kp_tuned;
   }
 
   // dt is the block's real span, not an assumed cadence -- arrivals pause whenever tagged audio

@@ -490,6 +490,19 @@
 > is position, not rate. Build-19 cycle time to beat: wire inside 20 µs held 20 s at **+242 s**
 > from A's 13:35:45 boot.
 >
+> **Build 20 landed 13:45:26** (both 18:44:45Z, tails alive). 13:44 decomposition of build 19's
+> replug boot: err_A ≈ err_B (−96/−98 … −169/−168) with the wire at −3.5 µs → deadlines agree; the
+> earlier +311 µs shelf was pre-consensus disagreement during A's log gap. The ~10 µs stair-steps
+> were the integrals (A 57.3 → 59.7 → 57.3 ppm inside a minute) chasing the wander at Ki ∝ boost²
+> — removed in build 20. Cycle time graded at 13:53 from the 13:45:26 flash.
+>
+> **Build 20 (13:45) diverged from zero after crossing it — bumpless transfer.** B's integral went
+> 54.2 → 61.5 ppm in four blocks (13:45:49–53) as err crossed +232 → −189 µs: not Ki (0.005
+> ppm/block) but the bumpless transfer `I += (kp_old − kp_new)·e`, written for API tau changes and
+> now firing every block because kp is error-proportional — a hidden integrator of Δkp·e. The
+> wire then ran away from zero as the loop chased its own integral. **Build 21:** the transfer is
+> keyed on the tuned 1/tau only; the proportional boost steps the output on purpose.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
