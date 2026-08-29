@@ -129,6 +129,9 @@ class SnapclientHub final : public Component,
   void inject_starvation(uint32_t ms);
   /// @brief TEST HOOK: forwards to SnapcastClient::inject_split(); see there.
   void inject_split(int32_t us);
+  /// @brief TUNING HOOK: forwards to SnapcastClient::set_servo_param(); see there for the names
+  /// and bounds. Lets a tuning campaign run over the native API with no reflash.
+  void set_servo_param(const std::string &name, float value);
 
   template<typename F> void add_connection_callback(F &&callback) {
     this->connection_callbacks_.add(std::forward<F>(callback));

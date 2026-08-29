@@ -13,6 +13,7 @@
 #include "esphome/components/audio/audio.h"
 #include "esphome/components/ring_buffer/ring_buffer.h"
 #include "esphome/core/helpers.h"
+#include "esphome/core/preferences.h"
 
 #ifdef USE_SNAPCLIENT_FLAC
 #include <micro_flac/flac_decoder.h>
@@ -531,12 +532,6 @@ class SnapcastClient {
     // track what is actually programmed (including the nominal-rate fallback) or the
     // limiter ramps away from a value the clock is not running at.
     float trim_applied_ppm{0.0f};
-    // The KP the integrator was last conditioned for, so the bumpless transfer runs exactly
-    // once per switch rather than every chunk. 0 means "never conditioned": the first pass
-    // must NOT transfer, or it would apply (0 - kp) * error against a startup error that is
-    // large by definition. The gain constants live in the .cpp, so a sentinel is used rather
-    // than duplicating one of them here where it could drift out of step.
-    float trim_kp_last{0.0f};
     bool rate_lock_ok{false};
     uint32_t rate_lock_rate{0};
     // Trim wander over the report window. The trim IS the loop's estimate of the
@@ -549,15 +544,6 @@ class SnapcastClient {
     float trim_min_ppm{0.0f};
     float trim_max_ppm{0.0f};
     uint32_t trim_samples{0};
-    /// @brief Chunks in this report window where the trim was HELD by a pending drift split.
-    ///
-    /// The hold is deliberate -- steering on a prediction about to be declared wrong plants a
-    /// permanent displacement, since the servo has no position feedback -- but it was
-    /// indistinguishable in the log from the trim simply not running, both printing "(idle)".
-    /// That ambiguity cost real time: a flat frame-rate plateau on the wire, against a peer still
-    /// steering, reads as a board that stopped updating its clock. It is a board that froze it on
-    /// purpose, and the two need telling apart because only one of them is a bug.
-    uint32_t trim_split_holds{0};
     /// @brief Why the steering gate refused, sampled on the LAST chunk that it refused.
     ///
     /// Recorded rather than inferred, after three plausible explanations for a frozen clock were
@@ -617,15 +603,21 @@ class SnapcastClient {
     uint16_t resync_trace_idx{0};
     int64_t resync_trace_arm_us{0};
     uint32_t resync_drops{0};
-    // FAST POSITION CORRECTION. splice_hist is a ring of the frames spliced on each of the last
-    // MEDIAN_WINDOW/2 chunks, with splice_sum its total: a splice changes the error immediately
-    // but reaches the MEDIAN only after about half its window, so without subtracting what is
-    // already in flight the loop would keep correcting an error it has already fixed and
-    // overshoot -- which is the limit cycle this path is on record for.
-    static constexpr size_t SPLICE_HIST = MEDIAN_WINDOW / 2;
+    // FAST POSITION CORRECTION. splice_hist is a ring of the frames spliced on each recent chunk:
+    // a splice changes the rendered audio immediately but reaches the error SIGNAL only after its
+    // measurement lag, so without subtracting what is already in flight the loop would keep
+    // correcting an error it has already fixed and overshoot -- which is the limit cycle this path
+    // is on record for.
+    //
+    // The lag is a property of the SIGNAL, so the window over this ring is a parameter, not the
+    // ring size: on the demoted prediction it is half the median window (15 chunks, the historical
+    // value); on err_tag it is one pipeline depth (a splice is invisible until the spliced audio
+    // renders) plus half the averaging block, derived per episode from the measured depth.
+    // Inheriting 15 for both was right only by coincidence -- ~870 us/s of correction against a
+    // ~300 ms blind spot hides ~260 us, most of the 300 us release band.
+    static constexpr size_t SPLICE_HIST = 32;
     int8_t splice_hist[SPLICE_HIST]{};
     size_t splice_hist_idx{0};
-    int32_t splice_sum{0};
     // First instant the standing error was seen above the engage threshold, so a TRANSIENT cannot
     // arm position correction. See FAST_SPLICE_PERSIST_US. 0 = not currently above it.
     int64_t fast_splice_seen_us{0};
@@ -850,9 +842,65 @@ class SnapcastClient {
     int32_t drift_excess_min_us{0};
     int32_t drift_excess_max_us{0};
     int64_t drift_excess_since_us{0};
-    /// @brief Whether the trim is currently held because a split is pending confirmation, so the
-    /// enter/leave transitions log once rather than every chunk.
-    bool trim_split_held{false};
+    /// @brief DELAY LOOP state: the PI that steers the I2S rate on the MEASURED tag error
+    /// (err_tag), with the ledger nowhere in its loop. See delay_loop_update_.
+    ///
+    /// dl_active latches once the loop has seeded its integral from the trim applied at handoff;
+    /// it drops on tag loss (the trim is then HELD, not zeroed) and re-seeds on the next fresh
+    /// block. dl_err_us is the last completed block mean, consumed by fast_splice_ so position
+    /// correction runs on the measured error too -- while it is fresh, a ledger bias cannot move
+    /// audio through the splice path, which is the property the inject_split test grades.
+    bool dl_active{false};
+    bool dl_have_err{false};
+    int64_t dl_err_us{0};
+    /// Local time dl_err_us was computed; stale (> DL_ERR_STALE_US) hands fast_splice_ back to
+    /// the demoted prediction, where the split-pending guard applies again.
+    int64_t dl_err_at_us{0};
+    /// Gain the last block was conditioned under, for bumpless transfer across the decay schedule.
+    /// 0 = never conditioned.
+    float dl_kp_last{0.0f};
+    /// Last integral value persisted to NVS, and when -- the crystal offset survives boots so a
+    /// cold start engages at the learned rate instead of re-learning over ~90 s (iteration cost,
+    /// and one fewer boot transient). Saved only on real change at a slow cadence: NVS writes
+    /// block the player task briefly and wear flash.
+    float dl_saved_integral_ppm{0.0f};
+    int64_t dl_saved_at_us{0};
+    /// When the loop last (re-)engaged; a save needs DL_PERSIST_SETTLE_US of continuous engagement
+    /// first, or every boot overwrites the learned crystal with the first block's guess (measured:
+    /// restored +3.30, re-saved +0.63 within a second of engaging).
+    int64_t dl_engaged_since_us{0};
+    /// Slow average of the integral (time constant DL_PERSIST_EMA_S); THIS is what gets persisted.
+    /// The instantaneous integral swings tens of ppm with the common-mode timebase excursions
+    /// (measured: +98.73 saved while the loop sat at +46 a minute later), so a settle gate alone
+    /// still samples peaks. Seeded from the restored value, so a boot with no history is honest.
+    float dl_integral_ema_ppm{0.0f};
+    bool dl_integral_ema_valid{false};
+    /// In-range HOLD (tag loss, mapping flap): the P term at hold entry and when it began. While
+    /// holding, the programmed trim is integral + P*exp(-t/tau): a ~1 s mapping flap keeps P
+    /// intact (holding the integral alone stepped one board by -P ~ -25 ppm while its peer kept
+    /// applying P to the same common-mode error -- a differential step measured as ~130 us of
+    /// skew per flap), while a minutes-long outage still ends at the crystal offset.
+    float dl_hold_p_ppm{0.0f};
+    int64_t dl_hold_since_us{0};
+    /// AUTOTUNE accumulators: lag-1 autocorrelation of the block-error series over a 64-block
+    /// (~21 s) window -- a decade slower than the loop, which is the timescale separation that
+    /// keeps an adapter wrapped around a controller from becoming a second oscillator. Ringing
+    /// (r1 strongly negative) slows tau; a standing mean with r1 near +1 speeds it, inside hard
+    /// bounds. Player task only; reset whenever the toggle is off or the loop disengages.
+    /// The window itself is stored (64 floats) so r1 can be computed properly -- demeaned, one
+    /// normalisation -- rather than from running sums, which reported r1 = +1.07 on the first
+    /// live window (mixed n / n-1 denominators plus a trending mean).
+    static constexpr size_t AT_WINDOW = 64;
+    float at_win[AT_WINDOW]{};
+    uint32_t at_n{0};
+    /// Completed PI updates this report window, so the report can tell "loop running" from
+    /// "loop holding" -- the exact ambiguity the old "(idle)" trim snapshot had.
+    uint32_t dl_updates{0};
+    /// Newest accounted pipeline depth (pushed - played), sampled per chunk under playout_mutex_.
+    /// Sizes the splice in-flight horizon; a ledger bias of even a few ms is a fraction of a
+    /// chunk here, so this use survives ledger perturbation.
+    int64_t pipe_depth_frames{0};
+    int64_t dl_log_us{0};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};
   };
@@ -960,9 +1008,33 @@ class SnapcastClient {
   void accumulate_achieved_rate_(ServoState &st, const ChunkRecord &rec);
 
   /// Fast POSITION correction while converged: one frame per chunk against a standing offset the
-  /// rate loop would take ~40 s to integrate away. Returns the frames to splice this chunk
+  /// rate loop would take too long to integrate away. Returns the frames to splice this chunk
   /// (>0 drop, <0 insert, 0 none). See fast_splice_threshold_us.
-  int32_t fast_splice_(ServoState &st, int64_t median_err_us, uint32_t sample_rate, bool split_pending);
+  ///
+  /// @p err_us is whichever error signal is live -- the measured tag error when fresh, the demoted
+  /// prediction otherwise. @p hold gates the whole path (the split-pending guard, applied by the
+  /// caller ONLY on the prediction: a ledger bias is invisible to err_tag, so guarding it there
+  /// would disarm the mechanism against exactly the errors it can safely correct).
+  /// @p horizon_chunks is the signal's measurement lag in chunks -- how far back a splice is still
+  /// invisible to @p err_us -- over which in-flight splices are subtracted before the threshold
+  /// test. @p measured lifts the converged gate: a measured error cannot fight the muted coarse
+  /// convergence (which acts on the prediction), and gating it left an unconverged 1-2 ms dead
+  /// zone nothing corrected.
+  int32_t fast_splice_(ServoState &st, int64_t err_us, uint32_t sample_rate, bool hold,
+                       uint32_t horizon_chunks, bool measured);
+
+#ifdef USE_I2S_RATE_LOCK
+  /// @brief THE DELAY LOOP: PI rate steering on the measured tag error, the ledger nowhere in it.
+  ///
+  /// Pulls a completed block of DL_BLOCK_N tagged arrivals (accumulated on the speaker callback in
+  /// notify_audio_played_tagged), runs one PI update, and leaves the demand in st.trim_applied_ppm
+  /// for the caller to program. Between blocks, and through tag loss, the demand is simply not
+  /// changed -- the loop HOLDS ITS LAST TRIM, never its last error. Preconditions for an update:
+  /// tags fresh, and the deadline on the SHARED TSF mapping (on the local-Kalman fallback the
+  /// clock-offset wander is per-device, so steering on it misaligns the group; hold instead).
+  /// THREAD CONTEXT: player task.
+  void delay_loop_update_(ServoState &st);
+#endif
 
   /// Forces one repair cycle after a re-lock, if configured; a no-op otherwise. Called once per
   /// chunk from the player loop, after the convergence gate.
@@ -1201,6 +1273,28 @@ class SnapcastClient {
   int64_t tag_anchor_deadline_us_{0};
   int64_t tag_anchor_server_ts_{0};
 
+  /// @brief DELAY LOOP measurement accumulator: err_tag over the current control block.
+  ///
+  /// Separate from the diagnostic Welford below on purpose -- the diagnostics reset per report
+  /// (3.35 s), the control block completes every DL_BLOCK_N arrivals (~320 ms), and sharing an
+  /// accumulator between two consumers with different reset points is the conditional-reset bug
+  /// this file already paid for once. Written on the speaker callback under playout_mutex_,
+  /// drained by the player task in delay_loop_update_.
+  uint32_t dl_acc_n_{0};
+  double dl_acc_sum_us_{0.0};
+  /// Local render instants of the block's first and last arrivals: their span is the PI's dt, and
+  /// the last one is the freshness witness ("no arrival for DL_TAG_STALE_US" = tags lost).
+  int64_t dl_acc_first_us_{0};
+  int64_t dl_acc_last_us_{0};
+  /// @brief Tag-stream invalidation: arrivals rendering before this local instant are discarded.
+  ///
+  /// A setpoint change (buffer_ms / server latency) re-anchors the deadline immediately, but the
+  /// ~250 ms of audio already in flight was scheduled against the OLD deadline, so its tags would
+  /// carry the step as a corrupted measurement -- counted twice, in opposite directions. The same
+  /// applies to a hard resync and a timebase re-anchor. Blank for one pipeline depth and let the
+  /// loop resume on genuinely post-change audio.
+  int64_t dl_blank_until_us_{0};
+
   uint32_t delay_n_{0};
   double delay_mean_us_{0.0};
   double delay_m2_us_{0.0};
@@ -1405,6 +1499,47 @@ class SnapcastClient {
   // Whether the last chunk deadline came from the shared TSF mapping (vs the
   // per-device Kalman fallback); gates unmute so joins land on the final timebase
   bool deadline_on_shared_tsf_{false};
+  /// Set by chunk_deadline_us_ when the deadline source toggles (shared mapping <-> local
+  /// Kalman); consumed once per chunk by the player loop, which treats the toggle as a timebase
+  /// re-anchor (gain re-arm + tag-stream blank) -- the deadline steps by the mappings'
+  /// disagreement and nothing else reports it. Player task only, both sides.
+  bool deadline_source_switched_{false};
+  /// NVS slot for the delay loop's integral (the learned crystal offset). Player task only.
+  ESPPreferenceObject dl_integral_pref_;
+
+  /// @brief RUNTIME-TUNABLE loop parameters, settable over the native API (servo_param action)
+  /// so a tuning campaign needs no reflash -- every reflash costs five consensus membership
+  /// changes and a boot transient. Written from the API (main loop task), read on the player
+  /// task and speaker callback; atomics, defaults = the flashed constants. NOT persisted:
+  /// a reboot returns to the flashed values, which keeps a bad experiment one power-cycle from
+  /// gone. Every set is logged at WARN so the analyser's annotations carry it.
+  std::atomic<float> tune_tau_s_{10.0f};
+  /// Integral time (s): Ki = Kp / Ti. Decoupled from tau -- Ti = tau (Ki = Kp^2) made the integral
+  /// swing ~57 ppm p-p chasing the +-600 us / ~60 s common-mode wander (measured 21:08: +103->+114
+  /// in 2 s), so a hold froze a wrong 'crystal offset'. With the integral restored from NVS the
+  /// fast wind-up Ti = tau bought is moot; Ti belongs to the crystal's drift timescale (minutes).
+  std::atomic<float> tune_ti_s_{120.0f};
+  std::atomic<int32_t> tune_block_n_{32};
+  /// -1 = use config_.fast_splice_threshold_us.
+  std::atomic<int32_t> tune_splice_us_{-1};
+  std::atomic<int32_t> tune_tag_stale_ms_{1000};
+  std::atomic<int32_t> tune_blank_ms_{500};
+  std::atomic<int32_t> tune_gap_blank_ms_{50};
+  /// Master toggle: adapt tau automatically from the block-error series (see the autotune block
+  /// in delay_loop_update_). Off by default; a manual tau_s set while this is on will be
+  /// overridden by the next adaptation and says so in the log.
+  std::atomic<bool> tune_autotune_{false};
+  /// Persistence master switch (servo_param persist 0/1): off lets a suspected NVS-write side
+  /// effect (A-only post-boot receive stalls, 2026-08-28) be tested without a reflash.
+  std::atomic<bool> tune_persist_{true};
+
+ public:
+  /// @brief Set a runtime loop parameter by name; returns false for an unknown name or a value
+  /// outside its bounds. Names: tau_s [2..120], ti_s [10..1200], block_n [8..64], splice_us [0..10000, -1=config],
+  /// tag_stale_ms [200..10000], blank_ms [100..2000], gap_blank_ms [10..500], autotune {0,1}, persist {0,1}.
+  bool set_servo_param(const std::string &name, float value);
+
+ protected:
 #endif
   std::unique_ptr<uint8_t[]> slice_buffer_;
   static constexpr size_t SLICE_BUFFER_SIZE = 4096;

@@ -49,6 +49,17 @@ api:
         us: int
       then:
         - lambda: 'id(snap)->inject_split(us);'
+    # TUNING HOOK: set a delay-loop parameter at runtime -- no reflash, no membership churn, and
+    # the change lands in the log (SERVOPARAM, WARN) so the analyser's timeline carries it.
+    # Names/bounds live at SnapcastClient::set_servo_param: tau_s, block_n, splice_us,
+    # tag_stale_ms, blank_ms, gap_blank_ms, autotune (0/1 -- the master learn-and-adjust toggle,
+    # session-local, never persisted).
+    - action: servo_param
+      variables:
+        name: string
+        value: float
+      then:
+        - lambda: 'id(snap)->set_servo_param(name, value);'
 
 ota:
   - platform: esphome

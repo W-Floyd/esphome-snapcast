@@ -184,6 +184,14 @@ void SnapclientHub::inject_split(int32_t us) {
   }
 }
 
+void SnapclientHub::set_servo_param(const std::string &name, float value) {
+  if (this->client_ != nullptr) {
+    if (!this->client_->set_servo_param(name, value)) {
+      ESP_LOGW(TAG, "servo_param refused: %s=%.3f (unknown name or out of bounds)", name.c_str(), value);
+    }
+  }
+}
+
 void SnapclientHub::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
   if (this->client_ != nullptr) {
     this->client_->notify_audio_played(frames, timestamp_us);
