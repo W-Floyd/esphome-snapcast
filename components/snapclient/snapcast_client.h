@@ -901,6 +901,9 @@ class SnapcastClient {
     /// chunk here, so this use survives ledger perturbation.
     int64_t pipe_depth_frames{0};
     int64_t dl_log_us{0};
+    /// When a coarse correction (hard resync / aggressive catch-up) last acted on the MEASURED
+    /// error; another tag-driven one waits until the tags post-date it by a blank interval.
+    int64_t coarse_act_us{0};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};
   };

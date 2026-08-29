@@ -2617,6 +2617,19 @@ void SnapcastClient::player_task_() {
     // inside 90 us, because the servo was faithfully hitting a target that had been
     // moved.
     const int64_t error_us = predicted - deadline;  // >0: this chunk would play late
+    // COARSE DECISIONS ON THE MEASURED ERROR WHILE TAGS ARE LIVE. The prediction is built from the
+    // ledger; repaired, the repair moves real audio (-29/+29 ms pairs, 21:37), unrepaired, its bias
+    // rides the common wander into the 50 ms hard-resync threshold (three 50-53 ms resyncs on A in
+    // ten minutes, 21:47-21:51, each dropping real audio that err_tag then spliced back). Neither
+    // is acceptable; the measured error is the only safe basis for a coarse decision when it
+    // exists. It lags one block plus one pipeline depth, so a tag-driven correction may not be
+    // REPEATED until the tags have had time to see it -- the same blank interval the setpoint
+    // path uses. The prediction remains the fallback when tags are stale.
+    const bool coarse_on_tags = st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US;
+    const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
+    const bool coarse_ok =
+        !coarse_on_tags || st.coarse_act_us == 0 ||
+        st.dl_err_at_us > st.coarse_act_us + static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000;
     // Anchor for the SHADOW error (see the SHADOW log line). Stored, not recomputed.
     st.last_deadline_us = deadline;
     st.last_deadline_server_ts = rec.server_ts_us;
@@ -2704,7 +2717,7 @@ void SnapcastClient::player_task_() {
     // far outside the server's buffer is meaningless -- so anything past bufferMs
     // mutes on the spot, and the bailout above reconnects if it persists.
     bool mute_now = false;
-    if (std::abs(error_us) > hard_us) {
+    if (std::abs(coarse_err_us) > hard_us && coarse_ok) {
       if (now_us() - st.storm_window_us > RESYNC_STORM_WINDOW_US) {
         st.storm_window_us = now_us();
         st.storm_resyncs = 0;
@@ -2814,7 +2827,8 @@ void SnapcastClient::player_task_() {
     // log traffic competes with the audio stream on the already-congested link — a
     // feedback loop that prolongs the outage. The periodic sync report carries the
     // full per-window count either way.
-    if (error_us > hard_us) {
+    if (coarse_err_us > hard_us && coarse_ok) {
+      if (coarse_on_tags) st.coarse_act_us = now_us();
       // Hard resync, late: drop whole chunks until we catch back up
       if (now_us() - st.last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
         st.last_resync_log_us = now_us();
@@ -2845,10 +2859,11 @@ void SnapcastClient::player_task_() {
     }
 
     uint32_t drop_frames = 0;
-    if (error_us < -hard_us) {
+    if (coarse_err_us < -hard_us && coarse_ok) {
+      if (coarse_on_tags) st.coarse_act_us = now_us();
       // Hard resync, early: fill the gap with silence (bounded per chunk so the
       // loop stays responsive), keeping the DAC fed and continuous
-      const int64_t gap_frames = (-error_us) * rec.params.sample_rate / 1000000;
+      const int64_t gap_frames = (-coarse_err_us) * rec.params.sample_rate / 1000000;
       const uint32_t fill = std::min<int64_t>(gap_frames, rec.params.sample_rate / 2);
       if (now_us() - st.last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
         st.last_resync_log_us = now_us();
@@ -2866,11 +2881,12 @@ void SnapcastClient::player_task_() {
       }
       st.converged = st.converged && !mute_now;
       this->push_silence_(fill, rec.params);
-    } else if (std::abs(median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US) {
+    } else if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US && coarse_ok) {
+      if (coarse_on_tags) st.coarse_act_us = now_us();
       // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
       // doesn't leave playback audibly behind for long
       const int32_t adjust_frames =
-          static_cast<int32_t>(median_err_us * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
+          static_cast<int32_t>((coarse_on_tags ? coarse_err_us : median_err_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
       const int32_t max_adjust = std::max<int32_t>(1, frames / (SOFT_CORRECTION_DIVISOR / 4));
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
       if (adjust > 0) {

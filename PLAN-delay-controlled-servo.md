@@ -243,6 +243,21 @@
 > Build 13: with tags live the repair window is disarmed (ledger diagnostic-only, as the plan
 > always said); the repair survives only on the tags-absent fallback.
 >
+> **block_n 64 A/B (21:35–21:43): NO VERDICT** — the span contains the −29/+29 ms repair pair and a
+> delivery stall (1100/8890 rows rival-gated, sd 928 µs); the differential-rate dither read MAD
+> 1.49 vs 0.83 ppm but is dominated by those events. block_n stays 32 (the reboot into build 13
+> reset it). Rerun on a quiet span before deciding.
+>
+> **Build 13 outcome (21:42–21:56): the disarmed repair exposed the other half of the problem.**
+> A's unrepaired −29 ms split biased the PREDICTION, the common wander carried it over the 50 ms
+> threshold, and the hard-resync path dropped 50 ms of real audio three times (50/53/50 ms at
+> 21:47:48, :50, 21:51:13) that err_tag then spliced back — 253 out-of-range blocks, 39 splice
+> episodes, wire sd 272 / p2p 9.7 ms with 58% of rows rival-gated. B (clean ledger) had zero
+> events. REVIEW 3 called this: "the kept ledger rots without the deleted corrections". Repaired,
+> the prediction moves audio; unrepaired, it is biased. Build 14: hard resync, storm mute and the
+> aggressive catch-up decide on err_tag while tags are live (prediction only as the fallback), with
+> a re-measure guard (no repeat until the tags post-date the last action by one blank interval).
+>
 > Two findings from running it: **"SPLITINJECT ramp complete" is an unreliable witness** — it
 > logs only when the zero lands on a chunk that spends a whole frame, and this run reached zero
 > silently; use the SYNCX `drift`/`split` step as the positive control. And the boards wobble
