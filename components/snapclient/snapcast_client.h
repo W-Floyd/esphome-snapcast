@@ -1531,13 +1531,13 @@ class SnapcastClient {
   /// task and speaker callback; atomics, defaults = the flashed constants. NOT persisted:
   /// a reboot returns to the flashed values, which keeps a bad experiment one power-cycle from
   /// gone. Every set is logged at WARN so the analyser's annotations carry it.
-  std::atomic<float> tune_tau_s_{30.0f};  // 10 walked the wire ~0.6 us/sqrt(s) of P noise; 30 measured 12:04 (PLAN)
+  std::atomic<float> tune_tau_s_{120.0f};  // floor; error-proportional gain stiffens it (DL_GAIN_KNEE_US)
   /// Integral time (s): Ki = Kp / Ti. Decoupled from tau -- Ti = tau (Ki = Kp^2) made the integral
   /// swing ~57 ppm p-p chasing the +-600 us / ~60 s common-mode wander (measured 21:08: +103->+114
   /// in 2 s), so a hold froze a wrong 'crystal offset'. With the integral restored from NVS the
   /// fast wind-up Ti = tau bought is moot; Ti belongs to the crystal's drift timescale (minutes).
-  std::atomic<float> tune_ti_s_{120.0f};
-  std::atomic<int32_t> tune_block_n_{32};
+  std::atomic<float> tune_ti_s_{600.0f};
+  std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};
   std::atomic<int32_t> tune_tag_stale_ms_{1000};

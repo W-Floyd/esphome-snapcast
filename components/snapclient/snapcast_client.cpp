@@ -449,6 +449,14 @@ static constexpr int64_t DL_TAG_STALE_US = 1000000;
 // correction hands back to the demoted prediction (where the split-pending guard applies again).
 // Blocks complete every ~320 ms, so three missed blocks = the signal is gone, not late.
 static constexpr int64_t DL_ERR_STALE_US = 1000000;
+// Error-proportional gain: Kp = (1/tau) * max(1, |err| / DL_GAIN_KNEE_US), Ti divided by the same
+// factor, both capped so the effective tau never drops below DL_TAU_MIN_S. Inside the knee the loop
+// runs the slow tunables exactly (tau 120 / Ti 600 for the sub-us steady state); a few hundred us
+// after a boot or re-anchor is closed at tau 20 instead of 2-3 x 120 s (measured 13:27-13:33,
+// build 18: +330 us decaying with no overshoot for minutes). Continuous in the error, so there is
+// no state, no hysteresis and no gain step to excite; a large error simply gets a stiffer loop.
+static constexpr float DL_GAIN_KNEE_US = 75.0f;
+static constexpr float DL_TAU_MIN_S = 20.0f;
 // Tag fault (see ServoState::tag_miss): consecutive unmoved corrections that fault the tag path,
 // and how long the ledger takes over before tags are trusted again.
 static constexpr uint8_t TAG_FAULT_MISSES = 3;
@@ -3956,7 +3964,13 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // since a discrete event (hard resync, timebase re-anchor), never the error, and those events
   // also blank the tag stream -- so by the time a block completes under the elevated gain, the
   // audio it measured is genuinely post-event.
-  const float kp_run = 1.0f / this->tune_tau_s_.load(std::memory_order_relaxed);
+  // Error-proportional gain (see DL_GAIN_KNEE_US): the tunables are the floor, |err| raises them.
+  const float tau_tuned = this->tune_tau_s_.load(std::memory_order_relaxed);
+  const float ti_tuned = this->tune_ti_s_.load(std::memory_order_relaxed);
+  const float boost = std::clamp(std::abs(e) / DL_GAIN_KNEE_US, 1.0f, std::max(1.0f, tau_tuned / DL_TAU_MIN_S));
+  const float tau_eff = tau_tuned / boost;
+  const float ti_eff = ti_tuned / boost;
+  const float kp_run = 1.0f / tau_eff;
   // FLAT GAIN: Kp = 1/tau, no acquire->run schedule. The schedule bought fast nulling after a
   // hard resync when the rate loop was the only corrector; here anything past the splice
   // threshold belongs to the fast path and anything inside it does not need 2x gain -- while
@@ -4003,7 +4017,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (e > 0.0f)) {
     st.trim_integral_ppm =
         std::clamp(st.trim_integral_ppm +
-                       (kp / (now < DL_TI_BOOT_WINDOW_US ? DL_TI_BOOT_S : this->tune_ti_s_.load(std::memory_order_relaxed))) *
+                       (kp / (now < DL_TI_BOOT_WINDOW_US ? DL_TI_BOOT_S : ti_eff)) *
                            e * dt_s,
                    -clamp_ppm, clamp_ppm);
   }

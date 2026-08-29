@@ -451,6 +451,21 @@
 > B at 12:34 (stall → resync → +39 ms). The tag-fault fallback (build 18) breaks the deadlock; the
 > root fix is to never discard ring bytes that are not this record's — build 19.
 >
+> **Build 18 landed 13:25:09** (tag fault, boot fast-Ti off). Runtime tau 120 / Ti 600 / block 64
+> applied 13:27:05; graded 13:33–13:45. Post-flash the wire closed +330 µs as a pure first-order
+> approach (tau 120 → 4–6 min, no overshoot — correct for ζ ≈ 1, too slow to live with).
+> **Build 19: error-proportional gain** (operator's suggestion over a two-state schedule): Kp =
+> (1/tau)·max(1, |err|/75 µs), Ti divided by the same factor, effective tau floored at 20 s. Inside
+> the knee the slow tunables run exactly; at 450 µs the loop is already 6× stiffer. Continuous in
+> the error — no state, no hysteresis, no gain step. Replaces the event-driven schedule the flat
+> gain removed in build 7 without its flaw: it keys on the error, not on a timer.
+>
+> **Cycle time is now the metric (operator, 13:31).** `scripts/bench/converge-time.py --a-off --b-off
+> --wire-from` measures, from the reboot line: first DLLOOP, engage, first time |err| ≤ 75 µs holds
+> 20 s, and on the wire first time |A−B| ≤ 20 µs holds 20 s. **Baseline build 18 (tau 120 flat):**
+> engaged +14 s (A) / +22 s (B); neither board nor the wire converged within 450–490 s. Build 19
+> (error-proportional gain) flashed 13:3x against that.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
