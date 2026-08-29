@@ -690,6 +690,13 @@
 > was right throughout. **Build 29 reverts the sign.** Shadow-only remains the default; the
 > single-board step test (17:03–17:10) is the empirical check of "bias → wire" direction.
 >
+> **Single-board step test (17:03–17:10) — the empirical sign:** B align off (bias → 0): wire
+> +143 → +105. A's +60 µs bias removed: wire +105 → +33 → +8. So **positive bias = this board
+> plays EARLIER on the wire**, and with A at +60 the wire read +140 (A early) while A's delta was
+> +58 → **positive delta = EARLY**. Early must play later → bias −= delta·gain — the original code,
+> as build 29 has it. My derivation from the phase formula had two sign errors that cancelled;
+> the code comment now records the measurement, not the derivation.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

@@ -5308,14 +5308,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         if (align_cap > 0 && st.converged && align_due && group_delta != INT32_MIN) {
           const int32_t cap = align_cap;
           int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
-          // SIGN, from the definitions this time. phase = render_tsf - render_server: a board that
-          // renders the same server frame at a later TSF instant has the LARGER phase. group delta =
-          // mine - robust_mean(peers) (TsfSync::recompute_group_delta_), so a POSITIVE delta means
-          // this device rendered LATE and its deadline must move EARLIER: bias -= delta*gain. That is
-          // the original code. The 2026-08-29 build-23 flip (bias += delta*gain) was read off a
-          // 14:21 run whose group phase was still polluted; both applied runs after the flip drove
-          // the wire away from zero (A bias +60 -> wire +140..+173 us, 16:48-17:03) while the delta
-          // tracked the wire at r = +0.96 -- the measurement was right, the correction inverted.
+          // SIGN, MEASURED on the wire with a single-board step (2026-08-29 17:03-17:10): removing
+          // A's +60 us bias moved the wire B-A from +105 to +8 us, so a POSITIVE bias makes this
+          // board play EARLIER on the wire. And while A carried that +60 the wire read +140 (A early)
+          // with A's group delta at +58: a POSITIVE delta means this board is EARLY. Early -> must
+          // play later -> bias must go NEGATIVE: bias -= delta*gain. That is the original code; the
+          // build-23 flip (bias += delta*gain) was read off a run whose group phase was polluted,
+          // and both applied runs after it made an early board earlier (15:25-15:56 runaway;
+          // 16:48-17:03 wire +140..+173) while the delta tracked the wire at r = +0.96 -- the
+          // measurement was right, the correction inverted. Do not re-derive this from the phase
+          // formula; measure it.
           // Pairs beyond align_reject_us are ignored (a single +1717 us pair once moved the bias
           // 41 us) and the step is capped at align_step_us: this channel removes a standing offset
           // slowly and must never be able to create one quickly.
