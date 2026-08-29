@@ -1546,16 +1546,18 @@ class SnapcastClient {
   std::atomic<float> tune_ti_s_{600.0f};
   /// Error-proportional gain: Kp = (1/tau) * max(1, |err| / knee), effective tau floored at tau_min.
   /// Knee 25 us: tau 120 only inside the per-block noise, tau ~30 s at 100 us, tau_min beyond 120 us.
-  std::atomic<float> tune_knee_us_{25.0f};
+  std::atomic<float> tune_knee_us_{150.0f};  // above the +-350 us common wander; 25 kept the loops boosted in steady state
   std::atomic<float> tune_tau_min_s_{20.0f};
   /// render_align channel (inter-device, on the exchanged tag-derived render phase): cap in us
   /// (0 = off; seeded from YAML render_align_max), gain per due report, deadband in us.
-  std::atomic<int32_t> tune_align_max_us_{0};
-  std::atomic<float> tune_align_gain_{0.05f};
-  std::atomic<int32_t> tune_align_deadband_us_{20};
+  // Defaults = the 2026-08-29 18:00-18:45 operating point: 45 min, wire median +2.7 us, robust sd
+  // 5.0 us, 1-s change 0.19 us, zero events, with the channel applied at the measured sign.
+  std::atomic<int32_t> tune_align_max_us_{300};
+  std::atomic<float> tune_align_gain_{0.1f};
+  std::atomic<int32_t> tune_align_deadband_us_{3};
   std::atomic<int32_t> tune_align_reject_us_{500};  // pairs beyond this are not a measurement
-  std::atomic<int32_t> tune_align_step_us_{5};      // per due report (~10 s): 0.5 ppm at most
-  std::atomic<bool> tune_align_apply_{false};       // false = shadow: log the step, move nothing
+  std::atomic<int32_t> tune_align_step_us_{4};      // per due report (~10 s): 0.4 ppm at most
+  std::atomic<bool> tune_align_apply_{true};        // false = shadow: log the step, move nothing
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};

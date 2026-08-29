@@ -867,7 +867,9 @@ bool SnapcastClient::start() {
   if (this->config_.tsf_observer) {
     ESP_LOGI(TAG, "TSF observer mode: phase inputs logged");
   }
-  this->tune_align_max_us_.store(static_cast<int32_t>(this->config_.render_align_max_us), std::memory_order_relaxed);
+  if (this->config_.render_align_max_us > 0) {
+    this->tune_align_max_us_.store(static_cast<int32_t>(this->config_.render_align_max_us), std::memory_order_relaxed);
+  }
 #endif
 
   this->control_session_ = std::make_unique<ControlSession>(this->config_.client_id);

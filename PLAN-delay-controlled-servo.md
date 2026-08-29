@@ -714,6 +714,14 @@
 > constant; pairing noise ~10 µs × 0.1 = 1 µs/step is still far under the wire's slow term),
 > 45-minute window next.
 >
+> **45-min hands-off, align cap 150 / gain 0.1 / step 4 (18:00:07–18:45:07) — best window of the
+> day:** n=27,126, **median +2.7 µs, robust sd 5.0 µs, p2p 27.8 µs**; change 0.19 / 1.2 / 2.4 / 3.6
+> / 4.6 µs over 1/10/30/60/120 s; every 3-min median within ±8 µs at 0.4–3 µs spread; **zero
+> starvations, bailouts, TAGFAULTs, silences on A.** A's bias rail-limited at +150 with the delta
+> still −6…−20 → cap 300 at 18:46. Build 30 (not flashed — the bench is running well and a flash
+> costs a cycle): compiled defaults knee 150, align applied, cap 300, gain 0.1, step 4, deadband 3;
+> a YAML `render_align_max: 0ms` no longer forces the channel off.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
