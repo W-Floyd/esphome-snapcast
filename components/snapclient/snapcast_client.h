@@ -1509,6 +1509,8 @@ class SnapcastClient {
   bool deadline_source_switched_{false};
   /// NVS slot for the delay loop's integral (the learned crystal offset). Player task only.
   ESPPreferenceObject dl_integral_pref_;
+  /// Mirror of the ServoState EMA for the shutdown save (player task writes, main loop reads).
+  std::atomic<float> dl_integral_ema_mirror_{0.0f};
 
   /// @brief RUNTIME-TUNABLE loop parameters, settable over the native API (servo_param action)
   /// so a tuning campaign needs no reflash -- every reflash costs five consensus membership
@@ -1541,6 +1543,8 @@ class SnapcastClient {
   /// outside its bounds. Names: tau_s [2..120], ti_s [10..1200], block_n [8..64], splice_us [0..10000, -1=config],
   /// tag_stale_ms [200..10000], blank_ms [100..2000], gap_blank_ms [10..500], autotune {0,1}, persist {0,1}.
   bool set_servo_param(const std::string &name, float value);
+  /// Save the integral's slow average to NVS now (shutdown hook); see persist_now() in the .cpp.
+  void persist_now();
 
  protected:
 #endif

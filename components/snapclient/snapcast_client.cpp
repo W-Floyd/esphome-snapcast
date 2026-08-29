@@ -477,6 +477,13 @@ static constexpr int64_t DL_PERSIST_SETTLE_US = 60000000;
 // timebase excursions that swing the instantaneous integral by tens of ppm, short against the
 // tens-of-minutes crystal temperature drift it exists to capture.
 static constexpr float DL_PERSIST_EMA_S = 300.0f;
+// For the first minutes after BOOT (esp_timer time, so mapping flaps later do not re-trigger it)
+// the integral time is short: a restored integral can be ~20 ppm stale (timebase drift moved
+// while the board was off), which parks a standing error of mismatch/Kp that Ti = 120 s takes
+// ~5 min to absorb. 20 s absorbs it in about a minute; the common-mode wander swing that a fast
+// Ti allows is tolerated for these minutes only.
+static constexpr int64_t DL_TI_BOOT_WINDOW_US = 180000000;  // TODO next batch: 60 s -- 180 s chased the 60-s common wander (PLAN build 16)
+static constexpr float DL_TI_BOOT_S = 20.0f;
 // Out of range with the integral this far from its own slow average, the integral is wrong (it
 // was caught mid-swing by a hold: measured +114 against a +57 crystal, board then ran 50 ppm fast
 // and the hold kept it there). Snap it to the average; the fast path owns the position anyway.
@@ -3945,7 +3952,9 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   const float unclamped = p_term + st.trim_integral_ppm;
   if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (e > 0.0f)) {
     st.trim_integral_ppm =
-        std::clamp(st.trim_integral_ppm + (kp / this->tune_ti_s_.load(std::memory_order_relaxed)) * e * dt_s,
+        std::clamp(st.trim_integral_ppm +
+                       (kp / (now < DL_TI_BOOT_WINDOW_US ? DL_TI_BOOT_S : this->tune_ti_s_.load(std::memory_order_relaxed))) *
+                           e * dt_s,
                    -clamp_ppm, clamp_ppm);
   }
   st.trim_applied_ppm = std::clamp(p_term + st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
@@ -3958,6 +3967,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     const float alpha = std::min(1.0f, dt_s / DL_PERSIST_EMA_S);
     st.dl_integral_ema_ppm += alpha * (st.trim_integral_ppm - st.dl_integral_ema_ppm);
   }
+  this->dl_integral_ema_mirror_.store(st.dl_integral_ema_ppm, std::memory_order_relaxed);
 
   // Persist the learned crystal offset, slowly and only on real change; see DL_PERSIST_DELTA_PPM.
   // dl_saved_at_us == 0 means never saved this boot: the first write is allowed at once, or a
@@ -4198,6 +4208,19 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
   this->dl_acc_n_ = 0;
   this->dl_acc_sum_us_ = 0.0;
   this->playout_mutex_.unlock();
+}
+
+// SHUTDOWN HOOK. THREAD CONTEXT: main loop, from the hub's on_shutdown(). Saves the current EMA
+// so an OTA or a restart never restores a stale crystal estimate: the periodic save is gated to
+// 10 min / 2 ppm, so the value on flash could be minutes to hours old at the moment of reboot.
+void SnapcastClient::persist_now() {
+#ifdef USE_I2S_RATE_LOCK
+  float v = this->dl_integral_ema_mirror_.load(std::memory_order_relaxed);
+  if (std::isfinite(v) && v != 0.0f && std::abs(v) <= TRIM_CLAMP_MAX_PPM && this->dl_integral_pref_.save(&v)) {
+    global_preferences->sync();
+    ESP_LOGI(TAG, "Delay loop: integral %+.2f ppm persisted at shutdown", v);
+  }
+#endif
 }
 
 // TUNING HOOK. THREAD CONTEXT: main loop (API); every consumer reads atomics. WARN-logged so the

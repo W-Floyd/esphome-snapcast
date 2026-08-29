@@ -290,6 +290,48 @@
 > are live; catch-up threshold on tags = the splice bound. B rebooted by API to clear it meanwhile.
 > B's 22:46 reboot has no log (tails were dead) — cause unknown.
 >
+> **Build 16 (2026-08-29 ~11:40): boot settle.** After a boot the restored integral can be ~20 ppm
+> stale (both boards read +36 this morning against +55 persisted last night — common, so the
+> timebase's drift estimate or temperature, not one crystal), which at Kp 0.1 parks 200 µs that
+> Ti = 120 s takes ~5 min to absorb. Ti is 20 s for the first 180 s of esp_timer time (boot-scoped,
+> so mapping flaps later never re-trigger it), and the EMA is saved on shutdown (hub `on_shutdown`
+> → `persist_now`) so an OTA/restart restores the value at the moment of reboot rather than one up
+> to 10 min old. `internal_temperature` sensor added to the base config at 30 s so the analyser's
+> temperature lane can be correlated with the persisted crystal offset. Also this morning: B's
+> reconnect-after-stall recovered in ~20 s under build 15 (last night the same precondition wedged
+> for five minutes on the early side).
+>
+> **Build 16 first minutes (11:39–11:42):** both loops' `err` swing in phase (±350 µs, ~60 s
+> period — the common-mode timebase wander), and with Ti 20 s the integrals follow it (A 30→67→41
+> ppm, B 29→61→32; trim +14…+85 ppm) instead of averaging through it. The wire B−A drifted
+> −230→+50 µs as the difference of two loops chasing the same wander from different starting
+> points; the 11:42:52 persist (+50.5) landed on a crest (true ≈ +40). **Decision for the next
+> batch:** keep shutdown-persist, shorten `DL_TI_BOOT_WINDOW_US` to 60 s. Flutter in the same span
+> was three delivery events, none the loop: B-only ring dry 11:40:14 (276 ms), server-wide +7 ms
+> step 11:40:44 (observer's own phase moved +7.1 ms), A-only ring dry 11:41:15 (873/1366 ms).
+> **Hypothesis (not yet a finding):** every starvation this morning fell 1–7 min after an OTA
+> reboot (11:28→B 11:32–35; 11:38→B 11:40, A 11:41) — a post-boot starvation window.
+>
+> **Census (all of yesterday evening + this morning, stall clusters >60 s apart vs the preceding
+> "Boot seems successful"):** A 14 stalls, 8 within 300 s of a boot; B 15, 7 within 300 s. The
+> boards spend well under 10% of their time inside the first 5 min after a boot, so the post-boot
+> window carries roughly half the stalls at ~8× the base rate. The observer (no DAC, no OTA
+> churn) stalls too, at 1000–8000 s — the server-wide class. Two classes, then: a **post-boot
+> per-board receive stall** (RSSI fine, WiFi "signal good" at the moment of the bailout, TCP
+> simply stops delivering for 3+ s; 11:44:44 A escalated to a 4.6 s bailout + clean 3 s
+> reconnect) and the **server-wide pause**. Neither is the servo's; the servo's job is to make
+> them cheap, which build 15/16 does (splice-out in 3–4 s, reconnect in 3 s).
+>
+> **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
+> ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
+> morning it is B-dominated and the observer sees nothing — so at least part of the problem is
+> B's own link (B also logs 10 mapping flaps/hour to A's 2, and B is the board that stalled,
+> wedged and rebooted unobserved at 22:46). **Refined:** A's 7 were all its own 11:28 OTA reboot —
+> zero genuine pauses on A this morning; B's genuine events form ONE cluster, 11:32:24–11:35:12
+> (17 dry-ring reports, two bailouts), observer 0. RSSI is fine and B is the strongest (−44 dBm vs
+> A −48, observer −43), so it is not signal strength: a B-local receive stall (driver/AP-side per
+> client) distinct from last night's server-wide class where all three rings dipped together.
+>
 > Two findings from running it: **"SPLITINJECT ramp complete" is an unreliable witness** — it
 > logs only when the zero lands on a chunk that spends a whole frame, and this run reached zero
 > silently; use the SYNCX `drift`/`split` step as the positive control. And the boards wobble

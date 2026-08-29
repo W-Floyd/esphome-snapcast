@@ -132,6 +132,8 @@ class SnapclientHub final : public Component,
   /// @brief TUNING HOOK: forwards to SnapcastClient::set_servo_param(); see there for the names
   /// and bounds. Lets a tuning campaign run over the native API with no reflash.
   void set_servo_param(const std::string &name, float value);
+  /// Persist the delay loop's crystal estimate before a reboot (OTA, restart button).
+  void on_shutdown() override;
 
   template<typename F> void add_connection_callback(F &&callback) {
     this->connection_callbacks_.add(std::forward<F>(callback));

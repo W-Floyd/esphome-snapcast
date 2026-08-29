@@ -184,6 +184,12 @@ void SnapclientHub::inject_split(int32_t us) {
   }
 }
 
+void SnapclientHub::on_shutdown() {
+  if (this->client_ != nullptr) {
+    this->client_->persist_now();
+  }
+}
+
 void SnapclientHub::set_servo_param(const std::string &name, float value) {
   if (this->client_ != nullptr) {
     if (!this->client_->set_servo_param(name, value)) {

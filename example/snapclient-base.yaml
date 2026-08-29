@@ -51,9 +51,9 @@ api:
         - lambda: 'id(snap)->inject_split(us);'
     # TUNING HOOK: set a delay-loop parameter at runtime -- no reflash, no membership churn, and
     # the change lands in the log (SERVOPARAM, WARN) so the analyser's timeline carries it.
-    # Names/bounds live at SnapcastClient::set_servo_param: tau_s, block_n, splice_us,
-    # tag_stale_ms, blank_ms, gap_blank_ms, autotune (0/1 -- the master learn-and-adjust toggle,
-    # session-local, never persisted).
+    # Names/bounds live at SnapcastClient::set_servo_param: tau_s, ti_s, block_n, splice_us,
+    # tag_stale_ms, blank_ms, gap_blank_ms, autotune (0/1 -- one-sided learn-and-adjust toggle),
+    # persist (0/1). Session-local: a reboot restores the flashed defaults.
     - action: servo_param
       variables:
         name: string
@@ -280,6 +280,12 @@ text_sensor:
       entity_category: diagnostic
 
 sensor:
+  # Die temperature, so the analyser can correlate the persisted crystal offset with temperature
+  # (i2s-skew.py parses "'ESP Temperature': Sending state 47.7 °C"). 30 s: the crystal moves over
+  # minutes, and each state line is one more log line on a link that is often the bottleneck.
+  - platform: internal_temperature
+    name: "ESP Temperature"
+    update_interval: 30s
   - platform: wifi_signal
     id: wifi_rssi
     name: WiFi RSSI
