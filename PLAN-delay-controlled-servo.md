@@ -1,5 +1,242 @@
 # PLAN — control the measured transport delay, not a model of it
 
+> **IMPLEMENTED 2026-08-28** in `snapcast_client.{h,cpp}`; see `delay_loop_update_` and the
+> constants at `DL_BLOCK_N`. Decisions taken where the plan left a range, and one deviation it
+> forces on its own logic:
+>
+> * **tau = 10 s** (`DL_KP_RUN_PPM_PER_US` 0.1, Ti = tau, Ki = Kp²) as the starting point — the
+>   plan's three independent arguments all favoured the shorter figure. Grade against 30 s on the
+>   wire before trusting it.
+> * **The starvation re-baseline and phantom clamp are KEPT**, against the "deleted outright"
+>   bullet. Its own caveat is why: they may go "only because ... the ledger becomes
+>   diagnostic-only", but the DEMOTED prediction (hard resync, stale bailout, storm mute, splice
+>   fallback) still consumes the ledger, so it is not diagnostic-only and deleting its
+>   truth-keepers reintroduces the post-restart death spiral the comment at
+>   `notify_audio_played()` records. This is the same argument REVIEW 3 made for flow control,
+>   applied to the consumer the deletion list itself retains. Nothing else about them changed.
+> * **`converged` stays median-based** (the existing latch, cleared by mute/hard events) rather
+>   than the adopted err_tag definition: it is the UNMUTE audibility gate, driven by the retained
+>   scheduling comparison, and an err_tag-based latch would deadlock unmute in exactly the
+>   tags-absent configurations the fallback exists for. The property the redefinition protected —
+>   a ledger bias must not move audio through the splice path — is held instead where it lives:
+>   `fast_splice_` consumes err_tag while fresh, and the split-pending guard survives on the
+>   prediction fallback.
+> * **The split detector and repair are kept in full** (the trace's answer): their one remaining
+>   job is guarding the splice fallback. The 3 s split-pending TRIM hold and `trim_split_holds`
+>   are deleted — the rate loop no longer reads the prediction, so there is nothing to hold
+>   against.
+> * The splice in-flight horizon is derived per chunk as pipeline-depth-chunks + half the
+>   averaging block (from the ledger depth, used only as a window LENGTH in whole chunks — a
+>   multi-ms bias is sub-quantum there); the prediction fallback keeps the historical 15.
+> * Tag-stream blanking (one pipeline depth, `DL_SETPOINT_BLANK_US`) fires on setpoint changes
+>   AND on every `mark_kp_event_` (hard resync, timebase re-anchor) — those displace audio or
+>   step the mapping, so in-flight tags describe the old placement.
+> * The proposed "re-arm only above 2x the threshold" splice hysteresis was NOT added: it predates
+>   the round that read `fast_splice_`'s real shape, which already carries bench-tested
+>   anti-chatter (4 s persistence to arm, release at 300 µs, repair holdoff). Reusing the
+>   mechanism means reusing its hysteresis; only the in-flight horizon changed.
+>
+> **RUN 2026-08-28 ~18:29, board B (f04d74): the two-sided `inject_split(+1000)` test PASSED.**
+> (a) the bias landed — SYNCX `drift` stepped −1 → **+1020 µs** (45 frames) and stood; (b) the
+> audio did not move — B's DLLOOP err stayed inside its ±150 µs settle wobble through ramp,
+> 90 s of standing bias, and the negated restore (drift back to +23 µs); the group render delta
+> stayed at its baseline; no fast splice engaged. The old servo displaced ~1100 µs on this exact
+> injection the same morning. Also observed live: board A carried a NATURAL sawtooth split
+> (drift alternating −49 ms ↔ −1 µs, the mixer-ring artifact, correctly refused by the
+> steadiness band) while its measured error stayed double-digit µs — ledger immunity on a
+> disturbance nobody injected.
+>
+> **Found on first flash and fixed: the trim half of the threshold rule was not implemented.**
+> "Above `fast_splice_threshold`, splice; below it, trim" — the first build's PI ran at ANY error
+> magnitude. Measured consequences: engaged at err +15081 µs on a boot and slammed to the
+> +1000 ppm rail, and wound the integral to −994 ppm chasing a delivery stall's displaced audio
+> (B, 18:35, buffer 1750→574 ms, ~2900 frames dropped by the coarse path with the loop live under
+> it). Second build holds the trim and skips seeding while |err_tag| ≥ the splice threshold —
+> the fast path owns that regime; the loop keeps publishing its error for it.
+>
+> Also captured (pre-existing, not delay-loop): B's late-side stale bailout reconnected mid-stall,
+> the new session started playback before first time sync, and there is **no early-side bailout**
+> — it wedged inserting silence at err ≈ 10.96×10¹² µs (a collapsed clock mapping) for 5+ minutes,
+> feeding a ~17 ms-spread estimate into the group consensus, until manually rebooted. In
+> `b.log` around 18:36–18:41 for a post-mortem.
+>
+> **Found by digging into the recurring wire events (19:12–19:20): SPEAKER-CALLBACK STALLS
+> corrupt every local render timestamp, and no existing gate catches them.** The task stalls
+> 60–1500 ms (measured fleet-wide: A 709/1499 ms, B 92–439 ms, observer 210–1110 ms — systemic
+> and pre-existing); the DAC keeps draining DMA, and on resume the queued completions are stamped
+> with a late "now". Both the measured and inferred render phases then spike by ~the stall length
+> (they share those stamps — +141/+263 ms published into the group at the 19:12/19:13 events,
+> `group=` polluted to −85 ms), and the same stamps feed err_tag. The tag-age gate passes them
+> because both sides of the age are the same late clock; TSF was proven clean (574 consecutive
+> sandwiches within ±12 µs across a spike). Fixed in build 4: a feedback gap > 50 ms (norm ~10 ms)
+> blanks the tag stream for one pipeline depth and refuses the phase publish for observations
+> rendered inside the blank. **Open: what starves the speaker task for up to 1.5 s** — that is a
+> scheduler/driver question, and it also bounds how well ANY render-timestamp instrument can work.
+>
+> **Found 19:41 (build 4): a DEADLINE SOURCE SWITCH is an unannounced timebase step.** A fell off
+> the shared mapping, its local Kalman disagreed by ~29 ms, and the switch stepped the deadline
+> and the published phase by that amount with no `Timebase step` log, no epoch bump, no blanking
+> — not a consensus move, so nothing reported it. The loop refused it correctly (out-of-range
+> hold, integral kept, a full minute at err −29 ms) and the coarse machinery walked the audio
+> over audibly (~26 ms inserted, +3.5 ms overshoot, splice-back) — the second "flutter". Build 5
+> flags the toggle in `chunk_deadline_us_` and the player loop treats it as a re-anchor (gain
+> re-arm + tag blank). **Open, clock_sync-side:** the audible cost of a switch is bounded by the
+> local-vs-shared disagreement — steering the idle local Kalman toward the adopted shared mapping
+> would make fallbacks seamless; and why A lost the shared mapping at 19:40 at all (beacon/TSF
+> availability) is the same wifi-health question as the speaker stalls.
+>
+> **Found 19:47-19:51 (build 5): an UNCONVERGED DEAD ZONE between the splice threshold and
+> converge_fine.** Post-boot under Never-Mute, A sat at err +1.0→+2.0 ms creeping +20 µs/s for
+> 4.5 minutes with nothing correcting: the loop out-of-range-holds (correct), `fast_splice_` was
+> gated on `st.converged`, the coarse steer fallback lives in the !trim_holds branch (skipped —
+> the rate lock's gate passes on `|median| <= converge_fine`), and the aggressive branch needs
+> 10 ms. Build 6 lifts the converged gate for the MEASURED error only — it cannot fight the muted
+> coarse convergence, which acts on the prediction; the prediction fallback keeps the gate.
+>
+> **Corrected attribution:** the 19:41 −29 ms event was NOT a mapping/source step — consensus ran
+> n=3 spread <1 ms throughout, and the ledger error stayed small while only err_tag and the
+> published phase (the two tag-identity consumers) read −29 ms. That is a sustained ~one-chunk
+> TAG-IDENTITY error through the media-source/mixer path, self-recovering, drifting at crystal
+> rate while it stood. **Open, top of the list:** find it — evidence pinned in `a.log`
+> 19:41:22–19:42:18. (Build 5's source-switch announcement stays: the boot-time flapping is real,
+> and B's post-boot log shows it firing 4x in 3 min.)
+>
+> **Builds 7–8 (iteration speed + tuning):** `reflash-speakers.sh` (one build, two OTAs);
+> `servo_param(name,value)` API action + `scripts/servo-param.py` for runtime tuning of tau_s,
+> block_n, splice_us, gate timings, and the `autotune` master toggle (lag-1-autocorrelation
+> adapter on tau, 64-block windows, bounds [5,60] s, WARN-logged, never persisted);
+> `scripts/bench/dl-window.py` for one-command window grading; NVS persistence of the integral
+> (first-save gate fixed in build 8). Build 8 also: **flat Kp = 1/tau** — the acquire→run schedule
+> scaled Ki = Kp² by 4x on every re-arm and source flaps re-armed every ~25 s, winding A's
+> integral to +134 ppm; source switches now blank only; and the tag-stale / mapping-lost holds
+> program the INTEGRAL, not the last trim (measured holding +192..+236 ppm of boot P term).
+>
+> **Autotune v1 run 20:26–20:28 (build 8), stopped after 45 s.** Two defects: the r1 estimator
+> reported +1.07/+1.04/+1.02 (mixed n and n−1 normalisations over running sums — impossible values,
+> instrument first); and the speed-up rule fired identically on both boards within a second
+> (10→8.5→7.2→6.1 s) because a standing mean with r1≈1 is exactly what tracking the common-mode
+> timebase wander looks like — loop lag and a moving target are indistinguishable on one device.
+> Build 9: proper demeaned lag-1 r1 over a stored 64-sample window; **one-sided adaptation**
+> (ringing → slow down only; the operator's tau is the floor); persistence first-save gated on
+> 60 s of continuous engagement (build 8 re-saved +0.63 within a second of engaging). A 254 ms
+> delivery stall on B at 20:27:23 during the run was unrelated (radio class); both loops closed
+> the aftermath cleanly at the shortened tau.
+>
+> **Top clock_sync item, found 20:29–20:36: recurring COMMON-MODE TIMEBASE STEPS of 60–100 ms.**
+> Both speakers hard-resynced by the same amount within 0.5 s of each other three times in seven
+> minutes (−60 @20:29:45, −65/−62 @20:33:44, +100/+50 @20:36:06), alternating sign; the observer
+> logged `Consensus over 1 estimate(s)` at 20:29:44 — the speakers' estimates dropping out of
+> and back into the set moves the deterministic mean by tens of ms. Alignment survives (common
+> mode) but under Never-Mute every step is an audible skip on every speaker. Not the delay loop:
+> it held through each. **Correction, 20:51: every one of these steps lines up with OPERATOR
+> activity** — OTA uploads/reboots (20:29:37 build → 20:29:45 step; 20:33:46 reboot → 20:33:44
+> step; 20:51:15–18 triple step during the build-10 upload, with the observer logging n=3→1→3 and
+> spread 2643 µs) or the replugs (20:36:06). An OTA in progress stalls a speaker's time-sync/beacon
+> path, its estimate drops out of the set, and the deterministic mean jumps. CLAUDE.md's warning
+> verbatim: the operator was the dominant disturbance. Whether the steps occur on a QUIET bench is
+> unmeasured — the 6-minute build-9 window had none. Also: build 9's OTA was silently ROLLED BACK by a replug 40 s after the
+> reboot (both boards reported build 8's compile time via API device_info) — verify the running
+> build over the API after every flash; restart the logger process instead of replugging.
+>
+> **Build 9 live (verified via API), 20:41+: autotune v2 holds correctly** — r1 = +0.93..0.95 (valid
+> now), both boards flag the identical common-mode window and neither acts. Persistence wrote
+> +50.79 (A) but **+98.73 on B while its integral read +46 a minute later**: the ~45 s common-mode
+> excursions swing the instantaneous integral by tens of ppm, so a settle gate still samples
+> peaks. Build 10 persists a 300 s EMA of the integral instead.
+>
+> **RESULT — build 9, tau 10 s, autotune v2 armed, 20:44–20:50 (6 min, zero events of any kind
+> on either board):** loop error A/B median −41/−45 MAD 152/151 p5..p95 ±375 µs — that is the
+> common-mode timebase wander, and A–B r = **+0.997**. What lands between devices: **differential
+> error median +2 MAD 10 µs, p5 −23 / p95 +26** (n=326); group render delta A −5 MAD 14, B −7
+> MAD 15. Against the morning baseline (wire MAD 20.0 / p2p 243; group delta MAD 26 / 16) the
+> on-device differential MAD is half the wire MAD and the group deltas are tighter on both boards.
+> Wire confirmation over the same kind of quiet span is the remaining grade.
+>
+> **WIRE RESULT, build 10, live analyzer window: n=1303 mean −10.9 µs sd 42.9 p2p 134 µs** (morning
+> baseline sd 46.7 / p2p 242.8 — peak-to-peak nearly halved). Remaining visible artefact: two ~27 ppm
+> rate steps on B lasting a few seconds, each a `deadline on local fallback` hold — holding the
+> INTEGRAL drops P instantly while the peer keeps applying P to the same common-mode error, so a
+> ~1 s mapping flap costs ~130 µs of differential skew. Build 11: in-range holds carry P and decay
+> it toward the integral over tau (short flaps step nothing; long outages still end at crystal);
+> out-of-range keeps integral-only.
+>
+> **RESOLVED AS BENCH INFRASTRUCTURE (21:05): the "A stalls" are GROUP-WIDE delivery pauses from
+> the server/network side, present ALL DAY.** At every A stall the observer's and B's rings dipped
+> at the same instant (B to 208 ms at 20:36:07; observer to 992 ms at 20:58:12); A simply empties
+> first. `no chunk records for 3 s, ring holds 0` census per hour today (A / B): 14h 120/128,
+> **15h 263/297**, 18h 12/21, 19h 20/18, 20h 17/13, 21h 8/10 — tonight is a quieter-than-average
+> day for it. The snapserver (192.168.1.2) is not this Mac. Not the persist, not the mapping, not
+> A's radio (RSSI −30, no WiFi events). Under Never-Mute each pause is an audible skip on every
+> board. Investigate the server host / AP; the client cannot fix a source that stops sending.
+> Superseded suspect kept below for the record:
+>
+> **Open suspect, A only: receive stalls 1.5–2.5 min after boot, ending in the stale bailout**
+> (20:36:08→13 and 20:58:14→21, lateness growing ~1 s per 2 s, RSSI −30 dBm, no WiFi events, B
+> unaffected). Both followed A's first NVS persist of the boot (by 38 s and 4.7 s); A's eight
+> earlier boots tonight, none of which persisted early, had no such stall — but one persist
+> (20:30:43) had no stall either. Mechanism if real: NVS commit → flash erase/compaction stalls
+> the receive path. Natural test: A's next persist is due ~21:08 (10-min gate); a stall within
+> a minute of it is strong evidence. `servo_param persist 0` (build 12) turns saves off for a
+> controlled test.
+>
+> **WIRE, build 11, 21:0x: n=1300 mean −0.19 µs sd 3.51 µs p2p 11.8 µs** — from the morning's
+> sd 46.7 / p2p 243. Residual: a ±5 µs cyclical differential = the two loops' mismatched
+> tracking of the ±375–600 µs / ~60 s common-mode wander (dead time differs per board by ±30 ms,
+> visible as `pipeline 247→211` annotations). Levers: longer tau (tracks less of the wander —
+> **tau 30 set over the API at 21:09:27 as an A/B**), a smoother consensus mapping (clock_sync),
+> or slow feed-forward from the group render delta (deliberately still off).
+>
+> **Tuning defect found 21:08: Ti = tau (Ki = Kp²) lets the integral swing ~57 ppm p-p chasing the
+> wander** (A: +103.6 → +114.4 in 2 s at err +600 µs; crystal is +57). A delivery-pause hold then
+> froze it at +114 and the board ran ~50 ppm fast, err to −5.2 ms, splices dragged it back. Ti was
+> tied to tau for cold-boot wind-up speed, which NVS persistence made moot. Build 12 (flashed
+> ~21:12): `ti_s` tunable, default 120 s (Ki = Kp/Ti → ~2 ppm swing); out-of-range with the
+> integral > 20 ppm from its own 300 s average snaps it to the average (A sat at +94 vs +57 for
+> minutes with the hold faithfully keeping the wrong value); `persist` on/off knob. tau 30 re-applied
+> after the reboot to continue the A/B on the differential residual.
+>
+> **tau = 30 A/B (21:13–21:17, build 12, Ti 120): WORSE — differential err median +425 MAD 161 µs,
+> r = 0.75** (vs +2 / 10 / 0.997 at tau 10). Mechanism: the loop's standing error is
+> integral_error / Kp; at Kp 0.033 a ~15 ppm integral misestimate parks ~450 µs (A: median +438
+> with integral +50 against a ~+65 crystal), and Ti = 120 s pulls it in only slowly. tau 30 is
+> viable only once the integral is within ~1 ppm; reverted to tau 10 at 21:17 with Ti kept at
+> 120 s. Confounded A/B (two parameters changed) — noted so it is not repeated. **Wire confirms
+> (from `test.csv` via `scripts/bench/wire-window.py`, rival-gated): tau 30 span 21:14:30–21:18:50
+> mean +373 MAD 148 sd 202 p2p 1172 µs; after the revert, 21:24–21:25 mean +29 MAD 5.5 sd 7.3
+> p2p 21 µs and still draining.** The analyzer CSV is now graded directly, not read off plots.
+>
+> **How well does the device SEE the wire skew? (21:22–21:27:30, settled, wire averaged per 1 s
+> device sample, n=284):** the loop-error differential errA−errB vs the analyzer: **r = +0.88,
+> slope 0.87, means +31.3 vs +33.8 µs (bias ~2.5 µs), residual sd 12.8 µs** — an essentially
+> unbiased estimate with ~13 µs of per-second noise (→ ~2 µs after a minute of averaging). The
+> render-phase difference (phase_b−phase_a, what the group exchange carries) is far worse: sd 46 µs
+> settled, r −0.55, bias +70 µs, and +938 µs bias / 786 µs sd during excursions (stall stamps).
+> Implication: a slow differential feed-forward should be built on exchanged err_tag, not on the
+> render phases, and only after minutes of median filtering. Realistic floor: standing offset →
+> ~2 µs; the ±5 µs wander residual (dead-time asymmetry) is the next term. **Analyzer precision,
+> measured, not quoted:** `scatter_ns` (median |per-frame skew − within-capture fit|) is 26 ns
+> median / 40 ns p90 over the settled span — the wire resolves each capture's B−A offset to tens
+> of ns, so every µs in sd 3.5 / p2p 11.8 is real board behaviour. (The "0.71 µs fit floor" in
+> the yaml comment is an older, different quantity; retracted as a limit.)
+>
+> **Build 12 / tau 10 / Ti 120, settled (21:28–21:33): WIRE mean +5.7 MAD 3.9 sd 5.3 p2p 26.6 µs;
+> on-device differential median +11 MAD 13, r 0.992.** A ~+6 µs standing offset remains (slow-Ti
+> residual). The ±5 ppm `fs_b − fs_a` hash the operator saw "near zero" coincides with the steepest
+> COMMON rate ramp (~120 ppm/min), not with the zero crossing: unsynchronised 0.33 s blocks sample
+> a fast ramp at different phases, so the two P terms differ by a few ppm block-to-block; ±5 ppm ×
+> 0.3 s ≈ ±1.5 µs, which is the skew wiggle seen. Inaudible. `block_n 64` set at 21:33:50 as an
+> A/B on the dither (halves update rate, doubles averaging; splice horizon follows).
+>
+> Two findings from running it: **"SPLITINJECT ramp complete" is an unreliable witness** — it
+> logs only when the zero lands on a chunk that spends a whole frame, and this run reached zero
+> silently; use the SYNCX `drift`/`split` step as the positive control. And the boards wobble
+> ±150 µs in ANTI-PHASE post-reflash (render_align confirmed off) — judged on the settled
+> window below.
+>
+> **Not yet run:** the flow-control read-site trace, tau grading (10 s vs 30 s), the cold-boot
+> peak measurement, and the settled-bench comparison against the 2026-08-28 baseline
+> (wire MAD 20.0 / sd 46.7 / p2p 242.8) — the last needs twenty uninterrupted minutes.
+
 The servo steers on a prediction. Everything defensive around it exists because that prediction is
 built from a ledger that can be silently wrong. A render tag measures the same quantity directly, so
 the defences become unnecessary rather than better tuned.
