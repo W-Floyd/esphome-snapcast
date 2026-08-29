@@ -31,10 +31,21 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-**DELAY-CONTROLLED SERVO IS LIVE (build 14, `29ca74f`, 2026-08-29) — see `HANDOFF.md` and
-`PLAN-delay-controlled-servo.md`.** Wire went from sd 46.7 / p2p 243 µs (2026-08-28 morning) to
-sd 8.9 / p2p 45 over 11.5 quiet minutes with a zero event census on both boards. Open items, by
-audible impact:
+**BUILD 27 IS LIVE (2026-08-29 16:00) — see `HANDOFF.md` "Builds 15–27" and
+`PLAN-delay-controlled-servo.md`.** Since build 14: rate-lock dither, error-proportional gain
+(tau 120 / Ti 600 / block 64 floor, knee 150 on the bench), tag-fault → split repair → reconnect
+backstop, dead-session detector, cold-start crystal seed, observer publishes no phase, render_align
+shadow-only. Cycle time (wire ≤ 20 µs held, from reboot): 18 >450 s → 26 46 s. Steady-state
+fast noise 0.30 µs/√s; slow 5–7 µs term is per-board measurement error. Open items, by impact:
+
+- **Tag/ledger split after a chunk-drop storm** (root cause open; repair bounds it). **Align sign**
+  (shadow window running; `align-shadow.py`). **Post-boot starvation cluster** (3 stalls in 12 min
+  after every boot; same AP/channel; TX power ruled out). **B's USB serial wedges on every OTA**
+  (replug, never within 2 min). Server `buffer` 2000 → 4000+ ms rides out RTO back-off holes.
+- **Differential channel for <1 µs**: needs a better exchanged signal (publish a line, or the 30 Hz
+  exchange now that there is a consumer); magnitude-knee scheduling cannot separate the common
+  wander from a real error.
+- Older items below still stand where not superseded:
 
 - **Server-side delivery pauses** (all three boards' rings dip at the same instants; 120–297/hour
   on 2026-08-28 afternoon, 8–20/hour that night). Investigate the Pi host / process-stream loop /

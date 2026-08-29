@@ -214,6 +214,57 @@ capture to ~26 ns (`scatter_ns`), so every µs on the wire is board behaviour.
    exchanged err_tag); dead-time compensation for the ±5 µs wander residual.
 5. HA `number`/`switch` entities on the tunables; parse `DLLOOP` into the analyser CSV.
 
+## Builds 15–27 in one afternoon (2026-08-29, 11:00–16:00) — what changed and what the ledger says
+
+All committed on `main`; `PLAN-delay-controlled-servo.md` carries the blow-by-blow with the evidence.
+
+**Mechanisms now in the firmware**
+* **Rate-lock dither** (build 17): the MCLK fractional divider's achievable ratios are 0.5–1.2 ppm
+  apart at our operating point; `RateLock::tick()` (speaker callback, ~100 Hz) sigma-delta dithers
+  between the two bracketing ratios. Residual ≤ one step × one tick ≈ 10 ns.
+* **Error-proportional gain** (builds 19–21): Kp = (1/tau)·max(1, |err|/knee), effective tau floored at
+  `tau_min_s`; Ti is NOT boosted; the bumpless transfer keys on the tuned 1/tau only (with a
+  per-block-varying kp it had become a hidden integrator — build 20 diverged from zero).
+  Defaults tau 120 / Ti 600 / block 64 / knee 25; on the bench knee 150 (above the ±350 µs common
+  wander). A magnitude knee cannot separate "far from setpoint" from "the common wander" — that is
+  the standing limitation.
+* **Tag fault** (builds 18/23/25): a coarse correction on err_tag that leaves err_tag unmoved is a
+  miss only while tag and ledger DISAGREE (> 3 ms); three misses → TAGFAULT: tags distrusted 180 s,
+  the accounting-split repair pre-armed (it is what actually closes the split — the LEDGER slips,
+  the tags were right), reconnect only on a second fault without a repair.
+* **Dead-session detector** (build 26): 15 s without any received byte on a connected session →
+  reconnect. Both boards starved 4+ min at 15:07 after the server dropped their sessions with no
+  FIN; nothing else could notice.
+* **Cold start** (build 25): no NVS integral → seed from the TSF own-crystal estimate and run the
+  fast boot Ti 180 s. A restored board never sees either (fast Ti on a restored board integrated
+  the post-boot transient into +13 ppm — build 17).
+* **Observer publishes no render phase** (build 22): its +9.5 ms phase had made the speakers'
+  group render delta bimodal and useless.
+* **render_align** is runtime-tunable (`align_max_us / align_gain / align_deadband_us /
+  align_reject_us / align_step_us / align_apply`) and SHADOW-ONLY by default (build 27). Two live
+  runs both drove the wire away from zero (sign unproven; the second was self-reinforcing).
+  `align_max_us 0` clears the bias. Settle the sign with `scripts/bench/align-shadow.py` first.
+* Runtime tunables persist nothing: every reflash resets them (`servo-param.py`).
+
+**Cycle time** (wire |A−B| ≤ 20 µs held 20 s, from the reboot line; `scripts/bench/converge-time.py`):
+build 18 >450 s · 19 242 · 22 209 · 24 74 · 25 67 · 26 46. Boot→engage is ~15–20 s of that.
+
+**Steady state** (`scripts/bench/wire-sf.py`, structure function): with tau 30 the 1-s change fell
+0.63 → 0.38 µs and with knee 150 to 0.30; the slow term (5–7 µs over 20–60 s) is a per-board error
+that does not average — the exchanged render phase has the same 7 µs and does not track the wire
+— so it is the measurement, not the mapping alone. <1 µs needs a differential channel with a
+better exchanged signal (publish a line, or the 30 Hz exchange, now that there is a consumer).
+
+**Bench tooling**: `watch-bench.py` (persistent Monitor: TAGFAULT/stalls/bailouts/|err|>5 ms/split
+>5 ms/wire >200 µs/no-correlation/log gaps), `converge-time.py`, `wire-sf.py`, `wire-vs-common.py`,
+`align-shadow.py`, `dl-window.py`, `wire-window.py`, `servo-param.py`.
+
+**Open**: root cause of the tag/ledger split after a chunk-drop storm on an empty ring (repair
+bounds its cost; mechanism unknown — every player-side path read is aligned); align sign; the
+post-boot starvation cluster (3 stalls in 12 min after a boot, same AP/channel, TX power ruled
+out); B's USB serial wedges on every OTA (logger restart does not recover it; replug does — never
+within 2 min of the OTA); server `buffer` 2000 → 4000+ ms would ride out RTO back-off holes.
+
 ## `render_align`'s replacement signal — IMPLEMENTED, FLASHED, GRADED, PASSES (2026-08-28)
 
 `PLAN-render-align-signal.md` is built, on all five boards, and **it passes its ratio test: 0.94
