@@ -538,6 +538,51 @@
 > correlates with the wire (A +0.75, B −0.60, ~10 µs per 3.3 s sample) — enough for a slow
 > channel on the standing offset (+47 µs at 13:53–13:58) and the slow drift.
 >
+> **Build 22 landed 14:05:28 (speakers 19:01:51Z; observer reflashed).** Render deltas on B after
+> the fix: −22…0 µs, no more +9.5 ms half. Cycle time from the reboot: wire inside 20 µs held from
+> **+209 s** (build 19: 242; build 18: >450), boards inside 75 µs at +241/+242 s (knee back at the
+> compiled 25 after the reflash). 14:13:58: `knee_us 150` and `align_max_us 2000` (gain 0.05,
+> deadband 20) on both speakers — the inter-device channel is live for the first time with a clean
+> group phase; graded 14:16–14:27.
+>
+> **14:15:34–14:21:04 the bench Mac slept again** (all three log tails gap; analyser process
+> survived, CSV current). The align channel's first window was voided and re-armed 14:23–14:35
+> (`align_deadband_us` 3 since 14:15:10). First RALIGN steps seen on A: group −62 → bias −19, −17,
+> −15, −12 (+3 µs per due report = gain 0.05 × 60). B stalled 14:11:48 (three late resyncs) →
+> clean bailout/reconnect 14:11:53, SHADOW diff −32 µs afterwards — no tag/ledger split, so the
+> 13:21-class desync is not a certainty after every storm. Both loops healthy post-sleep.
+>
+> **render_align's first live run (14:21–14:24) ran the wrong way.** A: delta −60 held while bias
+> stepped −19 → −10 and the wire fell −69 → −94 µs at 0.3–0.4 ppm — exactly gain × delta per due
+> report. The wire had A LATE; the code read negative delta as EARLY. B mirrored it. Then one bad
+> pair (+1717 µs) moved A's bias 41 µs in one step and the wire jumped +110 µs. Disabled 14:24:49.
+> **Build 23:** step = +delta × gain (sign measured, not assumed), pairs beyond `align_reject_us`
+> (500) ignored, step capped at `align_step_us` (5 µs per ~10 s report = 0.5 ppm max).
+>
+> **Build 23 (14:26:47): the tag fault fired and was not enough.** 14:29:21 A starved → hard resync
+> 330 ms → SHADOW diff −15,039 µs → `TAGFAULT … err_tag −12592 (ledger −807)` at 14:29:34 — the
+> detector works. But distrust only stops the thrash: A then sat at err_tag −15.9 ms (holding),
+> ledger −0.6 ms, wire 3.4 ms off, indefinitely — three measurements, none agreeing, nothing able
+> to rebuild the tag path. **Build 24:** TAGFAULT also requests a reconnect (the late-stream
+> bailout's flag): the session teardown rebuilds the pipeline and its tag tracks, and every
+> observed bailout has come back with tags and ledger agreeing within tens of µs. ~3 s gap vs an
+> open-ended desync. The root (why a chunk-drop storm on an empty ring desyncs tags from audio)
+> is still open; the reconnect bounds its cost.
+>
+> **What actually repaired A (14:33:41):** not a reconnect — the accounting-split repair, re-armed
+> by TAGFAULT: "accounted queue ran +14987 us against measured latency for 3 s", ledger corrected,
+> coarse path moved the audio, and one report later SHADOW diff was −55 µs with err_tag +2.5 ms
+> → fast splice → done. So the LEDGER was the side that had slipped by 15 ms (RECON drift 14988
+> the whole time) and the tags were right; the "misses" happened because the tag-driven catch-up's
+> frame drops were being undone by the split (the ledger, not the audio, absorbed them). It took
+> four minutes only because each 60-s fault window expired and three misses had to re-accumulate
+> before the repair got its 3-s window (TAGFAULT ×3: 14:29:34, 14:30:37, 14:31:41, 14:32:44).
+> **Build 25 plan:** on TAGFAULT run the repair at once (pre-arm `drift_excess_since_us`) and hold
+> the fault 180 s. Build 24 (reconnect on TAGFAULT) stays as the backstop if the repair does not
+> close the split. Bench watchdog (`scripts/bench/watch-bench.py`) now runs as a persistent
+> Monitor: TAGFAULT / stalls / bailouts / |err| > 5 ms / split > 5 ms / wire > 200 µs / analyser
+> no-correlation / log gaps, one line per event with a 5-min cooldown.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

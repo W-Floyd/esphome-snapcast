@@ -1546,6 +1546,8 @@ class SnapcastClient {
   std::atomic<int32_t> tune_align_max_us_{0};
   std::atomic<float> tune_align_gain_{0.05f};
   std::atomic<int32_t> tune_align_deadband_us_{20};
+  std::atomic<int32_t> tune_align_reject_us_{500};  // pairs beyond this are not a measurement
+  std::atomic<int32_t> tune_align_step_us_{5};      // per due report (~10 s): 0.5 ppm at most
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};

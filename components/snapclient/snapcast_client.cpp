@@ -717,7 +717,7 @@ static constexpr int64_t REANCHOR_MIN_INTERVAL_US = 60000000;
 // Reports between corrections. One report was inside the loop delay, which is what sustained the
 // cycle above.
 static constexpr uint32_t RENDER_ALIGN_EVERY_N_REPORTS = 3;
-static constexpr int32_t RENDER_ALIGN_MAX_STEP_US = 50;
+// RENDER_ALIGN_MAX_STEP_US: now servo_param align_step_us (default 5)
 // Below this the delta is measurement noise: the render delta's own MAD is ~15 us against a
 // truth MAD of 1.7 us, so correcting inside that band would inject noise, not remove it.
 // RENDER_ALIGN_DEADBAND_US: now servo_param align_deadband_us (default 20)
@@ -2674,8 +2674,16 @@ void SnapcastClient::player_task_() {
           st.tag_fault_until_us = now_us() + TAG_FAULT_US;
           ESP_LOGW(TAG,
                    "TAGFAULT: %u tag-driven corrections left err_tag at %+" PRId64
-                   " us (ledger says %+" PRId64 ") -- distrusting tags for %" PRId64 " s, coarse on the ledger",
+                   " us (ledger says %+" PRId64 ") -- distrusting tags for %" PRId64 " s and reconnecting to rebuild the tag path",
                    static_cast<unsigned>(TAG_FAULT_MISSES), st.dl_err_us, error_us, TAG_FAULT_US / 1000000);
+          // REPAIR, NOT JUST DIAGNOSIS. Distrusting the tags stopped the thrash (build 18) but left
+          // the audio parked: A sat at err_tag -15.9 ms / ledger -0.6 ms / wire 3.4 ms off for minutes
+          // after the 14:29:21 stall (build 23), because nothing rebuilds a tag path that has come
+          // apart from the audio. A reconnect does -- the session teardown re-creates the pipeline and
+          // the tag tracks with it, and every observed bailout came back with tags and ledger agreeing
+          // within tens of us (B 14:11:53: SHADOW diff -32 us). ~3 s gap instead of an open-ended
+          // desync. Same flag as the late-stream bailout; the network task reconnects without backoff.
+          this->reconnect_requested_.store(true, std::memory_order_relaxed);
         }
       } else {
         st.tag_miss = 0;
@@ -4342,6 +4350,12 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "align_deadband_us") {
     if (!(value >= 0.0f && value <= 1000.0f)) return false;
     this->tune_align_deadband_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "align_reject_us") {
+    if (!(value >= 10.0f && value <= 20000.0f)) return false;
+    this->tune_align_reject_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "align_step_us") {
+    if (!(value >= 1.0f && value <= 200.0f)) return false;
+    this->tune_align_step_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "autotune") {
     this->tune_autotune_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "persist") {
@@ -5237,10 +5251,21 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         if (align_cap > 0 && st.converged && align_due && group_delta != INT32_MIN) {
           const int32_t cap = align_cap;
           int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
-          if (std::abs(group_delta) > this->tune_align_deadband_us_.load(std::memory_order_relaxed)) {
+          // SIGN, MEASURED NOT ASSUMED (2026-08-29 14:21-14:24, first live run with a clean group
+          // phase): A's group delta read -60 us while the wire had A LATE by 60-90 us; stepping the
+          // bias by -delta*gain (+3 us per due report) delayed A further and the wire fell at the
+          // same 0.3-0.4 ppm; B's mirror image did the same. A negative delta means this device is
+          // LATE, so the bias must move WITH the delta. And a single bad pairing (+1717 us) moved
+          // the bias 41 us in one step: pairs beyond align_reject_us are ignored and the step is
+          // capped at align_step_us (default 5) -- this channel removes a standing offset slowly,
+          // it must never be able to create one quickly.
+          const int32_t reject = this->tune_align_reject_us_.load(std::memory_order_relaxed);
+          const int32_t max_step = this->tune_align_step_us_.load(std::memory_order_relaxed);
+          if (std::abs(group_delta) > this->tune_align_deadband_us_.load(std::memory_order_relaxed) &&
+              std::abs(group_delta) <= reject) {
             const int32_t step =
-                std::clamp<int32_t>(static_cast<int32_t>(-group_delta * this->tune_align_gain_.load(std::memory_order_relaxed)),
-                                    -RENDER_ALIGN_MAX_STEP_US, RENDER_ALIGN_MAX_STEP_US);
+                std::clamp<int32_t>(static_cast<int32_t>(group_delta * this->tune_align_gain_.load(std::memory_order_relaxed)),
+                                    -max_step, max_step);
             bias = std::clamp<int32_t>(bias + step, -cap, cap);
             this->render_bias_us_.store(bias, std::memory_order_relaxed);
           }
