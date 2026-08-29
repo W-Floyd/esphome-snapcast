@@ -227,6 +227,22 @@
 > 0.3 s ≈ ±1.5 µs, which is the skew wiggle seen. Inaudible. `block_n 64` set at 21:33:50 as an
 > A/B on the dither (halves update rate, doubles averaging; splice horizon follows).
 >
+> **Ten settled minutes, build 12 / tau 10 / Ti 120, WIRE 21:27–21:37 (n=11096, no rows
+> rival-gated): mean +3.7 median +3.6 MAD 3.8 sd 5.2 p2p 30.4 µs.** Standing offset draining
+> (+5.7 → +3.7 over the span). Against the morning baseline (sd 46.7 / p2p 243) that is 9x on sd
+> and 8x on peak-to-peak over a window long enough to include two server-side delivery pauses.
+>
+> **The "wild flutter" and the 19:41 −29 ms event have one cause: the ACCOUNTING SPLIT REPAIR
+> still fires with tags live.** A 21:37:52 `Accounting split repaired: ran −29026 us`, 21:38:15
+> `+29024 us` — the mixer-ring drift sawtooth briefly held steady, passed the steadiness band, and
+> the repair stepped the ledger; the demoted prediction jumped and the hard-resync path dropped
+> 1404 frames of REAL audio (31.8 ms), err_tag read the true −32 ms for 24 s, the sawtooth flipped,
+> a second repair stepped back and 1512 frames were inserted. Skip, stutter, "fixed itself". The
+> delay loop was immune throughout (integral +56.61 held). Both earlier attributions of the 19:41
+> event (mapping step, then tag mis-identity) were wrong — it was this: same ±29 ms signature.
+> Build 13: with tags live the repair window is disarmed (ledger diagnostic-only, as the plan
+> always said); the repair survives only on the tags-absent fallback.
+>
 > Two findings from running it: **"SPLITINJECT ramp complete" is an unreliable witness** — it
 > logs only when the zero lands on a chunk that spends a whole frame, and this run reached zero
 > silently; use the SYNCX `drift`/`split` step as the positive control. And the boards wobble

@@ -4652,6 +4652,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             st.drift_excess_since_us = (std::abs(drift_for_repair) >= DRIFT_REPAIR_US) ? now_us() : 0;
             st.drift_excess_min_us = drift_for_repair;
             st.drift_excess_max_us = drift_for_repair;
+          } else if (st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US) {
+            // TAGS LIVE: the ledger is diagnostic-only and a repair is pure harm. It steps
+            // pushed_frames_total_ by the drift, the demoted prediction jumps, and the hard-resync
+            // path moves REAL audio by that much against a bookkeeping artefact -- measured on A
+            // 2026-08-28 21:37:52 / 21:38:15: repairs of -29026 then +29024 us (the mixer-ring drift
+            // sawtooth), 1404 frames dropped then 1512 inserted, err_tag reading the true -32 ms in
+            // between, an audible skip-then-stutter that "fixed itself" when the sawtooth flipped.
+            // The 19:41 "-29 ms" event was the same repair. Disarm the window entirely so a stale
+            // split does not fire the instant tags drop out; the fallback re-arms from scratch.
+            st.drift_excess_since_us = 0;
           } else if (now_us() - st.drift_excess_since_us >= DRIFT_REPAIR_HOLD_US) {
             // Trust the measurement: drop the accounted queue by the whole drift. Playback was
             // running that far early, so the prediction moves later and the servo walks the phase
