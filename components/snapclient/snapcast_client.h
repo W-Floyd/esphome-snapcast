@@ -1484,7 +1484,8 @@ class SnapcastClient {
 
 #ifdef USE_I2S_RATE_LOCK
   // Hardware clock steering; owned here, driven by the player task's servo. The
-  // speaker callback thread only pokes invalidate_baseline() (atomic flag).
+  // speaker callback thread pokes invalidate_baseline() (atomic flag) and runs the
+  // dither step tick() once per callback (see RateLock).
   std::unique_ptr<RateLock> rate_lock_;
 #endif
 

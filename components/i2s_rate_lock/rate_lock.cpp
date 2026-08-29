@@ -135,7 +135,11 @@ bool RateLock::read_baseline_() {
   // "ideal" throws away the rate the servo had converged on and dumps the loop on
   // its rail while the integral unwinds. If the register still holds what we wrote,
   // nothing was reprogrammed: keep the reference and the trim exactly as they are.
-  if (this->ours_valid_ && frac == this->last_frac_val_ && this->base_ratio_ > 0.0) {
+  const bool ours = frac == this->last_frac_val_.load(std::memory_order_relaxed) ||
+                    (this->dither_on_.load(std::memory_order_relaxed) &&
+                     (frac == this->dither_lo_.load(std::memory_order_relaxed) ||
+                      frac == this->dither_hi_.load(std::memory_order_relaxed)));
+  if (this->ours_valid_ && ours && this->base_ratio_ > 0.0) {
     ESP_LOGD(TAG, "I2S%u divider unchanged since our last write; keeping baseline", this->port_);
     return true;
   }
@@ -150,7 +154,7 @@ bool RateLock::read_baseline_() {
   this->base_int_ = div_num;
   this->base_num_ = b;
   this->base_den_ = a;
-  this->last_frac_val_ = frac;
+  this->last_frac_val_.store(frac, std::memory_order_relaxed);
 
   const double programmed = div_num + static_cast<double>(b) / a;
   this->base_ratio_ = programmed;
@@ -195,6 +199,7 @@ bool RateLock::set_trim_ppm(float ppm) {
   if (this->rebaseline_.exchange(false, std::memory_order_relaxed)) {
     this->baseline_valid_ = false;
     this->applied_ppm_ = 0.0f;
+    this->dither_on_.store(false, std::memory_order_relaxed);
   }
   if (!this->baseline_valid_) {
     if (!this->read_baseline_()) {
@@ -218,36 +223,86 @@ bool RateLock::set_trim_ppm(float ppm) {
     return false;
   }
 
-  // Best rational b/a for the target fraction: exhaustive over the denominator
-  // (~500 float ops, runs at most a few times per second while the servo steps)
-  uint32_t best_b = 0, best_a = 1;
-  double best_err = frac;
+  // The two achievable ratios that bracket the target fraction: the largest b/a <= frac
+  // and the smallest b/a >= frac over all denominators (~1000 float ops, a few times per
+  // second). Where one of them IS the target (err < 1e-9) there is nothing to dither.
+  uint32_t lo_b = 0, lo_a = 1, hi_b = 1, hi_a = 1;
+  double lo_v = 0.0, hi_v = 1.0;
   for (uint32_t a = 2; a <= MAX_DENOMINATOR; a++) {
-    const auto b = static_cast<uint32_t>(
-        std::min(std::lround(frac * a), static_cast<long>(a - 1)));
-    const double err = std::fabs(frac - static_cast<double>(b) / a);
-    if (err < best_err) {
-      best_err = err;
-      best_b = b;
-      best_a = a;
-      if (err < 1e-9) {
-        break;
-      }
+    const double fa = frac * a;
+    const auto bl = static_cast<uint32_t>(std::min(static_cast<long>(std::floor(fa)), static_cast<long>(a - 1)));
+    const auto bh = static_cast<uint32_t>(std::min(static_cast<long>(std::ceil(fa)), static_cast<long>(a - 1)));
+    const double vl = static_cast<double>(bl) / a, vh = static_cast<double>(bh) / a;
+    if (vl <= frac && vl > lo_v) {
+      lo_v = vl;
+      lo_b = bl;
+      lo_a = a;
+    }
+    if (vh >= frac && vh < hi_v) {
+      hi_v = vh;
+      hi_b = bh;
+      hi_a = a;
     }
   }
+  const uint32_t lo_val = encode_frac(lo_b, lo_a);
+  const uint32_t hi_val = encode_frac(hi_b, hi_a);
+  const double gap = hi_v - lo_v;
+  const bool exact = gap < 1e-9 || (frac - lo_v) < 1e-9 || (hi_v - frac) < 1e-9;
 
-  const uint32_t val = encode_frac(best_b, best_a);
-  if (val != this->last_frac_val_) {
-    // Single 32-bit store: the fraction changes atomically
-    i2s_hw(this->port_)->tx_clkm_div_conf.val = val;
-    this->last_frac_val_ = val;
+  if (exact) {
+    // Single value: whichever end coincides with the target
+    const bool use_lo = (frac - lo_v) <= (hi_v - frac);
+    const uint32_t val = use_lo ? lo_val : hi_val;
+    this->dither_on_.store(false, std::memory_order_relaxed);
+    if (val != this->last_frac_val_.load(std::memory_order_relaxed)) {
+      // Single 32-bit store: the fraction changes atomically
+      i2s_hw(this->port_)->tx_clkm_div_conf.val = val;
+      this->last_frac_val_.store(val, std::memory_order_relaxed);
+    }
+    this->dither_gap_ppm_ = 0.0f;
+    const double applied_ratio = this->base_int_ + (use_lo ? lo_v : hi_v);
+    this->applied_ppm_ = static_cast<float>((1.0 - applied_ratio / base_ratio) * 1e6);
+  } else {
+    // Publish the bracket for tick(); duty = share of ticks on hi so the mean hits frac.
+    // Order: lo/hi/duty first, then dither_on_, so tick() never pairs a new duty with an
+    // old bracket. tick() writes the register from here on; nothing is written now, so
+    // the current value (one of the previous bracket, or the last single value) stays
+    // until the first tick -- at most one 10 ms interval at the old rate.
+    const double duty = (frac - lo_v) / gap;
+    this->dither_lo_.store(lo_val, std::memory_order_relaxed);
+    this->dither_hi_.store(hi_val, std::memory_order_relaxed);
+    this->dither_duty_.store(static_cast<uint32_t>(std::lround(duty * 65536.0)), std::memory_order_relaxed);
+    this->dither_on_.store(true, std::memory_order_release);
+    this->dither_gap_ppm_ = static_cast<float>(gap / base_ratio * 1e6);
+    // The dithered mean IS the target, to 1/65536 of the gap
+    this->applied_ppm_ = static_cast<float>((1.0 - target / base_ratio) * 1e6);
   }
-  // Marks last_frac_val_ as OUR value, so a later re-baseline can tell "the driver
+  // Marks the written values as OURS, so a later re-baseline can tell "the driver
   // reprogrammed the clock" from "nothing happened since we wrote this"
   this->ours_valid_ = true;
-  const double applied_ratio = this->base_int_ + static_cast<double>(best_b) / best_a;
-  this->applied_ppm_ = static_cast<float>((1.0 - applied_ratio / base_ratio) * 1e6);
   return true;
+}
+
+void RateLock::tick() {
+  if (!this->dither_on_.load(std::memory_order_acquire)) {
+    return;
+  }
+  // First-order sigma-delta in 1/65536 units: the accumulator carries the running
+  // shortfall between the requested duty and the hi-ticks delivered, so the long-run
+  // share of hi equals duty and the instantaneous error never exceeds one tick.
+  this->sd_acc_ += this->dither_duty_.load(std::memory_order_relaxed);
+  uint32_t want;
+  if (this->sd_acc_ >= 65536u) {
+    this->sd_acc_ -= 65536u;
+    want = this->dither_hi_.load(std::memory_order_relaxed);
+  } else {
+    want = this->dither_lo_.load(std::memory_order_relaxed);
+  }
+  if (want != this->last_frac_val_.load(std::memory_order_relaxed)) {
+    // Single 32-bit store: the fraction changes atomically
+    i2s_hw(this->port_)->tx_clkm_div_conf.val = want;
+    this->last_frac_val_.store(want, std::memory_order_relaxed);
+  }
 }
 
 #else  // !CONFIG_IDF_TARGET_ESP32S3
@@ -255,6 +310,7 @@ bool RateLock::set_trim_ppm(float ppm) {
 // Stub backend: rate lock unavailable, the caller's splice servo stays in charge.
 bool RateLock::read_baseline_() { return false; }
 bool RateLock::set_trim_ppm(float) { return false; }
+void RateLock::tick() {}
 
 #endif  // CONFIG_IDF_TARGET_ESP32S3
 

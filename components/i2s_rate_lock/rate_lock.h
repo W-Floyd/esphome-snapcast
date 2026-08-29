@@ -23,8 +23,20 @@ namespace esphome::i2s_rate_lock {
 /// works with whatever rate/mclk_multiple the speaker chose and needs no channel
 /// handle -- only the port number.
 ///
-/// THREAD CONTEXT: set_trim_ppm() and applied_ppm() are player-task-only;
-/// invalidate_baseline() may be called from any thread.
+/// Rational quantization and dithering. With a <= 511 the achievable ratios form a Farey
+/// sequence: at the bench operating point (+47..+56 ppm on a 14 + 76/441 base) the achievable
+/// values are 0.5-1.2 ppm apart, and the applied trims logged by the servo were exactly that
+/// set. Nearest-value selection therefore left each board up to half a step off its request,
+/// uncorrelated between boards, for the seconds between step crossings -- a few us of
+/// sawtooth on the wire once the servo's own noise was tuned below it. set_trim_ppm() keeps
+/// the two achievable ratios that BRACKET the request and tick(), called at the speaker-
+/// callback cadence (~100 Hz), switches between them with a first-order sigma-delta so the
+/// mean rate equals the request; the residual position error is bounded by one step x one
+/// tick (~1 ppm x 10 ms = 10 ns). Each switch is the same single atomic 32-bit register
+/// store the lock always used.
+///
+/// THREAD CONTEXT: set_trim_ppm() and applied_ppm() are player-task-only; tick() is
+/// speaker-task-only; invalidate_baseline() may be called from any thread.
 class RateLock {
  public:
   explicit RateLock(uint8_t i2s_port) : port_(i2s_port) {}
@@ -43,9 +55,18 @@ class RateLock {
   /// registers and re-applies the full requested trim on top of the new baseline.
   void invalidate_baseline() { this->rebaseline_.store(true, std::memory_order_relaxed); }
 
-  /// @brief Trim actually achieved by the last successful set_trim_ppm(), after
-  /// rational quantization (~0.15 ppm steps). Diagnostics only.
+  /// @brief Trim actually achieved by the last successful set_trim_ppm(): the dithered mean,
+  /// which equals the request to ~1e-5 ppm when two bracketing ratios exist. Diagnostics only.
   float applied_ppm() const { return this->applied_ppm_; }
+  /// @brief Spacing (ppm) between the two ratios tick() is dithering between; 0 when the
+  /// request is exactly representable or steering is off. Diagnostics only.
+  float dither_gap_ppm() const { return this->dither_gap_ppm_; }
+
+  /// @brief Sigma-delta step: selects the lower or upper bracketing ratio for the next
+  /// interval and writes it if it differs from what the register holds. Call once per
+  /// speaker callback (~100 Hz). Cheap: a few atomics and at most one register store.
+  /// THREAD CONTEXT: speaker task.
+  void tick();
 
   /// @brief Tells the lock which output rate the speaker is running, so the baseline
   /// can be corrected to the exact ideal divider instead of inheriting the I2S
@@ -78,9 +99,20 @@ class RateLock {
   float baseline_corrected_ppm_{0.0f};
   // Last written fractional-field register value, to skip redundant writes -- and to
   // recognise our own trim on a re-baseline, so it is not mistaken for a divider the
-  // driver chose. ours_valid_ says last_frac_val_ actually came from us.
-  uint32_t last_frac_val_{0};
+  // driver chose. ours_valid_ says last_frac_val_ actually came from us. Atomic because
+  // both set_trim_ppm() (player task) and tick() (speaker task) write the register.
+  std::atomic<uint32_t> last_frac_val_{0};
   bool ours_valid_{false};
+
+  // Dither state published by set_trim_ppm(), consumed by tick(). lo/hi are encoded
+  // register values of the bracketing ratios; duty is the fraction of ticks that should
+  // run on hi, in 1/65536. dither_on_ false = single value, tick() does nothing.
+  std::atomic<uint32_t> dither_lo_{0};
+  std::atomic<uint32_t> dither_hi_{0};
+  std::atomic<uint32_t> dither_duty_{0};
+  std::atomic<bool> dither_on_{false};
+  uint32_t sd_acc_{0};  // sigma-delta accumulator, speaker task only
+  float dither_gap_ppm_{0.0f};
 };
 
 }  // namespace esphome::i2s_rate_lock

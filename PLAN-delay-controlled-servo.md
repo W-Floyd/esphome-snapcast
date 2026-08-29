@@ -322,6 +322,60 @@
 > reconnect) and the **server-wide pause**. Neither is the servo's; the servo's job is to make
 > them cheap, which build 15/16 does (splice-out in 3–4 s, reconnect in 3 s).
 >
+> **Per-board stall class, traced one hop further (11:41–11:52):** A alone stalled at 11:41:15,
+> 11:44:44 and 11:49:50 (the last two escalated to a 4 s bailout + 3 s reconnect); B clean since
+> 11:40. During each stall the `snap_net` task kept logging (TSF/UDP alive) while TCP chunk
+> records stopped dead — ring 81 ms → 0 in one second, no gradual decline. Server side
+> (`debian-hp-z440`, snapserver in docker): no error until A's own reset; `ss -tni` shows A's
+> session rtt 52 ± 23 ms with retransmits, B's 40 ms. So the packets leave the server and die on
+> A's WiFi hop; RSSI is fine both ways, and the SuperMini boots at `output_power: 8.5dB` — a
+> marginal *uplink* (ACKs) is exactly what turns one lost retransmit into an RTO back-off of
+> 0.25→0.5→1→2 s = a 3.75 s hole. **Experiment 11:52:01:** A's "WiFi TX Power" raised to 14 dBm
+> over the API (driver readback 14.00), B left at boot power as the control. Pass = A's stalls
+> stop while B's rate is unchanged; then the same for B and a config change.
+>
+> **11:53:15 — inconclusive for TX power, informative otherwise:** A *and the observer* went dry
+> in the same second (A → bailout at 11:53:22), B did not. All three boards sit on the same AP
+> (`70:58:A4:1E:1E:09`, channel 1, 2.4 GHz). Yesterday's census has the same shape: many stalls
+> hit A and B in the same second, several hit one of them. A loss burst on channel 1 that each
+> client survives or not by its own margin fits every observation; a per-board TX-power story
+> fits only some. The servo cannot fix this, but the *buffer* can: the client holds ~1.7 s ahead of
+> playout (SYNCX `buffered 1671–1750 ms` = server `buffer` 2000 ms minus the ~300 ms pipeline), and an RTO back-off hole is 0.25+0.5+1+2 = 3.75 s,
+> so every such hole beats the buffer by construction. Server buffer 4000–5000 ms would absorb
+> one back-off cycle outright — the single cheapest lever on the table.
+>
+> **Not a finding (checked):** the integral sits above the TSF mapping's ppm — A +56 vs +40,
+> B +52 vs +42 over 11:46–11:55. Last night 23:10–23:40 it was the same (A +58 vs +40, B +51 vs
+> +40), so it is a steady per-board offset between "server-time mapping slope" and "I2S trim that
+> holds tags on the deadline" — the DAC clock's own error against the crystal — not a build-16
+> effect. Retracts the "wasn't there last night" remark made from a point sample of `Crystal:
+> mine` (a different quantity).
+>
+> **Steady-state anatomy (12:0x, goal < 1 µs swing).** Wire A−B over the stall-free 11:54–12:00
+> (n=6357, rival-gated): median +3.4 µs, robust sd 3.3 µs; robust sd of the *change* over a lag
+> is 0.11 µs @0.1 s, 0.63 @1 s, 2.4 @10 s, 4.6 @60 s, 6.1 @120 s — grows as √τ, a random walk:
+> the boards' **rate** difference is noisy and position integrates it. Within a 10-s block the
+> wire is 0.78 µs; the swing is all slow. On-device the P term is the source: per update (0.33 s)
+> `err` changes by 18 µs median and `trim` by 1.75 ppm = Kp·Δerr; err's own robust sd is 129 µs
+> (the common wander, which cancels between boards) — the *uncorrelated* part of the 18 µs per
+> update is what walks the wire. Levers, all runtime: tau 10 → 30 (P noise 3×), block_n 32 → 64
+> (√2), then the exchanged-err differential term. **12:04:53: tau_s=30 on both boards**
+> (SERVOPARAM on A and B); graded 12:05:30–12:16 with `scratchpad/wire-sf.py`.
+>
+> **The floor under the P noise: divider quantization (12:1x).** With tau 30 the wire turned into
+> a sawtooth, p2p ~10 µs: the analyser's `fs_b` sits on two discrete levels 0.16 Hz (3.6 ppm)
+> apart in ~3 s squares while B's requested trim glides 45→58 ppm. The achievable MCLK ratios
+> 14 + b/a (a ≤ 511) form a Farey sequence spaced **0.5–1.2 ppm** across B's range (+47..+56):
+> B's TRIMDBG `applied` values (+54.90, +53.19, +52.07, +51.19, +50.69, +50.16) are exactly that
+> set (54.927, 53.219, 52.099, 51.215, 50.721, 50.188). The lock picked the single nearest ratio,
+> so each board carried an uncorrelated error of up to half a step for the seconds between
+> crossings — ~1 ppm × 3 s ≈ 3 µs per leg, the sawtooth. (A first sweep reported a 4.2 ppm gap at
+> +59.9; that was a scripting artefact — the neighbours there are 0.32–0.38 ppm apart. Retracted.) **Build 17 adds sigma-delta dithering:** `set_trim_ppm`
+> publishes the two bracketing ratios and a duty; `RateLock::tick()`, called from
+> `notify_audio_played` at the DMA cadence (~100 Hz), switches between them with a first-order
+> accumulator. Mean rate = request; residual ≤ one step × one tick ≈ 10 ns. Same single atomic
+> 32-bit register store as before. `read_baseline_` recognises either bracket value as ours.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

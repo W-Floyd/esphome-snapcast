@@ -281,11 +281,17 @@ text_sensor:
 
 sensor:
   # Die temperature, so the analyser can correlate the persisted crystal offset with temperature
-  # (i2s-skew.py parses "'ESP Temperature': Sending state 47.7 °C"). 30 s: the crystal moves over
+  # (i2s-skew.py parses "DIETEMP 47.700 C", emitted below). 30 s: the crystal moves over
   # minutes, and each state line is one more log line on a link that is often the bottleneck.
   - platform: internal_temperature
     name: "ESP Temperature"
     update_interval: 30s
+    # This ESPHome logs sensor states at VERBOSE ("'x' >> 47.7 °C"), so the stock "Sending state"
+    # line never appears at DEBUG (0 hits in 200 MB of bench logs). Emit the analyser's DIETEMP shape
+    # ourselves; one short dedicated line, no variable-length tail (CLAUDE.md).
+    on_value:
+      then:
+        - lambda: 'ESP_LOGD("dietemp", "DIETEMP %.3f C", x);'
   - platform: wifi_signal
     id: wifi_rssi
     name: WiFi RSSI

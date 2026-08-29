@@ -482,7 +482,7 @@ static constexpr float DL_PERSIST_EMA_S = 300.0f;
 // while the board was off), which parks a standing error of mismatch/Kp that Ti = 120 s takes
 // ~5 min to absorb. 20 s absorbs it in about a minute; the common-mode wander swing that a fast
 // Ti allows is tolerated for these minutes only.
-static constexpr int64_t DL_TI_BOOT_WINDOW_US = 180000000;  // TODO next batch: 60 s -- 180 s chased the 60-s common wander (PLAN build 16)
+static constexpr int64_t DL_TI_BOOT_WINDOW_US = 60000000;  // 180 s chased the 60-s common wander (PLAN build 16)
 static constexpr float DL_TI_BOOT_S = 20.0f;
 // Out of range with the integral this far from its own slow average, the integral is wrong (it
 // was caught mid-swing by a hold: measured +114 against a +57 crystal, board then ran 50 ppm fast
@@ -1190,6 +1190,13 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
 
 // THREAD CONTEXT: Speaker playback callback thread
 void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) {
+#ifdef USE_I2S_RATE_LOCK
+  // Rate-lock dither step at the DMA cadence; see RateLock::tick(). A no-op unless the
+  // requested trim falls between two achievable divider ratios.
+  if (this->rate_lock_ != nullptr) {
+    this->rate_lock_->tick();
+  }
+#endif
   bool rebaselined = false;
   this->playout_mutex_.lock();
   if (this->playout_valid_) {
