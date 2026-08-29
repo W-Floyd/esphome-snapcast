@@ -376,6 +376,81 @@
 > accumulator. Mean rate = request; residual ≤ one step × one tick ≈ 10 ns. Same single atomic
 > 32-bit register store as before. `read_baseline_` recognises either bracket value as ours.
 >
+> **Build 17 landed 12:17:10** (both compiled 17:16:28Z). Shutdown-persist verified exact (A
+> +56.80 saved/restored, B +51.79). DIETEMP flowing (A 63.6 °C, B 65.1 °C). Boot fast-Ti judged
+> harmful now that the restore is exact: it integrated the settling transient behind the
+> 1000→2000 ms setpoint change (err +500..+950 µs) into +13 ppm on A in 8 s → window set to 0 for
+> build 18. The tau-30 window (12:05–12:16) was voided by a group-wide −19 ms deadline step at
+> 12:10:36 (A −19.5, B −18.8, observer −4.7/+2.5 ms after its own deadline-source switch at
+> 12:09:50) — infrastructure, parked per the steady-state focus.
+>
+> **Build 17 first minutes:** dither confirmed live — TRIMDBG `applied` is now continuous
+> (+57.25, +48.06, +42.51 …) instead of the Farey set, zero rate-lock warnings. The reflash reset
+> the session tunables, so tau was 10 again and the P term thrashed (A +37→+114 ppm, B −33→+66)
+> through the post-boot fallback flaps; tau 30 re-issued 12:20:32 and made the compiled default
+> for build 18 (with the boot fast-Ti window 0). Build-17 wire grade: 12:22–12:33 via wire-sf.
+>
+> **Where the remaining wander comes from (12:22–12:33, build 17, tau 30, dither live).** The
+> wire's change does not follow the common wander (r +0.10 → not gain/phase mismatch). The
+> on-device `err_a − err_b` averaged over 1/5/20/60 s has robust sd 14.8 / 10.0 / 7.1 / 11.7 µs —
+> white noise would fall to ~2 by 60 s — so each board carries a **slow (tens of seconds) ~7 µs
+> error of its own** against its deadline, which the loop tracks onto the wire (r(wire, err_a −
+> err_b) = +0.77). It is not the server-time mapping alone: the observer's `PHASEIN` A−B render
+> phase (TSF-timestamped, mapping-free) has the same 7.4 µs and does NOT track the wire (r +0.30,
+> wrong sign; residual 15 µs). So the render-phase / tag measurement itself has ~7 µs of slow
+> per-board error. Consequence: the loop should not follow errors on the 20–60 s scale at all —
+> the true disturbance (crystal vs temperature) moves ~0.1 ppm/min, far slower. **Next test
+> (runtime, no flash): tau 120, Ti 600, block_n 64** — attenuates the 20–60 s measurement wander
+> ~4× and stops the 8-ppm rate swings spent chasing mapping noise. Cost: the ±350 µs common wander
+> passes to absolute playout, which is common to every board and inaudible.
+>
+> **Build 17 graded (12:22–12:33, tau 30, dither, n=12,598):** median −3.5 µs, robust sd 4.9 µs;
+> change over 1/10/30/60/120 s = 0.38 / 2.2 / 3.9 / 7.1 / 7.7 µs vs build 16 (tau 10) 0.63 / 2.4 /
+> 3.6 / 4.6 / 6.1. Fast noise halved (P term + dither), slow wander unchanged or worse — as the
+> slow per-board measurement error predicts: tau 30 still follows a 7 µs error that moves over
+> 20–60 s.
+>
+> **INCIDENT 12:38–13:17 — a tag/ledger split the servo cannot escape.** (The bench Mac slept
+> ~12:38–12:55 and again ~12:56–13:11, so the logs have holes; the boards did not.) When logging
+> resumed A held `err_tag` = −19.4 ms and B +91..+97 ms, constant for 40 minutes. `SHADOW` shows the
+> disagreement exactly: A err_tag −19435 vs err_live +1698 (diff −21133 = RECON drift 20000);
+> B err_tag +90997 vs err_live −21472 (diff +112469 = RECON drift −112449). `RENDERTAG measured`
+> vs `inferred` differ by the same 20 / 110 ms. So the tag identity path and the frame ledger
+> disagree by an accounting split — and since build 13 the split repair is disarmed while tags
+> are live, while since build 14 every coarse correction acts on err_tag. Result: B hard-resynced
+> every ~20 s ("KP re-armed (hard resync (late))" ×N) and err_tag never moved; A's fast splice hit
+> its bound with −19476 still standing and gave up ("measurement fault") — over and over. The
+> analyser saw no shared audio (>17 ms apart). **Corrections that do not move the measurement
+> they act on must invalidate that measurement**, not repeat. Fix to design: when a coarse
+> correction on err_tag is followed (after the re-measure guard) by |err_tag| unchanged within a
+> fraction of the correction, declare the tag path faulted — drop tag identity (re-anchor tags),
+> fall back to the ledger error for coarse decisions, re-arm the split repair. Both boards
+> restarted over the API at 13:17 to clear it.
+>
+> **Implemented for build 18 (tag fault):** the first err_tag block that post-dates a tag-driven
+> coarse correction judges it — |err_tag| still ≥ 75 % of the value acted on is a miss; three
+> consecutive misses set `tag_fault_until_us` = now + 60 s and log `TAGFAULT`. While faulted, the
+> coarse selection, the measured-error splice gate and the split-repair disarm all treat tags as
+> stale, so the ledger drives coarse decisions and the accounting repair can run. The rate loop
+> itself keeps its out-of-range hold (which covered both observed cases) — a sub-millisecond tag
+> fault would still bias the integral slowly; open item. Mechanism of the split itself still
+> unknown: `push_chunk_` tags each slice with `rec.server_ts_us` + offset assuming the ring bytes it
+> reads are that record's, and `discard_ring_bytes_` keeps ring and record queue aligned on the
+> resync paths; the observed biases (20.000 ms on A, 112.45 ms on B, equal to RECON drift) grew with
+> B's tag-driven resyncs, so a ring/record desync on one of those paths is the suspect.
+>
+> **Trigger caught live (A, 13:21, six minutes after a clean restart):** `no chunk records for 3 s,
+> ring holds 0` → hard resync 1464 ms late → **98 hard resyncs over 128 chunks** (a chunk-drop storm
+> on an EMPTY ring) → `RECON drift` jumps from −52245 to **+44988** and from then on `SHADOW diff` is a
+> constant −45 ms (err_tag −43…−47 ms, err_live within ±2.6 ms). Mechanism (to verify in code): the
+> late-resync path drops the record AND calls `discard_ring_bytes_(rec.bytes)`; with the ring empty
+> that read blocks in 100 ms ticks until bytes arrive — the decoder's bytes for LATER records — and
+> eats them. Ring and record queue are then misaligned by the total mis-discarded bytes, every
+> subsequent slice is tagged with the wrong `rec.server_ts_us`, and err_tag carries a constant bias
+> equal to the misalignment — which is exactly what the ledger's "drift" measures. Same signature on
+> B at 12:34 (stall → resync → +39 ms). The tag-fault fallback (build 18) breaks the deadlock; the
+> root fix is to never discard ring bytes that are not this record's — build 19.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

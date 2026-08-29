@@ -449,6 +449,10 @@ static constexpr int64_t DL_TAG_STALE_US = 1000000;
 // correction hands back to the demoted prediction (where the split-pending guard applies again).
 // Blocks complete every ~320 ms, so three missed blocks = the signal is gone, not late.
 static constexpr int64_t DL_ERR_STALE_US = 1000000;
+// Tag fault (see ServoState::tag_miss): consecutive unmoved corrections that fault the tag path,
+// and how long the ledger takes over before tags are trusted again.
+static constexpr uint8_t TAG_FAULT_MISSES = 3;
+static constexpr int64_t TAG_FAULT_US = 60LL * 1000000;
 // Tag-stream blanking after a setpoint change / hard resync / timebase re-anchor: one pipeline
 // depth (~250-300 ms measured) plus margin, so every arrival folded into a block was scheduled
 // against the deadline the loop is currently steering toward.
@@ -482,7 +486,12 @@ static constexpr float DL_PERSIST_EMA_S = 300.0f;
 // while the board was off), which parks a standing error of mismatch/Kp that Ti = 120 s takes
 // ~5 min to absorb. 20 s absorbs it in about a minute; the common-mode wander swing that a fast
 // Ti allows is tolerated for these minutes only.
-static constexpr int64_t DL_TI_BOOT_WINDOW_US = 60000000;  // 180 s chased the 60-s common wander (PLAN build 16)
+// Fast integral after boot: DISABLED (window 0). Build 16 used Ti 20 s for 180 s to absorb a
+// stale restored integral, but with the integral persisted at shutdown the restore is exact
+// (+56.80 saved, +56.80 restored), and the fast Ti instead integrated the first seconds' settling
+// transient (err +500..+950 us behind a 1000->2000 ms setpoint change) into a +13 ppm error
+// (56.8 -> 69.6 in 8 s, build 17 boot). Kept as a switch for a board with no NVS value.
+static constexpr int64_t DL_TI_BOOT_WINDOW_US = 0;
 static constexpr float DL_TI_BOOT_S = 20.0f;
 // Out of range with the integral this far from its own slow average, the integral is wrong (it
 // was caught mid-swing by a hold: measured +114 against a +57 crystal, board then ran 50 ppm fast
@@ -2639,11 +2648,35 @@ void SnapcastClient::player_task_() {
     // exists. It lags one block plus one pipeline depth, so a tag-driven correction may not be
     // REPEATED until the tags have had time to see it -- the same blank interval the setpoint
     // path uses. The prediction remains the fallback when tags are stale.
-    const bool coarse_on_tags = st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US;
+    //
+    // TAG FAULT. A correction made on err_tag must move err_tag once the tags post-date it; if it
+    // does not, the measurement is disconnected from the audio and acting on it again is harm
+    // (B: a hard resync every ~20 s for 40 minutes on a constant +97 ms, 2026-08-29 12:38-13:17).
+    // The first block after the guard interval judges the last tag-driven correction: |err_tag|
+    // still >= 75% of what it was = a miss. Three in a row fault the tag path for TAG_FAULT_US,
+    // during which every consumer of "tags live" falls back to the ledger.
+    const bool tags_fresh = st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US;
+    const int64_t blank_us = static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000;
+    if (tags_fresh && st.coarse_act_err_us != 0 && st.dl_err_at_us > st.coarse_act_us + blank_us) {
+      const int64_t before = std::abs(st.coarse_act_err_us);
+      st.coarse_act_err_us = 0;
+      if (std::abs(st.dl_err_us) >= before - before / 4) {
+        if (++st.tag_miss >= TAG_FAULT_MISSES) {
+          st.tag_miss = 0;
+          st.tag_fault_until_us = now_us() + TAG_FAULT_US;
+          ESP_LOGW(TAG,
+                   "TAGFAULT: %u tag-driven corrections left err_tag at %+" PRId64
+                   " us (ledger says %+" PRId64 ") -- distrusting tags for %" PRId64 " s, coarse on the ledger",
+                   static_cast<unsigned>(TAG_FAULT_MISSES), st.dl_err_us, error_us, TAG_FAULT_US / 1000000);
+        }
+      } else {
+        st.tag_miss = 0;
+      }
+    }
+    const bool coarse_on_tags = tags_fresh && now_us() >= st.tag_fault_until_us;
     const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
     const bool coarse_ok =
-        !coarse_on_tags || st.coarse_act_us == 0 ||
-        st.dl_err_at_us > st.coarse_act_us + static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000;
+        !coarse_on_tags || st.coarse_act_us == 0 || st.dl_err_at_us > st.coarse_act_us + blank_us;
     // Anchor for the SHADOW error (see the SHADOW log line). Stored, not recomputed.
     st.last_deadline_us = deadline;
     st.last_deadline_server_ts = rec.server_ts_us;
@@ -2842,7 +2875,10 @@ void SnapcastClient::player_task_() {
     // feedback loop that prolongs the outage. The periodic sync report carries the
     // full per-window count either way.
     if (coarse_err_us > hard_us && coarse_ok) {
-      if (coarse_on_tags) st.coarse_act_us = now_us();
+      if (coarse_on_tags) {
+        st.coarse_act_us = now_us();
+        st.coarse_act_err_us = coarse_err_us;
+      }
       // Hard resync, late: drop whole chunks until we catch back up
       if (now_us() - st.last_resync_log_us >= RESYNC_LOG_INTERVAL_US) {
         st.last_resync_log_us = now_us();
@@ -2874,7 +2910,10 @@ void SnapcastClient::player_task_() {
 
     uint32_t drop_frames = 0;
     if (coarse_err_us < -hard_us && coarse_ok) {
-      if (coarse_on_tags) st.coarse_act_us = now_us();
+      if (coarse_on_tags) {
+        st.coarse_act_us = now_us();
+        st.coarse_act_err_us = coarse_err_us;
+      }
       // Hard resync, early: fill the gap with silence (bounded per chunk so the
       // loop stays responsive), keeping the DAC fed and continuous
       const int64_t gap_frames = (-coarse_err_us) * rec.params.sample_rate / 1000000;
@@ -2905,7 +2944,10 @@ void SnapcastClient::player_task_() {
       // "with -8 ms still standing", declared a measurement fault (a rule written for the
       // prediction), stood down 4 s, re-armed, and repeated -- B sat 8-10 ms early for 5+ minutes
       // (2026-08-29 11:20-11:25) while the analyser found no shared audio inside its window.
-      if (coarse_on_tags) st.coarse_act_us = now_us();
+      if (coarse_on_tags) {
+        st.coarse_act_us = now_us();
+        st.coarse_act_err_us = coarse_err_us;
+      }
       // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
       // doesn't leave playback audibly behind for long
       const int32_t adjust_frames =
@@ -3051,7 +3093,8 @@ void SnapcastClient::player_task_() {
         // correct). When tags are stale the demoted prediction is the only estimate left, and
         // there the guard is irreplaceable: a ledger bias is then indistinguishable from a real
         // error, and refusing to act on a suspect one is the best anything can do.
-        const bool tag_err_live = st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US;
+        const bool tag_err_live = st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US &&
+                                  now_us() >= st.tag_fault_until_us;
         // The in-flight horizon is a property of the SIGNAL's measurement lag. For err_tag it is
         // one pipeline depth (a splice is invisible until the spliced audio renders) plus half the
         // averaging block, derived from the measured depth rather than inherited from the median's
@@ -4715,7 +4758,8 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             st.drift_excess_since_us = (std::abs(drift_for_repair) >= DRIFT_REPAIR_US) ? now_us() : 0;
             st.drift_excess_min_us = drift_for_repair;
             st.drift_excess_max_us = drift_for_repair;
-          } else if (st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US) {
+          } else if (st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US &&
+                     now_us() >= st.tag_fault_until_us) {
             // TAGS LIVE: the ledger is diagnostic-only and a repair is pure harm. It steps
             // pushed_frames_total_ by the drift, the demoted prediction jumps, and the hard-resync
             // path moves REAL audio by that much against a bookkeeping artefact -- measured on A

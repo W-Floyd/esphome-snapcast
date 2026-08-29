@@ -904,6 +904,18 @@ class SnapcastClient {
     /// When a coarse correction (hard resync / aggressive catch-up) last acted on the MEASURED
     /// error; another tag-driven one waits until the tags post-date it by a blank interval.
     int64_t coarse_act_us{0};
+    /// The measured error that correction acted on, so the first block that post-dates it can be
+    /// judged: did the correction move the measurement it was based on? 0 = nothing to judge.
+    int64_t coarse_act_err_us{0};
+    /// Consecutive tag-driven corrections that left |err_tag| essentially where it was. Three
+    /// declare the tag path faulted (see tag_fault_until_us). A measurement that corrections cannot
+    /// move is not measuring the audio: 2026-08-29 12:38-13:17, B hard-resynced every ~20 s on a
+    /// constant +97 ms err_tag and A's splice gave up on -19.5 ms over and over, for 40 minutes,
+    /// while SHADOW showed the tag and ledger errors apart by exactly the RECON drift.
+    uint8_t tag_miss{0};
+    /// While now < this, err_tag is not trusted: coarse decisions, the measured-error splice and
+    /// the split-repair disarm all fall back to the ledger, as if tags were stale.
+    int64_t tag_fault_until_us{0};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};
   };
@@ -1519,7 +1531,7 @@ class SnapcastClient {
   /// task and speaker callback; atomics, defaults = the flashed constants. NOT persisted:
   /// a reboot returns to the flashed values, which keeps a bad experiment one power-cycle from
   /// gone. Every set is logged at WARN so the analyser's annotations carry it.
-  std::atomic<float> tune_tau_s_{10.0f};
+  std::atomic<float> tune_tau_s_{30.0f};  // 10 walked the wire ~0.6 us/sqrt(s) of P noise; 30 measured 12:04 (PLAN)
   /// Integral time (s): Ki = Kp / Ti. Decoupled from tau -- Ti = tau (Ki = Kp^2) made the integral
   /// swing ~57 ppm p-p chasing the +-600 us / ~60 s common-mode wander (measured 21:08: +103->+114
   /// in 2 s), so a hold froze a wrong 'crystal offset'. With the integral restored from NVS the
