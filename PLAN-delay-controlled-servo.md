@@ -705,6 +705,15 @@
 > 75 µs from +78 s (the wire's ≤20 µs criterion was not met before the events — the ~−100 µs standing
 > offset is precisely what align was still removing).
 >
+> **30-min hands-off, align cap 150 / gain 0.05 / step 2 (17:29–17:59):** wire median −17 µs but
+> wandering +55 → −6 (17:36 event) → +107 → the 17:45:15 server-wide starvation → −82 → −14 µs at
+> 17:58 with a 2-min robust sd of **0.6 µs** — the quietest block of the day. A's bias climbed +14
+> → +73 while its group delta shrank −50 → −19: the channel removes the standing offset, at a rate
+> (~2 µs per 10-s report) slower than the events re-create it (50–100 µs every ~10 min). One
+> starvation, zero bailouts, zero TAGFAULTs on A. 18:00: gain 0.1 / step 4 (half the time
+> constant; pairing noise ~10 µs × 0.1 = 1 µs/step is still far under the wire's slow term),
+> 45-minute window next.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
