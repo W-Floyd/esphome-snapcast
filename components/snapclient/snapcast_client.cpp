@@ -2881,7 +2881,16 @@ void SnapcastClient::player_task_() {
       }
       st.converged = st.converged && !mute_now;
       this->push_silence_(fill, rec.params);
-    } else if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) > SOFT_CORRECTION_AGGRESSIVE_US && coarse_ok) {
+    } else if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) >
+                   (coarse_on_tags ? static_cast<int64_t>(FAST_SPLICE_MAX_FRAMES) * 1000000 /
+                                         static_cast<int64_t>(rec.params.sample_rate)
+                                   : SOFT_CORRECTION_AGGRESSIVE_US) &&
+               coarse_ok) {
+      // On the MEASURED error the catch-up threshold is the fast splice's own 128-frame bound
+      // (~2.9 ms), not 10 ms. Between the two nothing corrected: the splice episode hit its bound
+      // "with -8 ms still standing", declared a measurement fault (a rule written for the
+      // prediction), stood down 4 s, re-armed, and repeated -- B sat 8-10 ms early for 5+ minutes
+      // (2026-08-29 11:20-11:25) while the analyser found no shared audio inside its window.
       if (coarse_on_tags) st.coarse_act_us = now_us();
       // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
       // doesn't leave playback audibly behind for long
@@ -2924,7 +2933,13 @@ void SnapcastClient::player_task_() {
       // converged latches, so it binds only during acquisition, where the coarse machinery is
       // already in charge. Muted convergence uses hard splices while far out (much faster than
       // the trim slew), handing off to the loop for the end-game.
-      if (!(st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us))) {
+      // GATE ON THE MEASURED ERROR WHILE TAGS ARE LIVE: with a biased ledger the median can sit
+      // outside converge_fine forever on an unconverged board, which parked the rate loop OFF and
+      // handed position to the prediction-driven steer fallback -- measured on B 2026-08-29: median
+      // +2019 us (ledger) vs err_tag -8.6 ms, -136 frames dropped by the steer against +120 inserted
+      // by the tag-driven fast path per report, a tug of war that held B 9 ms early indefinitely.
+      const int64_t gate_err_us = coarse_on_tags ? coarse_err_us : median_err_us;
+      if (!(st.rate_lock_ok && (st.converged || std::abs(gate_err_us) <= this->config_.converge_fine_us))) {
         // The refusal, with the terms that caused it. Overwritten per refusing chunk so the report
         // carries the most recent one; see ServoState::gate_seen.
         st.gate_seen = true;
@@ -2932,7 +2947,7 @@ void SnapcastClient::player_task_() {
         st.gate_converged = st.converged;
         st.gate_median_err_us = static_cast<int32_t>(median_err_us);
       }
-      if (st.rate_lock_ok && (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)) {
+      if (st.rate_lock_ok && (st.converged || std::abs(gate_err_us) <= this->config_.converge_fine_us)) {
         // DELAY LOOP: at most one PI step per completed measurement block (~3 Hz); between blocks,
         // and through everything that suppresses tags, the demand is left exactly where it was --
         // which is what "hold the last trim, never the last error" means concretely. The gain
@@ -2995,7 +3010,7 @@ void SnapcastClient::player_task_() {
 #endif
       // While muted (pre-convergence) audibility doesn't constrain splice size, so
       // steer hard to reach the band quickly, then single frames for the end-game
-      if (!trim_holds) {
+      if (!trim_holds && !coarse_on_tags) {
         const uint32_t steer_frames = (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)
                                           ? 1
                                           : startup_steer_frames(frames);
@@ -3152,7 +3167,9 @@ void SnapcastClient::player_task_() {
     // PI settles, and requiring consecutive sub-deadband medians stretched
     // post-boot mutes to ~20 s of counter resets. Corrections inside the gate (UNMUTE_BAND_DEADBANDS)
     // are trim-only and inaudible.
-    if (std::abs(median_err_us) <= UNMUTE_BAND_DEADBANDS * this->config_.sync_deadband_us) {
+    // The unmute/converged latch reads the measured error while tags are live: a biased ledger
+    // otherwise keeps a board 'unconverged' with its audio perfectly placed (or vice versa).
+    if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) <= UNMUTE_BAND_DEADBANDS * this->config_.sync_deadband_us) {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
       // Don't unmute onto a provisional timebase: a device still on its Kalman fallback while
       // peers are audible will step by up to the plausibility bound when it finally adopts the

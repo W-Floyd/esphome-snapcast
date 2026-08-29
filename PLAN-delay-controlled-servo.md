@@ -278,6 +278,18 @@
 > event census of exactly zero on both boards** — no resyncs, splices, out-of-range holds, stale
 > tags, mutes or repairs.
 >
+> **2026-08-29 11:20, found from "why no correlation": B sat 8–10 ms EARLY for 5+ minutes and
+> nothing could close it.** Two prediction consumers I had left alone were still moving audio:
+> the rate-lock fine-band GATE and the unconverged STEER fallback both read the ledger median
+> (+2019 µs, biased) while err_tag read −8.6 ms — the gate stayed shut (B never "converged" after
+> an unobserved reboot at 22:46), so the steer dropped −136 frames per report on the ledger while
+> the tag-driven fast path inserted +120: a tug of war. And between the fast splice's 128-frame
+> bound (~2.9 ms, "measurement fault" — a rule written for the prediction) and the 10 ms aggressive
+> threshold, nothing corrects a REAL error. Build 15: gate, steer, unmute latch and the catch-up
+> threshold all read the measured error while tags are live; the steer fallback is off while tags
+> are live; catch-up threshold on tags = the splice bound. B rebooted by API to clear it meanwhile.
+> B's 22:46 reboot has no log (tails were dead) — cause unknown.
+>
 > Two findings from running it: **"SPLITINJECT ramp complete" is an unreliable witness** — it
 > logs only when the zero lands on a chunk that spends a whole frame, and this run reached zero
 > silently; use the SYNCX `drift`/`split` step as the positive control. And the boards wobble
