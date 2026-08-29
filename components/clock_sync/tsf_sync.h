@@ -167,6 +167,10 @@ class TsfSync {
   /// correction (0.708 ppm, ~71 us per 100 s against a ~7 us floor) is understood.
   float crystal_delta_ppm() const { return this->crystal_delta_ppm_.load(std::memory_order_relaxed); }
 
+  /// @brief This device's own crystal rate against the radio timebase, ppm, or NaN when unknown.
+  /// Available within seconds of boot -- the delay loop seeds a cold (no-NVS) integral from it.
+  float own_crystal_ppm() const { return this->pub_crystal_ppm_.load(std::memory_order_relaxed); }
+
   /// @brief This device's own render phase, or RENDER_PHASE_UNKNOWN. Diagnostics: a delta is
   /// only absent because one SIDE is unknown, and without seeing both there is no way to tell
   /// which.

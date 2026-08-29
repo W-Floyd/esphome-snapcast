@@ -916,6 +916,11 @@ class SnapcastClient {
     /// While now < this, err_tag is not trusted: coarse decisions, the measured-error splice and
     /// the split-repair disarm all fall back to the ledger, as if tags were stale.
     int64_t tag_fault_until_us{0};
+    /// Consecutive TAGFAULTs with no split repair between them; two escalate to a reconnect.
+    uint8_t tag_fault_streak{0};
+    /// No NVS integral was restored at boot: seed from the TSF crystal estimate at first engage
+    /// and run the fast boot Ti; a fresh board otherwise winds ~56 ppm through Ki over 10+ min.
+    bool dl_cold_start{true};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};
   };
@@ -1206,6 +1211,8 @@ class SnapcastClient {
   std::atomic<bool> discovery_enabled_{false};
   // Asks the network task to drop the session (target changed); checked in recv waits
   std::atomic<bool> reconnect_requested_{false};
+  /// Local time of the last byte received on the stream socket; 0 = fresh session. Network task only.
+  int64_t last_rx_us_{0};
 
   // Clock offset filter: fed by the network task, read by the player task + main loop.
   Mutex filter_mutex_;

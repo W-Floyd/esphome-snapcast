@@ -583,6 +583,36 @@
 > Monitor: TAGFAULT / stalls / bailouts / |err| > 5 ms / split > 5 ms / wire > 200 µs / analyser
 > no-correlation / log gaps, one line per event with a 5-min cooldown.
 >
+> **Build 24 boot (14:35:24): wire −5 µs by +76 s, ±1 µs by +116 s** — cycle-time ledger now
+> 18: >450 s · 19: 242 · 22: 209 · 24: ~90–115 s. The boot's own 15 s (first DLLOOP +12, engage
+> +14…19) is now a large fraction; the remainder is the boosted P closing a few hundred µs.
+>
+> **Build 25 (queued behind the build-24 align grade):** (1) TAGFAULT requires tag/ledger
+> DISAGREEMENT (> 3 ms) — B's 14:37:54 fault fired with err_tag +47827 / ledger +47490, a healthy
+> tag path 47 ms late after a starvation, and build 24 reconnected for nothing. (2) On a genuine
+> fault: pre-arm the split repair (the thing that actually fixed A at 14:33:41), fault window
+> 180 s, reconnect only on a second fault without a repair. (3) Cold start: no NVS integral →
+> seed from the TSF own-crystal estimate at first engage (~14 ppm from the DAC's trim; a fresh
+> board otherwise winds 56 ppm through Ki for 10+ min) and run the fast boot Ti for 180 s — only
+> when cold; a restored board never sees it.
+>
+> **Build 24 graded:** wire inside 20 µs held from **+74 s** after the reboot (ledger: 18 >450 ·
+> 19 242 · 22 209 · 24 74). The align run 14:39–14:49 is void as a steady-state number — it holds
+> A's 14:45 and B's 14:47 starvations, one false TAGFAULT reconnect and one late-stream bailout —
+> but its 1-s change of 0.30 µs (knee 150 → tau 120 inside the wander) is the quietest fast noise
+> yet; the slow terms (median −39, robust sd 27) are the events. Three starvations in the 12 min
+> after the 14:35 boot (B 14:37, A 14:45, B 14:47): the post-boot cluster again.
+>
+> **15:07–15:12: a dead session nobody noticed.** The Mac slept 14:50–15:11; when it woke, both
+> boards showed "PLAYER STALLED: no chunk completed for 245 s", rings empty, while MLS44 was
+> `playing` on the server and the server listed both speakers *disconnected* ("Removing inactive
+> sessions" 15:07:08). `recv_exact_` waits on a silent socket forever — it keeps sending Time
+> requests into it and nothing ever returns false — and the late-stream bailout cannot fire
+> without chunks to be late. A client that has lost its server without a FIN starves until reboot.
+> **Build 26:** `last_rx_us_` tracks the last byte received; 15 s of total silence on a connected
+> session (Time replies come every 1 s streaming, every few s idle) → WARN + reconnect. The
+> watchdog's STALLED/NOCORR lines were what surfaced it.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

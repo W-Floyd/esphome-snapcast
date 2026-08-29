@@ -51,6 +51,8 @@ static constexpr uint32_t TIME_SYNC_BURST_COUNT = 10;
 static constexpr uint32_t TIME_SYNC_BURST_INTERVAL_MS = 100;
 // While no stream is active, sync only often enough to keep the clock estimate warm
 static constexpr uint32_t TIME_SYNC_IDLE_INTERVAL_MS = 2000;
+// Longest silence (no message of any kind) tolerated on a connected session; see recv_exact_.
+static constexpr int64_t SESSION_SILENCE_US = 15LL * 1000000;
 
 static constexpr uint32_t RECONNECT_DELAY_MS = 2000;
 static constexpr uint32_t CONNECT_TIMEOUT_MS = 5000;
@@ -459,7 +461,8 @@ static constexpr int64_t DL_ERR_STALE_US = 1000000;
 // Tag fault (see ServoState::tag_miss): consecutive unmoved corrections that fault the tag path,
 // and how long the ledger takes over before tags are trusted again.
 static constexpr uint8_t TAG_FAULT_MISSES = 3;
-static constexpr int64_t TAG_FAULT_US = 60LL * 1000000;
+static constexpr int64_t TAG_SPLIT_US = 3000;  // tag vs ledger disagreement that makes a miss a fault
+static constexpr int64_t TAG_FAULT_US = 180LL * 1000000;  // 60 expired before the repair got its window (14:29-14:33)
 // Tag-stream blanking after a setpoint change / hard resync / timebase re-anchor: one pipeline
 // depth (~250-300 ms measured) plus margin, so every arrival folded into a block was scheduled
 // against the deadline the loop is currently steering toward.
@@ -498,7 +501,7 @@ static constexpr float DL_PERSIST_EMA_S = 300.0f;
 // (+56.80 saved, +56.80 restored), and the fast Ti instead integrated the first seconds' settling
 // transient (err +500..+950 us behind a 1000->2000 ms setpoint change) into a +13 ppm error
 // (56.8 -> 69.6 in 8 s, build 17 boot). Kept as a switch for a board with no NVS value.
-static constexpr int64_t DL_TI_BOOT_WINDOW_US = 0;
+static constexpr int64_t DL_TI_BOOT_WINDOW_US = 180000000;  // COLD START ONLY (dl_cold_start): no NVS value to restore
 static constexpr float DL_TI_BOOT_S = 20.0f;
 // Out of range with the integral this far from its own slow average, the integral is wrong (it
 // was caught mid-swing by a hold: measured +114 against a +57 crystal, board then ran 50 ppm fast
@@ -1424,6 +1427,7 @@ void SnapcastClient::network_task_() {
 }
 
 void SnapcastClient::connection_session_() {
+  this->last_rx_us_ = now_us();  // silence is measured from the connect, not from the last session
   this->reconnect_requested_.store(false, std::memory_order_relaxed);
 
   // Target precedence: override (manual/select entities) > configured server > mDNS
@@ -1740,12 +1744,25 @@ bool SnapcastClient::recv_exact_(uint8_t *buf, size_t len) {
     if (ready == 0) {
       // Idle wait: keep time sync and ClientInfo flowing even when no stream is playing
       this->service_tx_();
+      // DEAD SESSION. A server that drops the session without a FIN leaves this socket open and
+      // silent: no chunks, no Time replies, and nothing here ever returned false -- both boards sat
+      // with empty rings for 4+ minutes on 2026-08-29 15:07-15:12 ("no chunk completed for 245 s")
+      // while the server listed them disconnected and MLS44 kept playing. The late-stream bailout
+      // cannot fire without chunks to be late. Time replies arrive every second while streaming
+      // and every few seconds idle, so SESSION_SILENCE_US of nothing at all is a dead peer.
+      if (this->last_rx_us_ != 0 && now_us() - this->last_rx_us_ > SESSION_SILENCE_US) {
+        ESP_LOGW(TAG, "Server silent for %" PRId64 " s (no message of any kind): reconnecting",
+                 (now_us() - this->last_rx_us_) / 1000000);
+        this->last_rx_us_ = 0;
+        return false;
+      }
       continue;
     }
     int n = recv(this->sock_, buf + got, len - got, 0);
     if (n <= 0) {
       return false;
     }
+    this->last_rx_us_ = now_us();
     got += n;
   }
   return true;
@@ -2360,6 +2377,7 @@ void SnapcastClient::player_task_() {
       st.dl_saved_integral_ppm = saved;
       st.dl_integral_ema_ppm = saved;
       st.dl_integral_ema_valid = true;
+      st.dl_cold_start = false;
       ESP_LOGI(TAG, "Delay loop: integral restored %+.2f ppm from NVS", saved);
     }
   }
@@ -2668,22 +2686,36 @@ void SnapcastClient::player_task_() {
     if (tags_fresh && st.coarse_act_err_us != 0 && st.dl_err_at_us > st.coarse_act_us + blank_us) {
       const int64_t before = std::abs(st.coarse_act_err_us);
       st.coarse_act_err_us = 0;
-      if (std::abs(st.dl_err_us) >= before - before / 4) {
+      // A miss counts only while the tags and the ledger DISAGREE: on B at 14:37:54 both read
+      // +47.5 ms after a starvation (just under the 50 ms hard-resync threshold) and the bounded
+      // catch-up simply needed ~15 s -- three "misses" faulted a healthy tag path and, on build
+      // 24, forced a needless reconnect. Agreement means the measurement is fine and the coarse
+      // path is merely slow; disagreement is the fault this exists for.
+      const bool disagree = std::abs(st.dl_err_us - error_us) > TAG_SPLIT_US;
+      if (std::abs(st.dl_err_us) >= before - before / 4 && disagree) {
         if (++st.tag_miss >= TAG_FAULT_MISSES) {
           st.tag_miss = 0;
           st.tag_fault_until_us = now_us() + TAG_FAULT_US;
           ESP_LOGW(TAG,
                    "TAGFAULT: %u tag-driven corrections left err_tag at %+" PRId64
-                   " us (ledger says %+" PRId64 ") -- distrusting tags for %" PRId64 " s and reconnecting to rebuild the tag path",
+                   " us (ledger says %+" PRId64 ") -- distrusting tags for %" PRId64 " s, repairing the ledger now",
                    static_cast<unsigned>(TAG_FAULT_MISSES), st.dl_err_us, error_us, TAG_FAULT_US / 1000000);
-          // REPAIR, NOT JUST DIAGNOSIS. Distrusting the tags stopped the thrash (build 18) but left
-          // the audio parked: A sat at err_tag -15.9 ms / ledger -0.6 ms / wire 3.4 ms off for minutes
-          // after the 14:29:21 stall (build 23), because nothing rebuilds a tag path that has come
-          // apart from the audio. A reconnect does -- the session teardown re-creates the pipeline and
-          // the tag tracks with it, and every observed bailout came back with tags and ledger agreeing
-          // within tens of us (B 14:11:53: SHADOW diff -32 us). ~3 s gap instead of an open-ended
-          // desync. Same flag as the late-stream bailout; the network task reconnects without backoff.
-          this->reconnect_requested_.store(true, std::memory_order_relaxed);
+          // REPAIR, NOT JUST DIAGNOSIS. What closed the 15 ms split on A at 14:33:41 was the
+          // accounting-split repair, which the fault had re-armed: the LEDGER had slipped (RECON drift
+          // +14988 the whole time), the tags were right, and the tag-driven catch-up's frame drops
+          // were being absorbed by the split rather than moving the audio. Pre-arm the repair so it
+          // runs on the next sample instead of after a fresh 3-s window; the fault window itself is
+          // 180 s so it cannot expire underneath it (60 s did, four times).
+          st.drift_excess_since_us = now_us() - DRIFT_REPAIR_HOLD_US;
+          // BACKSTOP: a second consecutive fault with no repair in between means the split is not in
+          // the ledger -- the tag path itself has come apart from the audio -- and only a reconnect
+          // rebuilds it (every observed bailout came back with tags and ledger agreeing within tens
+          // of us: B 14:11:53, SHADOW diff -32). ~3 s gap instead of an open-ended desync.
+          if (++st.tag_fault_streak >= 2) {
+            ESP_LOGW(TAG, "TAGFAULT twice without a repair -- reconnecting to rebuild the tag path");
+            st.tag_fault_streak = 0;
+            this->reconnect_requested_.store(true, std::memory_order_relaxed);
+          }
         }
       } else {
         st.tag_miss = 0;
@@ -4004,6 +4036,20 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     // the integral is 0 anyway, and that wind-up is the closed-loop PI response to a ~40 ppm rate
     // step: peak ~0.5*crystal/Kp ~ 200 us at tau = 10 s, under the splice threshold.
     st.dl_kp_last = 1.0f / tau_tuned;
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+    // COLD START SEED. A fresh board has no NVS integral and would wind ~56 ppm through Ki --
+    // 10+ minutes at Ti 600, spent near the splice/out-of-range thresholds. The TSF crystal
+    // estimate is the same hardware property measured against the radio within seconds of boot;
+    // it sits ~14 ppm from the trim the DAC actually needs (int +56 vs crystal +42, measured all
+    // day), which the fast boot Ti then absorbs in tens of seconds instead of tens of minutes.
+    if (st.dl_cold_start && st.trim_integral_ppm == 0.0f && this->tsf_sync_ != nullptr) {
+      const float seed = this->tsf_sync_->own_crystal_ppm();
+      if (std::isfinite(seed) && std::abs(seed) <= TRIM_CLAMP_MAX_PPM) {
+        st.trim_integral_ppm = seed;
+        ESP_LOGI(TAG, "Delay loop: cold start, integral seeded %+.2f ppm from the TSF crystal estimate", seed);
+      }
+    }
+#endif
     st.dl_active = true;
     st.dl_engaged_since_us = now;
     ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
@@ -4037,7 +4083,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (e > 0.0f)) {
     st.trim_integral_ppm =
         std::clamp(st.trim_integral_ppm +
-                       (kp / (now < DL_TI_BOOT_WINDOW_US ? DL_TI_BOOT_S : ti_eff)) *
+                       (kp / ((st.dl_cold_start && now < DL_TI_BOOT_WINDOW_US) ? DL_TI_BOOT_S : ti_eff)) *
                            e * dt_s,
                    -clamp_ppm, clamp_ppm);
   }
@@ -4844,6 +4890,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
                      "Accounting split repaired: accounted queue ran %+" PRId32 " us against measured latency "
                      "for %" PRId64 " s; playback was that far %s",
                      drift_for_repair, DRIFT_REPAIR_HOLD_US / 1000000, drift_for_repair > 0 ? "early" : "late");
+            st.tag_fault_streak = 0;  // the ledger was the side that slipped; the tag path stands
             // The repair steps the accounting, so the median error the PI sees is about to move by
             // the size of the split. Nulling that fast is what limits how long the displacement
             // integrates -- and the repair's displacement is the largest single term measured.
