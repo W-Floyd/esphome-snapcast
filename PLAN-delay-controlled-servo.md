@@ -1,5 +1,16 @@
 # PLAN — control the measured transport delay, not a model of it
 
+> **CURRENT STATE (2026-08-29, build 14 `29ca74f`) — read this, skip the log below unless you
+> need the evidence.** Live on all boards: PI on `err_tag`, tau 10 s, Ti 120 s, block 32, flat Kp;
+> integral persisted (300 s EMA) and restored at boot; out-of-range → hold integral (snap to EMA if
+> > 20 ppm off); tag-loss/mapping-flap → hold integral + P decaying over tau; tag stream blanked on
+> setpoint change, re-anchor, source switch and feedback gaps > 50 ms; `fast_splice_`, hard resync,
+> storm mute and aggressive catch-up all decide on `err_tag` while tags are live, the ledger
+> prediction only as the fallback; the split repair disarmed while tags are live; runtime tunables
+> over `servo_param`; one-sided autotune available, off. Wire: sd 46.7 / p2p 243 µs → sd 8.9 /
+> p2p 45 (11.5 quiet minutes, zero events). Remaining audible events are server-side delivery
+> pauses. Open items are listed in `HANDOFF.md`.
+>
 > **IMPLEMENTED 2026-08-28** in `snapcast_client.{h,cpp}`; see `delay_loop_update_` and the
 > constants at `DL_BLOCK_N`. Decisions taken where the plan left a range, and one deviation it
 > forces on its own logic:

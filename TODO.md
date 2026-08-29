@@ -31,6 +31,26 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
+**DELAY-CONTROLLED SERVO IS LIVE (build 14, `29ca74f`, 2026-08-29) — see `HANDOFF.md` and
+`PLAN-delay-controlled-servo.md`.** Wire went from sd 46.7 / p2p 243 µs (2026-08-28 morning) to
+sd 8.9 / p2p 45 over 11.5 quiet minutes with a zero event census on both boards. Open items, by
+audible impact:
+
+- **Server-side delivery pauses** (all three boards' rings dip at the same instants; 120–297/hour
+  on 2026-08-28 afternoon, 8–20/hour that night). Investigate the Pi host / process-stream loop /
+  AP. Not fixable on the client.
+- **Speaker-task feedback stalls** (60–1500 ms, fleet-wide). Blanked in firmware; root cause open.
+- **Consensus steps around OTA/replug** (operator-induced, 60–100 ms common-mode); boot-time
+  mapping flapping; **play-before-time-sync early-side wedge** (no bailout exists on the early side).
+- **Slow differential feed-forward** on exchanged `err_tag` (the measured right signal: r 0.88,
+  bias 2.5 µs vs the wire) to remove the ~+4 µs standing offset; dead-time compensation per board
+  for the ±5 µs wander residual; tau 30 re-test once integrals are within ~1 ppm.
+- **`block_n` 32 vs 64** on a quiet span (expected wash; the noise floor flattens at B=32).
+- **HA `number`/`switch` entities** on the `servo_param` tunables; parse `DLLOOP` into the
+  analyser CSV (`dl_err_a_us`, `dl_err_b_us`, overlay `errA−errB` on the wire skew).
+- Persist API-set tunables across reboot? Currently deliberate NOT (safety); revisit when they are
+  entities.
+
 **30 Hz BEACONS: MEASURED, DOES NOT HURT, AND IT RETIRES THE RADIO-CONTENTION HYPOTHESIS
 (2026-08-28, `f93eb9d`).** Three constants, since two are hard ceilings: `BEACON_INTERVAL_US`
 1 s -> 33.3 ms, `SERVICE_MIN_INTERVAL_US` 200 ms -> 20 ms (service() returns early inside it, so

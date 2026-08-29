@@ -116,6 +116,20 @@ Therefore:
   errors are masquerading as findings. One run had `rival = 0.942` on 100% of rows because
   `--samples 200000` was dropped from the command line.
 
+* **Verify the running build over the API after every OTA.** A replug 40 s after an OTA reboot
+  rolled both boards back to the previous firmware while the OTA log said "successful"; a persist
+  gate then "did not work" for a whole build because the build was not running. `device_info`'s
+  `compilation_time` is the witness. Restore wedged USB tails by restarting the logger, not by
+  replugging.
+* **Grade the wire from the CSV, not from plots.** Two rounds of screenshots were read for what the
+  analyser had already written to `test.csv` (`offset_ns`, `rival`, `scatter_ns`, both boards'
+  phases). `scripts/bench/wire-window.py` grades a wall-clock span rival-gated; the analyser's own
+  per-capture precision is ~26 ns, so every µs it shows is board behaviour.
+* **When a measured error and an estimated error disagree by 30 ms, ask which one the coarse
+  path is acting on.** Three attributions of one event (mapping step, tag mis-identity, then the
+  accounting-split repair) were made before the repair log line — present all along — was grepped.
+  The equal-and-opposite pair signature (−29026/+29024 µs) was the tell.
+
 ## Verifying a claim about code
 
 * **Match the variable and the operator, never the expected values.** Checking that `st.converged`

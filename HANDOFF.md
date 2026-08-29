@@ -1,12 +1,12 @@
-# HANDOFF — snapclient sync work, as of 2026-08-28 00:30
+# HANDOFF — snapclient sync work, as of 2026-08-29 00:45
 
 ## Bench layout
 
 | board | role | log | flashed with |
 |---|---|---|---|
-| `snapclient-supermini-e985e8` | speaker A, **logic-analyser channel A** | `a.log` | `example/esp32-s3-supermini.yaml` |
-| `snapclient-supermini-f04d74` | speaker B, **logic-analyser channel B** | `b.log` | `example/esp32-s3-supermini.yaml` |
-| `snapclient-observer-e99574`  | TSF observer, drives no DAC | `observer.log` | `example/observer-supermini.yaml` |
+| `snapclient-supermini-e985e8` | speaker A, **logic-analyser channel A**, `/dev/tty.usbmodem101` | `a.log` | `example/esp32-s3-supermini.yaml` |
+| `snapclient-supermini-f04d74` | speaker B, **logic-analyser channel B**, `/dev/tty.usbmodem1101` | `b.log` | `example/esp32-s3-supermini.yaml` |
+| `snapclient-observer-e99574`  | TSF observer, drives no DAC, `/dev/tty.usbmodem201101` | `observer.log` | `example/observer-supermini.yaml` |
 | `f049c8` | unreachable all session, unflashed | — | — |
 | `f04fc4`, `ESP32-Caster`, `a56b60` | other speakers, not in the probed group | — | — |
 
@@ -153,6 +153,66 @@ if sd worsens.
 
 `TODO.md` carries the full record, including retractions. Two findings were reported and later
 overturned; both are struck through rather than deleted, because how they happened is useful.
+
+## THE DELAY-CONTROLLED SERVO — IMPLEMENTED, FLASHED, GRADED (2026-08-28 evening → 2026-08-29)
+
+**This is now the live design on all five boards (build 14, `29ca74f`).** The rate servo steers on
+the MEASURED render error (`err_tag` = tagged frame's render instant − its deadline), setpoint zero,
+in 32-arrival blocks at ~3 Hz, PI with Kp = 1/tau (tau 10 s) and Ki = Kp/Ti (Ti 120 s). The ledger
+prediction survives only as the tags-absent fallback for the per-chunk scheduling path. The integral
+(the crystal offset) is persisted to NVS as a 300 s EMA and restored at boot, so a cold boot engages
+at +57 ppm with no wind-up. Full narrative, every retraction included: `PLAN-delay-controlled-servo.md`.
+
+    wire (B−A, MLS44, rival-gated CSV)     morning baseline      build 14, 11.5 quiet min
+    median / MAD / sd / p2p                +1.2 / 20.0 / 46.7 / 243   +4.0 / 5.3 / 8.9 / 45 µs
+    on-device group delta MAD              A 26, B 16                A 22, B 15
+    on-device A−B loop-error differential  —                         median +2, MAD 9, r(A,B) 0.995
+    event census (resync/splice/OOR/repair) —                        zero on both boards
+
+**Headline test passed:** `inject_split(+1000)` moved the ledger +1020 µs and the audio not at all
+(the old servo displaced ~1100 µs on the same injection that morning).
+
+**What the bench found in twelve builds (each measured, fixed, re-measured):**
+
+* Above the splice threshold the fast path owns position; the PI never runs there (build 3).
+* Never re-seed the integral; every hold programs the integral (out of range) or carries P decaying
+  over tau (tag loss, mapping flap). Both omissions produced audible limit cycles (builds 3, 11).
+* Speaker-callback stalls (60–1500 ms, fleet-wide) stamp completions late → phases and err_tag lie
+  by the stall length while tag-age reads normal. Blank the tag stream on any feedback gap > 50 ms (4).
+* Ti = tau let the integral swing ~57 ppm p-p chasing the ±600 µs / ~60 s common-mode wander; Ti is
+  now decoupled (120 s) and an out-of-range integral > 20 ppm from its EMA snaps back (12).
+* **The accounting-split repair is disarmed while tags are live** (13): it fires all day in
+  equal-and-opposite pairs from the mixer-ring drift sawtooth (−29026/+29024 µs, …) and under the
+  new design each step went straight to the hard-resync path as a 30–50 ms audible move.
+* **Coarse decisions (hard resync, storm mute, aggressive catch-up) use err_tag while tags are
+  live** (14): unrepaired, the prediction's bias rode the wander into the 50 ms threshold.
+* Autotune exists (`servo_param autotune 1`) but is one-sided (slows on ringing only): a
+  standing mean with r1 ≈ 1 is what tracking the common-mode wander looks like on ONE device.
+
+**Bench workflow that made twelve builds possible in an evening:** `./reflash-speakers.sh` (one
+build, two OTAs); `scripts/servo-param.py <name> <value> <hosts>` for tau_s, ti_s, block_n,
+splice_us, gate timings, autotune, persist — session-local, reboot restores flashed defaults;
+`scripts/bench/dl-window.py --a-off N --b-off N` grades a log window anchored on byte offsets;
+`scripts/bench/wire-window.py --from HH:MM:SS --to HH:MM:SS` grades the analyser CSV, rival-gated.
+
+**What the device can see of the wire (measured 21:22–21:27):** errA−errB vs analyser r = 0.88,
+bias 2.5 µs, 13 µs/s noise — an honest but coarse estimate (→ ~2 µs after a minute). The
+render-phase difference is far worse (sd 46 µs, biased +70 µs, stall spikes). Any slow differential
+feed-forward should be built on exchanged err_tag, not on the phases. The analyser resolves each
+capture to ~26 ns (`scatter_ns`), so every µs on the wire is board behaviour.
+
+**Open, by audible impact:**
+
+1. **Server-side delivery pauses** — the dominant audible event all day (`no chunk records for 3 s,
+   ring holds 0`: 120–297/hour at 14–15h, 8–20/hour tonight), seen by all three boards at the same
+   instants; the Pi host / process-stream loop / AP. The client cannot fix a source that stops.
+2. Speaker-task feedback stalls — blanked, root cause open.
+3. Consensus steps around OTA/replug (operator-induced) and boot-time mapping flapping; the
+   play-before-time-sync early-side wedge (18:36, `b.log`) has no bailout.
+4. `block_n` 32 vs 64 A/B on a quiet span (probably a wash); tau 30 only once integrals are within
+   ~1 ppm (standing error is integral_error/Kp); the ~+4 µs standing offset (feed-forward on
+   exchanged err_tag); dead-time compensation for the ±5 µs wander residual.
+5. HA `number`/`switch` entities on the tunables; parse `DLLOOP` into the analyser CSV.
 
 ## `render_align`'s replacement signal — IMPLEMENTED, FLASHED, GRADED, PASSES (2026-08-28)
 
@@ -356,3 +416,16 @@ survives a power cycle; one instance is not a rate.
   of uncommitted work.
 * **Log lines truncate.** `pad=` at the end of `RECON` reads as `pad=882` for a counter in the
   tens of millions; `tsf=` is cut off entirely. Add a short dedicated line instead.
+* **A replug within ~2 min of an OTA reboot ROLLS BACK to the previous firmware** while the OTA log
+  says successful (the new app has not marked itself valid yet). Both boards reported the previous
+  build's compile time via API `device_info` after a 40 s replug. Verify the running build over the
+  API after every flash; restore wedged USB tails by restarting the `esphome logs` process, not by
+  replugging.
+* **An IDE restart kills the `esphome logs` tails** (they live in its terminals); the logs freeze
+  and the analyser keeps annotating from frozen files. Port map: `usbmodem101` A, `usbmodem1101` B,
+  `usbmodem201101` observer. Append (`>>`) when restarting so byte offsets stay valid.
+* **`SPLITINJECT ramp complete` is an unreliable witness** — it logs only when the zero lands on a
+  chunk that spends a whole frame. Use the SYNCX `drift`/`split` step as the positive control.
+* **Grade the wire from the CSV, not from plots.** `scripts/bench/wire-window.py` reads `test.csv`
+  with the rival gate; the analyser writes NaN rows on PCM-lock loss.
+
