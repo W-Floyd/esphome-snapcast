@@ -2698,7 +2698,7 @@ void SnapcastClient::player_task_() {
           st.tag_fault_until_us = now_us() + TAG_FAULT_US;
           ESP_LOGW(TAG,
                    "TAGFAULT: %u tag-driven corrections left err_tag at %+" PRId64
-                   " us (ledger says %+" PRId64 ") -- distrusting tags for %" PRId64 " s, repairing the ledger now",
+                   " us (ledger says %+" PRId64 ") -- distrusting tags for %" PRId64 " s and reconnecting",
                    static_cast<unsigned>(TAG_FAULT_MISSES), st.dl_err_us, error_us, TAG_FAULT_US / 1000000);
           // REPAIR, NOT JUST DIAGNOSIS. What closed the 15 ms split on A at 14:33:41 was the
           // accounting-split repair, which the fault had re-armed: the LEDGER had slipped (RECON drift
@@ -2707,15 +2707,15 @@ void SnapcastClient::player_task_() {
           // runs on the next sample instead of after a fresh 3-s window; the fault window itself is
           // 180 s so it cannot expire underneath it (60 s did, four times).
           st.drift_excess_since_us = now_us() - DRIFT_REPAIR_HOLD_US;
-          // BACKSTOP: a second consecutive fault with no repair in between means the split is not in
-          // the ledger -- the tag path itself has come apart from the audio -- and only a reconnect
-          // rebuilds it (every observed bailout came back with tags and ledger agreeing within tens
-          // of us: B 14:11:53, SHADOW diff -32). ~3 s gap instead of an open-ended desync.
-          if (++st.tag_fault_streak >= 2) {
-            ESP_LOGW(TAG, "TAGFAULT twice without a repair -- reconnecting to rebuild the tag path");
-            st.tag_fault_streak = 0;
-            this->reconnect_requested_.store(true, std::memory_order_relaxed);
-          }
+          // RECONNECT NOW. Waiting for the repair or a second fault cost three minutes of audible
+          // desync on A and the observer (16:38:26 -> 16:41:30): the repair's drift median spans
+          // DRIFT_WINDOW samples at the 20-s RECON cadence, right for a slow accounting drift and
+          // structurally too slow for an acute fault. A genuine fault (tag/ledger disagreement,
+          // corrections not moving the measurement) has one proven remedy -- the session teardown
+          // rebuilds the pipeline and its tag tracks, and every observed reconnect came back with
+          // tags and ledger agreeing within tens of us (B 14:11:53: SHADOW diff -32). ~3 s gap.
+          st.tag_fault_streak = 0;
+          this->reconnect_requested_.store(true, std::memory_order_relaxed);
         }
       } else {
         st.tag_miss = 0;

@@ -649,6 +649,15 @@
 > inside it and cannot be read. Next: apply with a tiny cap (align_max_us 60, step 2) and watch
 > the wire for ten minutes — bounded harm, decisive result.
 >
+> **16:38:16 server-wide starvation (A + observer) → genuine TAGFAULTs (A −3.5 ms vs +1.8; observer
+> −33.7 vs +1.5) → the build-27 repair-first path did NOT repair:** RECON drift matched the split
+> (A +4988, observer +34989 — the ledger had slipped again) and the residual gate did not refuse,
+> but the repair's drift median is over DRIFT_WINDOW samples at the 20-s RECON cadence — minutes
+> — so the second-fault backstop fired first at 16:41:30/36 (reconnect). Three minutes of desync,
+> the applied-align test (cap 60) voided. **Build 28:** a genuine TAGFAULT reconnects at once; the
+> repair pre-arm stays as a bonus. The disagreement rule makes the false-positive reconnects of
+> build 24 impossible, so the immediate reconnect is now safe.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
