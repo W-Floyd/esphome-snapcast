@@ -658,6 +658,15 @@
 > repair pre-arm stays as a bonus. The disagreement rule makes the false-positive reconnects of
 > build 24 impossible, so the immediate reconnect is now safe.
 >
+> **Build 28 fleet flash (16:43): B came up 58–61 ms off A (observer PHASEIN) and stayed there
+> 3+ minutes with no reconnect** — no TAGFAULT (which needs tag/ledger DISagreement: a plain 60 ms
+> lateness with both agreeing is not a fault) and apparently no hard resync either, although 60 ms
+> exceeds the 50 ms threshold; B's serial has been wedged since its 15:12 OTA so the mechanism is
+> invisible. Restarted B over the API 16:48:5x. Lesson for the cycle-time work: **a board without
+> serial is a board that cannot be iterated on** — B's replug is the precondition for the next
+> round. Open question to answer once B logs again: what holds a board 60 ms late with tags and
+> ledger agreeing (the coarse path should have taken it: hard resync > 50 ms, catch-up below).
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
