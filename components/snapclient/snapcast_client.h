@@ -1537,6 +1537,10 @@ class SnapcastClient {
   /// in 2 s), so a hold froze a wrong 'crystal offset'. With the integral restored from NVS the
   /// fast wind-up Ti = tau bought is moot; Ti belongs to the crystal's drift timescale (minutes).
   std::atomic<float> tune_ti_s_{600.0f};
+  /// Error-proportional gain: Kp = (1/tau) * max(1, |err| / knee), effective tau floored at tau_min.
+  /// Knee 25 us: tau 120 only inside the per-block noise, tau ~30 s at 100 us, tau_min beyond 120 us.
+  std::atomic<float> tune_knee_us_{25.0f};
+  std::atomic<float> tune_tau_min_s_{20.0f};
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};

@@ -25,14 +25,25 @@ def board(f,off):
     for i,l in enumerate(out):
         acc+=len(l.encode('utf-8','ignore'))+1
         if acc>off: pos=i; break
-        # 'integral restored' fires ~1 s after reset; 'Boot seems successful' ~57 s later. Prefer the
-        # former as the anchor; a later 'Boot seems successful' must not overwrite it.
-        if 'integral restored' in l:
+    # A PRE-flash offset (the normal case: recorded before the OTA) has the boot AFTER it: take the
+    # first marker within the 4 MB after the offset if there is one, else the last one before it.
+    for i in range(pos, min(len(out), pos+60000)):
+        l=out[i]
+        if 'integral restored' in l or 'Boot seems successful' in l:
             m=TS.match(l)
-            if m: boot=secs(m); boot_kind='restored'; boot_idx=i
-        elif 'Boot seems successful' in l and boot_kind!='restored':
-            m=TS.match(l)
-            if m: boot=secs(m); boot_kind='safe_mode'; boot_idx=i
+            if m:
+                boot=secs(m); boot_kind=('restored' if 'restored' in l else 'safe_mode')+' (after offset)'; boot_idx=i
+                break
+    if boot is None:
+      for i,l in enumerate(out[:pos]):
+          # 'integral restored' fires ~1 s after reset; 'Boot seems successful' ~57 s later. Prefer the
+          # former as the anchor; a later 'Boot seems successful' must not overwrite it.
+          if 'integral restored' in l:
+              m=TS.match(l)
+              if m: boot=secs(m); boot_kind='restored'; boot_idx=i
+          elif 'Boot seems successful' in l and boot_kind!='restored':
+              m=TS.match(l)
+              if m: boot=secs(m); boot_kind='safe_mode'; boot_idx=i
     out=out[boot_idx:] if boot is not None else out[pos:]  # events from the reboot itself, not from the offset
     t0=boot; eng=None; first_dl=None; inside_since=None; conv=None; last=None
     for l in out:

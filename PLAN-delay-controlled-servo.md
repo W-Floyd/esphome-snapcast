@@ -466,6 +466,30 @@
 > engaged +14 s (A) / +22 s (B); neither board nor the wire converged within 450–490 s. Build 19
 > (error-proportional gain) flashed 13:3x against that.
 >
+> **Build 19 first boot (13:32:41):** the error-proportional gain engaged as designed — B at err
+> +995 µs ran kp 0.050 (tau 20), back to 0.010 inside the knee within ~2 min; B |err| ≤ 90 µs by
+> 13:35. The wire closed −390 → 0 at +17 ppm in ~35 s… and parked at **+311 µs for a minute**
+> (13:34:00–13:34:40) with B's own error at −90 µs. So the plateau is not the loop: it is the two
+> boards disagreeing about WHERE zero is. Consensus adopts the mean of the live estimate set
+> (`adopted +0 us from target` always — by design, so mappings are identical when the sets are);
+> spreads were 200–700 µs, so two boards holding different sets (a beacon lost by one, up to
+> PEER_MAP_STALE_US) differ by O(spread/n) ≈ 100–250 µs — the right magnitude. A's log tail died
+> with the OTA (replug 13:35:45 restored it; build 19 confirmed still running), so the
+> decomposition wire = err_A − err_B + Δdeadline could not be done on this boot; it is being
+> done on A's second boot at 13:44.
+>
+> **Build 19 second look (A's replug boot):** the on-device `err a−b` tracked the wire, so this
+> boot's slow tail was the loop's own: inside the 75 µs knee the gain is back at tau 120 and the
+> −150 µs undershoot (integral wound while boosted) unwinds at that rate. **Build 20:** knee and tau
+> floor become runtime tunables (`knee_us`, default 25; `tau_min_s`, default 20; `tau_s` bound
+> raised to 600) so the acquisition shape is iterated over the API. Knee 25 → tau ≈ 30 s at 100
+> µs, tau 120 only inside the per-block noise.
+ Also in build 20: **Ti is no longer boosted.** Ki = kp/Ti
+> already rises with kp; dividing Ti too made Ki ∝ boost² and wound the (correct, restored)
+> integral during the position catch-up — the −150 µs undershoot and the long tail. A boot error
+> is position, not rate. Build-19 cycle time to beat: wire inside 20 µs held 20 s at **+242 s**
+> from A's 13:35:45 boot.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

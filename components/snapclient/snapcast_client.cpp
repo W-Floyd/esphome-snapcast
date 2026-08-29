@@ -449,14 +449,13 @@ static constexpr int64_t DL_TAG_STALE_US = 1000000;
 // correction hands back to the demoted prediction (where the split-pending guard applies again).
 // Blocks complete every ~320 ms, so three missed blocks = the signal is gone, not late.
 static constexpr int64_t DL_ERR_STALE_US = 1000000;
-// Error-proportional gain: Kp = (1/tau) * max(1, |err| / DL_GAIN_KNEE_US), Ti divided by the same
-// factor, both capped so the effective tau never drops below DL_TAU_MIN_S. Inside the knee the loop
+// Error-proportional gain: Kp = (1/tau) * max(1, |err| / knee_us), Ti divided by the same
+// factor, both capped so the effective tau never drops below tau_min_s. Inside the knee the loop
 // runs the slow tunables exactly (tau 120 / Ti 600 for the sub-us steady state); a few hundred us
 // after a boot or re-anchor is closed at tau 20 instead of 2-3 x 120 s (measured 13:27-13:33,
 // build 18: +330 us decaying with no overshoot for minutes). Continuous in the error, so there is
 // no state, no hysteresis and no gain step to excite; a large error simply gets a stiffer loop.
-static constexpr float DL_GAIN_KNEE_US = 75.0f;
-static constexpr float DL_TAU_MIN_S = 20.0f;
+// Both runtime tunables now (servo_param knee_us / tau_min_s); defaults in snapcast_client.h.
 // Tag fault (see ServoState::tag_miss): consecutive unmoved corrections that fault the tag path,
 // and how long the ledger takes over before tags are trusted again.
 static constexpr uint8_t TAG_FAULT_MISSES = 3;
@@ -3964,12 +3963,18 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // since a discrete event (hard resync, timebase re-anchor), never the error, and those events
   // also blank the tag stream -- so by the time a block completes under the elevated gain, the
   // audio it measured is genuinely post-event.
-  // Error-proportional gain (see DL_GAIN_KNEE_US): the tunables are the floor, |err| raises them.
+  // Error-proportional gain: the tunables are the floor, |err| raises them (knee_us / tau_min_s).
   const float tau_tuned = this->tune_tau_s_.load(std::memory_order_relaxed);
   const float ti_tuned = this->tune_ti_s_.load(std::memory_order_relaxed);
-  const float boost = std::clamp(std::abs(e) / DL_GAIN_KNEE_US, 1.0f, std::max(1.0f, tau_tuned / DL_TAU_MIN_S));
+  const float knee_us = this->tune_knee_us_.load(std::memory_order_relaxed);
+  const float tau_min = this->tune_tau_min_s_.load(std::memory_order_relaxed);
+  const float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
   const float tau_eff = tau_tuned / boost;
-  const float ti_eff = ti_tuned / boost;
+  // Ti is NOT boosted: Ki = kp/Ti already rises with kp. Dividing Ti too made Ki scale with boost^2
+  // and wound the (already correct, NVS-restored) integral during the position catch-up -- the
+  // -150 us undershoot and the minutes-long tail on A's 13:35 boot. A boot error is position, not
+  // rate; P should close it and the integral should barely move.
+  const float ti_eff = ti_tuned;
   const float kp_run = 1.0f / tau_eff;
   // FLAT GAIN: Kp = 1/tau, no acquire->run schedule. The schedule bought fast nulling after a
   // hard resync when the rate loop was the only corrector; here anything past the splice
@@ -4292,7 +4297,7 @@ void SnapcastClient::persist_now() {
 // defaults -- a bad experiment is one power cycle from gone.
 bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   if (name == "tau_s") {
-    if (!(value >= 2.0f && value <= 120.0f)) return false;
+    if (!(value >= 2.0f && value <= 600.0f)) return false;
     if (this->tune_autotune_.load(std::memory_order_relaxed)) {
       ESP_LOGW(TAG, "SERVOPARAM tau_s set manually while autotune is ON; the next adaptation will move it");
     }
@@ -4315,6 +4320,12 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "gap_blank_ms") {
     if (!(value >= 10.0f && value <= 500.0f)) return false;
     this->tune_gap_blank_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "knee_us") {
+    if (!(value >= 5.0f && value <= 1000.0f)) return false;
+    this->tune_knee_us_.store(value, std::memory_order_relaxed);
+  } else if (name == "tau_min_s") {
+    if (!(value >= 2.0f && value <= 600.0f)) return false;
+    this->tune_tau_min_s_.store(value, std::memory_order_relaxed);
   } else if (name == "autotune") {
     this->tune_autotune_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "persist") {
