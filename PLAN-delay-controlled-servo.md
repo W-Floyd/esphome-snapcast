@@ -697,6 +697,14 @@
 > as build 29 has it. My derivation from the phase formula had two sign errors that cancelled;
 > the code comment now records the measurement, not the derivation.
 >
+> **Build 29 (17:12:40), align applied with the measured sign, cap 60 (17:16:25–17:24):** A's bias
+> +50 → +57 while its group delta shrank −139 → −23 and the wire closed −106 → −8 µs — the
+> inter-device channel removing a standing offset, the first time it has done so. Ended by the
+> 17:24:50 server-wide starvation (+256 µs) and A's clean bailout at 17:26:39. Bias pinned at the
+> cap → cap raised to 150 (17:29); 30-minute hands-off window follows. Cycle time build 29: A inside
+> 75 µs from +78 s (the wire's ≤20 µs criterion was not met before the events — the ~−100 µs standing
+> offset is precisely what align was still removing).
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
