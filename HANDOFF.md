@@ -241,9 +241,11 @@ All committed on `main`; `PLAN-delay-controlled-servo.md` carries the blow-by-bl
 * **Observer publishes no render phase** (build 22): its +9.5 ms phase had made the speakers'
   group render delta bimodal and useless.
 * **render_align** is runtime-tunable (`align_max_us / align_gain / align_deadband_us /
-  align_reject_us / align_step_us / align_apply`) and SHADOW-ONLY by default (build 27). Two live
-  runs both drove the wire away from zero (sign unproven; the second was self-reinforcing).
-  `align_max_us 0` clears the bias. Settle the sign with `scripts/bench/align-shadow.py` first.
+  align_reject_us / align_step_us / align_apply`) and SHADOW-ONLY by default (build 27). **Sign
+  measured on the wire (17:03–17:10, single-board step):** positive bias = this board plays EARLIER;
+  positive group delta = this board is EARLY; so `bias -= delta*gain` (the original code; build 29
+  restores it after a wrong flip in build 23 that made two live runs run away). `align_max_us 0`
+  clears the bias. Enable with `align_apply 1`, cap small (60 µs) first.
 * Runtime tunables persist nothing: every reflash resets them (`servo-param.py`).
 
 **Cycle time** (wire |A−B| ≤ 20 µs held 20 s, from the reboot line; `scripts/bench/converge-time.py`):
