@@ -503,6 +503,41 @@
 > wire then ran away from zero as the loop chased its own integral. **Build 21:** the transfer is
 > keyed on the tuned 1/tau only; the proportional boost steps the output on purpose.
 >
+> **Cycle-time ledger (wire |A−B| ≤ 20 µs held 20 s, from the reboot line):** build 18 (tau 120
+> flat) > 450 s; build 19 (boost, Ti boosted) 242 s; build 20 (knee 25, Ti unboosted) never inside
+> its 248 s of life — diverged after crossing zero (bumpless transfer); build 21 (transfer keyed on
+> tuned kp) flashed 13:49:34, back at +16 µs by +100 s, integrals flat — graded at +8 min.
+>
+> **Build 21 graded (from the 13:49:34 reboot):** A inside 75 µs from +150 s, B from +261 s,
+> integrals flat (A 56.2–56.6, B 54.5→53.9) — the bumpless fix holds. But the wire never held
+> inside 20 µs in 466 s: median **+61 µs**, robust sd 21, 1-s change 1.4 µs (build 17: 0.38). Two
+> lessons. (1) A magnitude knee cannot separate "far from setpoint" from "the common wander": err
+> carries the ±350 µs common wander, so with knee 25 the loops sit at tau 30–60 in steady state and
+> the P noise is back. Knee above the wander (~200+) restores the slow steady state but gives back
+> the slow tail below it. Magnitude alone cannot have both. (2) The +61 µs offset with both loops
+> at their setpoints is the two boards' deadlines disagreeing — the estimate-set path-dependence.
+> **Both point at the same structure:** a fast channel on the DIFFERENTIAL (my render phase −
+> group render phase, already exchanged over TSF and already tag-derived) and the slow channel on
+> err_tag. That is `render_align`, parked in the code as "blocked on ledger-independence" — which
+> the tag path now provides.
+>
+> **Can the exchanged render phase drive a differential channel today? No.** 13:52–13:58, the
+> on-device TSF render-group delta (SYNCX `render N us`, tag-derived, published per ~3.3 s report,
+> paired within 300 ms): A robust sd 39 µs, r with the wire −0.23; B carries 7 ms outliers. The
+> wire itself wandered ±20 µs. The pairing is the problem, as the 30 Hz note predicted: two boards
+> sample their phase at different instants while the common wander moves at ~40 µs/s, so a 300 ms
+> pairing window alone is ±12 µs, and the 3.3 s cadence makes pairs rare. To use it: publish a
+> LINE (phase + slope, extrapolable like the timebase estimates) or raise the exchange rate — i.e.
+> the beacon-rate experiment, now with a consumer. Knee moved to 150 µs over the API at 13:58:41
+> (above the common wander) for the steady-state grade 14:01–14:11.
+>
+> **Build 22 (fleet flash, all three boards):** the observer publishes no render phase (its +9.5 ms
+> value was half of the speakers' group mean); `render_align` cap/gain/deadband become
+> `servo_param align_max_us / align_gain / align_deadband_us` so the inter-device channel can be
+> switched on and tuned over the API. With the observer excluded, the exchanged render delta
+> correlates with the wire (A +0.75, B −0.60, ~10 µs per 3.3 s sample) — enough for a slow
+> channel on the standing offset (+47 µs at 13:53–13:58) and the slow drift.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

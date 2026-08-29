@@ -713,14 +713,14 @@ static constexpr int64_t REANCHOR_MIN_INTERVAL_US = 60000000;
 // proportional gain near 0.5x ultimate; 0.05 is a 5x reduction on a value already known to
 // oscillate. Stepping every third report puts the correction interval beyond the loop delay as
 // well, which does not depend on the gain estimate being right.
-static constexpr float RENDER_ALIGN_GAIN = 0.05f;
+// RENDER_ALIGN_GAIN: now servo_param align_gain (default 0.05)
 // Reports between corrections. One report was inside the loop delay, which is what sustained the
 // cycle above.
 static constexpr uint32_t RENDER_ALIGN_EVERY_N_REPORTS = 3;
 static constexpr int32_t RENDER_ALIGN_MAX_STEP_US = 50;
 // Below this the delta is measurement noise: the render delta's own MAD is ~15 us against a
 // truth MAD of 1.7 us, so correcting inside that band would inject noise, not remove it.
-static constexpr int32_t RENDER_ALIGN_DEADBAND_US = 20;
+// RENDER_ALIGN_DEADBAND_US: now servo_param align_deadband_us (default 20)
 static constexpr int64_t FAST_SPLICE_RELEASE_US = 300;
 // Bound on one episode, so a mis-measurement cannot walk the audio indefinitely: 128 frames is
 // ~2.9 ms at 44.1 kHz, comfortably more than any planted offset measured (1.4 ms) and far less
@@ -864,6 +864,7 @@ bool SnapcastClient::start() {
   if (this->config_.tsf_observer) {
     ESP_LOGI(TAG, "TSF observer mode: phase inputs logged");
   }
+  this->tune_align_max_us_.store(static_cast<int32_t>(this->config_.render_align_max_us), std::memory_order_relaxed);
 #endif
 
   this->control_session_ = std::make_unique<ControlSession>(this->config_.client_id);
@@ -4332,6 +4333,15 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "tau_min_s") {
     if (!(value >= 2.0f && value <= 600.0f)) return false;
     this->tune_tau_min_s_.store(value, std::memory_order_relaxed);
+  } else if (name == "align_max_us") {
+    if (!(value >= 0.0f && value <= 20000.0f)) return false;
+    this->tune_align_max_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "align_gain") {
+    if (!(value >= 0.0f && value <= 1.0f)) return false;
+    this->tune_align_gain_.store(value, std::memory_order_relaxed);
+  } else if (name == "align_deadband_us") {
+    if (!(value >= 0.0f && value <= 1000.0f)) return false;
+    this->tune_align_deadband_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "autotune") {
     this->tune_autotune_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "persist") {
@@ -5077,7 +5087,12 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // are exactly the moments a wrong correction would be hardest to attribute afterwards.
           // phase_local is the local instant of the TSF sandwich this phase was built from -- pass it
           // so the group only differences phases sampled close together.
-          if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN) {
+          // AN OBSERVER PUBLISHES NO RENDER PHASE. It drives no DAC, its pipeline depth is not a
+          // speaker's, and its phase sat +9.2..+10.1 ms from the two speakers' (2026-08-29 13:52-58)
+          // -- in the group's weighted mean that made the speakers' render_group_delta bimodal
+          // (A: median +5120 us, values near 0 half the time and near +9.5 ms the other half) and
+          // unusable for steering. It still receives and logs everyone else's (PHASEIN).
+          if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN && !this->config_.tsf_observer) {
             this->tsf_sync_->set_render_phase_us(measured_phase, phase_local);
           } else {
             this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
@@ -5216,12 +5231,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         // acting on a measurement that does not yet contain the previous correction.
         this->render_align_tick_++;
         const bool align_due = (this->render_align_tick_ % RENDER_ALIGN_EVERY_N_REPORTS) == 0;
-        if (this->config_.render_align_max_us > 0 && st.converged && align_due && group_delta != INT32_MIN) {
-          const int32_t cap = static_cast<int32_t>(this->config_.render_align_max_us);
+        // Cap, gain and deadband are runtime tunables (servo_param align_max_us / align_gain /
+        // align_deadband_us); align_max_us defaults to the YAML render_align_max (0 = off).
+        const int32_t align_cap = this->tune_align_max_us_.load(std::memory_order_relaxed);
+        if (align_cap > 0 && st.converged && align_due && group_delta != INT32_MIN) {
+          const int32_t cap = align_cap;
           int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
-          if (std::abs(group_delta) > RENDER_ALIGN_DEADBAND_US) {
+          if (std::abs(group_delta) > this->tune_align_deadband_us_.load(std::memory_order_relaxed)) {
             const int32_t step =
-                std::clamp<int32_t>(static_cast<int32_t>(-group_delta * RENDER_ALIGN_GAIN),
+                std::clamp<int32_t>(static_cast<int32_t>(-group_delta * this->tune_align_gain_.load(std::memory_order_relaxed)),
                                     -RENDER_ALIGN_MAX_STEP_US, RENDER_ALIGN_MAX_STEP_US);
             bias = std::clamp<int32_t>(bias + step, -cap, cap);
             this->render_bias_us_.store(bias, std::memory_order_relaxed);

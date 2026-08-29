@@ -1541,6 +1541,11 @@ class SnapcastClient {
   /// Knee 25 us: tau 120 only inside the per-block noise, tau ~30 s at 100 us, tau_min beyond 120 us.
   std::atomic<float> tune_knee_us_{25.0f};
   std::atomic<float> tune_tau_min_s_{20.0f};
+  /// render_align channel (inter-device, on the exchanged tag-derived render phase): cap in us
+  /// (0 = off; seeded from YAML render_align_max), gain per due report, deadband in us.
+  std::atomic<int32_t> tune_align_max_us_{0};
+  std::atomic<float> tune_align_gain_{0.05f};
+  std::atomic<int32_t> tune_align_deadband_us_{20};
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};
