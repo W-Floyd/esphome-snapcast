@@ -35,8 +35,9 @@ section; most of the obvious approaches have already failed on hardware.
 `PLAN-delay-controlled-servo.md`.** Since build 14: rate-lock dither, error-proportional gain
 (tau 120 / Ti 600 / block 64 floor, knee 150 on the bench), tag-fault → split repair → reconnect
 backstop, dead-session detector, cold-start crystal seed, observer publishes no phase, render_align
-shadow-only. Cycle time (wire ≤ 20 µs held, from reboot): 18 >450 s → 26 46 s. Steady-state
-fast noise 0.30 µs/√s; slow 5–7 µs term is per-board measurement error. Open items, by impact:
+applied at the measured sign (build 30 defaults, `aaba353`, not yet flashed). Cycle time (wire ≤ 20
+µs held, from reboot): 18 >450 s → 26 46 s. Steady state 18:00–18:45: median +2.7 µs, robust sd
+5.0 µs, 0.19 µs/√s, zero events. Open items, by impact:
 
 - **Tag/ledger split after a chunk-drop storm** (root cause open; repair bounds it). **Align sign**
   (shadow window running; `align-shadow.py`). **Post-boot starvation cluster** (3 stalls in 12 min
