@@ -4390,6 +4390,16 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "align_max_us") {
     if (!(value >= 0.0f && value <= 20000.0f)) return false;
     this->tune_align_max_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+    if (value == 0.0f) {
+      // Off means off: a bias left standing after the channel is disabled kept A's deadline
+      // shifted -339 us at 15:56 with nothing able to clear it short of a reboot.
+      this->render_bias_us_.store(0, std::memory_order_relaxed);
+    }
+  } else if (name == "align_apply") {
+    // 0 = SHADOW: compute and log the step, apply nothing. The channel walked A's bias -159 ->
+    // -339 us while the group delta GREW -124 -> -305 (15:43-15:56): self-reinforcing, sign still
+    // unproven against the wire. Shadow it beside the wire until the sign is measured, then apply.
+    this->tune_align_apply_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "align_gain") {
     if (!(value >= 0.0f && value <= 1.0f)) return false;
     this->tune_align_gain_.store(value, std::memory_order_relaxed);
@@ -5313,8 +5323,13 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int32_t step =
                 std::clamp<int32_t>(static_cast<int32_t>(group_delta * this->tune_align_gain_.load(std::memory_order_relaxed)),
                                     -max_step, max_step);
-            bias = std::clamp<int32_t>(bias + step, -cap, cap);
-            this->render_bias_us_.store(bias, std::memory_order_relaxed);
+            if (this->tune_align_apply_.load(std::memory_order_relaxed)) {
+              bias = std::clamp<int32_t>(bias + step, -cap, cap);
+              this->render_bias_us_.store(bias, std::memory_order_relaxed);
+            } else {
+              ESP_LOGD(TAG, "RALIGN shadow: group %+" PRId32 " would step %+" PRId32 " us (bias held %+" PRId32 ")",
+                       group_delta, step, bias);
+            }
           }
           ESP_LOGD(TAG, "RALIGN group %+" PRId32 " -> bias %+" PRId32 " us (cap %" PRId32 ")", group_delta, bias,
                    cap);

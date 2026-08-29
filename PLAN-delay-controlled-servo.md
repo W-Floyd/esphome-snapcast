@@ -613,6 +613,31 @@
 > session (Time replies come every 1 s streaming, every few s idle) → WARN + reconnect. The
 > watchdog's STALLED/NOCORR lines were what surfaced it.
 >
+> **Build 25 boot (15:12:43): wire inside 20 µs held from +67 s** (ledger 18 >450 · 19 242 · 22
+> 209 · 24 74 · 25 67). Align (sign flipped, step 5, deadband 3) on since 15:15:47: A's bias walks
+> −32 → −39 against a group delta of −43…−61 while the wire sits at −44 µs, robust sd 8.6, not
+> closing over 5 min — the bias is moving and the wire is not following. Suspects: both boards
+> receiving same-sign deltas (then both advance and the difference stands still), or A's deadline
+> off the shared-TSF path where the bias is applied. B's serial is wedged post-OTA, so its side is
+> read from the observer's PHASEIN.
+>
+> **Build 26 boot (15:22:53): wire inside 20 µs held from +46 s** (ledger 18 >450 · 19 242 · 22
+> 209 · 24 74 · 25 67 · 26 46). The Mac slept again 15:26:42–15:43:00; during it the server logged
+> A disconnect/reconnect 15:28:09→12 and B 15:31:21→24 — client-initiated, 3 s apart, i.e. the
+> dead-session detector or the bailout doing its job while nobody watched (the a.log gap hides
+> which). Runtime params (knee 150, align on) survived, no reboot. Align graded 15:43:30–15:54.
+> B's serial is still wedged post-OTA (logger restarted, no output) — needs a replug.
+>
+> **Align run 15:25:56–15:56 (sign flipped): still wrong, and self-reinforcing.** A's bias walked
+> −159 → −164 → −339 µs while its group delta grew −124 → −305; two outlier pairs (−22.9 ms,
+> −35.9 ms) were correctly rejected. Wire at −605 µs by 15:57 — but the Mac slept 15:43:52–15:56:30
+> and the server logged both speakers dropping and reconnecting inside the window, so the wire
+> cannot arbitrate the sign from this run. Align disabled, both speakers restarted 15:57 to clear
+> the standing biases (nothing else could — fixed in build 27: `align_max_us 0` zeroes the bias).
+> **Build 27 demotes align to SHADOW** (`align_apply`, default 0): the step is computed and
+> logged, nothing moves, and the sign is settled by regressing the logged would-be step against
+> the wire before anything is applied. CLAUDE.md said shadow first; this is the cost of not.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
