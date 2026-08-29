@@ -638,6 +638,17 @@
 > logged, nothing moves, and the sign is settled by regressing the logged would-be step against
 > the wire before anything is applied. CLAUDE.md said shadow first; this is the cost of not.
 >
+> **Build 27 (fleet, 16:02:53) and the first clean 30-minute window (16:05:54–16:35:55, shadow
+> align, knee 150):** n=23,563, median −33 µs, robust sd 16.8, change 0.32 / 2.4 / 6.7 / 9.7 /
+> 11.3 µs over 1/10/30/60/120 s; **zero TAGFAULT, zero server-silence events, no reconnects**;
+> the observer's 16:15 starvation was absorbed silently. Cycle time: wire inside 20 µs from +4 s
+> (both boards rebooted together into the same state — not a fair number), A inside 75 µs at
+> +142 s. **Align sign, settled by shadow:** A's group delta (median −36) vs wire B−A (median −35),
+> r = +0.72 over 248 pairs — negative delta = A late = wire negative, so the build-23 convention
+> (step = +delta·gain, advance when late) is RIGHT; the 15:56 runaway had two session drops
+> inside it and cannot be read. Next: apply with a tiny cap (align_max_us 60, step 2) and watch
+> the wire for ten minutes — bounded harm, decisive result.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

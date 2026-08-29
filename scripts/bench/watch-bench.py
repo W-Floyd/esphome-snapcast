@@ -11,7 +11,8 @@ LOGS={"A":"a.log","B":"b.log","OBS":"observer.log"}; CSV="test.csv"
 COOL=300; last={}
 def emit(kind,msg):
     t=time.time()
-    if t-last.get(kind,0)<COOL: return
+    cool=1800 if kind.endswith("LOGGAP") else COOL   # a wedged tail is one event, not one per 5 min
+    if t-last.get(kind,0)<cool: return
     last[kind]=t; print(time.strftime("%H:%M:%S"),kind,msg,flush=True)
 pos={k:os.path.getsize(v) for k,v in LOGS.items()}
 lastline={k:time.time() for k in LOGS}

@@ -21,7 +21,9 @@ def near(t):
     i=bisect.bisect_left(ws,t-2); j=bisect.bisect_right(ws,t+2); return st.mean(w[1] for w in wire[i:j]) if j-i>5 else None
 def corr(x,y):
     mx,my=st.mean(x),st.mean(y); sx=math.sqrt(sum((p-mx)**2 for p in x)); sy=math.sqrt(sum((p-my)**2 for p in y)); return sum((p-mx)*(q-my) for p,q in zip(x,y))/(sx*sy) if sx and sy else float('nan')
-for board,f,expect in (("A","a.log",-1),("B","b.log",+1)):
+# Convention: a NEGATIVE delta = this board is LATE. Wire is B-A, so A late <=> wire negative <=> r(delta_A, wire) POSITIVE;
+# B late <=> wire positive <=> r(delta_B, wire) NEGATIVE.
+for board,f,expect in (("A","a.log",+1),("B","b.log",-1)):
     out=subprocess.run(f"tail -c 40000000 {f} | grep -a 'RALIGN' | grep -oaE '^\\[[0-9:.]+\\]|group [-+0-9]+'",shell=True,capture_output=True,text=True).stdout.split("\n")
     x=[];y=[]
     for i in range(0,len(out)-1,2):
