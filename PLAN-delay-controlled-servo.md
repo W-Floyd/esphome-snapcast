@@ -258,6 +258,15 @@
 > aggressive catch-up decide on err_tag while tags are live (prediction only as the fallback), with
 > a re-measure guard (no repeat until the tags post-date the last action by one blank interval).
 >
+> **Build 14, WIRE 22:13–22:24:30 (11.5 min, n=11156, ZERO rows rival-gated): mean +5.5 median +4.0
+> MAD 5.3 sd 8.9 p2p 45.2 µs.** No hard resyncs, no repairs, no splice episodes on either board
+> through the span — the first window since the morning with nothing in it but the loop and the
+> common-mode wander. Comparable to build 12's quiet 10 min (sd 5.2 / p2p 30.4); against the
+> morning baseline sd 46.7 / p2p 243. On-device over the same span: A median −3 MAD 102, B −2
+> MAD 110 (common mode, r = 0.995), **differential err median +2 MAD 9 p5 −20 p95 +27 µs, and an
+> event census of exactly zero on both boards** — no resyncs, splices, out-of-range holds, stale
+> tags, mutes or repairs.
+>
 > Two findings from running it: **"SPLITINJECT ramp complete" is an unreliable witness** — it
 > logs only when the zero lands on a chunk that spends a whole frame, and this run reached zero
 > silently; use the SYNCX `drift`/`split` step as the positive control. And the boards wobble
