@@ -2674,3 +2674,21 @@ any target the subtraction inverts. Judge path keeps the full horizon.
 **Prediction:** tag residual steps fire one block (~0.65 s) after the ledger step instead of 3.4 s;
 pend= prints nonzero at those decisions; all six injections ≤ ~11 s (2 s detect + step + land ~3 s +
 5 s hold), no double-steps (no equal-size ledger/tag pairs), TAGFAULTs 0.
+
+### 2026-08-30 18:14–18:21 — build 79 graded: 10/10/10 s clean, the residue is a deadline tail
+
+Six injections 50 / 34 / 30 / 10 / 10 / 10 s, TAGFAULTs 0. The machinery predicted held: pend printed
+in flight (+2721), the sign guard zeroed inverted targets, three runs hit the 10 s goal exactly
+(which includes the 5 s hold — convergence ~5 s). Two residues:
+1. One block of pend margin is marginal post-hole (pipe drained, landing ~12 ms out): +1429 stepped,
+   0.64 s later pend=+0, +992 re-stepped → −1163 overshoot. Fixed: two blocks (build 54's lesson).
+2. The slow runs are all post-window tails: wire and gd read −150..−450 µs while err_tag AND the
+   ledger read ~0 (SHADOW diff −12..−56), and the observer's PHASEIN sees only ~20 % of the wire
+   error in the beaconed phase — every on-device signal shares the deadline, so the deadline itself
+   moved. The per-board deadline term is the shared-offset EWMA in tsf_sync; nothing on that path
+   logs below the 2000 µs snap. Build 80 adds OFFDBG (rawgap/dflt/sandwich/trust, 0.5 Hz) before any
+   fix — suspect the instrument-free path, do not fix blind.
+**Prediction (hypothesis):** during an injection OFFDBG shows dflt walking ~200-400 µs on the
+injected board (burst-biased samples or feed-forward across the stall) and relaxing over tens of
+seconds, matching the wire tail. If dflt stays flat, the hypothesis is dead and the tail source
+must be sought between the deadline and the DAC instead.
