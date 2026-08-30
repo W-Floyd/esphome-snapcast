@@ -2284,3 +2284,18 @@ chunk after 2 s so the network task survives and the stall/dead-session paths ca
 in two lines with records=, stream_active and iterations. The 'Render phase' log line (on B's 07:51
 logger-ring crash stack) is VERBOSE. Reproduction is a ≥40 s server hole; the next one will name the
 player's phase and the queue depth.
+
+### 2026-08-30 08:09–08:37 — the wedge cleared itself (api.reboot_timeout), build 61 graded
+
+Both boards came back by ESPHome's `api.reboot_timeout` (15 min without an API client: HA dropped them
+at 07:54:57/07:55:37 → software resets 08:09:57/08:10:38, no panic). Build 61 flashed 08:14:04; locked
++25 s (B, own error) / +20 s (A, on group agreement).
+
+**Align gain 0.3 with the kick, per-minute wire medians (µs):** −11, −6, −5, −7, −3, +0.7, −0.1 | +17 (event)
+| +5.7, +3.3 | event | −24, −6, −23 (events) | −4, −0.3, −0.9, +5.9, +1.0, +0.5. Mean inside ±1 within ~6 min
+of boot and again within ~4 min after each disturbance; MAD 0.6–2 µs in quiet minutes. No hunting.
+
+**Common march persists:** A's bias −15 → +67 in 20 min while B's stayed +25…+50; A's delta read
+negative in 17 of 20 cycles (−6…−18) with B's near zero or positive — the sum of deltas is still
+negative on average. The pairing-age × mapping-ramp mechanism (07:42 entry) stands; at this rate A
+reaches the +500 cap in ~2 h. Beacon sample-age fix next.
