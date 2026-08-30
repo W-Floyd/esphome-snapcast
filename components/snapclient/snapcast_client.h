@@ -939,6 +939,7 @@ class SnapcastClient {
     static constexpr size_t WIN_STEPS = 8;
     int64_t win_step_us[WIN_STEPS]{};
     int64_t win_step_at_us[WIN_STEPS]{};
+    int64_t win_step_land_frame[WIN_STEPS]{};  // pushed_frames_total_ the step was applied at (landed when played passes it)
     size_t win_step_idx{0};
     /// No NVS integral was restored at boot: seed from the TSF crystal estimate at first engage
     /// and run the fast boot Ti; a fresh board otherwise winds ~56 ppm through Ki over 10+ min.

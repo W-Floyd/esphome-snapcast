@@ -2878,7 +2878,15 @@ void SnapcastClient::player_task_() {
     }
     st.ledger_prev_err_us = error_us;
     const bool coarse_ok =
-        !coarse_on_tags || st.coarse_act_us == 0 || st.dl_err_at_us > st.coarse_act_us + blank_us;
+        !coarse_on_tags || st.coarse_act_us == 0 ||
+        // IN THE WINDOW THE PACING IS STRUCTURAL, NOT TEMPORAL: one step per block (the sameblk
+        // rule) with steps still in flight subtracted frame-exactly (pend, below). A block that
+        // straddles a landing reads err_pre; err_pre - pend is exactly the residual the step will
+        // leave, so acting on it is correct and immediate -- the 3.2 s travel blank existed only
+        // because build 78's time-estimated pend could not be trusted. The judge path ("did the
+        // step work") keeps the full blank_us horizon: it must observe the outcome, not predict it.
+        (resync_window && st.dl_err_at_us > st.coarse_act_us) ||
+        st.dl_err_at_us > st.coarse_act_us + blank_us;
     // In the window, an error above the arm that takes NO step is the case that needs explaining
     // (build 44, B at +600 us for 45 s). One line per block, never per chunk: ~38 lines/s crashes
     // the ESPHome logger's ring buffer.
@@ -3213,20 +3221,30 @@ void SnapcastClient::player_task_() {
       // ring depth + one block, and the target is what the tags will read once they have landed.
       int64_t pending_us = 0;
       if (resync_window && coarse_on_tags) {
-        // The step is taken from the chunk entering the RING, which holds ~1.7 s ahead of the push
-        // into the pipeline (~250 ms), and the block that reads it is ~650 ms long: ring + pipeline
-        // + block. Build 52 used pipeline + block alone and pend= read 0 at every decision.
-        const int64_t horizon_us =
-            static_cast<int64_t>(ring_ms) * 1000 +
-            st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
-            static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
+        // A step has LANDED when the DAC has played past the frame index it was applied at: the drop
+        // is consumed where pushed_frames_total_ advances and the tags are observed where
+        // played_frames_total_ advances, so the two counters straddle exactly the travel that
+        // matters. Build 78 estimated the travel as instantaneous ring+pipe+block, which under-reads
+        // while the ring is drained post-hole: pend read +0 at every decision and the next tag round
+        // re-stepped each ledger step in full (17:54:10 +2729 ledger, 17:54:13 +2766 tag). One block
+        // of margin on top -- the tag average must complete a block of post-landing audio before the
+        // step is visible in coarse_err. 6 s hard expiry in case a rebaseline moved the counters
+        // underneath a recorded index.
+        const int64_t block_frames =
+            static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US *
+            static_cast<int64_t>(rec.params.sample_rate) / 1000000;
         const int64_t now_p = now_us();
         for (size_t i = 0; i < ServoState::WIN_STEPS; i++) {
-          if (st.win_step_at_us[i] != 0 && now_p - st.win_step_at_us[i] < horizon_us) {
+          if (st.win_step_at_us[i] == 0 || now_p - st.win_step_at_us[i] > 6000000)
+            continue;
+          if (this->played_frames_total_ < st.win_step_land_frame[i] + block_frames)
             pending_us += st.win_step_us[i];
-          }
         }
         coarse_target_us -= pending_us;
+        // The subtraction must never manufacture a step the measurement did not ask for: if the
+        // in-flight accounting flips the sign of the target, the honest statement is "wait".
+        if (pending_us != 0 && (coarse_target_us > 0) != (coarse_err_us > 0))
+          coarse_target_us = 0;
       }
       // A ONE-BOARD POSITION STEP ON A COMMON ERROR IS A DIFFERENTIAL ERROR. After a boot into a
       // running group err_tag is mostly the +-150 us common deadline wander, and A's window steps on
@@ -3308,6 +3326,10 @@ void SnapcastClient::player_task_() {
         st.win_step_us[st.win_step_idx] =
             static_cast<int64_t>(adjust) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
         st.win_step_at_us[st.win_step_idx] = st.resync_step_at_us;
+        // Landing marker: the drop is consumed inside THIS chunk's push, so it has reached the DAC
+        // once played_frames_total_ passes the pipeline position the chunk occupies.
+        st.win_step_land_frame[st.win_step_idx] =
+            this->pushed_frames_total_ + static_cast<int64_t>(frames);
         st.win_step_idx = (st.win_step_idx + 1) % ServoState::WIN_STEPS;
       }
       st.steer_dir = 0;
@@ -4434,6 +4456,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
     std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
+    std::fill(std::begin(st.win_step_land_frame), std::end(st.win_step_land_frame), 0);
     st.resync_inside_since_us = 0;
     ESP_LOGI(TAG, "Delay loop: resync window re-opened on a %+.0f us step t=%" PRId64, e, now);
   }
@@ -4507,6 +4530,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
     std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
+    std::fill(std::begin(st.win_step_land_frame), std::end(st.win_step_land_frame), 0);
     st.phase_transient_until_us = std::max(st.phase_transient_until_us, now + PHASE_TRANSIENT_US);  // re-engage = deadline source change
     ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
              st.trim_integral_ppm, st.dl_err_us, now);
@@ -4823,6 +4847,7 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
       now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
     std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
+    std::fill(std::begin(st.win_step_land_frame), std::end(st.win_step_land_frame), 0);
   // Every event that re-arms the gain schedule -- a hard resync, a timebase re-anchor -- also
   // displaced audio or stepped the deadline mapping, so the tags of audio already in flight
   // describe the OLD placement. Blank the delay loop's tag stream for one pipeline depth, same as
