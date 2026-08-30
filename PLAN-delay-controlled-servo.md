@@ -2200,3 +2200,13 @@ deadlines. Proposal: unmute on group agreement (|gd| small for N s, or no peer) 
 err_tag — seconds instead of minutes after a boot or reconnect — keeping the err_tag rule when the
 delta is unknown. Operator's call: it trades a common ~0.5 ms offset from the server's timeline
 (inaudible as such) for 2–3 minutes of silence.
+
+### 2026-08-30 07:20 — build 58: unmute on group agreement (own error ≤ 4 ms); never_mute covers start-up
+
+Operator: a few ms from the server's timeline is tolerable (3–5), mutual offset is not; and "never mute
+means never mute, even during startup". Build 58: the unmute latch passes when own error is inside
+2 × sync_deadband as before, OR the group delta is inside that band and own error ≤ `UNMUTE_COMMON_US`
+(4 ms); delta unknown → own-error rule; `never_mute` no longer silences start-up at all. Prediction for
+this boot: "Sync locked on group agreement" within ~20–40 s of boot (first pairing ≈ +14 s, a median
+window of agreement), correlation on the wire at about the same time instead of +150…190 s. The build-57
+align grade (deadband 1, gain 0.03) was cut short by this flash; it restarts after the boot settles.
