@@ -2658,3 +2658,19 @@ chunk-to-chunk (+41.8/+27.7/+36.4/+42.2 in 300 ms during the 17:41:51 burst), le
 floor). Prediction: every injection ~10–13 s; tails only where the gate's gd floor leaves them.
 cmp=1 big-drift census reads 49 % but the window was all bursts (genuine ledger displacement is real
 and comparable during refill); the decisive check — drift consumers — reads zero on both boards.
+
+### 2026-08-30 18:0x — build 78 graded, build 79: frame-exact pend, block-cadence decisions
+
+78's six injections: 11 / 30 / 11 / 14 / 24 / 6 s. The stability gate landed every ledger first step
+at +1.9 s, but the logs show the remaining cost is structural: pend read +0 at every decision (its
+travel estimate — instantaneous ring+pipe+block — under-reads while the ring is drained post-hole),
+so the next tag round re-stepped each ledger step in full (17:54:10 +2729 ledger → 17:54:13 +2766
+tag), and every extra round cost a 3.2 s blank plus the landing. The landing instant is exactly
+knowable: the drop is consumed where pushed_frames_total_ advances, tags are observed where
+played_frames_total_ advances — landed when played passes the recorded index (+1 block for the tag
+average, 6 s expiry against rebaselines). With pend frame-exact, the window's act blank is
+unnecessary: one step per block (sameblk), err_pre − pend IS the coming residual, sign guard zeroes
+any target the subtraction inverts. Judge path keeps the full horizon.
+**Prediction:** tag residual steps fire one block (~0.65 s) after the ledger step instead of 3.4 s;
+pend= prints nonzero at those decisions; all six injections ≤ ~11 s (2 s detect + step + land ~3 s +
+5 s hold), no double-steps (no equal-size ledger/tag pairs), TAGFAULTs 0.
