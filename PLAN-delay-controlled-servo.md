@@ -2210,3 +2210,27 @@ means never mute, even during startup". Build 58: the unmute latch passes when o
 this boot: "Sync locked on group agreement" within ~20–40 s of boot (first pairing ≈ +14 s, a median
 window of agreement), correlation on the wire at about the same time instead of +150…190 s. The build-57
 align grade (deadband 1, gain 0.03) was cut short by this flash; it restarts after the boot settles.
+
+### 2026-08-30 07:22–07:40 — build 58 boot; align at 0.03 crawls; build 59 delivers align steps by rate
+
+**Build 58 boot (07:22:17):** connected/first audio +7.5 s; wire correlated **+14 s** at +28 µs (never_mute
+now means no start-up silence); first group delta +15 s; B "Sync locked" +19.7 s (own error), A +26.4 s
+"on group agreement" (own err 369 µs; the anchor held it 2.6 s reading −29 ms — the drift flip). Previous
+boot: +150 / +186 s.
+
+**Align at gain 0.03, deadband 1:** wire −60 → −31 µs in 12 min while the two biases moved a combined
+78 µs and the deltas stayed at A −25 / B +17 the whole time — the correction is not reaching the phases
+at the rate it is applied, because a bias moves the deadline and the audio follows through the PI at
+τ = 120 s. The gain is small *because* of that lag; the lag is the thing to remove.
+
+**Build 59 — ALIGN KICK:** a bias change of D is delivered as position immediately, by lowering/raising
+the rate by up to 10 ppm until D has moved (5 µs in ~0.5 s), inside `delay_loop_update_` after the PI
+output. Align's loop lag becomes the ~3.5 s tag visibility; runtime `align_gain 0.3`, `align_deadband_us
+1`, `align_step_us 20`. Prediction: the wire's mean reaches 0 ± 5 µs within ~1–2 min of any offset and
+holds; no multi-minute sawtooth. Risk to watch: the kick and the PI's own P response overlap for ~2 s
+after each step (0.04 ppm at 5 µs — should be invisible).
+
+**"A's rate PWM is larger than B's" (sub-second):** both brackets are the same width (A 53/309..47/274,
+0.83 ppm; B 29/169..81/472, 0.88 ppm) — the difference is duty: A 0.97 (one opposite tick in ~33 → a
+~0.3 s repeating bump), B 0.57 (toggles every couple of 10-ms ticks). Same 0.85 ppm × 10 ms ≈ 8 ns per
+toggle; cosmetic on the fs trace. A second-order or dithered sigma-delta would whiten it.
