@@ -4625,6 +4625,9 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sa
     const int64_t in_flight_us = static_cast<int64_t>(in_flight) * frame_us;
     const int64_t effective_us = err_us - in_flight_us;
     if (st.fast_splice_active) {
+      // Splicing every chunk: my phase does not describe my audio until a horizon after the LAST
+      // spliced frame, so keep the transient rolling (the engage-site mark alone expired mid-splice).
+      st.phase_transient_until_us = std::max(st.phase_transient_until_us, now_us() + PHASE_TRANSIENT_US);
       // Release inside half the ARM threshold: with the resync window arming at 100 us, a fixed
       // 300 us release sat ABOVE the arm point and the splice re-engaged every release (build 31
       // boot: engaged at -102, -104, -104 us in a row). Steady state keeps its 300 us.
@@ -5148,12 +5151,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int64_t own_f = static_cast<int64_t>(measured.dbg_own_us) * rate_i / 1000000;
             const int64_t xfer_f = static_cast<int64_t>(measured.dbg_xfer_us) * rate_i / 1000000;
             ESP_LOGD(TAG,
-                     "RECON drift=%" PRId32 " acct=%" PRId64 " meas=%" PRIu32 " sum=%" PRIu32 " own=%" PRIu32
+                     "RECON drift=%" PRId32 " cmp=%d acct=%" PRId64 " meas=%" PRIu32 " sum=%" PRIu32 " own=%" PRIu32
                      " xfer=%" PRIu32 " inflight=%" PRIu32 " queued=%" PRIu32 " dma=%" PRIu32 " age=%" PRId64
                      " pushed=%" PRId64
                      " played=%" PRId64 " clamped=%" PRId64 " | srcrx=%" PRIu32 " srctx=%" PRIu32 " sinkrx=%" PRIu32
                      " r_push=%" PRId64 " r_src=%" PRId64 " r_mix=%" PRId64 " pad=%" PRIu32,
-                     fill_drift_us, accounted_us, measured.microseconds,
+                     // cmp=0: the snapshot fell inside a blocking write (or its history is unusable)
+                     // and NOTHING consumes this drift -- the census of 14:23 counted 32 % of lines
+                     // beyond 5 ms that were all cmp=0-class prints of refused snapshots.
+                     fill_drift_us, fill_comparable ? 1 : 0, accounted_us, measured.microseconds,
                      measured.dbg_own_us + measured.dbg_xfer_us + measured.dbg_inflight_us + measured.dbg_queued_us +
                          measured.dbg_dma_us,
                      measured.dbg_own_us, measured.dbg_xfer_us, measured.dbg_inflight_us, measured.dbg_queued_us,
