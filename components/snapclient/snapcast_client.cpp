@@ -462,6 +462,8 @@ static constexpr int64_t DL_ERR_STALE_US = 1000000;
 // and how long the ledger takes over before tags are trusted again.
 static constexpr uint8_t TAG_FAULT_MISSES = 3;
 static constexpr int64_t TAG_SPLIT_US = 3000;  // tag vs ledger disagreement that makes a miss a fault
+static constexpr int64_t TAG_JUDGE_US = 1000000;   // measurement lag before a correction is judged
+static constexpr int64_t TAG_SETTLE_US = 20000000; // no fault judgement in the first 20 s after engage
 static constexpr int64_t TAG_FAULT_US = 180LL * 1000000;  // 60 expired before the repair got its window (14:29-14:33)
 // Tag-stream blanking after a setpoint change / hard resync / timebase re-anchor: one pipeline
 // depth (~250-300 ms measured) plus margin, so every arrival folded into a block was scheduled
@@ -2694,7 +2696,21 @@ void SnapcastClient::player_task_() {
                                             this->tune_resync_blank_ms_.load(std::memory_order_relaxed))
                                  : this->tune_blank_ms_.load(std::memory_order_relaxed)) *
         1000;
-    if (tags_fresh && st.coarse_act_err_us != 0 && st.dl_err_at_us > st.coarse_act_us + blank_us) {
+    // JUDGE ONLY AFTER THE MEASUREMENT CAN SHOW THE EFFECT. The action cadence (blank_us, 200 ms in
+    // the resync window) is not the measurement lag (pipeline ~280 ms + one block ~650 ms): build 32
+    // judged three actions inside one lag and faulted BOTH boards 20 s after boot on the normal
+    // post-boot tag/ledger settling (+3.1 vs -0.9 ms), reconnecting them for nothing. Judge at
+    // max(blank, TAG_JUDGE_US), and not at all in the first TAG_SETTLE_US after engage.
+    const bool settled = st.dl_engaged_since_us != 0 && now_us() - st.dl_engaged_since_us > TAG_SETTLE_US;
+    if (tags_fresh && st.coarse_act_err_us != 0 &&
+        st.dl_err_at_us > st.coarse_act_us + std::max<int64_t>(blank_us, TAG_JUDGE_US)) {
+      if (!settled) {
+        st.coarse_act_err_us = 0;
+        st.tag_miss = 0;
+      }
+    }
+    if (tags_fresh && st.coarse_act_err_us != 0 && settled &&
+        st.dl_err_at_us > st.coarse_act_us + std::max<int64_t>(blank_us, TAG_JUDGE_US)) {
       const int64_t before = std::abs(st.coarse_act_err_us);
       st.coarse_act_err_us = 0;
       // A miss counts only while the tags and the ledger DISAGREE: on B at 14:37:54 both read
