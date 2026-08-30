@@ -2634,3 +2634,14 @@ one fault at 16:59 was the gap/rebaseline door, closed in `b26c7a4`). 30-min gra
 hole inside: median +1.6 µs, robust sd 9.0, 75 % inside ±10 µs. The 32–34 s recoveries are the tag-blank
 horizon itself now in the path (tags quiet ~4 s → first step later than before); acceptable against the
 faults it removes — revisit only if <15 s matters more than fault-free holes.
+
+### 2026-08-30 17:35 — build 77: computed travel horizon; the <10 s resync project opens
+
+Operator: take option 2, then drive post-hole convergence under 10 s. Build 77 replaces the fixed 4 s
+tag blank with `travel_horizon_us_()` = ring + pipeline + two blocks (live mirrors, clamp 1–5 s;
+~2.7 s at the 2 s server buffer). Its injection run prints per-event timelines (hard resync, each
+RSTEP, window close, relative to the injection) so the 24–34 s budget decomposes into named intervals.
+Known structure of the budget: hole 0.3 s → hard resync ~+2 s → ledger first step (now trustworthy,
+gain 1.0) → tags return at the horizon → one verify step → close. If the ledger's first step lands
+inside 100 µs — the ledger agrees with the tags to ~50 µs now — the target is reachable by trimming
+the resync detection (+2 s) and the close timer's place in the metric.
