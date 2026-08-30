@@ -1565,7 +1565,8 @@ class SnapcastClient {
   std::atomic<bool> tune_align_apply_{true};        // false = shadow: log the step, move nothing
   /// Resync window (s) after an event, and the splice threshold (us) inside it. Target: |A-B| < 100 us
   /// within 5 s of a disturbance.
-  std::atomic<float> tune_resync_win_s_{30.0f};
+  std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)
+  std::atomic<float> tune_resync_gain_{0.6f};    // fraction of the measured error corrected per step
   std::atomic<int32_t> tune_resync_splice_us_{100};
   std::atomic<int32_t> tune_resync_blank_ms_{900};  // step-and-verify cadence in the window: pipeline + one block
   std::atomic<int32_t> tune_block_n_{64};

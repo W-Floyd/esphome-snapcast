@@ -3031,8 +3031,16 @@ void SnapcastClient::player_task_() {
       }
       // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
       // doesn't leave playback audibly behind for long
+      // DAMPED in the resync window: the block error lags the audio by a block, so correcting all
+      // of it each step rang (build 34, 300 ms injection on A: -4717 -> +4125 -> -1251 -> +740 us).
+      // Correcting resync_gain (60 %) of it converges in three steps without the overshoot.
+      const int64_t coarse_target_us = coarse_on_tags ? coarse_err_us : median_err_us;
+      const int64_t coarse_step_us =
+          resync_window ? static_cast<int64_t>(static_cast<float>(coarse_target_us) *
+                                               this->tune_resync_gain_.load(std::memory_order_relaxed))
+                        : coarse_target_us;
       const int32_t adjust_frames =
-          static_cast<int32_t>((coarse_on_tags ? coarse_err_us : median_err_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
+          static_cast<int32_t>(coarse_step_us * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
       // RESYNC WINDOW = STEP AND VERIFY. One correction of the whole measured error per measurement
       // lag (resync_blank_ms ~ pipeline + one block), bounded at half a chunk, and the continuous
       // fast splice stays OUT of the window: build 33 ran both at once and the splice bang-banged
@@ -4474,6 +4482,9 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_win_s") {
     if (!(value >= 0.0f && value <= 600.0f)) return false;
     this->tune_resync_win_s_.store(value, std::memory_order_relaxed);
+  } else if (name == "resync_gain") {
+    if (!(value >= 0.1f && value <= 1.0f)) return false;
+    this->tune_resync_gain_.store(value, std::memory_order_relaxed);
   } else if (name == "resync_blank_ms") {
     if (!(value >= 50.0f && value <= 2000.0f)) return false;
     this->tune_resync_blank_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);

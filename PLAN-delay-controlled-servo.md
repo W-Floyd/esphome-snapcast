@@ -822,6 +822,14 @@
 > one bounded (≤ half a chunk) correction of the measured error per `resync_blank_ms` (900 ≈
 > pipeline + block), arming at 100 µs — and the PI runs at the floor tau regardless of the knee.**
 >
+> **Build 34 measured (22:36:50):** boot < 100 µs from +48 s, zero post-boot faults. Injected 300 ms
+> on B: **+11 s**. On A: +31 s — step-and-verify RANG (−4717 → +4125 → −1251 → +740 µs: full-error
+> steps against a block-lagged measurement), then parked at −114 µs exactly as the 30-s window
+> closed. 1000 ms on A: +21 s (18 s of it the analyser out of range, >17 ms). A false TAGFAULT at
+> 22:42:39 on the second A injection: a 1-s judge lag still saw pre-correction samples in the block
+> average → build 35 judge lag 2 s. **Build 36:** damped steps (`resync_gain` 0.6), window 60 s.
+> Resync ledger (300 ms injection → |A−B| < 100 µs held 5 s): 31: 12 s · 34: 11 s (B) / 31 s (A).
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
