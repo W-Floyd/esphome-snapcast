@@ -275,7 +275,10 @@ block starts after the step), bounded at half a chunk; the ledger may take the f
 bang-banged against the block-averaged error), and the PI runs at the floor tau regardless of the
 knee. Tag-fault judgement waits 2 s and never fires in the first 20 s after engage (builds 32/33
 faulted both boards 20 s after boot on the normal settling). Ledger (300 ms injection → <100 µs held
-5 s): build 31 12 s · 34 11/31 · 36 8/9/13/17 · 37 see PLAN. Boot to <100 µs: 31 27 s · 34 48 · 36 24.
+5 s): build 31 12 s · 34 11/31 · 36 8/9/13/17 · 37 9/–/7/15 · 40 11/34/10/8 (flat tails, no drift). Boot to
+<100 µs: 31 27 s · 34 48 · 36 24 · 37 22 · 40 34. No per-board rate boost anywhere since build 40 (see the
+rule below); build 41 removes the knee for the same reason; build 42 arms the in-window step at 100 µs
+with one step per block.
 
 **THE RULE THAT EXPLAINS THE STAIRS (measured 22:58, build 37): any gain that only one board has
 converts common-mode error into differential motion.** After a one-board disturbance A ran its

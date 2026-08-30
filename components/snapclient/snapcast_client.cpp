@@ -3023,7 +3023,11 @@ void SnapcastClient::player_task_() {
                         : (coarse_on_tags ? static_cast<int64_t>(FAST_SPLICE_MAX_FRAMES) * 1000000 /
                                                 static_cast<int64_t>(rec.params.sample_rate)
                                           : SOFT_CORRECTION_AGGRESSIVE_US)) &&
-               coarse_ok) {
+               coarse_ok && (!resync_window || !coarse_on_tags || st.dl_err_at_us != st.resync_last_block_us)) {
+      // In the window a tag-based step needs the error to have PERSISTED across a block boundary:
+      // the block used for the previous decision may not be used again (one block, one step), and
+      // with the arm at 100 us this is what keeps the +-60 us block noise from being stepped on.
+      if (resync_window && coarse_on_tags) st.resync_last_block_us = st.dl_err_at_us;
       // On the MEASURED error the catch-up threshold is the fast splice's own 128-frame bound
       // (~2.9 ms), not 10 ms. Between the two nothing corrected: the splice episode hit its bound
       // "with -8 ms still standing", declared a measurement fault (a rule written for the
