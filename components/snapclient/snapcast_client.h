@@ -1488,6 +1488,7 @@ class SnapcastClient {
 #endif
   uint16_t next_message_id_{0};
   bool stream_active_{false};
+  bool emit_room_wait_logged_{false};  // emit_pcm_ has already reported this ring-room episode
   // Written by the network task on every chunk, read from the main loop
   std::atomic<int64_t> last_chunk_us_{0};
   int64_t next_time_sync_us_{0};

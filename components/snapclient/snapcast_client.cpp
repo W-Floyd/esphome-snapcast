@@ -606,6 +606,10 @@ static constexpr int32_t DRIFT_REPAIR_US = 2000;
 // a silent unbounded wait is indistinguishable from a dead task, which is exactly how three wedges
 // today read in the logs. Long enough that ordinary inter-chunk gaps never trip it.
 static constexpr int64_t PUSH_STALL_LOG_US = 3000000;
+// How long emit_pcm_ (the network task) may wait for ring room before dropping the chunk instead.
+// Two seconds is longer than any legitimate drain wait (one chunk frees in 26 ms) and far shorter
+// than the dead-session and bailout detectors, which must keep running on this task.
+static constexpr int64_t EMIT_ROOM_WAIT_MAX_US = 2000000;
 // How long the player may go without completing a chunk before the main loop says so. Well past
 // any legitimate gap: the keepalive path completes chunks, and a stream that has genuinely ended
 // clears stream_active_, which gates the warning.
@@ -948,28 +952,31 @@ void SnapcastClient::loop() {
       // serving. One cause explains all of that at once: an exhausted heap. The mixer cannot
       // allocate its ring buffer on start, sockets cannot be accepted, mDNS cannot answer, and the
       // main loop carries on because it allocates nothing.
-      ESP_LOGE(TAG,
-               "PLAYER STALLED: no chunk completed for %" PRId64 " s, phase=%s, ring=%zu bytes, "
-               "output_active=%d, heap free=%" PRIu32 " largest=%" PRIu32 " min_ever=%" PRIu32
-               " records=%u iters=+%" PRIu32 " -- audio is not being written",
+      // TWO LINES, because the one line was 300+ bytes and the 256-byte formatting ceiling cut it
+      // at "output_active=0, he" on every 2026-08-30 07:53 occurrence -- records=, the field the
+      // comment below calls decisive, was never printed (see CLAUDE.md: no load-bearing line may
+      // have a variable-length tail).
+      ESP_LOGE(TAG, "PLAYER STALLED: no chunk completed for %" PRId64 " s, phase=%s, ring=%zu bytes, records=%u, "
+                    "output_active=%d, stream_active=%d, iters=+%" PRIu32,
                (now - this->player_progress_at_us_) / 1000000,
                phase < (sizeof(PHASE_NAMES) / sizeof(PHASE_NAMES[0])) ? PHASE_NAMES[phase] : "?",
                this->pcm_ring_ != nullptr ? this->pcm_ring_->available() : 0,
-               this->output_active_.load(std::memory_order_relaxed) ? 1 : 0,
-               static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
-               static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
-               static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)),
                // THE decisive field. A full ring with an EMPTY queue means PCM nobody has a record
                // for; a full ring with records waiting means the player is not consuming them, and
                // those are opposite bugs. Everything so far has been inferred from which of the two
                // is true, and it was never actually measured.
-               this->record_queue_ != nullptr
-                   ? static_cast<unsigned>(uxQueueMessagesWaiting(this->record_queue_))
-                   : 0u,
+               this->record_queue_ != nullptr ? static_cast<unsigned>(uxQueueMessagesWaiting(this->record_queue_)) : 0u,
+               this->output_active_.load(std::memory_order_relaxed) ? 1 : 0, this->stream_active_ ? 1 : 0,
                // Iterations since the last report. Zero means the task is genuinely blocked;
                // non-zero means it is running and taking a path that never completes a chunk,
                // which the phase stamp cannot show because every such path re-stamps IDLE.
                this->player_iters_.load(std::memory_order_relaxed) - this->player_iters_seen_);
+      ESP_LOGE(TAG,
+               "PLAYER STALLED heap: free=%" PRIu32 " largest=%" PRIu32 " min_ever=%" PRIu32
+               " -- audio is not being written",
+               static_cast<uint32_t>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+               static_cast<uint32_t>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)),
+               static_cast<uint32_t>(heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL)));
       this->player_iters_seen_ = this->player_iters_.load(std::memory_order_relaxed);
     }
   }
@@ -2322,13 +2329,34 @@ void SnapcastClient::emit_pcm_(const uint8_t *data, size_t len, int64_t server_t
   // Waiting for the space first is enough: either the whole chunk fits and its record follows, or
   // nothing is written and the player still has records for every byte in the ring, so it drains
   // and space appears. There is no state in between for a deadlock to live in.
+  // ... AND NEVER WAIT FOREVER. 2026-08-30 07:53: after a 40 s server outage and a dead-session
+  // reconnect, both speakers sat with ring=520704 (one chunk short of full), the player producing no
+  // line for minutes, the mixer never restarted, and this loop holding the network task -- no ping,
+  // no API, no OTA, replug only. Whatever wedged the player, the network task must outlive it: after
+  // EMIT_ROOM_WAIT_MAX_US the chunk is dropped (the audio is late by then anyway) and the session
+  // keeps serving time sync and control, so the stall detector and the dead-session/bailout paths
+  // can still act. Logged once per episode.
+  const int64_t room_wait_start = now_us();
   while (this->pcm_ring_->free() < len && !this->shutdown_.load(std::memory_order_relaxed)) {
     if (!this->output_active_.load(std::memory_order_relaxed) &&
         !this->stream_active_) {
       return;  // nothing is going to drain this; drop rather than hold the network task
     }
+    if (now_us() - room_wait_start > EMIT_ROOM_WAIT_MAX_US) {
+      if (!this->emit_room_wait_logged_) {
+        this->emit_room_wait_logged_ = true;
+        ESP_LOGE(TAG,
+                 "emit_pcm_: no ring room for %zu bytes after %" PRId64 " ms (ring %zu/%zu, records queued %u, "
+                 "output_active=%d) -- dropping chunks, not the network task",
+                 len, EMIT_ROOM_WAIT_MAX_US / 1000, this->pcm_ring_->available(), static_cast<size_t>(this->config_.buffer_size),
+                 static_cast<unsigned>(uxQueueMessagesWaiting(this->record_queue_)),
+                 this->output_active_.load(std::memory_order_relaxed) ? 1 : 0);
+      }
+      return;
+    }
     vTaskDelay(pdMS_TO_TICKS(10));
   }
+  this->emit_room_wait_logged_ = false;
   size_t written = 0;
   while (written < len && !this->shutdown_.load(std::memory_order_relaxed)) {
     written += this->pcm_ring_->write_without_replacement(data + written, len - written, pdMS_TO_TICKS(100));
