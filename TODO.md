@@ -1943,3 +1943,4 @@ Earned expensively; ignoring these cost hours.
 - The ±8 µs meander: P-term noise → `block_n` 64→128 or τ 120→240 (both cost response); measure the SF trade.
 - The wedge's player side: what blocks the player after a dead-session reconnect (mixer never restarted); reproduce with a ≥40 s server hole now that STALLED prints records=/iters.
 - Audit non-main-task ESP_LOGD lines (logger ring crashes); consider ESPHome logger task buffer size.
+- Repeat the single-board deadline-step test (freeze align, create a known bias via a small cap, zero it, watch 5 min) to measure deadline→wire gain; then revisit the 28 % figure with build 69's accumulator fix.

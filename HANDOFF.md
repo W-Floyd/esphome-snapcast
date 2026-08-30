@@ -592,3 +592,17 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
 * Build 64 quiet minutes: wire medians +0.1…+5.7 µs, MAD 0.3–1.9; delta sums ~0; recovery to ±3 within
   ~2 min of a timebase event. Build 65 makes align gain 0.3 / deadband 1 / step 20 the compiled defaults;
   a 45-min untouched grade started 09:45.
+
+## Builds 66–69 (2026-08-30 09:55–11:25)
+
+* 66: a tag distrust ends after three blocks of tag/ledger agreement within 1 ms (was a 180-s timer;
+  measured 13 s at 10:07 vs minutes of ledger-only steering on a ledger that flips by 52 ms).
+* 67: biases exchanged in the beacon; each device subtracts the group mean (≤2 µs/cycle). The common
+  march (+3 µs/min on both) is gone; biases hold within ±40 of zero.
+* 68: one `phase_transient_until_us` (window steps, hard resyncs, deadline fallback/re-engage) silences
+  the beacon; align runs only while own |err_tag| is in the unmute band. Boot lock +21/+25 s.
+* 69: align's fractional accumulator discards the clamped excess — a transient delta over the 20 µs cap
+  had been queuing +20 steps against later deltas (the "bias moves against its delta" oddities).
+* Measured, open: over 29 cycles only 28 % of the differential bias reached the wire within 10 s
+  (kicks verified delivered at +5 ppm·s each); a single-board deadline-step test was contaminated by a
+  timebase event — repeat in a quiet hour. Server holes every 10–30 min remain the dominant disturbance.
