@@ -2527,3 +2527,15 @@ new PHASEIN lines.
 Also from the step test's baseline: 13:10–13:14 the wire was noisy (MAD 20–38) with single-cycle delta
 readings of −62 (A) and +36/+52 (B) five minutes after boot — the PHASEIN lines around them are the
 first raw look at that class.
+
+### 2026-08-30 13:35 — the deadline-source flap is a first-order disturbance in its own right
+
+Census (today, per hour): `deadline on local fallback` A 2–24, B 1–32; consensus spreads > 1 ms 20–100.
+Each fallback flips the deadline by the shared-vs-local difference (~100 µs), the coarse path steps the
+audio to it (`RSTEP src=ledger +124, +155, −157` at 13:11–13:14), the PI holds and then re-engages with
+its P-term wherever it was (`P −9.47`), and the peer — correctly — sees a 100 µs move and aligns to it.
+The 13:10–13:14 baseline noise (MAD 20–38 µs) and B's bias walk −2 → −41 were all this. The mapping
+itself expires only after 5 s; these are single-call evaluation failures (a bad TSF sandwich or an
+age-clamp rejection) that last one chunk. Fix: hold the last good shared offset, extrapolated by the
+mapping drift, for a short grace period before declaring a fallback — a 1-s blip must not move the
+deadline. Build 73.
