@@ -2506,3 +2506,24 @@ So both actuator paths are whole; the "28 %" of 10:56 was the accumulator carryi
 in 69) plus a 10-s window on a τ = 120 s path. Open question left from this run: why the wire sat at +55
 when align was frozen five minutes after boot — the first minutes after a lock deserve a look with the
 new PHASEIN lines.
+
+### 2026-08-30 13:30 — build 72: three mechanisms from one afternoon's instruments
+
+1. **Stairs** (operator's plot 13:24, +46 → 0 in 5–13 µs steps): the 10 ppm kick lands each align step
+   inside ~1 s, then nothing for a cycle. Kick capped at 1.5 ppm — a 15 µs step becomes a 10-s ramp;
+   still 10× faster than the PI's τ. Same convergence time, no stairs.
+2. **Each board reads the other ~18 µs later** (PHASEIN on the speakers: A `4D74 d=+16`, B `85E8
+   d=+20`, ages 0.8–1.5 s): phase = tsf − server drifts at the mapping rate (`map +41 ppm`), and the
+   peer's sample was not extrapolated to my instant. Now `peer + drift × (mine_at − peer_at)`. The
+   re-centring had been absorbing this as common mode; every delta was inflated by it.
+3. **RECON drift = −52 245 µs exactly = 2 × 1152 frames, on 40 % of reports, always with xfer=50000.**
+   The mixer has copied a slice the ledger adds only when the blocking `on_audio_write` returns; the
+   pipeline is kept full by backpressure so writes block routinely and the mixer's snapshot lands inside
+   one. The ledger was right; the comparison was made at the wrong instant. Snapshots inside a write
+   window are now "not comparable". This "drift" armed the split repair, held the unmute anchor (`anchor
+   reads −49343`) and was the ledger side of every TAGFAULT disagreement. Prediction: RECON |drift| > 5 ms
+   on ~0 % of reports; far fewer TAGFAULTs after storms; unmute never waits on the anchor.
+
+Also from the step test's baseline: 13:10–13:14 the wire was noisy (MAD 20–38) with single-cycle delta
+readings of −62 (A) and +36/+52 (B) five minutes after boot — the PHASEIN lines around them are the
+first raw look at that class.
