@@ -794,6 +794,10 @@ static constexpr int64_t FAST_SPLICE_PERSIST_US = 4000000;
 // at the unmute instant risks waiting out the bound on every event and unmuting late with no
 // benefit. Tighten again once an event has been graded at this value.
 static constexpr int32_t UNMUTE_ANCHOR_US = 100;
+// Own error against the server timeline that is still acceptable to unmute into when the GROUP
+// agrees (see the unmute latch): a common offset of this size is inaudible as such; mutual offsets
+// are what the mute is for. Operator's bound 2026-08-30: 3-5 ms.
+static constexpr int64_t UNMUTE_COMMON_US = 4000;
 // A bound on that wait. Silence is also a defect: if the anchor never settles -- a mixer reporting
 // a depth that does not describe the whole pipeline, say -- unmuting late but audible beats staying
 // quiet, and the log line says which happened. Long enough for the ~3.3 s drift window to fill
@@ -3463,7 +3467,24 @@ void SnapcastClient::player_task_() {
     // are trim-only and inaudible.
     // The unmute/converged latch reads the measured error while tags are live: a biased ledger
     // otherwise keeps a board 'unconverged' with its audio perfectly placed (or vice versa).
-    if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) <= UNMUTE_BAND_DEADBANDS * this->config_.sync_deadband_us) {
+    // UNMUTE ON GROUP AGREEMENT. Mute-until-converged exists to hide MUTUAL desync; the group render
+    // delta measures exactly that. After a boot both boards read the same ~-700 us against the server
+    // timeline (common: the mapping, not a mutual offset), the gate rightly refuses one-board steps
+    // on it, and each board spent tau = 120 s closing it in silence before "Sync locked" (07:10 boot:
+    // A +150 s, B +186 s) -- while |group delta| was < 30 us from +30 s. Being a few ms from the
+    // server's timeline is tolerable (operator, 2026-08-30: 3-5 ms); being apart from each other is
+    // not. So: own error inside the band as before, OR the group agrees (|delta| inside the same
+    // band) with own error inside UNMUTE_COMMON_US. Delta unknown -> the own-error rule alone.
+    const int64_t unmute_err_us = std::abs(coarse_on_tags ? coarse_err_us : median_err_us);
+    const int64_t unmute_band_us = UNMUTE_BAND_DEADBANDS * this->config_.sync_deadband_us;
+    bool group_agrees = false;
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+    if (this->tsf_sync_ != nullptr && this->tsf_sync_->consensus_n() >= 2) {
+      const int32_t ugd = this->tsf_sync_->render_group_delta_us();
+      group_agrees = ugd != INT32_MIN && std::abs(ugd) <= unmute_band_us && unmute_err_us <= UNMUTE_COMMON_US;
+    }
+#endif
+    if (unmute_err_us <= unmute_band_us || group_agrees) {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
       // Don't unmute onto a provisional timebase: a device still on its Kalman fallback while
       // peers are audible will step by up to the plausibility bound when it finally adopts the
@@ -3497,6 +3518,9 @@ void SnapcastClient::player_task_() {
                           " us after %" PRId64 " s -- unmuting anyway; expect a planted offset of "
                           "about the difference against the other devices",
                      median_err_us, st.drift_med_last_us, UNMUTE_ANCHOR_MAX_WAIT_US / 1000000);
+          } else if (group_agrees && unmute_err_us > unmute_band_us) {
+            ESP_LOGI(TAG, "Sync locked on group agreement (own err %" PRId64 " us, anchor %" PRId32 " us), unmuting",
+                     unmute_err_us, st.drift_med_last_us);
           } else {
             ESP_LOGI(TAG, "Sync locked (median %" PRId64 " us, anchor %" PRId32 " us), unmuting", median_err_us,
                      st.drift_med_last_us);
@@ -3525,7 +3549,10 @@ void SnapcastClient::player_task_() {
     this->reanchor_after_relock_(st);
 
     this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::SERVO), std::memory_order_relaxed);
-    this->push_chunk_(rec, drop_frames, !st.converged);
+    // NEVER_MUTE means never: the start-up silence until "Sync locked" is a mute like any other, and
+    // it hid the wire from the analyser for 1.5-4 minutes after every boot (2026-08-30 07:10).
+    const bool startup_silent = !st.converged && this->sync_resilience() != SyncResilience::NEVER_MUTE;
+    this->push_chunk_(rec, drop_frames, startup_silent);
     // One completed chunk. The main loop watches this for movement; see PlayerPhase.
     this->player_progress_.fetch_add(1, std::memory_order_relaxed);
 
