@@ -2707,9 +2707,13 @@ void SnapcastClient::player_task_() {
     if (resync_window && frame_bytes > 0 && rec.params.sample_rate > 0) {
       const int64_t ring_us_now = static_cast<int64_t>(
           static_cast<uint64_t>(this->pcm_ring_->available()) * 1000000ULL / (frame_bytes * rec.params.sample_rate));
-      const int64_t horizon_now = ring_us_now +
-                                  st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
-                                  static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
+      // TWO blocks, not one: build 54 (ring + pipeline + one block = 2.6 s) still judged on a block whose
+      // mean straddled the landing -- tag error flat at +5.5 ms for the whole 2.6 s after a +3.0 ms
+      // ledger step, dropping 3.4 s after it (02:03:35-39). A block mean is wholly post-step only once
+      // a full block has elapsed after the landing.
+      const int64_t horizon_now =
+          ring_us_now + st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
+          2 * static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
       blank_us = std::max(blank_us, horizon_now);
     }
     // JUDGE ONLY AFTER THE MEASUREMENT CAN SHOW THE EFFECT. The action cadence (blank_us, 200 ms in
@@ -3139,11 +3143,16 @@ void SnapcastClient::player_task_() {
                                                   : std::min<int64_t>(coarse_target_us, std::abs(gd));
         }
       }
+      // The damping (resync_gain) is for the TAG steps, which act on a lagged, block-averaged
+      // measurement. The ledger's first step after a hard resync is arithmetic -- the dropped chunks
+      // are counted -- and with a ~3.4 s wait before the next decision, leaving 20 % of it on the
+      // table costs a whole round (build 54: 47-70 s). It takes the full target.
       const int64_t coarse_step_us =
           !coarse_step_ok ? 0
-          : resync_window ? static_cast<int64_t>(static_cast<float>(coarse_target_us) *
-                                                 this->tune_resync_gain_.load(std::memory_order_relaxed))
-                          : coarse_target_us;
+          : (resync_window && coarse_on_tags)
+              ? static_cast<int64_t>(static_cast<float>(coarse_target_us) *
+                                     this->tune_resync_gain_.load(std::memory_order_relaxed))
+              : coarse_target_us;
       const int32_t adjust_frames =
           static_cast<int32_t>(coarse_step_us * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
       // RESYNC WINDOW = STEP AND VERIFY. One correction of the whole measured error per measurement
