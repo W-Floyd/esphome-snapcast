@@ -2155,3 +2155,13 @@ starvations, bailouts, TAGFAULTs; 2 deadline fallbacks on A; 3 window re-opens o
 gate was built for, now bounded by the gap rule; it is what widened the 10-s block sd from ~7 to 14
 against builds 29/30). Align at step 20 also contributes 20 µs quanta. Steady state is otherwise the
 same board as before the resync work: sub-µs at 1 s, wander-limited above 30 s.
+
+### 2026-08-30 04:35 — unattended: group-wide starvation → TAGFAULT + reconnect on A (and the observer); B left with a 2.1 ms split
+
+04:35:05 all three boards starved together (server/AP). A: tags +21.8 ms vs ledger +1.0 → TAGFAULT →
+reconnect → by 04:36 tags and ledger agree at −600 µs and the PI is closing it. B: no fault, but from
+04:36:05 `err_tag −450 … err_live +1650`, diff −2.1 ms, standing — below `TAG_SPLIT_US` (3 ms), so no
+judge, no reconnect; the coarse path steers on tags, the fast splice and steering see the ledger's
++1.6 ms, and the two will fight or freeze exactly as at 00:34 (then 20 ms, now 2 ms). Third instance
+tonight of a post-storm split that only a reconnect clears. The analyser lost correlation at 04:36:17
+— the speakers' I2S restarted on reconnect, so that is its ~100 s blindness, not a 17 ms gap.
