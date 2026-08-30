@@ -2457,3 +2457,9 @@ medians: +7, +8, +8, +5, −1, +4, +1, +6, +2, −2, −0, −4, −5, +0, +6 | 
 +3, −1, +1, +4, +9 | −5, −8, −1, −2, +15, +10, +10, −1, +1, −7, −8, −3 µs — the ±8…20 excursions all
 coincide with event counts (server holes at 11:36, 11:52, 11:55–57, 12:02) or a transient delta (11:44
 A −30 / B +26 for one cycle). Quiet-minute MAD 0.4–1.6 µs. Delta sums ±6 except during those.
+
+**Build 69, 11:22–12:02, rival-gated:** n = 11293, median **+0.9 µs**, robust sd 6.1, 56 % of samples inside
+±5 µs, 84 % inside ±10, 96 % inside ±20 — with seven server holes inside the window. Structure
+function: 1 s 0.24 · 10 s 2.1 · 30 s 4.7 · 60 s 6.7 · 120 s 10.3 µs (build 30, a quiet window: 0.24 /
+1.6 / 3.5 / 5.3 / 8.1). `wire-sf.py` is not rival-gated and reported robust sd 138 for the same span —
+the event rows; graded with the gated computation above instead.

@@ -606,3 +606,5 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
 * Measured, open: over 29 cycles only 28 % of the differential bias reached the wire within 10 s
   (kicks verified delivered at +5 ppm·s each); a single-board deadline-step test was contaminated by a
   timebase event — repeat in a quiet hour. Server holes every 10–30 min remain the dominant disturbance.
+* Build 69 grade, 40 min with seven server holes: wire median +0.9 µs, robust sd 6.1, 84 % of samples
+  inside ±10 µs; SF 1 s 0.24 / 60 s 6.7 / 120 s 10.3 µs. Biases inside ±18 and tracking the deltas.
