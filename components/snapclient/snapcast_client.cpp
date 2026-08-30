@@ -3083,7 +3083,11 @@ void SnapcastClient::player_task_() {
       // ring depth + one block, and the target is what the tags will read once they have landed.
       int64_t pending_us = 0;
       if (resync_window && coarse_on_tags) {
+        // The step is taken from the chunk entering the RING, which holds ~1.7 s ahead of the push
+        // into the pipeline (~250 ms), and the block that reads it is ~650 ms long: ring + pipeline
+        // + block. Build 52 used pipeline + block alone and pend= read 0 at every decision.
         const int64_t horizon_us =
+            static_cast<int64_t>(ring_ms) * 1000 +
             st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
             static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
         const int64_t now_p = now_us();
