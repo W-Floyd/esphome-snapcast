@@ -2338,3 +2338,16 @@ for the ring's travel time after a position step or a hard resync (~3.5 s, build
 `in_transient` = a step or hard resync within the last 4 s (`kp_event_us`, `resync_step_at_us`);
 converged/window play no part. Prediction: boot behaves as 62 (lock ~+20–25 s, wire correlated ~+14 s),
 and a single-board reconnect still leaves the peer's bias untouched during the ~4 s of steps.
+
+### 2026-08-30 09:09–09:37 — build 64 (4-s transient rule): boot as 62, quiet minutes at 0 ± 1 µs
+
+Boot: lock +15 s (A) / +25 s (B), wire correlated +14 s. Quiet stretch 09:16–09:24, per-minute wire medians:
++2.9, +3.7, +5.7, −2.6, +1.2, +0.5, +1.3, **+0.1, +0.6**, MAD 0.3–1.9 µs; delta sums −5…+2; biases A +72…+84,
+B +62…+81 (common drift ~+10 in 10 min, from +80 in 20 before the sample-age fix). 09:33 B reconnect: A's
+view of B +1848 (rejected), A's bias 63 → 71 → 65 — it did **not** chase (build 62: −6 → −75). Recovery to
+±3 within two minutes of each event (09:25 fallback, 09:31–33 reconnect).
+
+Steady-state score at this point: mean pinned at 0 by align (gain 0.3, deadband 1, step 20, kick,
+sample-age pairing, transient-quiet beacons); the residual is the ±3–8 µs per-minute meander from
+P-term noise plus the timebase's own events. Build 65 makes the runtime align values the compiled
+defaults and starts a 45-min untouched grade.
