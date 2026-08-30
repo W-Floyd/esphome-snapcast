@@ -1921,3 +1921,21 @@ instant (`Consensus spread 1484 µs`, `Offset ramp +49.91 ppm (map −6.72)`), f
 00:00:22 (`map +40.56`; B re-opened its window on −628). The observer drives no DAC, so this is the
 shared TSF→server mapping stepping, not playout — the consensus-jolt open item, now with a size: 18 ms
 for ~10 s. The wire moved only ~+130 because both speakers moved together.
+
+### 2026-08-30 00:03–00:06 — why align overshoots: its actuator is a deadline, its sensor is the audio, and the PI's τ sits between them
+
+00:03:30–00:04:50, gain 0.5 / step 20: A's group delta sat at −50 → −53 → −64 → −51 → −41 for 80 s
+while A's bias marched +116 → +136 → +156 → +176 → +196 → +210; the wire moved −40 → −52 → −43;
+A's err_tag read −150…−250 (early) the whole time. Each 20 µs bias step moves A's *deadline* later;
+the audio only follows when the PI (τ = 120 s) has turned that err_tag into position. The exchanged
+phase is the audio, so it keeps reporting the gap for two minutes after the correction that closes it
+is already in the deadline — and align, an integrator, keeps stepping. The code comment says "the loop
+delay is ~2 reports"; it is ~2 reports plus τ. With gain 0.1 that lag gave the slow ±100 µs sawtooth
+seen all evening; with 0.5 it gives this. Gain back to 0.1 at 00:05:28 (step cap left at 20).
+
+**Fix (build 45): publish the settled phase.** `phase − err_tag` is where this frame's successors will
+render once the PI has removed the error it is already acting on; publishing that instead of the raw
+phase takes τ out of align's loop (and out of the resync gate, which reads the same delta), symmetrically
+on every board. err_tag is what the PI is about to remove by definition, so no new tunable. Prediction:
+group deltas fall within one or two align cycles of a bias step instead of ~120 s, so gain 0.5 becomes
+usable, and the boot/injection tails that were align-limited close in tens of seconds.
