@@ -423,6 +423,8 @@ class TsfSync {
   /// that last moved it. The feed-forward step below is a rate times an interval, and this is
   /// the interval's start. 0 = no sample yet.
   int64_t offset_filter_local_us_{0};
+  int64_t offdbg_at_us_{0};   // OFFDBG throttle
+  double offdbg_flt_{0.0};   // filter value at the last OFFDBG line
   bool shared_hold_logged_{false};  // one log line per hold episode (shared_server_offset_us)
   /// @brief This device's TSF-vs-esp_timer rate, d(tsf - local)/dt in ppm, measured from the
   /// samples the offset filter already takes. A crystal ratio: stable, hardware-only, and in

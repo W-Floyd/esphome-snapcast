@@ -1584,6 +1584,25 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
     // interrupt latency, and averaging it in spends filter authority on known-bad data.
     this->offset_filter_us_ += OFFSET_EWMA_ALPHA * (static_cast<double>(raw_us) - this->offset_filter_us_);
   }
+  // Instrumentation for the post-window wire tail (build 79, 18:14-18:21): on-device err_tag and
+  // ledger both read ~0 while the wire and gd read -150..-450 us, i.e. the deadline itself moved.
+  // The one per-board term in the deadline is THIS filter's state, and nothing on this path logs at
+  // walk-sized granularity (snap is 2000 us and silent below it). One short line, ~0.5 Hz: the
+  // raw-vs-filter gap, how far the filter moved since the last line, the sandwich width and trust
+  // floor, and the call gap the feed-forward bridged. All fields bounded.
+  {
+    const int64_t now_dbg = local_now_us;
+    if (now_dbg - this->offdbg_at_us_ >= 2000000) {
+      const int64_t dflt =
+          this->offdbg_at_us_ == 0 ? 0 : static_cast<int64_t>(this->offset_filter_us_ - this->offdbg_flt_);
+      ESP_LOGD(TAG, "OFFDBG rawgap=%+" PRId64 " dflt=%+" PRId64 " sandw=%" PRId64 " floor=%" PRId64 " trust=%d",
+               std::clamp<int64_t>(raw_us - static_cast<int64_t>(this->offset_filter_us_), -9999999, 9999999),
+               std::clamp<int64_t>(dflt, -9999999, 9999999), sandwich_us, this->sandwich_floor_us_,
+               sandwich_us <= trust_us ? 1 : 0);
+      this->offdbg_at_us_ = now_dbg;
+      this->offdbg_flt_ = this->offset_filter_us_;
+    }
+  }
   offset_us = static_cast<int64_t>(this->offset_filter_us_);
   return true;
 }
