@@ -3256,6 +3256,7 @@ void SnapcastClient::player_task_() {
       }
       if (resync_window && adjust != 0) {
         st.resync_step_at_us = now_us();
+        st.phase_transient_until_us = st.resync_step_at_us + PHASE_TRANSIENT_US;
         st.win_step_us[st.win_step_idx] =
             static_cast<int64_t>(adjust) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
         st.win_step_at_us[st.win_step_idx] = st.resync_step_at_us;
@@ -4227,6 +4228,9 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   const float clamp_hold = trim_clamp_ppm(this->config_.converge_fine_us);
   auto enter_hold = [&](const char *why) {
     st.dl_active = false;
+    // A deadline-source change moves my audio relative to my measured phase without a step: hold
+    // the beacon quiet for the horizon (build 68; see phase_transient_until_us).
+    st.phase_transient_until_us = std::max(st.phase_transient_until_us, now + PHASE_TRANSIENT_US);
     st.dl_hold_p_ppm = st.trim_applied_ppm - st.trim_integral_ppm;
     st.dl_hold_since_us = now;
     ESP_LOGD(TAG, "Delay loop: %s, holding integral %+.2f ppm + P %+.2f decaying over tau t=%" PRId64, why,
@@ -4292,8 +4296,10 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // open" and NOT "unconverged": build 63 used those and at boot neither board broadcast anything,
   // so there was no group delta for the gate or the group-agreement unmute, and both crawled in on
   // the PI (+528 us on the wire for a minute, 09:08).
-  const bool in_transient = (st.kp_event_us != 0 && now - st.kp_event_us < PHASE_TRANSIENT_US) ||
-                            (st.resync_step_at_us != 0 && now - st.resync_step_at_us < PHASE_TRANSIENT_US);
+  // Build 68: one field, set wherever my audio is about to move relative to my measured phase --
+  // window steps, hard resyncs (mark_kp_event_), and deadline source changes (fallback / re-engage:
+  // 10:46, B's fallback read as +203 to A and B stepped +100 chasing it).
+  const bool in_transient = now < st.phase_transient_until_us;
   this->publish_render_phase_(!in_transient);
 
   // ABOVE THE SPLICE THRESHOLD, SPLICE; BELOW IT, TRIM -- the plan's rule, and the trim half of
@@ -4424,6 +4430,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
     std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
+    st.phase_transient_until_us = std::max(st.phase_transient_until_us, now + PHASE_TRANSIENT_US);  // re-engage = deadline source change
     ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
              st.trim_integral_ppm, st.dl_err_us, now);
   }
@@ -4729,6 +4736,7 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
              TRIM_KP_ACQUIRE_PPM_PER_US, why, TRIM_KP_RUN_PPM_PER_US, TRIM_KP_DECAY_SPAN_S, now);
   }
   st.kp_event_us = now;
+  st.phase_transient_until_us = std::max(st.phase_transient_until_us, now + PHASE_TRANSIENT_US);
   st.post_event_until_us =
       now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
@@ -5590,10 +5598,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // (A: median +5120 us, values near 0 half the time and near +9.5 ms the other half) and
           // unusable for steering. It still receives and logs everyone else's (PHASEIN).
           {
-            const int64_t t_now = now_us();
-            const bool in_transient = (st.kp_event_us != 0 && t_now - st.kp_event_us < PHASE_TRANSIENT_US) ||
-                                      (st.resync_step_at_us != 0 && t_now - st.resync_step_at_us < PHASE_TRANSIENT_US);
-            this->tsf_sync_->set_render_phase_broadcast(!in_transient);
+            this->tsf_sync_->set_render_phase_broadcast(now_us() >= st.phase_transient_until_us);
           }
           if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN && !this->config_.tsf_observer) {
             // THE RAW PHASE, NOT A "SETTLED" ONE. Build 45 published phase - err_tag so that align (which
@@ -5744,7 +5749,14 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         // Cap, gain and deadband are runtime tunables (servo_param align_max_us / align_gain /
         // align_deadband_us); align_max_us defaults to the YAML render_align_max (0 = off).
         const int32_t align_cap = this->tune_align_max_us_.load(std::memory_order_relaxed);
-        if (align_cap > 0 && st.converged && align_due && group_delta != INT32_MIN) {
+        // ... AND ONLY WHILE MY OWN ERROR IS SMALL. converged is a latch; through a TAGFAULT recovery
+        // (tags distrusted, err_tag tens of ms) it stayed true and A walked its bias -73 -> -103 against
+        // a delta measured while A itself was off (10:38-10:42). Own error inside the unmute band, and
+        // out of transient, or no align step this cycle.
+        const bool own_steady = st.dl_have_err &&
+                                std::abs(st.dl_err_us) <= UNMUTE_BAND_DEADBANDS * this->config_.sync_deadband_us &&
+                                now_us() >= st.phase_transient_until_us;
+        if (align_cap > 0 && st.converged && own_steady && align_due && group_delta != INT32_MIN) {
           const int32_t cap = align_cap;
           int32_t bias = this->render_bias_us_.load(std::memory_order_relaxed);
           // SIGN, MEASURED on the wire with a single-board step (2026-08-29 17:03-17:10): removing
