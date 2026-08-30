@@ -2020,3 +2020,16 @@ opposite sign; build 50 carries the 1200 ms in-window blank for that.
 I2S clocks are measured and the boards, at first correlation, are within 4–250 µs. The instrument does
 not re-align its PCM decode promptly after an I2S restart; the post-boot wire is unmeasured for ~100 s.
 Operator's script — noted, not changed.
+
+### 2026-08-30 01:00–01:09 — build 50 (1200 ms in-window blank): 8 / 41 / >75 / … — the blank did not cover the first step
+
+Sequences still read: hard resync → ledger +1220 at t+1.8 s → **tag +1643 at t+2.7 s** → corrective
+steps of the other sign. The blank governs the tag path through `coarse_act_us`, which only a TAG step
+set; the ledger's first step set nothing the tag path waits on, so the next tag block — still predating
+the ledger step — was stepped as before. Build 51: any in-window step sets `coarse_act_us`.
+
+Tails +160 / −180 µs with the gate refusing on `|gd|` 15–89 < 100: the group delta reads the residual
+50–150 µs smaller than the wire does. That is the delta's own accuracy (pairing skew, single samples),
+and it is the floor for how small a residual the gate can *see*; below it only align and the PI act.
+Next lever after 51: a better group delta (pair by extrapolation; several samples per report), not a
+lower arm.
