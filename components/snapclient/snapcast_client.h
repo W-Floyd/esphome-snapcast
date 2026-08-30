@@ -1566,9 +1566,9 @@ class SnapcastClient {
   /// Resync window (s) after an event, and the splice threshold (us) inside it. Target: |A-B| < 100 us
   /// within 5 s of a disturbance.
   std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)
-  std::atomic<float> tune_resync_gain_{0.6f};    // fraction of the measured error corrected per step
+  std::atomic<float> tune_resync_gain_{0.8f};    // fraction of the measured error corrected per step (clean block)
   std::atomic<int32_t> tune_resync_splice_us_{100};
-  std::atomic<int32_t> tune_resync_blank_ms_{900};  // step-and-verify cadence in the window: pipeline + one block
+  std::atomic<int32_t> tune_resync_blank_ms_{1200}; // step-and-verify cadence: the judging block must START after the step (block 0.65 s + pipeline 0.28 s)
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};

@@ -830,6 +830,13 @@
 > average → build 35 judge lag 2 s. **Build 36:** damped steps (`resync_gain` 0.6), window 60 s.
 > Resync ledger (300 ms injection → |A−B| < 100 µs held 5 s): 31: 12 s · 34: 11 s (B) / 31 s (A).
 >
+> **Build 36 measured (22:45:32):** boot < 100 µs from **+24 s**; 300 ms injections A/B/A/B: **8, 9, 13,
+> 17 s**; zero false faults. Traces: an initial over-correction (−3289 → +3357 → −828: the first
+> post-resync block still averages pre-resync samples) and a 100–250 µs plateau walked down at 60 %
+> per ~1.3 s. **Build 37:** in the window the ledger error may take the first step at t+0 (it knows
+> the dropped chunks exactly; tags verify), tag steps wait a full block + pipeline (blank 1200), gain
+> 0.8. Resync ledger: 31: 12 · 34: 11/31 · 36: 8/9/13/17.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

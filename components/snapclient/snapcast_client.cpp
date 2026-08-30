@@ -3014,11 +3014,15 @@ void SnapcastClient::player_task_() {
       st.converged = st.converged && !mute_now;
       this->push_silence_(fill, rec.params);
     } else if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) >
-                   (coarse_on_tags
-                        ? (resync_window ? static_cast<int64_t>(this->tune_resync_splice_us_.load(std::memory_order_relaxed))
-                                         : static_cast<int64_t>(FAST_SPLICE_MAX_FRAMES) * 1000000 /
-                                               static_cast<int64_t>(rec.params.sample_rate))
-                        : SOFT_CORRECTION_AGGRESSIVE_US) &&
+                   (resync_window
+                        // In the window BOTH sources arm at resync_splice_us. Right after a hard resync
+                        // the tags are blanked, but the LEDGER knows exactly how many chunks were dropped,
+                        // so the sub-chunk residual is computable at t+0 instead of a block later; the
+                        // tag-based steps that follow verify and correct it (step-and-verify).
+                        ? static_cast<int64_t>(this->tune_resync_splice_us_.load(std::memory_order_relaxed))
+                        : (coarse_on_tags ? static_cast<int64_t>(FAST_SPLICE_MAX_FRAMES) * 1000000 /
+                                                static_cast<int64_t>(rec.params.sample_rate)
+                                          : SOFT_CORRECTION_AGGRESSIVE_US)) &&
                coarse_ok) {
       // On the MEASURED error the catch-up threshold is the fast splice's own 128-frame bound
       // (~2.9 ms), not 10 ms. Between the two nothing corrected: the splice episode hit its bound
