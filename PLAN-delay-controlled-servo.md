@@ -870,6 +870,15 @@
 > (tune_knee_us 1e6 → flat tau 120 / Ti 600 on both boards); acquisition = coarse step-and-verify
 > only. To be graded on both the injections and a 45-min structure function.
 >
+> **Build 40 measured (23:03:50, in-window rate boost removed):** boot < 100 µs from +34 s; 300 ms
+> injections A/B/A/B: **11, 34, 10, 8 s**, zero faults, and — the point of the build — **no stairs
+> away from sync**: every tail is flat (+14, −114 → −96, +60, −33). What remains is a standing
+> residual of 50–115 µs after the position steps, below the 150 µs in-window arm, which the
+> symmetric PI at tau 120 drains over minutes (B's 34 s was a −114 µs park). Resync ledger: 31 12 ·
+> 34 11/31 · 36 8/9/13/17 · 37 9/–/7/15 · 40 11/34/10/8. Next after build 41's data: let the
+> in-window coarse arm at 100 µs when the error has PERSISTED one measurement lag (two blocks) —
+> the same step-and-verify principle, not a lower magnitude threshold.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
