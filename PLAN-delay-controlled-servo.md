@@ -906,6 +906,12 @@
 > starvation-class errors skip the group-delta gate); below that every in-window step needs the
 > differential measurement to agree. Included in build 43's compile if it makes 23:27.
 >
+> **Gate availability:** over the last hour A's reports carried a valid group render delta on 895 of
+> 1433 (62 %; 34 % `render none`), typical |delta| 65 µs. So the group-gated in-window step is
+> available roughly two reports in three, at the 3.3-s report cadence — the price of acting only on
+> differential evidence is a slower resync (order 10 s) when the error is under 2 ms; above it the
+> starvation-class path is unchanged.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
