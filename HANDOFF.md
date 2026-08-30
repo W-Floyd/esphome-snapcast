@@ -564,3 +564,21 @@ ledger's first step never reaches the tags (PLAN 02:13); the tag error reads 60�
 after a step (measurement floor, also the group delta's). Both are the next design items; neither is a
 tunable. Also still open: the 51 ms `RECON drift` flip; post-storm splits nothing acts on; align's lag;
 the analyzer's ~100 s blindness after an I2S restart; the observer's own bailouts (old build).
+
+## Builds 57–62 (2026-08-30 07:10–08:55) — start-up, align, and the wedge
+
+* **Boot → audio → lock:** `never_mute` now means no start-up silence; the unmute latch also passes on
+  *group agreement* (|group delta| in band, own error ≤ 4 ms). 07:22 boot: audio at +7.5 s, wire
+  correlated +14 s at +28 µs, "Sync locked" +20/+26 s (was +150/+186). The previous "analyzer blind for
+  100 s after boot" was the boards playing silence until converged — retracted as an analyzer fault.
+* **Align (57–62):** fractional step accumulation; bias changes delivered as position by a ≤10 ppm rate
+  kick (removes the τ = 120 s lag that forced gain 0.03); beacon carries the phase's sample age so peers
+  pair on sample instants (the two deltas summed −8…−15 before, ±4 after; the common bias march is gone).
+  Runtime: `align_gain 0.3`, `align_deadband_us 1`, `align_step_us 20` — compiled defaults still 0.1/15/4.
+  Wire mean at 0 ± 1 within minutes; ±8 µs per-minute meander remains (P-term noise).
+* **The wedge (07:52):** 40 s server hole → reconnect → mixer never restarted, player silent, network
+  task parked in `emit_pcm_`'s ring-room wait → unreachable until `api.reboot_timeout` (15 min) reset both.
+  Build 61: `emit_pcm_` drops after 2 s instead; STALLED report split (records= now printed). Root cause
+  of the player's silence still open. Logger: per-second ESP_LOGD from non-main tasks crashes the
+  TaskLogBuffer ring (B 07:51) — 'Render phase' demoted; audit the rest.
+* Dither: A's bracket duty 0.97 vs B's 0.57 gives A a visible ~0.3 s bump at the same 0.85 ppm gap; cosmetic.

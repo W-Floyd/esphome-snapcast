@@ -1937,3 +1937,9 @@ Earned expensively; ignoring these cost hours.
 - 51 ms depth flip; SHADOW-split re-anchor; err_tag in the beacon for settled-phase align; analyzer post-boot re-alignment (operator's script).
 - Beacon: carry the render-phase SAMPLE age so the group delta pairs on true sample instants and extrapolates by the mapping ramp — both deltas currently read ~−8 (sum should be 0) and align marches the common deadline at gain 0.3 (PLAN 07:42).
 - ESPHome logger: non-main-thread ESP_LOGD from snap_net/speaker tasks crashes the TaskLogBuffer ring (three times tonight); audit remaining per-second lines from those tasks.
+
+## 2026-08-30 09:00 — next
+- Make the align runtime values (0.3 / 1 / 20) compiled defaults once a 45-min quiet grade confirms them.
+- The ±8 µs meander: P-term noise → `block_n` 64→128 or τ 120→240 (both cost response); measure the SF trade.
+- The wedge's player side: what blocks the player after a dead-session reconnect (mixer never restarted); reproduce with a ≥40 s server hole now that STALLED prints records=/iters.
+- Audit non-main-task ESP_LOGD lines (logger ring crashes); consider ESPHome logger task buffer size.
