@@ -1567,6 +1567,7 @@ class SnapcastClient {
   /// within 5 s of a disturbance.
   std::atomic<float> tune_resync_win_s_{30.0f};
   std::atomic<int32_t> tune_resync_splice_us_{100};
+  std::atomic<int32_t> tune_resync_blank_ms_{200};  // coarse re-act guard inside the window (500 outside)
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};

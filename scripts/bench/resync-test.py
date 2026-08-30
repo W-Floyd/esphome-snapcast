@@ -13,7 +13,9 @@ async def inject():
     ents,svcs=await c.list_entities_services()
     svc=[s for s in svcs if s.name=="inject_starvation"]
     if not svc: print("no inject_starvation service"); return None
-    c.execute_service(svc[0],{"ms":a.ms}); await asyncio.sleep(0.3); await c.disconnect(); return time.time()
+    r=c.execute_service(svc[0],{"ms":a.ms})
+    if asyncio.iscoroutine(r): await r
+    await asyncio.sleep(0.5); await c.disconnect(); return time.time()
 t0=asyncio.run(inject())
 if t0 is None: sys.exit(1)
 print(f"injected {a.ms} ms starvation on {a.host} at {time.strftime('%H:%M:%S',time.localtime(t0))}")

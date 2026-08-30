@@ -803,6 +803,14 @@
 > frame per chunk is 0.85 ms/s, so 500 µs closes in ~0.6 s + pipeline 0.3 s + one block's lag.
 > Steady state keeps 1 ms / 4 s so the common wander is never spliced.
 >
+> **Build 31 measured.** Boot (22:17:14): wire < 100 µs held from +27 s (14–17 s of it boot→engage).
+> Injected 300 ms starvation on A (22:21:26, `scripts/bench/resync-test.py`, first run had the
+> unawaited `execute_service` bug again — fixed): hard resync at once → 4.8 ms left → coarse
+> catch-up to ~450 µs by +9 s (one bounded action per 500 ms blank ≈ 1 ms/s) → splice/PI → **< 100
+> µs held from +12 s**. The splice bang-banged at the threshold (engage −121, one frame, release at
+> −99: arm 100 / release 300). **Build 32:** release band = arm/2; in the window the coarse blank is
+> `resync_blank_ms` (200) and the step 4× (frames/8 → frames/2 divisor).
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

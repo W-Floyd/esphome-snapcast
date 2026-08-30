@@ -2684,7 +2684,16 @@ void SnapcastClient::player_task_() {
     // still >= 75% of what it was = a miss. Three in a row fault the tag path for TAG_FAULT_US,
     // during which every consumer of "tags live" falls back to the ledger.
     const bool tags_fresh = st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US;
-    const int64_t blank_us = static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000;
+    // In the resync window (see ServoState::post_event_until_us) the coarse path may act again as
+    // soon as tags post-date the previous action by resync_blank_ms, and with a 4x step: a 300 ms
+    // injected starvation left 4.8 ms that took 4 s to walk down at one bounded action per 500 ms.
+    const bool resync_window = now_us() < st.post_event_until_us;
+    const int64_t blank_us =
+        static_cast<int64_t>(resync_window
+                                 ? std::min(this->tune_blank_ms_.load(std::memory_order_relaxed),
+                                            this->tune_resync_blank_ms_.load(std::memory_order_relaxed))
+                                 : this->tune_blank_ms_.load(std::memory_order_relaxed)) *
+        1000;
     if (tags_fresh && st.coarse_act_err_us != 0 && st.dl_err_at_us > st.coarse_act_us + blank_us) {
       const int64_t before = std::abs(st.coarse_act_err_us);
       st.coarse_act_err_us = 0;
@@ -3006,7 +3015,8 @@ void SnapcastClient::player_task_() {
       // doesn't leave playback audibly behind for long
       const int32_t adjust_frames =
           static_cast<int32_t>((coarse_on_tags ? coarse_err_us : median_err_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
-      const int32_t max_adjust = std::max<int32_t>(1, frames / (SOFT_CORRECTION_DIVISOR / 4));
+      const int32_t max_adjust =
+          std::max<int32_t>(1, frames / (resync_window ? SOFT_CORRECTION_DIVISOR / 16 : SOFT_CORRECTION_DIVISOR / 4));
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
       if (adjust > 0) {
         drop_frames = adjust;
@@ -4438,6 +4448,9 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_win_s") {
     if (!(value >= 0.0f && value <= 600.0f)) return false;
     this->tune_resync_win_s_.store(value, std::memory_order_relaxed);
+  } else if (name == "resync_blank_ms") {
+    if (!(value >= 50.0f && value <= 2000.0f)) return false;
+    this->tune_resync_blank_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "resync_splice_us") {
     if (!(value >= 20.0f && value <= 5000.0f)) return false;
     this->tune_resync_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
