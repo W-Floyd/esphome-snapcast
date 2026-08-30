@@ -2371,3 +2371,18 @@ tags were right (+358), the ledger wrong (+10384). After the reconnect tags and 
 +15, +5, −7 ms in consecutive reports: `corrected −0/+0` for over a minute, wire +3.5 ms. Build 66:
 three consecutive blocks of tag/ledger agreement inside 1 ms end the distrust (`Tags re-trusted`).
 The timer stays as the fallback for genuine tag faults, where the two never re-agree.
+
+### 2026-08-30 09:55–10:13 — build 66: re-trust in 13 s; quiet minutes at 0 ± 2 µs; a slower common march remains
+
+Boot lock +16 s (A, own error) / +19 s (B, on group agreement). Quiet minutes 09:58–10:06: −1.6, −0.4,
++0.1, −0.9, (+7.9 event), +3.0, −1.2, +0.7, +3.1, +0.6 µs; MAD 0.6–2.3. 10:07:01 server hole → A
+TAGFAULT 10:07:30 → **`Tags re-trusted` 10:07:43** (13 s, was 180); wire −91 → +3 by 10:09. B's view of A
+read +342 for two minutes while A was off by ms without stepping (a reconnect leaves a board out of
+band longer than the 4-s transient rule covers) — B's bias moved only +2 in that time (the 500 µs reject
+and the deadband/gain cap held it), acceptable.
+
+**Common march, slower:** A +46 → +94, B +72 → +115 in 15 min (~3 µs/min; was 8 before the sample-age
+fix). Delta sums in quiet minutes −4…−5 with B at 0: a residual ~5 µs asymmetry in A's view. Left as is
+it saturates the ±500 cap in ~2.5 h. Since a common bias shifts every deadline equally and carries no
+information, the clean fix is to exchange biases in the beacon and re-centre: each board subtracts
+the group-mean bias each cycle, keeping only the differential. Build 67.
