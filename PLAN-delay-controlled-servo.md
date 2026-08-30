@@ -2316,3 +2316,15 @@ Per minute (wire median | A gd, bias | B gd, bias | sum): +7 | −1,−9 | −3,
 −3,+1 | 0,−9 | −3 · +0.2 | −1,+2 | −1,−7 | −2 · +0.6 | +5,−7 | −1,−5 | +4. Delta sums −4…+7 (were −8…−15
 every cycle before), both biases inside ±12 µs for ten minutes (A had walked +80 in the previous 20).
 The wire mean is at 0 with ±8 µs per-minute wobble — the P-term meander, unchanged, as predicted.
+
+### 2026-08-30 08:54–09:03 — build 62, second half: align chases a peer in transient; two timebase jolts
+
+08:54 B TAGFAULT → reconnect. A's view of B: +1969, +1951, +2108 (rejected, > 500) then +89, +67, +47,
++19 as B stepped home — A walked its bias −6 → −75 toward where B *had been*; the wire swung −30…+25
+and took four minutes to settle. 09:02:46 both boards fast-spliced +2.3 ms at the same instant (a
+mapping step; both re-opened, both closed within 15 s). **Build 63:** a board whose resync window is
+open or which is not converged keeps measuring its phase for its own gate but broadcasts
+RENDER_PHASE_UNKNOWN, so peers hold still while it steps home. Prediction: on the next single-board
+reconnect the other board's bias does not move (RALIGN deltas "unknown"/held), and the wire returns to
+0 as soon as the resyncing board's own steps land (~10 s) instead of after a four-minute align
+excursion.
