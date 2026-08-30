@@ -2703,3 +2703,16 @@ show: the tail is a sub-arm residual (±100–250 µs). In inj 1 err_tag, gd and
 (+118→+239 / +49→+62 / +240) — a real, slowly-growing lateness below the 100 µs step arm, left to
 the tracking-gain PI (τ 120 s) and align (10 s cadence), hence 20–40 s. The <10 s answer for the
 end-game is acquisition gain inside the window with bumpless handoff, not more position steps.
+
+### 2026-08-30 18:42–18:46 — runtime A/B: knee 25 / tau_min 5 kills the tails; goal met
+
+knee_us default was 1e6 — the error-proportional gain boost was effectively OFF, so every sub-arm
+residual decayed at flat τ=120 s: that was the whole 30–50 s tail. Set knee_us 25 / tau_min_s 5 live
+on both boards (symmetric in the error, so wire-safe per the 08-29 per-board-boost lesson; the user
+has ruled a few ms of server-timeline desync tolerable). Four injections: graded 14/10/13/14 s —
+converged to <100 µs at +5…+9 s (grade includes the 5 s hold). kp visibly tracks |e| (0.008→0.048;
+0.200 at the 5 s floor absorbing a ±1 ms straddle in inj 4, where pend=+929 also held correctly with
+the two-block margin). Baked as compiled defaults for build 81.
+Open: kp 0.2 × ~950 µs gave a brief +241 ppm trim transient (inaudible, settled in 2 blocks) — watch
+the quiet-hour wire sd in the next soak for any cost of the boost at wander amplitudes (e≈80 µs →
+τ_eff 37 s, common-mode).

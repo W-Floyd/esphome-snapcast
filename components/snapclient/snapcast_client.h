@@ -1589,8 +1589,8 @@ class SnapcastClient {
   // was above knee 150 while the other was below 21 % of the time (median asymmetry 0.004 ppm/us =
   // 0.4 ppm of differential trim per 100 us of common wander). The rate gain must be the same
   // function of the error on every board; acquisition is the coarse path's job (position).
-  std::atomic<float> tune_knee_us_{1000000.0f};
-  std::atomic<float> tune_tau_min_s_{20.0f};
+  std::atomic<float> tune_knee_us_{25.0f};   // A/B 2026-08-30 18:42: tails 30-50 s at flat tau died in ~4 s
+  std::atomic<float> tune_tau_min_s_{5.0f};  // floor of the error-proportional boost (same A/B)
   /// render_align channel (inter-device, on the exchanged tag-derived render phase): cap in us
   /// (0 = off; seeded from YAML render_align_max), gain per due report, deadband in us.
   // Defaults = the 2026-08-29 18:00-18:45 operating point: 45 min, wire median +2.7 us, robust sd
