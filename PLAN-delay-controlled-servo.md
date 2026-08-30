@@ -811,6 +811,17 @@
 > −99: arm 100 / release 300). **Build 32:** release band = arm/2; in the window the coarse blank is
 > `resync_blank_ms` (200) and the step 4× (frames/8 → frames/2 divisor).
 >
+> **Builds 32/33 (22:23, 22:31): two regressions caught within minutes each.** 32: the 200 ms
+> in-window cadence let three misses accumulate inside one measurement lag → both boards TAGFAULTed
+> and reconnected 20 s after boot on the normal post-boot settling (+3.1 vs −0.9 ms); 33 judges a
+> correction only after max(blank, 1 s) and never in the first 20 s after engage. 33 boot: the
+> continuous fast splice and the block error fought — 28 frames one way, 16 back, 3, 8, 9, 4 within
+> two seconds — because the block error is held ~0.65 s while the splice moves the audio under the
+> average; the wire drifted −0.4 ppm with both boards ~−130 µs (under the knee → tau 120).
+> **Build 34: in the resync window the fast splice is OFF and the coarse path does step-and-verify —
+> one bounded (≤ half a chunk) correction of the measured error per `resync_blank_ms` (900 ≈
+> pipeline + block), arming at 100 µs — and the PI runs at the floor tau regardless of the knee.**
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

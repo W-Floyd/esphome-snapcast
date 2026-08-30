@@ -3014,9 +3014,11 @@ void SnapcastClient::player_task_() {
       st.converged = st.converged && !mute_now;
       this->push_silence_(fill, rec.params);
     } else if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) >
-                   (coarse_on_tags ? static_cast<int64_t>(FAST_SPLICE_MAX_FRAMES) * 1000000 /
-                                         static_cast<int64_t>(rec.params.sample_rate)
-                                   : SOFT_CORRECTION_AGGRESSIVE_US) &&
+                   (coarse_on_tags
+                        ? (resync_window ? static_cast<int64_t>(this->tune_resync_splice_us_.load(std::memory_order_relaxed))
+                                         : static_cast<int64_t>(FAST_SPLICE_MAX_FRAMES) * 1000000 /
+                                               static_cast<int64_t>(rec.params.sample_rate))
+                        : SOFT_CORRECTION_AGGRESSIVE_US) &&
                coarse_ok) {
       // On the MEASURED error the catch-up threshold is the fast splice's own 128-frame bound
       // (~2.9 ms), not 10 ms. Between the two nothing corrected: the splice episode hit its bound
@@ -3031,8 +3033,12 @@ void SnapcastClient::player_task_() {
       // doesn't leave playback audibly behind for long
       const int32_t adjust_frames =
           static_cast<int32_t>((coarse_on_tags ? coarse_err_us : median_err_us) * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
-      const int32_t max_adjust =
-          std::max<int32_t>(1, frames / (resync_window ? SOFT_CORRECTION_DIVISOR / 16 : SOFT_CORRECTION_DIVISOR / 4));
+      // RESYNC WINDOW = STEP AND VERIFY. One correction of the whole measured error per measurement
+      // lag (resync_blank_ms ~ pipeline + one block), bounded at half a chunk, and the continuous
+      // fast splice stays OUT of the window: build 33 ran both at once and the splice bang-banged
+      // (28 frames one way, 16 back, 3, 8, 9, 4 ... within two seconds) because the block error it
+      // acts on is held for ~0.65 s while its own splices move the audio underneath the average.
+      const int32_t max_adjust = std::max<int32_t>(1, resync_window ? frames / 2 : frames / (SOFT_CORRECTION_DIVISOR / 4));
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
       if (adjust > 0) {
         drop_frames = adjust;
@@ -4041,7 +4047,12 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   const float ti_tuned = this->tune_ti_s_.load(std::memory_order_relaxed);
   const float knee_us = this->tune_knee_us_.load(std::memory_order_relaxed);
   const float tau_min = this->tune_tau_min_s_.load(std::memory_order_relaxed);
-  const float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
+  float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
+  if (now < st.post_event_until_us) {
+    // Resync window: the residual under the knee is a known displacement, not wander -- run at the
+    // floor tau so the last ~100 us close in seconds rather than at tau 120.
+    boost = std::max(1.0f, tau_tuned / tau_min);
+  }
   const float tau_eff = tau_tuned / boost;
   // Ti is NOT boosted: Ki = kp/Ti already rises with kp. Dividing Ti too made Ki scale with boost^2
   // and wound the (already correct, NVS-restored) integral during the position catch-up -- the
@@ -4216,13 +4227,12 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sa
   // RESYNC WINDOW (ServoState::post_event_until_us): right after an event the error is a known
   // displacement, not wander, so the splice arms at resync_splice_us and immediately; in steady
   // state the configured threshold and the persistence wait keep it off the common wander.
+  // Inside the resync window the coarse path does step-and-verify corrections (see the player loop);
+  // the continuous splice is off so the two never act on the same block error (build 33 thrash).
   const bool post_event = now_us() < st.post_event_until_us;
   const int64_t cfg_threshold = static_cast<int64_t>(this->config_.fast_splice_threshold_us);
-  const int64_t threshold =
-      post_event && cfg_threshold > 0
-          ? std::min<int64_t>(cfg_threshold, this->tune_resync_splice_us_.load(std::memory_order_relaxed))
-          : cfg_threshold;
-  const int64_t persist_us = post_event ? 0 : FAST_SPLICE_PERSIST_US;
+  const int64_t threshold = post_event ? 0 : cfg_threshold;  // 0 = disabled below
+  const int64_t persist_us = FAST_SPLICE_PERSIST_US;
   const int64_t frame_us = sample_rate > 0 ? 1000000 / static_cast<int64_t>(sample_rate) : 0;
   int32_t applied = 0;
 
@@ -4276,9 +4286,9 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sa
         st.fast_splice_active = true;
         st.fast_splice_frames = 0;
         applied = effective_us > 0 ? 1 : -1;
-        ESP_LOGI(TAG, "Fast splice engaged%s: %" PRId64 " us standing for %" PRId64
+        ESP_LOGI(TAG, "Fast splice engaged: %" PRId64 " us standing for %" PRId64
                       " s, correcting by position at one frame (%" PRId64 " us) per chunk t=%" PRId64,
-                 post_event ? " (resync window)" : "", effective_us, persist_us / 1000000, frame_us, now_us());
+                 effective_us, persist_us / 1000000, frame_us, now_us());
       }
     } else {
       st.fast_splice_seen_us = 0;
