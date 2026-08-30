@@ -2578,3 +2578,14 @@ n = 22 177, median **+1.9 µs**, robust sd 11.5, 59 % inside ±10 µs, 77 % insi
 inside the window. **Deadline fallbacks: 0** (23 held blips). Biases ended at 0 / +1 µs. Every fault
 recovered by reconnect + re-trust with the peer holding still; the quiet stretches sat at ±5 µs. The
 remaining event class is the server holes themselves plus the post-refill tag outlier (TODO).
+
+### 2026-08-30 16:00 — the post-refill tag outlier, mechanism and fix (build 75)
+
+`err_tag = render − (anchor_deadline + (frame_server − anchor_server))`, and the anchor refreshes every
+chunk. After a hard resync the deadline steps by the resync size, but the audio rendering for the next
+ring + pipeline (~2–3.5 s) was pushed against the *old* deadline — its tags, read against the new
+anchor, report the whole displacement. The hard-resync tag blank was `blank_ms` (500 ms), so the tags
+re-entered mid-travel: −45.7 / −24.5 / +70.6 / +54.5 ms with the ledger under 1 ms, unmovable by
+corrections, → TAGFAULT → reconnect, five times on B this afternoon. Build 75 blanks the tags for
+`PHASE_TRANSIENT_US` (the measured travel horizon) at every kp event. Prediction: post-hole recovery
+without any TAGFAULT — hard resync, quiet tags for ~4 s, tags return agreeing with the ledger.

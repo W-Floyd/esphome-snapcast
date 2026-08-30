@@ -4766,7 +4766,16 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
   // a setpoint change. Repeated calls during a storm keep extending the blank, which is correct:
   // the mapping is still churning.
   this->playout_mutex_.lock();
-  this->dl_blank_until_us_ = now + static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000;
+  // BLANK THE TAGS FOR THE RING'S TRAVEL, NOT FOR blank_ms. After a hard resync the audio rendering
+  // for the next ring+pipeline (~2-3.5 s) was pushed against the OLD deadline; its tags evaluated
+  // against the refreshed anchor read the whole resync displacement. With a 500 ms blank the tags
+  // re-entered mid-travel: err_tag -45.7/-24.5/+70.6/+54.5 ms while the ledger sat under 1 ms, three
+  // corrections could not move it (an anchor mismatch is not a position error), and TAGFAULT +
+  // reconnect followed -- five times on B alone, 2026-08-30 14:26-14:55. PHASE_TRANSIENT_US is the
+  // same measured horizon the beacon quieting uses.
+  this->dl_blank_until_us_ =
+      now + std::max<int64_t>(static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000,
+                              PHASE_TRANSIENT_US);
   this->dl_acc_n_ = 0;
   this->dl_acc_sum_us_ = 0.0;
   this->playout_mutex_.unlock();
