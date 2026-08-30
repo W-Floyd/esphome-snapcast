@@ -1,4 +1,4 @@
-# HANDOFF — snapclient sync work, as of 2026-08-29 00:45
+# HANDOFF — snapclient sync work, as of 2026-08-30 19:00
 
 ## Bench layout
 
@@ -623,3 +623,30 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
   within 75 µs throughout). The post-refill tag outlier is fixed; injections + grade in the task log.
 * Build 75 grade: injections 34/11/32/24 s, zero TAGFAULTs during them; 30 min median +1.6 µs, 75 %
   inside ±10. The remaining two outlier doors (render gap, rebaseline) closed in b26c7a4 → next flash.
+
+## Builds 77–81 (2026-08-30 17:36–18:50) — the <10 s convergence goal, met
+
+* 77 named the budget: injections 20/15/10/32 s; the whole variance was the ledger's first step
+  landing on mid-refill readings (residuals 1–14 ms; the burst's ledger errors bounce 27→45 ms
+  chunk-to-chunk).
+* 78: the ledger's first window step waits for two consecutive readings within 20 % (500 µs floor).
+  Landed every first step at +1.9 s, but exposed the next layer: pend read +0 at every decision — its
+  travel estimate (instantaneous ring+pipe+block) under-reads while the ring is drained post-hole, so
+  each ledger step was re-stepped in full by the next tag round.
+* 79: frame-exact in-flight accounting — a step has landed exactly when `played_frames_total_` passes
+  the push index it was applied at (+ margin), with a sign guard so the subtraction can never
+  manufacture a wrong-way step; window decisions run at block cadence (the 3.2 s act blank removed;
+  the judge path keeps the horizon). 10/10/10 s on the clean runs. Margin re-learned as TWO blocks
+  (build 54's lesson: +1429 stepped, 0.64 s later pend=+0, +992 re-stepped → −1163 overshoot).
+* 80 instrumented the remaining 30–50 s tails (OFFDBG): the shared-offset-filter hypothesis was
+  retracted — the filter's motion is the genuine server-vs-local clock ramp and identical in tail and
+  clean runs. The tail is a sub-arm residual (±100–450 µs) that decayed at flat τ 120 s because
+  knee_us defaulted to 1e6: the error-proportional boost was OFF.
+* Runtime A/B (no reflash): knee_us 25 / tau_min_s 5 on both boards — symmetric in the error, so
+  wire-safe per the 08-29 per-board-boost lesson. Injections 14/10/13/14 s **including the 5 s
+  hold**, i.e. <100 µs at +5…+9 s. Baked as compiled defaults in 81. TAGFAULTs 0 throughout.
+* Open: quiet-hour wire sd under the boost (e≈80 µs wander now runs τ_eff≈37 s, common-mode — watch
+  the soak); cmp=1 big-drift census still nonzero on 77 (census window was all bursts; consumers all
+  read zero); the hard-resync tag door is now the critical path (~3.4 s) and could go frame-exact
+  like pend; the group delta under-reads the physical differential ~3–5× in tails (phase pairing /
+  extrapolation — unexplained, the wire and err_tag agree with each other).

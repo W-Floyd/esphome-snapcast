@@ -31,14 +31,14 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-**BUILD 27 IS LIVE (2026-08-29 16:00) — see `HANDOFF.md` "Builds 15–27" and
-`PLAN-delay-controlled-servo.md`.** Since build 14: rate-lock dither, error-proportional gain
-(tau 120 / Ti 600 / block 64 floor, knee 150 on the bench), tag-fault → split repair → reconnect
-backstop, dead-session detector, cold-start crystal seed, observer publishes no phase, render_align
-applied at the measured sign (build 30, flashed 20:38, boots to the operating point unaided). Cycle time (wire ≤ 20
-µs held, from reboot): 18 >450 s → 26 46 s. Steady state 18:00–18:45: median +2.7 µs, robust sd
-5.0 µs, 0.19 µs/√s, zero events. Resync after a disturbance (builds 31–37, step-and-verify
-window): 300 ms injection → <100 µs in 8–17 s (build 36), target 5 s — see HANDOFF. Open items, by impact:
+**BUILD 81 IS LIVE (2026-08-30 ~18:50) — see `PLAN-delay-controlled-servo.md` for the 77→81 arc.**
+Post-hole convergence goal (<100 µs within 10 s of a 300 ms injection) **met**: knee A/B graded
+14/10/13/14 s including the 5 s hold, i.e. converged at +5…+9 s. The three levers that got there:
+ledger first step waits for two consistent readings (78); frame-exact in-flight step accounting —
+landed when `played_frames_total_` passes the recorded push index — with a sign guard and two
+blocks of margin (79/80); error-proportional gain actually enabled (knee_us 1e6→25, tau_min_s
+20→5, baked in 81) so sub-arm tails decay at τ_eff ≈ 120·25/|e| instead of flat τ 120 s.
+TAGFAULTs through all injection rounds: 0. Open items, by impact:
 
 - **Tag/ledger split after a chunk-drop storm** (root cause open; repair bounds it). **Align sign**
   (shadow window running; `align-shadow.py`). **Post-boot starvation cluster** (3 stalls in 12 min
