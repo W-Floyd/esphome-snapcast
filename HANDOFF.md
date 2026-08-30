@@ -618,3 +618,6 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
 * Build 73, 90 min untouched through ~30 server holes: median +1.9 µs, robust sd 11.5, 77 % inside
   ±20 µs; deadline fallbacks 0; biases at 0/+1. Remaining event classes: the holes, and the post-refill
   tag outlier (tags read tens of ms while the ledger is sane → TAGFAULT → 15 s reconnect, B ×5).
+* Build 75 (tag blank spans the ring's travel): a real 16:50 hole hit B and the observer (old build)
+  simultaneously — the observer TAGFAULTed with the classic signature, B rode it clean (tag/ledger
+  within 75 µs throughout). The post-refill tag outlier is fixed; injections + grade in the task log.
