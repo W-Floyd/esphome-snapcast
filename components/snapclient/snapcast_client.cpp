@@ -462,6 +462,8 @@ static constexpr int64_t DL_ERR_STALE_US = 1000000;
 // and how long the ledger takes over before tags are trusted again.
 static constexpr uint8_t TAG_FAULT_MISSES = 3;
 static constexpr int64_t TAG_SPLIT_US = 3000;  // tag vs ledger disagreement that makes a miss a fault
+static constexpr int64_t TAG_AGREE_US = 1000;   // tag vs ledger agreement that counts toward re-trusting the tags
+static constexpr unsigned TAG_AGREE_BLOCKS = 3;  // consecutive agreeing blocks that end a tag distrust early
 static constexpr int64_t TAG_JUDGE_US = 2000000;   // pipeline 0.28 s + a 0.65 s block average + margin; 1 s judged blocks that still held pre-correction samples (22:42 false fault)
 static constexpr int64_t TAG_SETTLE_US = 20000000; // no fault judgement in the first 20 s after engage
 static constexpr int64_t TAG_FAULT_US = 180LL * 1000000;  // 60 expired before the repair got its window (14:29-14:33)
@@ -2804,6 +2806,26 @@ void SnapcastClient::player_task_() {
         }
       } else {
         st.tag_miss = 0;
+      }
+    }
+    // RE-TRUST THE TAGS ON EVIDENCE, NOT ON A TIMER. A TAGFAULT distrusts the tags for 180 s and steers
+    // coarse decisions on the ledger. 09:52 (2026-08-30): the fault fired because the LEDGER was 10 ms
+    // off (its steady split after a 576-frame insert); after the reconnect tags and ledger agreed
+    // within 40 us at +15 ms, but the tags stayed distrusted and the ledger's 52 ms flip showed the
+    // coarse path +15, +5, -7 ms in consecutive reports -- no consistent action for a minute, wire
+    // +3.5 ms. Three consecutive blocks of tag/ledger agreement inside TAG_AGREE_US end the distrust.
+    if (tags_fresh && now_us() < st.tag_fault_until_us && st.dl_err_at_us != st.tag_agree_block_us) {
+      st.tag_agree_block_us = st.dl_err_at_us;
+      if (std::abs(st.dl_err_us - error_us) < TAG_AGREE_US) {
+        if (++st.tag_agree_streak >= TAG_AGREE_BLOCKS) {
+          ESP_LOGI(TAG, "Tags re-trusted: agreed with the ledger within %" PRId64 " us for %u blocks (err_tag %+" PRId64
+                        ", ledger %+" PRId64 ") t=%" PRId64,
+                   TAG_AGREE_US, static_cast<unsigned>(st.tag_agree_streak), st.dl_err_us, error_us, now_us());
+          st.tag_fault_until_us = now_us();
+          st.tag_agree_streak = 0;
+        }
+      } else {
+        st.tag_agree_streak = 0;
       }
     }
     const bool coarse_on_tags = tags_fresh && now_us() >= st.tag_fault_until_us;

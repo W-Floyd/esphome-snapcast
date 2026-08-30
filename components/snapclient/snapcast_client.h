@@ -918,6 +918,8 @@ class SnapcastClient {
     int64_t tag_fault_until_us{0};
     /// Consecutive TAGFAULTs with no split repair between them; two escalate to a reconnect.
     uint8_t tag_fault_streak{0};
+    uint8_t tag_agree_streak{0};        // consecutive blocks of tag/ledger agreement while tags are distrusted
+    int64_t tag_agree_block_us{0};      // block the agreement streak last counted (one vote per block)
     /// RESYNC WINDOW: until this instant the fast splice arms at resync_splice_us with no persistence
     /// wait. Set at engage, at every mark_kp_event_ (hard resync, re-anchor, split repair) and at a
     /// reconnect. Measured 2026-08-29 without it: A's 21:05 reconnect took 25 s to |wire| < 100 us
