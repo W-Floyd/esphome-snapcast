@@ -186,6 +186,12 @@ class TsfSync {
   /// @brief This device's own render phase, or RENDER_PHASE_UNKNOWN. Diagnostics: a delta is
   /// only absent because one SIDE is unknown, and without seeing both there is no way to tell
   /// which.
+  void set_render_phase_broadcast(bool on) { this->render_phase_broadcast_.store(on, std::memory_order_relaxed); }
+  int64_t render_phase_for_beacon_() const {
+    return this->render_phase_broadcast_.load(std::memory_order_relaxed)
+               ? this->render_phase_us_.load(std::memory_order_relaxed)
+               : RENDER_PHASE_UNKNOWN;
+  }
   int64_t render_phase_us() const { return this->render_phase_us_.load(std::memory_order_relaxed); }
 
   static constexpr int64_t RENDER_PHASE_UNKNOWN = INT64_MIN;
@@ -269,6 +275,10 @@ class TsfSync {
   std::atomic<int64_t> render_phase_us_{INT64_MIN};
   /// Local time render_phase_us_ describes; 0 when unknown. See set_render_phase_us().
   std::atomic<int64_t> render_phase_at_us_{0};
+  /// Whether the beacon carries render_phase_us_ (true) or RENDER_PHASE_UNKNOWN (false). A board in
+  /// transient (resync window open, not converged) keeps measuring its phase for its own gate but
+  /// stops offering it to peers, so they hold still while it steps home. Player task writes.
+  std::atomic<bool> render_phase_broadcast_{true};
   int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance
   int64_t last_diverge_log_us_{0};
   int64_t last_render_log_us_{0};

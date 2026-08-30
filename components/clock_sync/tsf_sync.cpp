@@ -1120,7 +1120,7 @@ void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_
   pkt.server_id_hash = server_id_hash;
   pkt.stream_id_hash = stream_id_hash;
   pkt.pipeline_us = this->pipeline_us_.load(std::memory_order_relaxed);
-  pkt.render_phase_us = this->render_phase_us_.load(std::memory_order_relaxed);
+  pkt.render_phase_us = this->render_phase_for_beacon_();
   pkt.render_phase_age_ms = this->render_phase_age_ms_();
   pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
 
@@ -1228,7 +1228,7 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     // logic analyser with both reporting themselves perfect.
     const int32_t depth = this->pipeline_us_.load(std::memory_order_relaxed);
     pkt.pipeline_us = depth;  // PIPELINE_UNKNOWN is INT32_MIN, which passes through unchanged
-    pkt.render_phase_us = this->render_phase_us_.load(std::memory_order_relaxed);
+    pkt.render_phase_us = this->render_phase_for_beacon_();
     pkt.render_phase_age_ms = this->render_phase_age_ms_();
   }
   struct sockaddr_in dest = {};
@@ -1310,7 +1310,7 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
       this->broadcast_(local_now_us, est, server_id_hash, stream_id_hash);
       this->update_group_diagnostics_(local_now_us);
     }
-  } else if (this->render_phase_us_.load(std::memory_order_relaxed) != RENDER_PHASE_UNKNOWN &&
+  } else if (this->render_phase_for_beacon_() != RENDER_PHASE_UNKNOWN &&
              local_now_us - this->last_phase_tx_us_ >= 4 * BEACON_INTERVAL_US) {
     // Nothing to pool yet, but a phase worth publishing. Quarter rate: it feeds a correction that
     // steps every ~10 s, so it need not be fast, and every transmit is radio time the audio path

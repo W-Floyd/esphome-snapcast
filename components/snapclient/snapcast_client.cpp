@@ -4132,11 +4132,20 @@ void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord
 // log_sync_report_ (which also logs RENDERTAG/inferred); this one runs per delay-loop block so the
 // group delta has a fresh pairing every beacon. Publishes UNKNOWN rather than a stale value: the
 // freshness gate is the same 100 ms / blank rule, for the reasons documented at the report site.
-void SnapcastClient::publish_render_phase_() {
+void SnapcastClient::publish_render_phase_(bool steady) {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
   if (this->tsf_sync_ == nullptr || this->config_.tsf_observer) {
     return;
   }
+  // A BOARD IN TRANSIENT PUBLISHES NO PHASE. While its resync window is open or it is not converged
+  // its audio is being stepped toward its own deadline; a peer aligning to that chases a moving
+  // target. 08:54 (build 62): B reconnected, A's view of B went +1969 (rejected) then +89, +67, +47,
+  // +19 as B stepped home, and A walked its bias -6 -> -75 us toward where B had been -- a 70 us
+  // excursion on the wire that took four minutes to unwind. Dropping out of the group for the
+  // duration leaves the others holding still, which is what a resyncing peer needs from them.
+  // The phase is still measured and kept LOCALLY (the resync gate reads my own delta against the
+  // peers' phases while my window is open -- that is when it needs it); only the BEACON goes quiet.
+  this->tsf_sync_->set_render_phase_broadcast(steady);
   int64_t phase_tsf = 0, phase_local = 0, phase_width = 0;
   if (!TsfSync::raw_tsf_sample(phase_tsf, phase_local, phase_width)) {
     return;
@@ -4250,7 +4259,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // reports, unknown for the first 20-40 s after a boot, and the resync gate refusing for want of
   // evidence (build 48 boot, 00:43: RSTEP gd=unknown). Every ~0.65 s block on each board puts ~5
   // samples inside each 3.3 s and a pairing inside every beacon interval.
-  this->publish_render_phase_();
+  this->publish_render_phase_(st.converged && now >= st.post_event_until_us);
 
   // ABOVE THE SPLICE THRESHOLD, SPLICE; BELOW IT, TRIM -- the plan's rule, and the trim half of
   // it: position errors at the millisecond scale belong to the fast path, and a rate loop asked
@@ -5545,6 +5554,7 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // -- in the group's weighted mean that made the speakers' render_group_delta bimodal
           // (A: median +5120 us, values near 0 half the time and near +9.5 ms the other half) and
           // unusable for steering. It still receives and logs everyone else's (PHASEIN).
+          this->tsf_sync_->set_render_phase_broadcast(st.converged && now_us() >= st.post_event_until_us);
           if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN && !this->config_.tsf_observer) {
             // THE RAW PHASE, NOT A "SETTLED" ONE. Build 45 published phase - err_tag so that align (which
             // moves the deadline and then waits tau = 120 s for the PI to move the audio) would stop
