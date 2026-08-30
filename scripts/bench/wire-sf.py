@@ -12,7 +12,7 @@ with open("test.csv") as f:
         try: t=float(r["unix_s"]); o=float(r["offset_ns"]); rv=float(r["rival"])
         except: continue
         lt=dt.datetime.fromtimestamp(t).time()
-        if t0<=lt<=t1 and rv<=0.5: rows.append((t,o/1000))
+        if t0<=lt<=t1 and rv<0.3: rows.append((t,o/1000))  # 0.3: rows at 0.3-0.5 during events inflated robust sd to 138 us (2026-08-30 11:22-12:02)
 rows.sort(); ts=[r[0] for r in rows]; xs=[r[1] for r in rows]
 if len(xs)<100: print("only",len(xs),"rows"); sys.exit(1)
 def mad(v): m=st.median(v); return 1.4826*st.median([abs(a-m) for a in v])
@@ -26,4 +26,4 @@ for tau in (1,10,30,60,120):
 blk={}
 for t,x in rows: blk.setdefault(int(t//10),[]).append(x)
 means=[st.mean(v) for v in blk.values() if len(v)>50]
-print(f"  10-s block means robust sd {mad(means):.2f} us ({len(means)} blocks); within-block {st.median([mad(v) for v in blk.values() if len(v)>50]):.2f} us")
+if len(means)>2: print(f"  10-s block means robust sd {mad(means):.2f} us ({len(means)} blocks); within-block {st.median([mad(v) for v in blk.values() if len(v)>50]):.2f} us")
