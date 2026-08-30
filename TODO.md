@@ -1928,3 +1928,10 @@ Earned expensively; ignoring these cost hours.
 - Act on the SHADOW split: re-anchor the ledger from the tags when `err_tag − err_live` stands while the group depth agrees with the tags.
 - Align: carry err_tag in the TSF beacon so the group delta can be settled-phase; then gain 0.5 is safe.
 - Steady-state re-grade (45 min, no reflash) on the build that ends the night.
+
+## 2026-08-30 02:45 — after build 56
+- Steady-state grade of 56 (45 min, no reflash) — started 02:45, result in the session's task output / rerun `wire-sf.py`.
+- Why the ledger's first window step never reaches the tags (`push_chunk_` after an early hard resync's silence insert).
+- Land coarse steps at the pipeline end instead of the ring entrance → cuts the 3.5 s round to ~1 s; that is the path to <5 s.
+- Group-delta accuracy (pair by extrapolation, average per decision) — the gate's floor and align's.
+- 51 ms depth flip; SHADOW-split re-anchor; err_tag in the beacon for settled-phase align; analyzer post-boot re-alignment (operator's script).

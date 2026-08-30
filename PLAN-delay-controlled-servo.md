@@ -2123,3 +2123,25 @@ Floor after that: hard resync ≈ +2 s after the injection, first tag decision �
 lands ≈ 3.5 s later, verify one round after → ~9 s. Under 5 s needs the step to land faster than the
 ring (drop at the pipeline end, as the fast splice effectively does) or a shallower ring — a design
 choice for tomorrow, not a tunable. Runs 4's −200 µs tail is the tag-vs-wire measurement floor again.
+
+### 2026-08-30 02:33–02:41 — build 56 (gate bounds by the gap to the others; resync_gain 1.0): **9 / 27 / 9 / 9 s**
+
+Every sequence: hard resync → ledger step (still invisible to the tags) → ONE tag step of the full
+target 3.5 s later → window closed converged 6.5 s after that. Wire inside 100 µs held 5 s at +9 s in
+three of four, tails −40 / +25 / −40 µs; run 2's tail sat at −260 (tag-vs-wire floor, then a +422 re-open
+at +23 s) → 27 s. Zero TAGFAULTs all night from build 44 on.
+
+**Night's ledger, 300 ms injection → |wire| < 100 µs held 5 s (A, B, A, B):**
+41: 11/34/10/8 · 43: 12/>75/57/69 · 44: 21/>75/11/31 · 45: all >75 · 46 (window off): >75/>75/–/– ·
+48: >75/10/>75/10 · 49: 9/11/19/15 · 50: 8/41/>75/45 · 51: 11/>75/14/65 · 52: >75/11/44/>75 ·
+53: >75/51/>75/>75 · 54: 47/>75/70/>75 · 55: >75/65/46/64 · 55+gain 1.0: >75/40/9/51 · **56: 9/27/9/9**.
+Build 41's numbers were the accidental over-stepping of a window with no throttle; 56's are one step
+each, explained line by line.
+
+**The 9 s is structural now:** ~2 s from injection to the hard resync (ring refill), ~1.8 s to the first
+tag block, ~3.5 s for the step to travel ring + pipeline + block, then the close timer. To reach 5 s the
+step has to land faster than the ring — apply the coarse correction at the pipeline end (as the fast
+splice effectively does) or shorten the ring — and the ledger's first step has to actually reach the
+audio (or be dropped from the design; today it costs nothing but also does nothing).
+
+Runtime state left on both boards: `align_step_us 20` (default 4); everything else at compiled defaults.

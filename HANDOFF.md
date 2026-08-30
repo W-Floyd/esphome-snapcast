@@ -550,3 +550,17 @@ Open, with evidence in PLAN: the 51 ms `RECON drift` flip whenever the mixer tra
 full; post-storm tag/ledger splits that nothing acts on (SHADOW shows them; TAGFAULT's judge only
 watches coarse actions); align's lag (deadline actuator, audio sensor, PI τ between — needs peers'
 err_tag in the beacon); the analyzer's ~100 s blindness after an I2S restart.
+
+## Build 56 (2026-08-30 02:33) — resync 9 / 27 / 9 / 9 s; how it got there and what is structural
+
+Builds 51–56 each fixed one thing RSTEP showed: a ledger step blanks the tag path (51); the coarse target
+subtracts steps in flight (52/53 — subsumed); the in-window blank is the measured visibility horizon,
+ring + pipeline + two blocks ≈ 3.5 s, computed from the live ring depth (54/55); the ledger's first step
+takes the full target (55); the gate bounds a step by the gap to the others, `gd·n/(n−1)`, not by the
+delta to the mean (56); `resync_gain` 1.0 (56). Result: one tag step per injection, converged.
+
+Structural floor ≈ 9 s (ring travel 3.5 s per round, two rounds, plus 2 s to the hard resync). The
+ledger's first step never reaches the tags (PLAN 02:13); the tag error reads 60–250 µs from the wire
+after a step (measurement floor, also the group delta's). Both are the next design items; neither is a
+tunable. Also still open: the 51 ms `RECON drift` flip; post-storm splits nothing acts on; align's lag;
+the analyzer's ~100 s blindness after an I2S restart; the observer's own bailouts (old build).
