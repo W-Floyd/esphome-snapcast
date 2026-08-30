@@ -1846,3 +1846,50 @@ and cannot improve meaningfully — **do not judge this on the median.**
 * **Read `CLAUDE.md` first.** Three of four instrumentation defects found on 2026-08-28 produced
   confident, wrong numbers, and two conclusions in this document were reached only after earlier
   measurements of the same quantities had to be retracted.
+
+### 2026-08-29 23:27–23:50 — build 43 graded; the group-delta gate was inverted; the analyser's probes are swapped relative to the logs
+
+**Build 43 (flash 23:27:45), gate as written:** boot to |wire| ≤ 100 µs held 5 s: +31 s (steps A 2, B 5).
+Injections (300 ms): A 12 s, B **not inside 100 µs within 75 s**, A 57 s, B 69 s. Build 41 was 11/34/10/8.
+The gate made resync *worse*, and the log says exactly how.
+
+**Mechanism (23:32:14, injection on B).** Hard resync inserted 1958 ms of silence; residual err_tag −380 µs
+(early). Group render delta on B: −532 µs (RALIGN half-gap −266). Both signals said *early*, yet the gate
+test `(gd > 0) != (target < 0)` read "disagree" and refused every step for 60 s — `corrected -0/+0` on
+every report — and the PI (kp 0.008 ppm/µs) closed 400 µs in ~2 min, the +500 → +50 µs tail in the
+injection trace. Same at 23:36:37 (err −1500, gd −1545, one minute flat) until the window closed and
+the *fast splice* (outside the window) took it in one bite at 23:37:43.
+
+**Signs, from the definitions and not from a label:** `phase = TSF(render) − server_time` (larger =
+rendered later); `delta = mine − mean(peers)` → **delta > 0 = LATE**; `deadline = server_ts + buffer −
+offset + bias` → **positive bias = plays LATER**; `err_tag = render − deadline` → > 0 = late. RALIGN's
+`bias −= delta·gain` is right by derivation. The comment "delta > 0 = early / positive bias = earlier"
+(PLAN 17:03 step test, code comments) came from reading the wire header "B − A, positive = B later".
+
+**The analyser's probe b is on board A (e985e8).** Attribution table 23:27–23:42, 30-s bins:
+`fs_b − fs_a` (analyser) against `(trim − crystal)_B − (trim − crystal)_A` (what the boards asked for):
++4.10/−3.94, +3.73/−3.42, +2.79/−2.76, +0.71/−0.44, −3.06/+2.81 — equal and opposite in every bin.
+The channel the CSV calls "B" speeds up when board *A* asks for rate. So on the current probe placement
+**wire + = board B (f04d74) EARLIER**, and every wire-sign statement since the probes were placed must be
+read that way; the CSV's firmware columns (`crystal_b_ppm` from b.log) are correctly labelled by log,
+so the *same file* carries both conventions. Consistent with everything tonight: 23:32 wire +394 =
+B early, err_tag −380 ✓, PHASEIN B phase 383 µs smaller ✓; 23:37:43 B inserts 52 frames (later), wire
++1576 → +16 ✓. `scripts/i2s-skew.py` is the operator's file — not touched; noted here and in HANDOFF.
+
+**Build 44** (`(gd > 0) != (target > 0)`, comments corrected). Same code otherwise.
+
+**The 23:42:12 step (wire −160 → −460 in 20 s), while the gate was inverted.** A's TSF consensus spread
+reached 851 µs; the deadline fell to the local fallback for 1.2 s ("holding integral +56.42 + P +2.41"),
+re-engaged at 23:42:14 — engage opens a resync window — and A dropped 9 + 6 frames (−340 µs) on an
+error that was **common** (A +327, B +572 at that instant). gd was −204 (A early) against err +327
+(late): a genuine disagreement, which the inverted gate read as agreement. A swung +327 → −310; B, at
++570 with no step, decayed by PI. The ±300 µs common wander at 23:41–23:44 coincides with consensus
+spreads of 600–900 µs and `Offset ramp +19 ppm (map +24)` glitches on both boards — timebase, not
+playout; open item.
+
+**"Overshooting 0" (23:38–23:44, operator's observation).** After B's 1.4 ms splice the wire crossed
+zero and ran to −165 µs at −0.8 µs/s: the analyser's own `fs_b − fs_a` was +2.3 → +0.7 ppm over the
+same two minutes and the boards' requested rate differential matched it bin for bin — it is the two
+P-terms (kp 0.008 → 3 ppm at 400 µs) acting on errors that differed by 100–150 µs for a block-lag
+after a one-board position step, then the differential PI's τ = 120 s step response. Not an actuator
+fault; not the integrals (both moved +0.3 ppm together).
