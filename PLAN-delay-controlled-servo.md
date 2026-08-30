@@ -2555,3 +2555,9 @@ TAGFAULTs/reconnects/splices: per-minute medians ±5 µs with occasional ±8…�
 5 ms on ~32 % of report lines — determine whether the line prints raw values on snapshots the
 comparison (build 72) rightly refused, i.e. whether this is the instrument printing what the logic no
 longer consumes.
+
+**RECON census resolved:** the line is an unconditional diagnostic that recomputes drift from raw terms
+even on snapshots the build-72 logic refuses. Every *consumer* is silent since the 73 boot — Unmute
+held 0, anchor waits 0, repairs 0, drift-excess 0, SHADOW splits ≥10 ms 0, on both boards — so the
+in-write exclusion works; only the print lies. Gate the diagnostic on `fill_comparable` in the next
+build (74, batched). A 90-min untouched grade of 73 started 14:26.
