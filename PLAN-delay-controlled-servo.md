@@ -772,6 +772,14 @@
 > The fault path end to end: ~12 s of disruption for the class that cost 40 minutes at 12:38 and
 > 3 minutes at 16:38.
 >
+> **Build 30 defaults, 60-min hands-off (20:47–21:47), events included (one starvation → TAGFAULT
+> → 3-s reconnect at 21:05):** n=30,499, **median −2.1 µs, robust sd 7.6 µs**, change 0.24 / 1.6 /
+> 3.5 / 5.3 / 8.1 µs over 1/10/30/60/120 s, 5-min medians −16…+15 µs. Bias creep gone with deadband
+> 15 (+102 → +110 in an hour vs +67 with deadband 3). The deadband's cost: up to ~15 µs of standing
+> offset left alone (21:45: −12.6 with the delta at −5…−14) — the exchanged phase's own bias, which
+> only a better exchanged signal (a published line, or a faster exchange) removes. State of the
+> bench at 21:47: all three boards on build 30, no API tuning, watchdog armed, B's serial wedged.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

@@ -253,7 +253,9 @@ All committed on `main`; `PLAN-delay-controlled-servo.md` carries the blow-by-bl
 
 **Steady state with the inter-device channel applied (build 29, knee 150, align gain 0.1 / step 4):**
 18:00–18:45 (cap 150): n=27,126, wire median +2.7 µs, robust sd 5.0 µs, p2p 27.8 µs; 18:46–19:31
-(cap 300): n=25,155, **median +4.2 µs, robust sd 4.0 µs, p2p 46.9 µs**, 3-min medians 0…+11 µs,
+(cap 300): n=25,155, **median +4.2 µs, robust sd 4.0 µs, p2p 46.9 µs**, 3-min medians 0…+11 µs;
+20:47–21:47 on build 30's compiled defaults with a starvation/TAGFAULT/reconnect inside: median −2.1 µs,
+robust sd 7.6 µs, 5-min medians −16…+15 µs, bias creep gone (deadband 15),
 1-s change 0.19 µs, every 3-min median within ±8 µs, zero events. Build 30 (`be736f3`, FLASHED fleet-wide
 20:38, boots to the operating point with no API tuning; wire ≤ 20 µs at +73 s) makes that the compiled default: knee 150, align applied, cap 500, gain 0.1,
 step 4, deadband 15 (the exchanged phase carries a ~10 µs bias of its own; a 3 µs deadband made the
