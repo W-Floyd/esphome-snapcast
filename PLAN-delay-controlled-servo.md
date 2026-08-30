@@ -2615,3 +2615,14 @@ A real server hole hit B (build 75) and the observer (old build, no fix) at 16:5
 The observer TAGFAULTed at 16:50:38 with the classic signature (err_tag −17.7 ms, ledger −0.7). B rode
 it clean: tags and ledger agreed within 30–75 µs the whole way (+1.2 ms decaying to +77 µs, no fault,
 no reconnect). Same disturbance, same moment, one variable.
+
+### 2026-08-30 16:59 — the outlier's second and third doors: the render-gap blank and the rebaseline
+
+A's injection recovery TAGFAULTed (+11.8 ms tags, +0.9 ledger) with the hard-resync blank already at
+the horizon — the sequence was: three hard resyncs (blank set ✓, RSKIP showed blank=3242 ms), then
+`Pipeline drained; re-baselining` at 16:59:00 **after** the blank was armed: the reseed moved the
+prediction again, and the render-gap blank in the speaker callback still used 500 ms. SHADOW five
+seconds later: err_tag +16.6 ms vs ledger +6.6. All three doors now use the same travel horizon
+(hard resync, render gap, rebaseline) — committed as `b26c7a4`, rides into the next flash (with the
+write-window ring). One mechanism, three entrances; the observer-vs-B control at 16:50 stands for the
+door that was already closed.
