@@ -37,7 +37,8 @@ section; most of the obvious approaches have already failed on hardware.
 backstop, dead-session detector, cold-start crystal seed, observer publishes no phase, render_align
 applied at the measured sign (build 30, flashed 20:38, boots to the operating point unaided). Cycle time (wire ≤ 20
 µs held, from reboot): 18 >450 s → 26 46 s. Steady state 18:00–18:45: median +2.7 µs, robust sd
-5.0 µs, 0.19 µs/√s, zero events. Open items, by impact:
+5.0 µs, 0.19 µs/√s, zero events. Resync after a disturbance (builds 31–37, step-and-verify
+window): 300 ms injection → <100 µs in 8–17 s (build 36), target 5 s — see HANDOFF. Open items, by impact:
 
 - **Tag/ledger split after a chunk-drop storm** (root cause open; repair bounds it). **Align sign**
   (shadow window running; `align-shadow.py`). **Post-boot starvation cluster** (3 stalls in 12 min

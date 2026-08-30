@@ -264,6 +264,19 @@ medians within ±10 µs, zero A events; the observer's crash-rejoin at 19:33 jol
 (starvations, bailouts) re-create 50–100 µs offsets every ~10 min on a bad hour, so the two
 numbers to watch are the event census and the 3-min medians.
 
+**Resync after a disturbance (builds 31–37, 22:15–23:00; target |A−B| < 100 µs within 5 s).**
+Measured with `scripts/bench/resync-test.py HOST 300` (an `inject_starvation` over the API, then
+the wire timed back inside the band at 1-s resolution). Mechanism: a **resync window**
+(`resync_win_s` 60) opened at engage, at every `mark_kp_event_` and at reconnect, in which the
+coarse path does **step-and-verify** — arms at `resync_splice_us` (100), corrects `resync_gain` (0.8)
+of the measured error once per `resync_blank_ms` (1200 ≈ a full block + pipeline, so the judging
+block starts after the step), bounded at half a chunk; the ledger may take the first step at t+0
+(it knows the dropped chunks exactly), the continuous fast splice is OFF inside the window (it
+bang-banged against the block-averaged error), and the PI runs at the floor tau regardless of the
+knee. Tag-fault judgement waits 2 s and never fires in the first 20 s after engage (builds 32/33
+faulted both boards 20 s after boot on the normal settling). Ledger (300 ms injection → <100 µs held
+5 s): build 31 12 s · 34 11/31 · 36 8/9/13/17 · 37 see PLAN. Boot to <100 µs: 31 27 s · 34 48 · 36 24.
+
 **Cycle time** (wire |A−B| ≤ 20 µs held 20 s, from the reboot line; `scripts/bench/converge-time.py`):
 build 18 >450 s · 19 242 · 22 209 · 24 74 · 25 67 · 26 46. Boot→engage is ~15–20 s of that.
 
