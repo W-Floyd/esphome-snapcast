@@ -2257,3 +2257,14 @@ fraction of the common part.
 
 **B crash 07:51:26:** `assert failed: prvSendItemDoneNoSplit ringbuf.c:374`, log rate ~5 lines/s at the
 time (not the 38/s logger case). Backtrace decode pending the ELF. Then a 12 s server hole → bailout.
+
+**B crash decoded** (build-59 ELF, `xtensa-esp32s3-elf-addr2line`): `xRingbufferSendComplete` ←
+`TaskLogBuffer::send_message_thread_safe` ← `log_vprintf_non_main_thread_` ← `TsfSync::update_group_diagnostics_`
+(tsf_sync.cpp:1050, the once-a-second "Render phase mine … delta" line) ← `service_tx_` (snap_net task).
+Same class as the earlier logger crashes: ESPHome's non-main-thread log path into the TaskLogBuffer ring.
+Build 60: that line is VERBOSE. Log rate was ~5 lines/s — this is not the 38/s overflow, it is the
+thread-safe send itself.
+
+**07:52:38 → server dead.** All three boards lost chunks; A's dead-session detector reconnected at +15 s,
+B bailed out at 12 s late; both reconnected 07:53:15 and received nothing — snapserver's stream stopped
+(source side). Build-59 grade cut short at 7 minutes.

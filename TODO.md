@@ -1935,3 +1935,5 @@ Earned expensively; ignoring these cost hours.
 - Land coarse steps at the pipeline end instead of the ring entrance → cuts the 3.5 s round to ~1 s; that is the path to <5 s.
 - Group-delta accuracy (pair by extrapolation, average per decision) — the gate's floor and align's.
 - 51 ms depth flip; SHADOW-split re-anchor; err_tag in the beacon for settled-phase align; analyzer post-boot re-alignment (operator's script).
+- Beacon: carry the render-phase SAMPLE age so the group delta pairs on true sample instants and extrapolates by the mapping ramp — both deltas currently read ~−8 (sum should be 0) and align marches the common deadline at gain 0.3 (PLAN 07:42).
+- ESPHome logger: non-main-thread ESP_LOGD from snap_net/speaker tasks crashes the TaskLogBuffer ring (three times tonight); audit remaining per-second lines from those tasks.
