@@ -2539,3 +2539,9 @@ itself expires only after 5 s; these are single-call evaluation failures (a bad 
 age-clamp rejection) that last one chunk. Fix: hold the last good shared offset, extrapolated by the
 mapping drift, for a short grace period before declaring a fallback — a 1-s blip must not move the
 deadline. Build 73.
+
+**Build 73:** `shared_server_offset_us` holds the filtered offset — carried forward by the measured
+crystal ratio, as the feed-forward already does — for up to 3 s when the TSF sample fails (NO_TSF); an
+AGE_CLAMP (TSF reset) still falls back. Prediction: `deadline on local fallback` drops from 2–32/h to
+~0 except at real mapping losses; the ~100 µs one-board steps and P-term holds that followed each flip
+disappear from the wire; the peer's bias no longer walks after them.

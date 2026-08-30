@@ -113,6 +113,7 @@ static constexpr int32_t PIPELINE_UNKNOWN = INT32_MIN;
 // hurt exactly the weakest link.
 static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // every device publishes at this rate
 static constexpr int64_t MAPPING_EXPIRY_US = 5000000;    // stale mapping → Kalman fallback
+static constexpr int64_t SHARED_HOLD_GRACE_US = 3000000;  // a TSF-sample blip shorter than this keeps the shared deadline (see shared_server_offset_us)
 // MUST TRACK THE BEACON RATE. service() returns early inside this interval, so it is a hard ceiling
 // on the beacon rate no matter what BEACON_INTERVAL_US says -- at 200 ms the beacons would cap at
 // 5 Hz and the experiment would silently not happen. service() is called per arriving message
@@ -1393,11 +1394,36 @@ bool TsfSync::shared_server_offset_us(int64_t local_now_us, int64_t &offset_us) 
   int64_t sandwich_us = 0;
   int64_t sample_tsf_us = 0;
   int64_t sample_local_us = 0;
-  if (evaluate_mapping_(tsf_base, tms_base, drift_ppm, raw_us, extrapolation_us, &sandwich_us, &sample_tsf_us,
-                        &sample_local_us) != EvalResult::OK) {
+  const EvalResult ev = evaluate_mapping_(tsf_base, tms_base, drift_ppm, raw_us, extrapolation_us, &sandwich_us,
+                                          &sample_tsf_us, &sample_local_us);
+  if (ev != EvalResult::OK) {
+    // HOLD THROUGH A BLIP. A single unreadable TSF sample (NO_TSF) used to answer "no shared mapping"
+    // for that one chunk: the caller's deadline flipped to the local Kalman (~100 us away), the
+    // coarse path stepped the audio to it, the delay loop held and re-engaged, and the peer aligned
+    // to a board that had really moved. 2026-08-30: 2-32 such flips per board per hour, six in the
+    // 2.5 minutes before the 13:14 step test. The mapping is still valid (expiry is 5 s) and the
+    // filter still holds a value; answer with it, carried forward by the measured crystal ratio
+    // exactly as the feed-forward below does, for up to SHARED_HOLD_GRACE_US. An AGE_CLAMP (TSF
+    // reset) is a real fallback and is not held.
+    if (ev == EvalResult::NO_TSF && this->offset_filter_seeded_ && this->offset_filter_local_us_ != 0 &&
+        local_now_us - this->offset_filter_local_us_ <= SHARED_HOLD_GRACE_US) {
+      double held = this->offset_filter_us_;
+      if (this->offset_rate_valid_) {
+        held += (this->offset_rate_ppm_ - static_cast<double>(drift_ppm)) * 1e-6 *
+                static_cast<double>(local_now_us - this->offset_filter_local_us_);
+      }
+      if (!this->shared_hold_logged_) {
+        this->shared_hold_logged_ = true;
+        ESP_LOGD(TAG, "Shared mapping: TSF sample failed, holding the filtered offset (age %" PRId64 " ms)",
+                 (local_now_us - this->offset_filter_local_us_) / 1000);
+      }
+      offset_us = static_cast<int64_t>(held);
+      return true;
+    }
     this->offset_filter_valid_ = false;
     return false;
   }
+  this->shared_hold_logged_ = false;
 
   // Low-pass the offset. Every call takes a FRESH sandwiched TSF sample, so its read noise --
   // up to SANDWICH_MAX_US, and uncorrelated between devices, therefore NOT cancelled by sharing
