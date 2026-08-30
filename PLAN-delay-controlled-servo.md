@@ -1965,3 +1965,24 @@ transfer-buffer available + sink in-flight + sink audio (mixer_speaker.cpp ~688)
 carries ~51 ms the accounting does not. With tags live it is harmless; after a TAGFAULT it is the
 ledger the board steers on for 180 s — B's 56 ms phantom hard resync at 00:14:04. Two fixes owed: name
 the double-counted term; re-trust tags on agreement, not on a timer.
+
+### 2026-08-30 00:33–00:36 — anatomy of a post-storm split that never heals (B, window off)
+
+B-only starvation 00:33:09 → 56/68 hard resyncs in two reports → from 00:34:14 `err_tag −17.6…−20.8 ms,
+err_live +2.4 → −0.05 ms`, diff −20.0 ms constant for 2+ minutes. **The tags are right:** the analyser
+lost correlation (boards > 17 ms apart) and B's own `Playout depth +20011 us vs group … for 126 s`
+agrees. The ledger is the thing that broke in the storm (mis-accounted drops), and every actuator that
+reads it is now steering toward a phantom:
+
+* the fast splice engages on the tag error, inserts its 128-frame bound (2.9 ms), declares
+  "measurement fault", hands back to the PI, re-arms 4 s later — six times;
+* the coarse path alternates source: each splice blanks the tags (`RENDERTAG sup=1`, ages to 8.6 s) →
+  `tags_fresh` false → coarse on the ledger median (+2.4 ms late → drop) → tags return → coarse on tags
+  (−20 ms → insert). `corrected −144/+114 frames` per report: the two sources undo each other;
+* TAGFAULT — the mechanism that exists for exactly this — never fires: its judge watches only
+  `coarse_act_err_us`, and with the source flipping every few seconds no single tag-driven coarse
+  action is ever judged three times against a still-standing err_tag.
+
+Cleared only by the build-47 reboot. What it needs (not tonight): a split judged on `err_tag − err_live`
+holding for N seconds *while the group depth agrees with the tags* → re-anchor the ledger from the tags
+(or reconnect) — the evidence is already in the SHADOW line; nothing acts on it.
