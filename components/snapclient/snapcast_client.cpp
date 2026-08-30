@@ -2691,10 +2691,11 @@ void SnapcastClient::player_task_() {
     // injected starvation left 4.8 ms that took 4 s to walk down at one bounded action per 500 ms.
     const bool resync_window = now_us() < st.post_event_until_us;
     const int64_t blank_us =
-        static_cast<int64_t>(resync_window
-                                 ? std::min(this->tune_blank_ms_.load(std::memory_order_relaxed),
-                                            this->tune_resync_blank_ms_.load(std::memory_order_relaxed))
-                                 : this->tune_blank_ms_.load(std::memory_order_relaxed)) *
+        // In the window the blank IS resync_blank_ms (pipeline ~250 ms + one block ~650 ms), not the
+        // smaller of the two: min(500, 1200) = 500 ms let the second and third steps of every build-48
+        // sequence act on blocks that predated the first (+2277 applied, next block read +4068).
+        static_cast<int64_t>(resync_window ? this->tune_resync_blank_ms_.load(std::memory_order_relaxed)
+                                           : this->tune_blank_ms_.load(std::memory_order_relaxed)) *
         1000;
     // JUDGE ONLY AFTER THE MEASUREMENT CAN SHOW THE EFFECT. The action cadence (blank_us, 200 ms in
     // the resync window) is not the measurement lag (pipeline ~280 ms + one block ~650 ms): build 32
