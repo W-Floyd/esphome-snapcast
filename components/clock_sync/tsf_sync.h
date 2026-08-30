@@ -10,6 +10,8 @@
 
 #include "esphome/core/helpers.h"
 
+#include <algorithm>
+#include <esp_timer.h>
 #include <atomic>
 #include <limits>
 #include <cstdint>
@@ -152,6 +154,16 @@ class TsfSync {
   /// weighting instead, which cannot step.
   int32_t render_group_delta_us() const {
     return this->render_group_delta_us_.load(std::memory_order_relaxed);
+  }
+  /// Age of the published render phase at this instant, in ms, for the beacon: 0xFFFF when there is
+  /// no phase or no sample instant. Network task.
+  uint16_t render_phase_age_ms_() const {
+    const int64_t at = this->render_phase_at_us_.load(std::memory_order_relaxed);
+    if (at == 0 || this->render_phase_us_.load(std::memory_order_relaxed) == RENDER_PHASE_UNKNOWN) {
+      return 0xFFFF;
+    }
+    const int64_t age_ms = (esp_timer_get_time() - at) / 1000;
+    return static_cast<uint16_t>(std::clamp<int64_t>(age_ms, 0, 0xFFFE));
   }
 
   /// @brief Our crystal rate minus the mean of our peers', in ppm, or NaN when unknown.

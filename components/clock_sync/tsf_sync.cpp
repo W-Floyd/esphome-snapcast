@@ -375,6 +375,14 @@ struct __attribute__((packed)) TsfPacket {
   // simply does not carry it, and 0 means "unknown" and is accepted by anyone, so a
   // half-flashed fleet degrades to the previous behaviour instead of splitting in two.
   uint32_t stream_id_hash;
+  // Age of render_phase_us at send time, ms (0xFFFF = unknown / older sender). The receiver pairs
+  // phases by SAMPLE instant, not by receipt: with the phase published once per block (~0.65 s) and
+  // beaconed once a second, the sample can be up to ~1.6 s older than its receipt, and the shared
+  // mapping ramps at 2-3 ppm most of the time, so an older phase reads later by ramp x age. Measured
+  // 2026-08-30 07:42-08:36: BOTH boards' group deltas read negative (A -6..-18, B ~0; the pair must
+  // sum to zero), and render_align marched both deadlines later together at 15 us/min. Appended
+  // last so an older sender's shorter packet still parses (see the short-packet defaults on receive).
+  uint16_t render_phase_age_ms;
 };
 
 // Fields from render_phase_us onward are the newest additions, so an older sender's packet is
@@ -542,8 +550,11 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       // perfectly usable. BOTH must be reset every iteration, since pkt is reused and would
       // otherwise carry the PREVIOUS sender's values -- for stream_id_hash that means silently
       // accepting a short packet as belonging to whatever stream the last long packet named.
-      pkt.crystal_ppm = NAN;
-      pkt.stream_id_hash = 0;
+      if (n < static_cast<ssize_t>(offsetof(TsfPacket, render_phase_age_ms))) {
+        pkt.crystal_ppm = NAN;
+        pkt.stream_id_hash = 0;
+      }
+      pkt.render_phase_age_ms = 0xFFFF;  // older sender: pair by receipt, as before
     }
     if (pkt.magic != TSF_MAGIC || pkt.version != TSF_VERSION) {
       continue;
@@ -610,7 +621,10 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     // keeps a peer's last phase when it reports UNKNOWN, so overwriting would be a no-op anyway,
     // and what we want is for this peer never to enter the statistic at all.
     if (phase_comparable) {
-      this->record_peer_phase_(*peer, pkt.render_phase_us, local_now_us);
+      // Pair by the peer's SAMPLE instant (receipt minus the age it reported), see TsfPacket.
+      const int64_t phase_sampled_us =
+          pkt.render_phase_age_ms == 0xFFFF ? local_now_us : local_now_us - static_cast<int64_t>(pkt.render_phase_age_ms) * 1000;
+      this->record_peer_phase_(*peer, pkt.render_phase_us, phase_sampled_us);
     }
 
     // PHASE-ONLY BEACON: the sender has no settled estimate to pool. Its phase and diagnostics
@@ -1107,6 +1121,7 @@ void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_
   pkt.stream_id_hash = stream_id_hash;
   pkt.pipeline_us = this->pipeline_us_.load(std::memory_order_relaxed);
   pkt.render_phase_us = this->render_phase_us_.load(std::memory_order_relaxed);
+  pkt.render_phase_age_ms = this->render_phase_age_ms_();
   pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
 
   struct sockaddr_in dest = {};
@@ -1214,6 +1229,7 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     const int32_t depth = this->pipeline_us_.load(std::memory_order_relaxed);
     pkt.pipeline_us = depth;  // PIPELINE_UNKNOWN is INT32_MIN, which passes through unchanged
     pkt.render_phase_us = this->render_phase_us_.load(std::memory_order_relaxed);
+    pkt.render_phase_age_ms = this->render_phase_age_ms_();
   }
   struct sockaddr_in dest = {};
   dest.sin_family = AF_INET;
