@@ -1552,7 +1552,11 @@ class SnapcastClient {
   std::atomic<float> tune_ti_s_{600.0f};
   /// Error-proportional gain: Kp = (1/tau) * max(1, |err| / knee), effective tau floored at tau_min.
   /// Knee 25 us: tau 120 only inside the per-block noise, tau ~30 s at 100 us, tau_min beyond 120 us.
-  std::atomic<float> tune_knee_us_{150.0f};  // above the +-350 us common wander; 25 kept the loops boosted in steady state
+  // KNEE OFF (1e6 us): the error-proportional boost is a per-board gain, and 22:13-22:59 one board
+  // was above knee 150 while the other was below 21 % of the time (median asymmetry 0.004 ppm/us =
+  // 0.4 ppm of differential trim per 100 us of common wander). The rate gain must be the same
+  // function of the error on every board; acquisition is the coarse path's job (position).
+  std::atomic<float> tune_knee_us_{1000000.0f};
   std::atomic<float> tune_tau_min_s_{20.0f};
   /// render_align channel (inter-device, on the exchanged tag-derived render phase): cap in us
   /// (0 = off; seeded from YAML render_align_max), gain per due report, deadband in us.

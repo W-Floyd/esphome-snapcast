@@ -863,6 +863,13 @@
 > cause. The knee's error-proportional boost carries the same asymmetry whenever one board is above
 > the knee and the other is not; it is tolerated because knee 150 sits above the wander, and noted.
 >
+> **The knee is the same asymmetry, chronic:** 22:13–22:59, one board above knee 150 with the other
+> below in **21.2 %** of paired blocks (both above 8.9 %), median kp asymmetry 0.004 ppm/µs → 0.4 ppm
+> of differential trim per 100 µs of common wander, for as long as the crossing lasts. Prediction:
+> with a flat rate gain the 60–120 s wire term (4.6–9.7 µs today) shrinks. **Build 41: knee off**
+> (tune_knee_us 1e6 → flat tau 120 / Ti 600 on both boards); acquisition = coarse step-and-verify
+> only. To be graded on both the injections and a 45-min structure function.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
