@@ -722,6 +722,19 @@
 > costs a cycle): compiled defaults knee 150, align applied, cap 300, gain 0.1, step 4, deadband 3;
 > a YAML `render_align_max: 0ms` no longer forces the channel off.
 >
+> **19:11:49 the observer CRASHED and rebooted** (`rst:0xc RTC_SW_CPU_RST`): `assert failed:
+> prvSendItemDoneNoSplit ringbuf.c:374 ((pxCurHeader->uxItemFlags & 8) == 0)` — a FreeRTOS ring
+> buffer item completed/returned twice, in the I2S speaker DMA path (the observer runs the full
+> speaker pipeline with no DAC attached). Just before it: `PADDISP pad=1281071 clamp=13559` — 1.28 M
+> frames of padding debt on the observer. Not seen on A today (B blind). Backtrace
+> Symbolised from the ELF: `xRingbufferSendComplete` ← `esphome::logger::TaskLogBuffer::
+> send_message_thread_safe` ← `Logger::log_vprintf_non_main_thread_` ← `Logger::log_vprintf_`.
+> **ESPHome's thread-safe logger buffer, not the servo**: the non-main-task log path double-
+> completed a ring item, under today's per-chunk DEBUG volume (RAW every 10 ms from the player
+> task, DEPTH/I2SDBG from the speaker/mixer tasks). Same path exists on the speakers. Mitigation
+> when the diagnostics are no longer needed: drop RAW/DEPTH/I2SDBG to VERBOSE. First crash of the
+> day on any board.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
