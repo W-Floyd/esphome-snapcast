@@ -3042,12 +3042,13 @@ void SnapcastClient::player_task_() {
                // it came back +26272. The tag path had one-block-one-step; the ledger had nothing.
                (!resync_window || coarse_on_tags || st.resync_step_at_us == 0 ||
                 now_us() - st.resync_step_at_us >= blank_us) &&
-               // WHILE TAGS ARE FRESH THE LEDGER DOES NOT STEP IN THE WINDOW. Build 46 boot (00:27:50):
-               // tag step -2680, ledger step +3592, tag -2732, ledger +3656 ... a +-4.5 ms limit cycle
-               // at 1 Hz, each source stepping on the other's step before the pipeline had shown it.
-               // The ledger's role in the window is the FIRST step after a hard resync, when the tags
-               // are blanked; once they are back it is the tags' error the step-and-verify is on.
-               (!resync_window || coarse_on_tags || !tags_fresh)) {
+               // THE LEDGER TAKES ONLY THE FIRST STEP OF A WINDOW. Build 46 boot (00:27:50): tag step
+               // -2680, ledger +3592, tag -2732, ledger +3656 ... a +-4.5 ms limit cycle at 1 Hz. Build 47
+               // gated the ledger on "tags not fresh" and cycled identically (00:39:34): every tag step
+               // blanks the tags for a moment, the ledger steps in that moment, the tags come back and
+               // step on the ledger's step. Freshness flickers; "has anything stepped in this window"
+               // does not. resync_step_at_us is zeroed wherever the window opens.
+               (!resync_window || coarse_on_tags || st.resync_step_at_us == 0)) {
       // In the window a tag-based step needs the error to have PERSISTED across a block boundary:
       // the block used for the previous decision may not be used again (one block, one step), and
       // with the arm at 100 us this is what keeps the +-60 us block noise from being stepped on.
@@ -4138,6 +4139,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   if (std::abs(e) > this->tune_resync_reopen_us_.load(std::memory_order_relaxed) && now >= st.post_event_until_us) {
     st.post_event_until_us =
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
+    st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
     st.resync_inside_since_us = 0;
     ESP_LOGI(TAG, "Delay loop: resync window re-opened on a %+.0f us step t=%" PRId64, e, now);
   }
@@ -4209,6 +4211,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     st.dl_engaged_since_us = now;
     st.post_event_until_us =
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
+    st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
     ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
              st.trim_integral_ppm, st.dl_err_us, now);
   }
@@ -4499,6 +4502,7 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
   st.kp_event_us = now;
   st.post_event_until_us =
       now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
+    st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
   // Every event that re-arms the gain schedule -- a hard resync, a timebase re-anchor -- also
   // displaced audio or stepped the deadline mapping, so the tags of audio already in flight
   // describe the OLD placement. Blank the delay loop's tag stream for one pipeline depth, same as
