@@ -1063,6 +1063,7 @@ class SnapcastClient {
   /// clock-offset wander is per-device, so steering on it misaligns the group; hold instead).
   /// THREAD CONTEXT: player task.
   void delay_loop_update_(ServoState &st);
+  void publish_render_phase_();  // per-block render phase to the group (see delay_loop_update_)
 #endif
 
   /// Forces one repair cycle after a re-lock, if configured; a no-op otherwise. Called once per

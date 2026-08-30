@@ -4002,6 +4002,40 @@ void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord
 #ifdef USE_I2S_RATE_LOCK
 // THREAD CONTEXT: player task. THE DELAY LOOP -- see the constants block at DL_BLOCK_N and
 // PLAN-delay-controlled-servo.md for the design and its bench evidence.
+// The MEASURED render phase -- TSF(first frame of the latest tagged render) minus that frame's
+// server time -- published to the group. Identical to the report-time computation in
+// log_sync_report_ (which also logs RENDERTAG/inferred); this one runs per delay-loop block so the
+// group delta has a fresh pairing every beacon. Publishes UNKNOWN rather than a stale value: the
+// freshness gate is the same 100 ms / blank rule, for the reasons documented at the report site.
+void SnapcastClient::publish_render_phase_() {
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+  if (this->tsf_sync_ == nullptr || this->config_.tsf_observer) {
+    return;
+  }
+  int64_t phase_tsf = 0, phase_local = 0, phase_width = 0;
+  if (!TsfSync::raw_tsf_sample(phase_tsf, phase_local, phase_width)) {
+    return;
+  }
+  this->playout_mutex_.lock();
+  const TaggedRender tr = this->tagged_render_;
+  const int64_t dl_blank = this->dl_blank_until_us_;
+  this->playout_mutex_.unlock();
+  constexpr int64_t RENDER_TAG_MAX_AGE_US = 100000;
+  const int64_t tag_age_us = phase_local - tr.adjusted_ts_us;
+  const bool tag_fresh = tr.adjusted_ts_us > 0 && tr.sample_rate > 0 && tag_age_us < RENDER_TAG_MAX_AGE_US &&
+                         tag_age_us > -RENDER_TAG_MAX_AGE_US && tr.adjusted_ts_us >= dl_blank;
+  if (!tag_fresh) {
+    this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
+    return;
+  }
+  const int64_t rate = static_cast<int64_t>(tr.sample_rate);
+  const int64_t first_frame_local = tr.adjusted_ts_us - static_cast<int64_t>(tr.frames) * 1000000 / rate;
+  const int64_t render_tsf = first_frame_local + (phase_tsf - phase_local);
+  const int64_t render_server = tr.server_ts_us + static_cast<int64_t>(tr.offset_frames) * 1000000 / rate;
+  this->tsf_sync_->set_render_phase_us(render_tsf - render_server, phase_local);
+#endif
+}
+
 void SnapcastClient::delay_loop_update_(ServoState &st) {
   // Pull the accumulator state. A completed block is drained; a partial one is left to fill --
   // unless the stream has gone stale, in which case the partial block spans a gap and is discarded
@@ -4085,6 +4119,13 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   st.dl_err_at_us = now;
   st.dl_have_err = true;
   st.dl_updates++;
+  // PUBLISH THE RENDER PHASE PER BLOCK, NOT PER REPORT. The group delta pairs my phase with a
+  // peer's only if the two were sampled within PHASE_PAIR_WINDOW_US (300 ms) of each other; with
+  // both boards publishing once per ~3.3 s report that was a coincidence -- delta known on 62 % of
+  // reports, unknown for the first 20-40 s after a boot, and the resync gate refusing for want of
+  // evidence (build 48 boot, 00:43: RSTEP gd=unknown). Every ~0.65 s block on each board puts ~5
+  // samples inside each 3.3 s and a pairing inside every beacon interval.
+  this->publish_render_phase_();
 
   // ABOVE THE SPLICE THRESHOLD, SPLICE; BELOW IT, TRIM -- the plan's rule, and the trim half of
   // it: position errors at the millisecond scale belong to the fast path, and a rate loop asked
