@@ -611,3 +611,5 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
 * Build 70: a fast splice marks the phase transient (engage); neither board chased a faulting peer in
   three faults. Grade 12:12–12:57 (six holes): median +2.5 µs, robust sd 9.7, 85 % inside ±20 µs.
   Unexplained: 1–2-min excursions to +10…+22 on asymmetric delta readings with no logged event.
+* Clean step test (build 71 hooks): deadline→wire gain ≈ 0.8–1.0 with the PI's τ; the kick path delivers a
+  40 µs step whole within 30 s; align closes a standing 46 µs in 90 s. The 28 % figure is retracted.

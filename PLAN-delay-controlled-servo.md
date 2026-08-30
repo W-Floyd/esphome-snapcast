@@ -2492,3 +2492,17 @@ gain is 1, with the PI's τ = 120 s shape), then `align_bias_kick_us 0` (−40 k
 within ~1 s plus one ring travel), restore. Event counts printed beside every row so a timebase event
 cannot pass as a result again. PHASEIN (both boards' raw phases, ages, group delta) is logged on the
 speakers once per align cycle for the unexplained excursions.
+
+### 2026-08-30 13:14–13:25 — the clean step test: deadline→wire gain ≈ 0.8–1.0 at τ ≈ 120 s; the kick path 1.0 in 30 s
+
+Align frozen on both (wire held at +55, MAD 0.2). A `align_bias_us +40` (deadline only): wire +55 → +60
+(30 s) → +67.5 (60 s) → +69 → +71 → +72 → +79.5 → +84 → +88 → +86 → **+86 (300 s)**: +31 of +40, the PI's
+first-order shape (40 × (1 − e^(−t/120)) predicts +15.7 at 60 s, +37 at 300 s; measured +12.4 and +31 with
+two small events inside). A `align_bias_kick_us 0` (−40 with the kick): +86 → **+46 within 30 s** and flat
+for three minutes — the kick delivers the whole step at once. Restore: align took the standing +46 to
++0.8 in 90 s. Sign as the mapping says (A's bias up → wire up).
+
+So both actuator paths are whole; the "28 %" of 10:56 was the accumulator carrying clamped excess (fixed
+in 69) plus a 10-s window on a τ = 120 s path. Open question left from this run: why the wire sat at +55
+when align was frozen five minutes after boot — the first minutes after a lock deserve a look with the
+new PHASEIN lines.
