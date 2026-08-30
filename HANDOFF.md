@@ -615,3 +615,6 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
   40 µs step whole within 30 s; align closes a standing 46 µs in 90 s. The 28 % figure is retracted.
 * Build 73 (shared-offset hold through TSF-sample blips): deadline fallbacks 0/0 in 47 min (were
   2–32/h); 40 quiet minutes at ±5 µs with zero faults — the flap was a first-order disturbance.
+* Build 73, 90 min untouched through ~30 server holes: median +1.9 µs, robust sd 11.5, 77 % inside
+  ±20 µs; deadline fallbacks 0; biases at 0/+1. Remaining event classes: the holes, and the post-refill
+  tag outlier (tags read tens of ms while the ledger is sane → TAGFAULT → 15 s reconnect, B ×5).

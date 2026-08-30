@@ -2570,3 +2570,11 @@ re-trust. This morning the ledger was the liar (the in-write snapshot); since bu
 sane through these and the tags claim tens of ms. Next design item: what the tag stream measures in the
 first seconds after a starvation refill (anchor from a pre-storm chunk? DMA tags spanning the silence?)
 — the reconnect recovers in ~15 s, but three per afternoon is the remaining event class. TODO'd.
+
+### 2026-08-30 14:25–15:55 — build 73, 90 minutes untouched through the worst server hour of the day
+
+n = 22 177, median **+1.9 µs**, robust sd 11.5, 59 % inside ±10 µs, 77 % inside ±20 — with 30 starvations,
+5 TAGFAULTs (all B, all the post-refill tag outlier), 7 reconnects, 1 splice each and 80 window re-opens
+inside the window. **Deadline fallbacks: 0** (23 held blips). Biases ended at 0 / +1 µs. Every fault
+recovered by reconnect + re-trust with the peer holding still; the quiet stretches sat at ±5 µs. The
+remaining event class is the server holes themselves plus the post-refill tag outlier (TODO).
