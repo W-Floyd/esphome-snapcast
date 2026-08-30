@@ -5785,7 +5785,11 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             this->render_align_frac_ += -static_cast<float>(group_delta) * this->tune_align_gain_.load(std::memory_order_relaxed);
             const int32_t step_i = static_cast<int32_t>(this->render_align_frac_);  // toward zero
             const int32_t step = std::clamp<int32_t>(step_i, -max_step, max_step);
-            this->render_align_frac_ -= static_cast<float>(step);
+            // Keep only the sub-microsecond remainder. Build 57-68 subtracted the CLAMPED step, so a
+            // transient delta larger than the cap left its excess queued: 11:06:39 B saw -206 once
+            // (0.3 x 206 = 62, stepped 20, kept 42) and then stepped +20, +20 on deltas of +1 and +14.
+            // The cap is a limiter, not a queue.
+            this->render_align_frac_ -= static_cast<float>(step_i);
             if (this->tune_align_apply_.load(std::memory_order_relaxed)) {
               const int32_t bias_before = bias;
               bias = std::clamp<int32_t>(bias + step, -cap, cap);
