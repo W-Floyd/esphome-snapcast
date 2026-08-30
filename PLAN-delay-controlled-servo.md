@@ -2608,3 +2608,10 @@ refused as designed. But 97 of ~560 **cmp=1** lines still carry −48/−51 ms: 
 single live begin/end pair misses it. Build 76: a ring of the last 8 completed write windows; a
 snapshot inside any of them is not comparable. (B's 16:08 crash: the Crystal line — relocated to the
 player task, see above; rides into 75.)
+
+### 2026-08-30 16:50 — build 75's tag blank confirmed against a built-in control
+
+A real server hole hit B (build 75) and the observer (old build, no fix) at 16:50:24 simultaneously.
+The observer TAGFAULTed at 16:50:38 with the classic signature (err_tag −17.7 ms, ledger −0.7). B rode
+it clean: tags and ledger agreed within 30–75 µs the whole way (+1.2 ms decaying to +77 µs, no fault,
+no reconnect). Same disturbance, same moment, one variable.
