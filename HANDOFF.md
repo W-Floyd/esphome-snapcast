@@ -246,13 +246,16 @@ All committed on `main`; `PLAN-delay-controlled-servo.md` carries the blow-by-bl
   positive group delta = this board is EARLY; so `bias -= delta*gain` (the original code; build 29
   restores it after a wrong flip in build 23 that made two live runs run away). `align_max_us 0`
   clears the bias. Enable with `align_apply 1`, cap small (60 µs) first.
-* Runtime tunables persist nothing: every reflash resets them (`servo-param.py`).
+* Runtime tunables persist nothing: every reflash resets them (`servo-param.py`) — build 30's
+  defaults ARE the operating point, so a reflash no longer needs a param pass.
+* `RAW` is VERBOSE since build 30: two boards crashed in ESPHome's thread-safe logger buffer
+  (`TaskLogBuffer::send_message_thread_safe` → `xRingbufferSendComplete` assert) under 38 lines/s.
 
 **Steady state with the inter-device channel applied (build 29, knee 150, align gain 0.1 / step 4):**
 18:00–18:45 (cap 150): n=27,126, wire median +2.7 µs, robust sd 5.0 µs, p2p 27.8 µs; 18:46–19:31
 (cap 300): n=25,155, **median +4.2 µs, robust sd 4.0 µs, p2p 46.9 µs**, 3-min medians 0…+11 µs,
-1-s change 0.19 µs, every 3-min median within ±8 µs, zero events. Build 30 (committed `aaba353`,
-not yet flashed) makes that the compiled default: knee 150, align applied, cap 500, gain 0.1,
+1-s change 0.19 µs, every 3-min median within ±8 µs, zero events. Build 30 (`be736f3`, FLASHED fleet-wide
+20:38, boots to the operating point with no API tuning; wire ≤ 20 µs at +73 s) makes that the compiled default: knee 150, align applied, cap 500, gain 0.1,
 step 4, deadband 15 (the exchanged phase carries a ~10 µs bias of its own; a 3 µs deadband made the
 bias creep ~1 µs/min forever). 19:32–20:32 (cap 500, deadband 3): median +2.3 µs, quiet-part 5-min
 medians within ±10 µs, zero A events; the observer's crash-rejoin at 19:33 jolted the wire +89 µs. The channel removes a standing offset at ~4 µs per 10-s report; events

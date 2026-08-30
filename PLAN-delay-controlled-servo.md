@@ -762,6 +762,11 @@
 > measured defaults (knee 150, align applied, cap 500, gain 0.1, step 4, deadband 15). A speaker
 > crash is a 20-s dropout and a membership jolt on the other; this outranks the graded window.
 >
+> **Build 30 landed 20:38:36 (fleet; speakers 01:36:28Z).** RAW gone (0 per 10 s). With the compiled
+> defaults and no API tuning: wire inside 20 µs held from **+73 s**, align active from boot (bias
+> +8 → +11 against a −16…−26 delta). Cycle-time ledger: 18 >450 · 19 242 · 22 209 · 24 74 · 25 67 ·
+> 26 46 · 30 73 (defaults only). 60-min hands-off grade of the defaults follows (20:47–21:47).
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
