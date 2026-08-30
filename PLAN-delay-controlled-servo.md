@@ -2362,3 +2362,12 @@ Afterwards A carries `RECON drift=10000` **constant** and `SHADOW err_tag −100
 ledger believes 10 ms more audio is queued than is measured — one DMA block — the accounting-split
 family again, this time steady rather than flipping. Audio is on the tags and is fine (wire ±10); it
 becomes a fault only if the tags go stale. Recorded; not acted on during the 45-min grade.
+
+### 2026-08-30 09:52 — TAGFAULT the wrong way round, then a minute of no action: build 66 re-trusts tags on agreement
+
+A's steady +10 ms ledger split (after the 09:43 576-frame insert) tripped TAGFAULT at 09:52:10 — the
+tags were right (+358), the ledger wrong (+10384). After the reconnect tags and ledger agreed within
+40 µs at +15 ms, yet the 180-s distrust kept coarse decisions on the ledger, whose 52 ms flip showed
++15, +5, −7 ms in consecutive reports: `corrected −0/+0` for over a minute, wire +3.5 ms. Build 66:
+three consecutive blocks of tag/ledger agreement inside 1 ms end the distrust (`Tags re-trusted`).
+The timer stays as the fallback for genuine tag faults, where the two never re-agree.
