@@ -248,8 +248,9 @@ All committed on `main`; `PLAN-delay-controlled-servo.md` carries the blow-by-bl
   clears the bias. Enable with `align_apply 1`, cap small (60 µs) first.
 * Runtime tunables persist nothing: every reflash resets them (`servo-param.py`).
 
-**Steady state with the inter-device channel applied (18:00–18:45, build 29, knee 150, align cap
-150 / gain 0.1 / step 4):** 45 min, n=27,126, **wire median +2.7 µs, robust sd 5.0 µs, p2p 27.8 µs**,
+**Steady state with the inter-device channel applied (build 29, knee 150, align gain 0.1 / step 4):**
+18:00–18:45 (cap 150): n=27,126, wire median +2.7 µs, robust sd 5.0 µs, p2p 27.8 µs; 18:46–19:31
+(cap 300): n=25,155, **median +4.2 µs, robust sd 4.0 µs, p2p 46.9 µs**, 3-min medians 0…+11 µs,
 1-s change 0.19 µs, every 3-min median within ±8 µs, zero events. Build 30 (committed `aaba353`,
 not yet flashed) makes that the compiled default: knee 150, align applied, cap 300, gain 0.1,
 step 4, deadband 3. The channel removes a standing offset at ~4 µs per 10-s report; events

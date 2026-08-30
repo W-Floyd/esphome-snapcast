@@ -735,6 +735,15 @@
 > when the diagnostics are no longer needed: drop RAW/DEPTH/I2SDBG to VERBOSE. First crash of the
 > day on any board.
 >
+> **45-min hands-off, align cap 300 / gain 0.1 / step 4 (18:46–19:31):** n=25,155, **median +4.2 µs,
+> robust sd 3.97 µs, p2p 46.9 µs**, change 0.19 / 1.2 / 2.2 / 3.7 / 4.6 µs over 1/10/30/60/120 s,
+> 3-min medians 0…+11 µs at 0.6–2 µs spread, zero events. A's bias +195 → +238 (≈1 µs/min) against a
+> delta averaging ≈ −5: the channel nulls the EXCHANGED phase, which sits ≈ +4 µs from the wire —
+> that offset is the exchanged measurement's own bias and is this channel's floor; the slow bias
+> creep is it integrating that bias. Cap → 500 (19:32) so it is not pinned; 60-min window next.
+> Steady-state ledger (wire robust sd): build 14 8.9 → 17 4.9 → 21 21 (knee 25, wrong regime) →
+> 27 16.8 (shadow) → 29 applied 5.0 → 4.0.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
