@@ -2181,3 +2181,22 @@ delta *sees* the standing offset every cycle; align does nothing with it because
 hunted at ±100 µs on 2026-08-29), `align_step_us 20`. Prediction: the wire mean walks from −10 to
 within ±3 over ~5–10 min and stays; the ±8 meander is untouched (that is P-term noise: `block_n` or τ,
 each a response-time trade, or better tags).
+
+### 2026-08-30 07:10–07:14 — why the wire is blind for 1.5–4 minutes after every boot: the boards play SILENCE until "Sync locked"
+
+Not the analyzer. `push_chunk_(rec, drop, silent = !st.converged)` zeroes every slice until the servo
+declares converged, and `frame_lag()` returns coef exactly 0.00 for a zero-variance channel. Tonight's
+unmute delays (boot → `Sync locked … unmuting`): A 24 / 28 / 83 / 85 / 19 / 68 / **150 s**; B … 25 / 19 /
+**186 s** (07:10 boot: A 07:13:19, B 07:13:55 → correlation at +191 s ✓). Converged requires the error
+inside `2 × sync_deadband` for a median window with the timebase settled, AND the drift anchor within
+100 µs — and A's anchor read **−49343** at 07:13:18 (the 51 ms `RECON drift` flip), "waiting for the
+accounting to agree", so the instrument bug delays unmute too (up to 15 s by `UNMUTE_ANCHOR_MAX_WAIT_US`).
+
+The long part is the PI: at boot both boards read the same ~−700 µs (common — the mapping, not a
+mutual offset), the gate correctly refuses one-board steps on it, and each board closes it at τ = 120 s
+before it will unmute. But mute-until-converged exists to hide *mutual* desync, and the group delta is
+the direct measurement of that: at 07:11:20 both boards had |gd| < 30 µs while still 600 µs from their
+deadlines. Proposal: unmute on group agreement (|gd| small for N s, or no peer) rather than on own
+err_tag — seconds instead of minutes after a boot or reconnect — keeping the err_tag rule when the
+delta is unknown. Operator's call: it trades a common ~0.5 ms offset from the server's timeline
+(inaudible as such) for 2–3 minutes of silence.
