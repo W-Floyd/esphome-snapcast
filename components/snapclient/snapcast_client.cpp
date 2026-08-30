@@ -4223,7 +4223,11 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sa
     const int64_t in_flight_us = static_cast<int64_t>(in_flight) * frame_us;
     const int64_t effective_us = err_us - in_flight_us;
     if (st.fast_splice_active) {
-      if (std::abs(effective_us) <= FAST_SPLICE_RELEASE_US || st.fast_splice_frames >= FAST_SPLICE_MAX_FRAMES) {
+      // Release inside half the ARM threshold: with the resync window arming at 100 us, a fixed
+      // 300 us release sat ABOVE the arm point and the splice re-engaged every release (build 31
+      // boot: engaged at -102, -104, -104 us in a row). Steady state keeps its 300 us.
+      const int64_t release_us = std::min<int64_t>(FAST_SPLICE_RELEASE_US, threshold / 2);
+      if (std::abs(effective_us) <= release_us || st.fast_splice_frames >= FAST_SPLICE_MAX_FRAMES) {
         if (st.fast_splice_frames >= FAST_SPLICE_MAX_FRAMES) {
           ESP_LOGW(TAG, "Fast splice hit its %" PRIu32 "-frame bound with %" PRId64
                         " us still standing -- treating as a measurement fault, handing back to the PI",
