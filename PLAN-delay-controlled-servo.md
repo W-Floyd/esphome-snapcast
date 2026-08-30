@@ -2645,3 +2645,16 @@ Known structure of the budget: hole 0.3 s → hard resync ~+2 s → ledger first
 gain 1.0) → tags return at the horizon → one verify step → close. If the ledger's first step lands
 inside 100 µs — the ledger agrees with the tags to ~50 µs now — the target is reachable by trimming
 the resync detection (+2 s) and the close timer's place in the metric.
+
+### 2026-08-30 17:41–17:45 — build 77 timelines: the budget named, the variance is the first step
+
+Injections 20 / 15 / **10** / 32 s, zero TAGFAULTs (a real group hole at 17:41:51 rode clean on both
+speakers while the observer faulted — second controlled confirmation). The timeline when it works
+(inj 3): hard resync +1.5 s → ledger step +2.5 → one tag step +7.1 → wire <100 µs at +10 s incl. the
+5-s hold. The variance: the ledger's first step landed on mid-refill readings that bounce tens of ms
+chunk-to-chunk (+41.8/+27.7/+36.4/+42.2 in 300 ms during the 17:41:51 burst), leaving 990 µs / 2.7 ms /
+14 ms residuals that cost extra 2.7-s rounds and, twice, a −300 µs tail below the gate's floor.
+**Build 78:** the ledger's first window step requires two consecutive readings within 20 % (500 µs
+floor). Prediction: every injection ~10–13 s; tails only where the gate's gd floor leaves them.
+cmp=1 big-drift census reads 49 % but the window was all bursts (genuine ledger displacement is real
+and comparable during refill); the decisive check — drift consumers — reads zero on both boards.
