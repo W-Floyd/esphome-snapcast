@@ -2598,3 +2598,13 @@ logger's thread-safe path. Demoted to VERBOSE there; the client now logs the ide
 player task at align cadence, so the analyzer's `crystal_a/b_ppm` columns keep working. The snap_net
 task now emits no periodic DEBUG lines; if a third crash arrives, it names the next one. Rides into
 build 75.
+
+### 2026-08-30 15:56–16:38 — build 74 graded; the cmp= field finds the exclusion's残 hole
+
+Grade: quiet minutes ±5 µs (16:19–16:35 mostly MAD ≤ 2), events at 16:08 (B's logger crash) and 16:10.
+The `cmp=` census: cmp=0 lines are exactly the old two-chunk artefact (xfer=50000, age 54–61 ms) —
+refused as designed. But 97 of ~560 **cmp=1** lines still carry −48/−51 ms: the snapshot is itself
+50–60 ms old, so it can fall inside a write window that had *ended* before the comparison ran, and the
+single live begin/end pair misses it. Build 76: a ring of the last 8 completed write windows; a
+snapshot inside any of them is not comparable. (B's 16:08 crash: the Crystal line — relocated to the
+player task, see above; rides into 75.)
