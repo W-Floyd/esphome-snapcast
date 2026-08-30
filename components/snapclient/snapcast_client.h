@@ -1577,10 +1577,10 @@ class SnapcastClient {
   // Defaults = the 2026-08-29 18:00-18:45 operating point: 45 min, wire median +2.7 us, robust sd
   // 5.0 us, 1-s change 0.19 us, zero events, with the channel applied at the measured sign.
   std::atomic<int32_t> tune_align_max_us_{500};  // 300 was reached within ~2 h by the ~1 us/min creep against the exchanged phase bias
-  std::atomic<float> tune_align_gain_{0.1f};
-  std::atomic<int32_t> tune_align_deadband_us_{15};  // covers the exchanged phase's own ~10 us bias; 3 made the bias creep ~1 us/min forever
+  std::atomic<float> tune_align_gain_{0.3f};
+  std::atomic<int32_t> tune_align_deadband_us_{1};  // covers the exchanged phase's own ~10 us bias; 3 made the bias creep ~1 us/min forever
   std::atomic<int32_t> tune_align_reject_us_{500};  // pairs beyond this are not a measurement
-  std::atomic<int32_t> tune_align_step_us_{4};      // per due report (~10 s): 0.4 ppm at most
+  std::atomic<int32_t> tune_align_step_us_{20};      // per due report (~10 s): 0.4 ppm at most
   std::atomic<bool> tune_align_apply_{true};        // false = shadow: log the step, move nothing
   /// Resync window (s) after an event, and the splice threshold (us) inside it. Target: |A-B| < 100 us
   /// within 5 s of a disturbance.
