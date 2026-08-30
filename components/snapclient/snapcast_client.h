@@ -923,6 +923,7 @@ class SnapcastClient {
     /// reconnect. Measured 2026-08-29 without it: A's 21:05 reconnect took 25 s to |wire| < 100 us
     /// (from +204 us at PI pace, below the 1 ms splice threshold); B's 22:13 boot > 75 s from +490.
     int64_t post_event_until_us{0};
+    int64_t resync_inside_since_us{0};  // when |err| last went inside the arm threshold (window close timer)
     /// No NVS integral was restored at boot: seed from the TSF crystal estimate at first engage
     /// and run the fast boot Ti; a fresh board otherwise winds ~56 ppm through Ki over 10+ min.
     bool dl_cold_start{true};
@@ -1568,7 +1569,8 @@ class SnapcastClient {
   std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)
   std::atomic<float> tune_resync_gain_{0.8f};    // fraction of the measured error corrected per step (clean block)
   std::atomic<float> tune_resync_reopen_us_{400.0f};  // a block error past this re-opens the window
-  std::atomic<int32_t> tune_resync_splice_us_{100};
+  std::atomic<int32_t> tune_resync_splice_us_{150};  // in-window coarse arm; 100 sat inside the +-60..150 us block noise and kept stepping after zero
+  std::atomic<float> tune_resync_close_s_{5.0f};     // inside the arm threshold this long -> window closes
   std::atomic<int32_t> tune_resync_blank_ms_{1200}; // step-and-verify cadence: the judging block must START after the step (block 0.65 s + pipeline 0.28 s)
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.

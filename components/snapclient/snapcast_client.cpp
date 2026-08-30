@@ -4067,7 +4067,24 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   if (std::abs(e) > this->tune_resync_reopen_us_.load(std::memory_order_relaxed) && now >= st.post_event_until_us) {
     st.post_event_until_us =
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
+    st.resync_inside_since_us = 0;
     ESP_LOGI(TAG, "Delay loop: resync window re-opened on a %+.0f us step t=%" PRId64, e, now);
+  }
+  // ... AND CLOSES ON CONVERGENCE, not on the timer. Left open for the full 60 s, the in-window
+  // coarse steps kept firing on the +-60..150 us post-event noise and the common wander after the
+  // wire had already crossed zero (22:59:04 -> -145 us by 22:59:34): each 80 % step over-corrects
+  // against the other board. Inside the arm threshold for resync_close_s -> the window is done.
+  if (now < st.post_event_until_us) {
+    if (std::abs(e) <= this->tune_resync_splice_us_.load(std::memory_order_relaxed)) {
+      if (st.resync_inside_since_us == 0) st.resync_inside_since_us = now;
+      else if (now - st.resync_inside_since_us >= static_cast<int64_t>(this->tune_resync_close_s_.load(std::memory_order_relaxed) * 1000000.0f)) {
+        st.post_event_until_us = now;
+        st.resync_inside_since_us = 0;
+        ESP_LOGD(TAG, "Delay loop: resync window closed, converged t=%" PRId64, now);
+      }
+    } else {
+      st.resync_inside_since_us = 0;
+    }
   }
   float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
   if (now < st.post_event_until_us) {
@@ -4496,6 +4513,9 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_win_s") {
     if (!(value >= 0.0f && value <= 600.0f)) return false;
     this->tune_resync_win_s_.store(value, std::memory_order_relaxed);
+  } else if (name == "resync_close_s") {
+    if (!(value >= 1.0f && value <= 60.0f)) return false;
+    this->tune_resync_close_s_.store(value, std::memory_order_relaxed);
   } else if (name == "resync_reopen_us") {
     if (!(value >= 100.0f && value <= 5000.0f)) return false;
     this->tune_resync_reopen_us_.store(value, std::memory_order_relaxed);

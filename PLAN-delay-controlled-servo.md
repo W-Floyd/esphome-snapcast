@@ -843,6 +843,13 @@
 > window closed → recovered at steady-state gains, 450 → 224 µs in 35 s. **Build 38:** a block error
 > past `resync_reopen_us` (400) re-opens the resync window whatever the cause.
 >
+> **22:58:48 A 300 ms injection (build 37): wire +1335 → 111 → 263 → 92 → 41 → −1 at +16 s, then kept
+> going −10 → −50 → −71 → −145 (22:59:34).** The window (60 s fixed) stayed open after convergence
+> and the coarse steps kept firing on the ±60–150 µs post-event noise, each 80 % step over-correcting
+> against the other board: stairs AWAY from sync. **Build 39:** the window closes once |err| has been
+> inside the arm threshold for `resync_close_s` (5); in-window arm `resync_splice_us` 100 → 150 (above
+> the block noise). Build 38's re-open rule (> 400 µs) is included.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
