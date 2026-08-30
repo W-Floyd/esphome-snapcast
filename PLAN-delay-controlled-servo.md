@@ -889,6 +889,16 @@
 > is the smaller of the two; no differential evidence → no step, the symmetric PI handles it. Build
 > 42's 100 µs arm / one-step-per-block is included but now gated this way.
 >
+> **Review of 22:14–23:27 (13 firmware commits, builds 31–43), asked for by the operator:** the
+> evening's instability has ONE cause — to reach "<100 µs in 5 s" one-board corrective actions were
+> pushed into the ±150 µs regime where the common deadline wander lives. Build 30 never acted below
+> 1 ms (splice, 4-s wait) or 2.9 ms (catch-up). Each regression is the same principle violated:
+> 31 splice at 100 µs (thrash), 32 200-ms cadence (false faults), 34 in-window PI boost (3 ppm
+> differential drift), 41 boot steps at 150 µs on common wander (±500 µs sawtooth). Keep: 40 (no
+> rate boost), 41 (knee off — to be graded), 33/35 (judge lag), 39 (close on converge), 38
+> (re-open), 43 (group-delta gating below 300). **Fallback without a reflash:** `resync_splice_us 300`
+> — the window's floor becomes "local by construction", resync ~10 s.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
