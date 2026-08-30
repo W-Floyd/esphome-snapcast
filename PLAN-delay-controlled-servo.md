@@ -2386,3 +2386,11 @@ fix). Delta sums in quiet minutes −4…−5 with B at 0: a residual ~5 µs asy
 it saturates the ±500 cap in ~2.5 h. Since a common bias shifts every deadline equally and carries no
 information, the clean fix is to exchange biases in the beacon and re-centre: each board subtracts
 the group-mean bias each cycle, keeping only the differential. Build 67.
+
+### 2026-08-30 10:20 — build 67: biases in the beacon, group mean subtracted
+
+`TsfPacket.render_bias_us` (INT32_MIN for older senders); each device publishes its bias every align
+cycle and subtracts the group mean, at most 2 µs per cycle (the cycles are unsynchronised; this bounds
+the differential a re-centre can open), delivered by the kick. Prediction: both biases stay near 0
+indefinitely (were marching +3 µs/min together), the wire unchanged (the common part never moved it),
+and the ±500 cap never approaches. Flashes after the build-66 grade completes.
