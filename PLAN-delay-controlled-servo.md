@@ -2482,3 +2482,13 @@ Boot lock +28/+22 s. B's 12:16 TAGFAULT: A read +2492 (rejected), A's bias +8 �
 Rival-gated grade 12:12–12:57 (six holes/faults inside): median +2.5 µs, robust sd 9.7, 40/56/85 % inside
 5/10/20 µs; SF 1 s 0.29 · 10 s 2.3 · 30 s 6.3 · 60 s 10.6 · 120 s 12.6. Build 69's window (seven holes):
 median +0.9, sd 6.1, 56/84/96 %. `wire-sf.py` rewritten (its pairing produced impossible values).
+
+### 2026-08-30 13:10 — build 71: bench hooks for a clean deadline step; PHASEIN on the speakers
+
+`servo_param align_bias_us N` sets the render bias to N (deadline only; the PI delivers it at τ);
+`align_bias_kick_us N` also queues the change as a kick. Protocol: `align_apply 0` on both, 60 s
+baseline, A `align_bias_us 40`, wire every 30 s for 5 min (expect −40 on the wire if the deadline→wire
+gain is 1, with the PI's τ = 120 s shape), then `align_bias_kick_us 0` (−40 kicked; expect the wire back
+within ~1 s plus one ring travel), restore. Event counts printed beside every row so a timebase event
+cannot pass as a result again. PHASEIN (both boards' raw phases, ages, group delta) is logged on the
+speakers once per align cycle for the unexplained excursions.
