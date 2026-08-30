@@ -792,6 +792,9 @@
 > 25 µs in the half-hour holding the observer's crash-rejoin. Three no-correlation minutes after
 > 18:00 (19:33 observer rejoin; 20:35–20:37 A crash + build-30 flash; 21:04–21:05 starvation).
 >
+> **22:13 B replugged (operator) — serial back after seven hours; build 30 confirmed on B.** 22:12:08
+> server-wide starvation just before it: observer TAGFAULT → reconnect (build 30 path), A no fault.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
