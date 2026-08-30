@@ -2692,3 +2692,14 @@ in flight (+2721), the sign guard zeroed inverted targets, three runs hit the 10
 injected board (burst-biased samples or feed-forward across the stall) and relaxing over tens of
 seconds, matching the wire tail. If dflt stays flat, the hypothesis is dead and the tail source
 must be sought between the deadline and the DAC instead.
+
+### 2026-08-30 18:34–18:38 — build 80 graded 30/10/10/10; OFFDBG retraction
+
+**Retraction:** the shared-offset-filter hypothesis is dead. OFFDBG shows dflt dominated by the
+genuine server-vs-local clock ramp (~+50–75 µs/s) and STATISTICALLY IDENTICAL between the one 30 s
+tail run and the clean run on the same board (74 vs 68 µs/s) — the deadline filter did not move the
+tail. Build 79's "deadline moved" reading conflated two tail species. What build 80's RSTEP streams
+show: the tail is a sub-arm residual (±100–250 µs). In inj 1 err_tag, gd and the wire all AGREE
+(+118→+239 / +49→+62 / +240) — a real, slowly-growing lateness below the 100 µs step arm, left to
+the tracking-gain PI (τ 120 s) and align (10 s cadence), hence 20–40 s. The <10 s answer for the
+end-game is acquisition gain inside the window with bumpless handoff, not more position steps.
