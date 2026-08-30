@@ -462,7 +462,7 @@ static constexpr int64_t DL_ERR_STALE_US = 1000000;
 // and how long the ledger takes over before tags are trusted again.
 static constexpr uint8_t TAG_FAULT_MISSES = 3;
 static constexpr int64_t TAG_SPLIT_US = 3000;  // tag vs ledger disagreement that makes a miss a fault
-static constexpr int64_t TAG_JUDGE_US = 1000000;   // measurement lag before a correction is judged
+static constexpr int64_t TAG_JUDGE_US = 2000000;   // pipeline 0.28 s + a 0.65 s block average + margin; 1 s judged blocks that still held pre-correction samples (22:42 false fault)
 static constexpr int64_t TAG_SETTLE_US = 20000000; // no fault judgement in the first 20 s after engage
 static constexpr int64_t TAG_FAULT_US = 180LL * 1000000;  // 60 expired before the repair got its window (14:29-14:33)
 // Tag-stream blanking after a setpoint change / hard resync / timebase re-anchor: one pipeline
