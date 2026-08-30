@@ -2299,3 +2299,12 @@ of boot and again within ~4 min after each disturbance; MAD 0.6–2 µs in quiet
 negative in 17 of 20 cycles (−6…−18) with B's near zero or positive — the sum of deltas is still
 negative on average. The pairing-age × mapping-ramp mechanism (07:42 entry) stands; at this rate A
 reaches the +500 cap in ~2 h. Beacon sample-age fix next.
+
+### 2026-08-30 08:40 — build 62: the beacon carries the render phase's sample age
+
+`TsfPacket.render_phase_age_ms` appended (older senders' shorter packets get 0xFFFF and pair by
+receipt as before); the receiver records the peer phase at `receipt − age` so the 300 ms pairing
+window compares true sample instants. Prediction: A's and B's deltas sum to ~0 (they read −8 / +2 all
+morning), the common bias march stops (A +80 µs in 20 min at gain 0.3), the wire mean unchanged (it
+was never affected by the common part). Both speakers reflashed together; the observer keeps its
+older beacon format and is handled by the short-packet path.
