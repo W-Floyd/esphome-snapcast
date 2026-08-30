@@ -925,6 +925,7 @@ class SnapcastClient {
     int64_t post_event_until_us{0};
     int64_t resync_inside_since_us{0};  // when |err| last went inside the arm threshold (window close timer)
     int64_t resync_last_block_us{0};    // dl_err_at_us of the block the last in-window step used (one block, one step)
+    int64_t rskip_log_at_us{0};         // block the last RSKIP line described (one line per block)
     /// No NVS integral was restored at boot: seed from the TSF crystal estimate at first engage
     /// and run the fast boot Ti; a fresh board otherwise winds ~56 ppm through Ki over 10+ min.
     bool dl_cold_start{true};

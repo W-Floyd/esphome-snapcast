@@ -2752,6 +2752,17 @@ void SnapcastClient::player_task_() {
     const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
     const bool coarse_ok =
         !coarse_on_tags || st.coarse_act_us == 0 || st.dl_err_at_us > st.coarse_act_us + blank_us;
+    // In the window, an error above the arm that takes NO step is the case that needs explaining
+    // (build 44, B at +600 us for 45 s). One line per block, never per chunk: ~38 lines/s crashes
+    // the ESPHome logger's ring buffer.
+    if (resync_window && coarse_on_tags && st.dl_err_at_us != st.rskip_log_at_us &&
+        std::abs(coarse_err_us) > this->tune_resync_splice_us_.load(std::memory_order_relaxed) &&
+        (!coarse_ok || st.dl_err_at_us == st.resync_last_block_us)) {
+      st.rskip_log_at_us = st.dl_err_at_us;
+      ESP_LOGD(TAG, "RSKIP err=%+" PRId64 " ok=%d sameblk=%d since_act=%" PRId64 " ms blank=%" PRId64 " ms",
+               coarse_err_us, coarse_ok ? 1 : 0, st.dl_err_at_us == st.resync_last_block_us ? 1 : 0,
+               st.coarse_act_us ? (st.dl_err_at_us - st.coarse_act_us) / 1000 : -1, blank_us / 1000);
+    }
     // Anchor for the SHADOW error (see the SHADOW log line). Stored, not recomputed.
     st.last_deadline_us = deadline;
     st.last_deadline_server_ts = rec.server_ts_us;
@@ -3083,6 +3094,19 @@ void SnapcastClient::player_task_() {
       // acts on is held for ~0.65 s while its own splices move the audio underneath the average.
       const int32_t max_adjust = std::max<int32_t>(1, resync_window ? frames / 2 : frames / (SOFT_CORRECTION_DIVISOR / 4));
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
+      // One short dedicated line per in-window decision (<= one per block). Build 44's B episode
+      // (23:51:29-23:52:15) sat at +600 us for 45 s with no step and nothing in the log said why.
+      if (resync_window) {
+        const int32_t gd_log = this->tsf_sync_ != nullptr ? this->tsf_sync_->render_group_delta_us() : INT32_MIN;
+        if (gd_log == INT32_MIN) {
+          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=unknown ok=%d step=%+" PRId64 " adj=%+" PRId32,
+                   coarse_target_us, coarse_on_tags ? "tag" : "ledger", coarse_step_ok ? 1 : 0, coarse_step_us, adjust);
+        } else {
+          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=%+" PRId32 " ok=%d step=%+" PRId64 " adj=%+" PRId32,
+                   coarse_target_us, coarse_on_tags ? "tag" : "ledger", gd_log, coarse_step_ok ? 1 : 0, coarse_step_us,
+                   adjust);
+        }
+      }
       if (adjust > 0) {
         drop_frames = adjust;
         st.soft_dropped_frames += adjust;
@@ -5316,7 +5340,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // (A: median +5120 us, values near 0 half the time and near +9.5 ms the other half) and
           // unusable for steering. It still receives and logs everyone else's (PHASEIN).
           if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN && !this->config_.tsf_observer) {
-            this->tsf_sync_->set_render_phase_us(measured_phase, phase_local);
+            // PUBLISH THE SETTLED PHASE, NOT THE INSTANTANEOUS ONE. render_align moves the deadline;
+            // the audio follows through the PI with tau = 120 s, so a raw phase keeps reporting the
+            // gap for two minutes after the bias that will close it has already been applied, and
+            // align -- an integrator -- keeps stepping into it (00:03-00:05: A's bias +116 -> +210
+            // against a group delta pinned at -50..-64, wire barely moving, err_tag -150..-250
+            // carrying the whole pending correction). err_tag is exactly the part of this phase the
+            // PI is about to remove, so phase - err_tag is where this frame's successors will render
+            // once it has. Same for the resync gate, which reads the same delta.
+            const int64_t settled_phase = measured_phase - (st.dl_have_err ? st.dl_err_us : 0);
+            this->tsf_sync_->set_render_phase_us(settled_phase, phase_local);
           } else {
             this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
           }
