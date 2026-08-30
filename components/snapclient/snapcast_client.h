@@ -927,6 +927,7 @@ class SnapcastClient {
     int64_t resync_last_block_us{0};    // dl_err_at_us of the block the last in-window step used (one block, one step)
     int64_t rskip_log_at_us{0};         // block the last RSKIP line described (one line per block)
     int64_t resync_step_at_us{0};       // last in-window position step of ANY source (ledger steps wait out the blank too)
+    float align_kick_us{0.0f};  // render_align bias change not yet delivered as position (ALIGN KICK)
     /// In-window position steps still on their way to the DAC. A drop is applied at PUSH time and the
     /// ring holds ~1.7 s of audio ahead of the DAC, so a step is invisible to the tags for ring depth
     /// + pipeline; the coarse target subtracts what is pending instead of waiting for it.

@@ -798,6 +798,9 @@ static constexpr int32_t UNMUTE_ANCHOR_US = 100;
 // agrees (see the unmute latch): a common offset of this size is inaudible as such; mutual offsets
 // are what the mute is for. Operator's bound 2026-08-30: 3-5 ms.
 static constexpr int64_t UNMUTE_COMMON_US = 4000;
+// Rate bound for delivering a render_align bias change as position (see ALIGN KICK). 10 ppm moves
+// 10 us per second: inaudible as a rate, and an order of magnitude below the trim clamp.
+static constexpr float ALIGN_KICK_MAX_PPM = 10.0f;
 // A bound on that wait. Silence is also a defect: if the anchor never settles -- a mixer reporting
 // a depth that does not describe the whole pipeline, say -- unmuting late but audible beats staying
 // quiet, and the log line says which happened. Long enough for the ~3.3 s drift window to fill
@@ -4385,6 +4388,23 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
                    -clamp_ppm, clamp_ppm);
   }
   st.trim_applied_ppm = std::clamp(p_term + st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
+  // ALIGN KICK: deliver a render_align bias change as position NOW, by rate, instead of letting the PI
+  // walk the audio to the moved deadline over tau = 120 s. That lag is what forced align's gain to
+  // 0.03 (0.1 hunted at +-100 us on 2026-08-29; +-10 us "5-minute sawtooth" on 2026-08-30) and made
+  // the wire's mean crawl at ~3 us/min. A +D us bias (deadline later) means the audio must play D us
+  // later: err_tag reads -D, the PI would slow by kp*D; here the rate is lowered by up to
+  // ALIGN_KICK_MAX_PPM until D has been delivered (5 us in ~0.5 s at 10 ppm), and the P-term's
+  // contribution at a 5 us error (0.04 ppm) is noise beside it. With the lag gone, align's loop is the
+  // ~3.5 s tag visibility and a gain of ~0.3 per 10-s cycle is stable.
+  if (st.align_kick_us != 0.0f) {
+    const float want_ppm = -st.align_kick_us / dt_s;  // deliver it all this block if allowed
+    const float kick_ppm = std::clamp(want_ppm, -ALIGN_KICK_MAX_PPM, ALIGN_KICK_MAX_PPM);
+    st.align_kick_us += kick_ppm * dt_s;  // delivered part: -kick_ppm*dt_s us of audio movement
+    if (std::abs(st.align_kick_us) < 0.05f) {
+      st.align_kick_us = 0.0f;
+    }
+    st.trim_applied_ppm = std::clamp(st.trim_applied_ppm + kick_ppm, -clamp_ppm, clamp_ppm);
+  }
 
   // Slow average of the integral, for persistence (see dl_integral_ema_ppm).
   if (!st.dl_integral_ema_valid) {
@@ -5677,8 +5697,10 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int32_t step = std::clamp<int32_t>(step_i, -max_step, max_step);
             this->render_align_frac_ -= static_cast<float>(step);
             if (this->tune_align_apply_.load(std::memory_order_relaxed)) {
+              const int32_t bias_before = bias;
               bias = std::clamp<int32_t>(bias + step, -cap, cap);
               this->render_bias_us_.store(bias, std::memory_order_relaxed);
+              st.align_kick_us += static_cast<float>(bias - bias_before);  // see ALIGN KICK in delay_loop_update_
             } else {
               ESP_LOGD(TAG, "RALIGN shadow: group %+" PRId32 " would step %+" PRId32 " us (bias held %+" PRId32 ")",
                        group_delta, step, bias);
