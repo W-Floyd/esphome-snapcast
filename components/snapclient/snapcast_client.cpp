@@ -3049,12 +3049,19 @@ void SnapcastClient::player_task_() {
       // the arm, did nothing. Errors above resync_local_us are local by construction (the wander
       // never reaches them) and step on err_tag; below it the step needs the GROUP render delta --
       // the on-device differential measurement -- to agree in sign, and moves by the smaller of the
-      // two. group delta > 0 = early; err_tag < 0 = early.
+      // two. SIGNS, from the definitions: phase = TSF(render) - server_time, larger = rendered LATER;
+      // group delta = mine - mean(peers), so delta > 0 = LATE. err_tag = render - deadline, > 0 = LATE.
+      // Same sign = agreement. Build 43 had this test inverted (its comment said "delta > 0 = early",
+      // a label inherited from the wire's B-A header while the analyser's probe b sat on board A):
+      // it refused every step on which the two agreed -- B sat at -380 us for 60 s after a 300 ms
+      // injection (23:32:14) with err_tag -380 / group delta -532, both saying EARLY, and the PI
+      // alone closed it in ~2 min. Verified 23:37:43: B's +52-frame insert moved the wire 1.56 ms
+      // in the direction err_tag and the phases had both named.
       bool coarse_step_ok = true;
       if (resync_window && coarse_on_tags &&
           std::abs(coarse_target_us) < this->tune_resync_local_us_.load(std::memory_order_relaxed)) {
         const int32_t gd = this->tsf_sync_ != nullptr ? this->tsf_sync_->render_group_delta_us() : INT32_MIN;
-        if (gd == INT32_MIN || std::abs(gd) > 500000 || ((gd > 0) != (coarse_target_us < 0)) ||
+        if (gd == INT32_MIN || std::abs(gd) > 500000 || ((gd > 0) != (coarse_target_us > 0)) ||
             std::abs(gd) < this->tune_resync_splice_us_.load(std::memory_order_relaxed)) {
           coarse_step_ok = false;  // no differential evidence: leave it to the (symmetric) PI
         } else {
