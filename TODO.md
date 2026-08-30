@@ -1945,4 +1945,4 @@ Earned expensively; ignoring these cost hours.
 - Audit non-main-task ESP_LOGD lines (logger ring crashes); consider ESPHome logger task buffer size.
 - ~~Deadline-step test~~ done 13:14 (gain ≈ 1, kick whole); the 28 % figure is retracted.
 - Fast splice: extend the phase transient per chunk while active (the engage mark covers ~4 s only); the edit did not match the release-block text.
-- The 1–2-min wire excursions (+10…+22) on asymmetric delta readings with no event: log both boards' raw pairings (PHASEIN-style) around them.
+- ~~1–2-min excursions~~ root-caused: deadline-source flaps (build 73 holds through them); PHASEIN stays on the speakers for anything left.

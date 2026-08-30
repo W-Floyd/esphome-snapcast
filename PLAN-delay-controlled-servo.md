@@ -2545,3 +2545,13 @@ crystal ratio, as the feed-forward already does — for up to 3 s when the TSF s
 AGE_CLAMP (TSF reset) still falls back. Prediction: `deadline on local fallback` drops from 2–32/h to
 ~0 except at real mapping losses; the ~100 µs one-board steps and P-term holds that followed each flip
 disappear from the wire; the peer's bias no longer walks after them.
+
+### 2026-08-30 13:36–14:23 — build 73 graded: zero deadline fallbacks; the longest quiet stretch yet
+
+**Fallbacks 0/0 in 47 minutes** (2–32/h before); the hold absorbed 11 (A) / 74 (B) TSF-sample blips.
+After the boot transient (13:38–13:43, B's serial replug inside it), 40 minutes with zero
+TAGFAULTs/reconnects/splices: per-minute medians ±5 µs with occasional ±8…±18 (14:12–13, 14:07), MAD
+0.5–3.5, delta sums ±17, biases inside ±30 and re-centred. Open: the RECON census still shows |drift| >
+5 ms on ~32 % of report lines — determine whether the line prints raw values on snapshots the
+comparison (build 72) rightly refused, i.e. whether this is the instrument printing what the logic no
+longer consumes.

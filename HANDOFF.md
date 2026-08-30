@@ -613,3 +613,5 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
   Unexplained: 1–2-min excursions to +10…+22 on asymmetric delta readings with no logged event.
 * Clean step test (build 71 hooks): deadline→wire gain ≈ 0.8–1.0 with the PI's τ; the kick path delivers a
   40 µs step whole within 30 s; align closes a standing 46 µs in 90 s. The 28 % figure is retracted.
+* Build 73 (shared-offset hold through TSF-sample blips): deadline fallbacks 0/0 in 47 min (were
+  2–32/h); 40 quiet minutes at ±5 µs with zero faults — the flap was a first-order disturbance.
