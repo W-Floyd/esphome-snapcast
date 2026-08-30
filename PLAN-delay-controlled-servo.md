@@ -2033,3 +2033,17 @@ Tails +160 / −180 µs with the gate refusing on `|gd|` 15–89 < 100: the grou
 and it is the floor for how small a residual the gate can *see*; below it only align and the PI act.
 Next lever after 51: a better group delta (pair by extrapolation; several samples per report), not a
 lower arm.
+
+### 2026-08-30 01:11–01:20 — build 51 (any window step blanks the tag path): 11 / >75 / 14 / 65 s
+
+The tag step now waits 1.6 s after the ledger step, and each sequence is a clean geometric descent:
+`+5285 → +647 → +396 → +164 → +107` (A), `+8564 → +751 → +756 → +172 → +105` (B), one step per
+~1.3 s, five steps, arm reached ~7 s after the hard resync (which itself comes ~2 s after the injection).
+Each step realises only ~half of itself by the next decision (+647 stepped +517 → next block +396, not
++130), so the effective gain is ~0.4 and it takes five rounds. The fast splice already solves this with
+in-flight accounting (`splice_hist`, effective = err − in_flight); the coarse target does not use it.
+
+B's tails (−144, −190 for 40–70 s) are below the 100 µs arm by the tags' reading (+105 → +84 → stop)
+while the wire still shows 150–190: the same tag-vs-wire ~60–100 µs residual as build 50, handed to
+align/PI. Not a threshold problem; a measurement-accuracy floor for both the tag error and the group
+delta at this timescale.
