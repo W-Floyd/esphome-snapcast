@@ -2626,3 +2626,11 @@ seconds later: err_tag +16.6 ms vs ledger +6.6. All three doors now use the same
 (hard resync, render gap, rebaseline) — committed as `b26c7a4`, rides into the next flash (with the
 write-window ring). One mechanism, three entrances; the observer-vs-B control at 16:50 stands for the
 door that was already closed.
+
+### 2026-08-30 16:43–17:18 — build 75 graded
+
+Injections: 34 / 11 / 32 / 24 s to <100 µs held 5 s, **zero TAGFAULTs during them** (prediction held; A's
+one fault at 16:59 was the gap/rebaseline door, closed in `b26c7a4`). 30-min grade with the real 16:50
+hole inside: median +1.6 µs, robust sd 9.0, 75 % inside ±10 µs. The 32–34 s recoveries are the tag-blank
+horizon itself now in the path (tags quiet ~4 s → first step later than before); acceptable against the
+faults it removes — revisit only if <15 s matters more than fault-free holes.

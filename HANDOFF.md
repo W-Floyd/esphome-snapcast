@@ -621,3 +621,5 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
 * Build 75 (tag blank spans the ring's travel): a real 16:50 hole hit B and the observer (old build)
   simultaneously — the observer TAGFAULTed with the classic signature, B rode it clean (tag/ledger
   within 75 µs throughout). The post-refill tag outlier is fixed; injections + grade in the task log.
+* Build 75 grade: injections 34/11/32/24 s, zero TAGFAULTs during them; 30 min median +1.6 µs, 75 %
+  inside ±10. The remaining two outlier doors (render gap, rebaseline) closed in b26c7a4 → next flash.
