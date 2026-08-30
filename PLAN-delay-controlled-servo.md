@@ -850,6 +850,19 @@
 > inside the arm threshold for `resync_close_s` (5); in-window arm `resync_splice_us` 100 → 150 (above
 > the block noise). Build 38's re-open rule (> 400 µs) is included.
 >
+> **WHY the stairs away from sync (22:58:48 injection, attributed actuator by actuator):** during
+> the slow drift (+18…+45 s) `trimB − trimA` = −7…−10 ppm against an equilibrium of ≈ −5.5 (crystals
+> A +42.3 / B +36.8); the surplus −2…−4 ppm IS the wire slope (−2…−3 µs/s). Both boards read the
+> same small positive error (common deadline wander, +30…+130 µs) but **A was in its resync window
+> at kp 0.05 and B in steady state at kp 0.008** → (0.05 − 0.008) × 80 µs ≈ 3.4 ppm of differential
+> rate, refreshed every block: the stairs. The ±80/250 µs steps at +45/+54 s are the same thing in
+> position form (A's coarse steps on an error that was mostly common). **Rule: any gain that only
+> one board has converts common-mode error into differential motion.** Build 40 removes the
+> in-window PI boost (rate gains identical across boards; position corrections resync). Builds 38/39
+> (re-open, close-on-converge, arm 150) stand — they bound the position steps, they were not the
+> cause. The knee's error-proportional boost carries the same asymmetry whenever one board is above
+> the knee and the other is not; it is tolerated because knee 150 sits above the wander, and noted.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

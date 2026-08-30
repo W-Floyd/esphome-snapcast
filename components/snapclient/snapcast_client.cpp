@@ -4086,12 +4086,14 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
       st.resync_inside_since_us = 0;
     }
   }
-  float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
-  if (now < st.post_event_until_us) {
-    // Resync window: the residual under the knee is a known displacement, not wander -- run at the
-    // floor tau so the last ~100 us close in seconds rather than at tau 120.
-    boost = std::max(1.0f, tau_tuned / tau_min);
-  }
+  // NO PER-BOARD RATE-GAIN BOOST IN THE RESYNC WINDOW. Measured 2026-08-29 22:58-22:59 (300 ms
+  // injection on A): with A at kp 0.05 inside its window and B at 0.008 outside, the SAME common
+  // deadline wander (+30..+130 us on both) became a 2-4 ppm differential trim -- (0.05-0.008) x 80 us
+  // -- and the wire walked away from zero at 2-3 us/s for 30 s in block-sized stairs. Any gain
+  // that only one board has turns common-mode error into differential motion; the rate loop's
+  // gain must be the same function of the error on every board. Position corrections (the coarse
+  // step-and-verify) do the resync: a bounded one-off, not a sustained rate.
+  const float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
   const float tau_eff = tau_tuned / boost;
   // Ti is NOT boosted: Ki = kp/Ti already rises with kp. Dividing Ti too made Ki scale with boost^2
   // and wound the (already correct, NVS-restored) integral during the position catch-up -- the
