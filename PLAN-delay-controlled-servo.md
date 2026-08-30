@@ -2145,3 +2145,13 @@ splice effectively does) or shorten the ring — and the ledger's first step has
 audio (or be dropped from the design; today it costs nothing but also does nothing).
 
 Runtime state left on both boards: `align_step_us 20` (default 4); everything else at compiled defaults.
+
+### 2026-08-30 02:41–03:26 — build 56 steady state, 45 min untouched (`align_step_us 20`)
+
+n=13589, median −10.3 µs, robust sd 9.0 µs, p2p 137 µs. Structure function: 1 s 0.22 · 10 s 1.28 ·
+30 s 3.0 · 60 s 4.95 · 120 s 7.7 µs; 10-s block means robust sd 14.4 µs (within-block 0.31). Events: zero
+starvations, bailouts, TAGFAULTs; 2 deadline fallbacks on A; 3 window re-opens on each board (the
+|e| > 400 µs re-open now fires on common wander and takes a one-board step — the sawtooth risk the
+gate was built for, now bounded by the gap rule; it is what widened the 10-s block sd from ~7 to 14
+against builds 29/30). Align at step 20 also contributes 20 µs quanta. Steady state is otherwise the
+same board as before the resync work: sub-µs at 1 s, wander-limited above 30 s.
