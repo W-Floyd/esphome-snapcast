@@ -2165,3 +2165,19 @@ judge, no reconnect; the coarse path steers on tags, the fast splice and steerin
 +1.6 ms, and the two will fight or freeze exactly as at 00:34 (then 20 ms, now 2 ms). Third instance
 tonight of a post-storm split that only a reconnect clears. The analyser lost correlation at 04:36:17
 — the speakers' I2S restarted on reconnect, so that is its ~100 s blindness, not a 17 ms gap.
+
+### 2026-08-30 06:07–07:07 — "sawtooth with a 5-minute period": what the hour actually contains
+
+Wire, rival-gated 30-s medians, 45 min: sd 7.6 µs, p2p 29, mean −10. Autocorrelation decays smoothly
+to zero at ~12 min — no line at 5 min; a meander with ~10-min correlation time on a standing offset.
+r(wire, errB−errA) = −0.35, r(dwire/dt, trimB−trimA) = +0.30: the P-terms' rate noise integrating,
+the √τ structure function seen since build 16. Group deltas: A median −8 (MAD 4), B +2 (MAD 4) — the
+delta *sees* the standing offset every cycle; align does nothing with it because (a) deadband 15 and
+(b) `int(−delta × 0.1)` truncates anything under 10 µs to zero. Both boards' biases sat frozen at
++195/+192 for the whole hour.
+
+**Build 57:** fractional accumulation of align steps. Runtime on both: `align_deadband_us 5`,
+`align_gain 0.03` (the correction reaches the audio through the PI's τ = 120 s; 0.1 per 10 s on that lag
+hunted at ±100 µs on 2026-08-29), `align_step_us 20`. Prediction: the wire mean walks from −10 to
+within ±3 over ~5–10 min and stays; the ±8 meander is untouched (that is P-term noise: `block_n` or τ,
+each a response-time trade, or better tags).
