@@ -4635,6 +4635,7 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sa
         st.fast_splice_seen_us = now_us();
       } else if (now_us() - st.fast_splice_seen_us >= persist_us) {
         st.fast_splice_active = true;
+        st.phase_transient_until_us = std::max(st.phase_transient_until_us, now_us() + PHASE_TRANSIENT_US);
         st.fast_splice_frames = 0;
         applied = effective_us > 0 ? 1 : -1;
         ESP_LOGI(TAG, "Fast splice engaged: %" PRId64 " us standing for %" PRId64
