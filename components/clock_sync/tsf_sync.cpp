@@ -1057,7 +1057,9 @@ void TsfSync::update_group_diagnostics_(int64_t local_now_us) {
     // far faster than the quantity changes. t= is esp_timer us, matching the other series lines.
     if (local_now_us - this->last_crystal_log_us_ >= RENDER_LOG_INTERVAL_US) {
       this->last_crystal_log_us_ = local_now_us;
-      ESP_LOGD(TAG, "Crystal: mine %+.3f group %+.3f delta %+.3f ppm t=%" PRId64, mine_crystal, group,
+      // VERBOSE: this ran on the snap_net task once a second and sat on the stack of B's 16:08:45
+      // logger-ring crash (same class as 07:51). The client logs the same line from the player task.
+      ESP_LOGV(TAG, "Crystal: mine %+.3f group %+.3f delta %+.3f ppm t=%" PRId64, mine_crystal, group,
                mine_crystal - group, local_now_us);
     }
   }

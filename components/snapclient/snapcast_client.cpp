@@ -5799,6 +5799,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         // two-board sum was -17..-21 with no event logged -- the output cannot diagnose itself.
         if (align_due) {
           this->tsf_sync_->log_phase_inputs(now_us());
+          // The Crystal line, from the PLAYER task: its network-task original sat on the stack of both
+          // logger-ring crashes (07:51, 16:08) and is VERBOSE there now. Same format -- the analyzer's
+          // crystal_a/b_ppm columns parse it.
+          const float cmine = this->tsf_sync_->own_crystal_ppm();
+          const float cdelta = this->tsf_sync_->crystal_delta_ppm();
+          if (!std::isnan(cmine) && !std::isnan(cdelta)) {
+            ESP_LOGD(TAG, "Crystal: mine %+.3f group %+.3f delta %+.3f ppm t=%" PRId64, cmine, cmine - cdelta, cdelta,
+                     now_us());
+          }
         }
         // Cap, gain and deadband are runtime tunables (servo_param align_max_us / align_gain /
         // align_deadband_us); align_max_us defaults to the YAML render_align_max (0 = off).
