@@ -780,6 +780,18 @@
 > only a better exchanged signal (a published line, or a faster exchange) removes. State of the
 > bench at 21:47: all three boards on build 30, no API tuning, watchdog armed, B's serial wedged.
 >
+> **Six-hour census 16:00–22:07 (byte-anchored; a first pass over a dateless 400 MB tail counted
+> yesterday's evening too — the trap CLAUDE.md warns about, caught by "22:46" appearing at 22:07).**
+> A: 5 boots (16:01, 16:43, 17:12 flashes; 20:34 crash; 20:37 flash), 1 crash (20:34, ESPHome logger),
+> 6 real starvations (16:38, 16:41, 17:24, 17:26, 17:45, 21:04), 1 bailout (17:26), 4 TAGFAULTs (three
+> in 16:38–16:41 under build 27's slow path, one at 21:05 handled in 12 s), 0 dead-session events,
+> 0 repairs. Observer: 4 boots (one crash 19:11, logger), 9 real starvations, 3 bailouts. B: no log
+> since its 15:12 serial wedge. Wire per 30 min: −42 (16:00, align runaway) · −2241 (16:30, B stuck
+> after the fleet flash + false faults) · +8/+78 (17:00–17:59, sign flip runs) · then **+3.8, +3.0,
+> +4.0, +3.5, +3.5, +0.9, −2.0, −4.3, +2.1 µs medians from 18:00 to 22:07 at robust sd 3–7 µs**,
+> 25 µs in the half-hour holding the observer's crash-rejoin. Three no-correlation minutes after
+> 18:00 (19:33 observer rejoin; 20:35–20:37 A crash + build-30 flash; 21:04–21:05 starvation).
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
