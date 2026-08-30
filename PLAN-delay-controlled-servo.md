@@ -2086,3 +2086,13 @@ from the live ring depth. One decision per ~2.7 s, each on a block that wholly p
 step. Prediction: ledger step → one tag step ~2.7 s later at ≈ 0.2 e → inside the arm ≈ 5.5 s after
 the hard resync, no sign flips; if it does not beat build 49 (9/11/19/15) the build-49 behaviour
 (1200 ms blank, no accounting) is the one to keep and the speed has to come from the first step's gain.
+
+### 2026-08-30 02:00–02:11 — build 54 (blank ≥ ring + pipeline + block): 47 / >75 / 70 / >75
+
+`RSKIP` every 0.65 s through the blank: after the ledger step (+3028 at 02:03:35.8) the tag error read
++5518, +5459, +5484, +5502 — flat — until 02:03:39.3 (+2990). The step became visible ~3.4 s after it
+was applied; the computed blank was 2.6 s, so the tag step at 2.9 s (+4401) again doubled it. A block
+mean is wholly post-step only a full block after the landing: horizon = ring + pipeline + **two**
+blocks (build 55). Also 55: the ledger's first step is arithmetic and takes gain 1.0; the 0.8 damping
+stays on the tag steps, which act on the lagged measurement. Prediction: ledger step → ~3.4 s → one tag
+step of ≈ tag/ledger offset (~1–1.7 ms tonight) × 0.8 → inside the arm ≈ 7 s after the hard resync.
