@@ -4059,6 +4059,16 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   const float ti_tuned = this->tune_ti_s_.load(std::memory_order_relaxed);
   const float knee_us = this->tune_knee_us_.load(std::memory_order_relaxed);
   const float tau_min = this->tune_tau_min_s_.load(std::memory_order_relaxed);
+  // WILD DESYNC RE-OPENS THE WINDOW. B's error stepped -66 -> -545 us in ten seconds at 22:56:57
+  // (a per-board timebase step under a 1-2 ms consensus spread; A flat) thirteen seconds after the
+  // boot window had closed, and recovery then ran at steady-state gains: 450 -> 224 us in 35 s. A
+  // jump past resync_reopen_us (400 -- the common wander stays under it) is a known displacement
+  // whatever caused it, and gets the step-and-verify treatment.
+  if (std::abs(e) > this->tune_resync_reopen_us_.load(std::memory_order_relaxed) && now >= st.post_event_until_us) {
+    st.post_event_until_us =
+        now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
+    ESP_LOGI(TAG, "Delay loop: resync window re-opened on a %+.0f us step t=%" PRId64, e, now);
+  }
   float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
   if (now < st.post_event_until_us) {
     // Resync window: the residual under the knee is a known displacement, not wander -- run at the
@@ -4486,6 +4496,9 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_win_s") {
     if (!(value >= 0.0f && value <= 600.0f)) return false;
     this->tune_resync_win_s_.store(value, std::memory_order_relaxed);
+  } else if (name == "resync_reopen_us") {
+    if (!(value >= 100.0f && value <= 5000.0f)) return false;
+    this->tune_resync_reopen_us_.store(value, std::memory_order_relaxed);
   } else if (name == "resync_gain") {
     if (!(value >= 0.1f && value <= 1.0f)) return false;
     this->tune_resync_gain_.store(value, std::memory_order_relaxed);

@@ -837,6 +837,12 @@
 > the dropped chunks exactly; tags verify), tag steps wait a full block + pipeline (blank 1200), gain
 > 0.8. Resync ledger: 31: 12 · 34: 11/31 · 36: 8/9/13/17.
 >
+> **22:56:57 B's measured error stepped −66 → −545 µs in 10 s with no coarse action on either board**
+> (A flat within ±90): consensus spread 1.0–1.9 ms at the time (the observer's estimate in the set),
+> RECON −52 ms (ledger-only sawtooth), align −4 µs. A per-board timebase step, 13 s after the boot
+> window closed → recovered at steady-state gains, 450 → 224 µs in 35 s. **Build 38:** a block error
+> past `resync_reopen_us` (400) re-opens the resync window whatever the cause.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

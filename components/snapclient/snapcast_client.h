@@ -1567,6 +1567,7 @@ class SnapcastClient {
   /// within 5 s of a disturbance.
   std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)
   std::atomic<float> tune_resync_gain_{0.8f};    // fraction of the measured error corrected per step (clean block)
+  std::atomic<float> tune_resync_reopen_us_{400.0f};  // a block error past this re-opens the window
   std::atomic<int32_t> tune_resync_splice_us_{100};
   std::atomic<int32_t> tune_resync_blank_ms_{1200}; // step-and-verify cadence: the judging block must START after the step (block 0.65 s + pipeline 0.28 s)
   std::atomic<int32_t> tune_block_n_{64};
