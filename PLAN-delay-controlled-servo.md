@@ -2063,3 +2063,11 @@ step and sign flips — and 2000 ms saw about half of it. Not a gain, not a unit
 **Build 52:** the coarse target subtracts the in-window steps applied within ring depth + one block
 (`pend=` on RSTEP). Prediction: second step ≈ 0.16 e, third ≈ 0.03 e; inside the arm three steps after
 the hard resync (~4 s), no sign flips. The same accounting the fast splice has had since `splice_hist`.
+
+### 2026-08-30 01:35–01:44 — build 52: `pend=+0` at every decision (>75 / 11 / 44 / >75 s)
+
+The subtraction was in place but its horizon was `pipe_depth_frames` (pushed − played ≈ 250 ms) plus
+a block — under a second — while the step is taken from the chunk entering the **ring** (`ring_ms`,
+~1.7 s ahead of the push). Every recorded step had aged out before the next decision, so nothing was
+subtracted and the sequences read like build 51's (`+1288 ledger → +1069 → +646 → +400 → +113`: the
+ledger step invisible 1.6 s later, half-visible at 2.9 s). Build 53: horizon = ring + pipeline + block.
