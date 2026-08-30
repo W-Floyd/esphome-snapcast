@@ -976,7 +976,12 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
     if (pair_gap > PHASE_PAIR_WINDOW_US || pair_gap < -PHASE_PAIR_WINDOW_US) {
       continue;  // sampled too far apart to difference; wait for a fresher pairing
     }
-    vals[n++] = static_cast<double>(this->peer_[i].phase_us - mine);
+    // Extrapolate the peer's phase to MY sample instant: phase = tsf - server drifts at the mapping rate
+    // (~41 ppm here), so a sample pair_gap older reads earlier by drift x gap. Measured 2026-08-30 13:25
+    // without this: each board read the other ~18 us LATER (A: d=+16, B: d=+20 at ages 0.8-1.5 s) -- a
+    // common-mode bias the re-centring absorbed but that inflated every delta.
+    vals[n++] = static_cast<double>(this->peer_[i].phase_us - mine) -
+                static_cast<double>(this->map_drift_ppm_) * 1e-6 * static_cast<double>(pair_gap);
   }
   if (n < 2) {
     // No peer paired closely enough THIS time. Keep the last valid delta rather than reporting

@@ -806,7 +806,7 @@ static constexpr int32_t UNMUTE_ANCHOR_US = 100;
 static constexpr int64_t UNMUTE_COMMON_US = 4000;
 // Rate bound for delivering a render_align bias change as position (see ALIGN KICK). 10 ppm moves
 // 10 us per second: inaudible as a rate, and an order of magnitude below the trim clamp.
-static constexpr float ALIGN_KICK_MAX_PPM = 10.0f;
+static constexpr float ALIGN_KICK_MAX_PPM = 1.5f;  // 10 ppm made every align step a stair (13:24, +46 -> 0 in 5-13 us steps); 1.5 ppm ramps a 15 us step over one 10-s cycle and still beats the PI's tau by 10x
 // Largest common-bias re-centring step per align cycle (see RALIGN): the devices' cycles are not
 // synchronised, so this bounds the differential a re-centre can open between two of them.
 static constexpr int32_t ALIGN_RECENTRE_MAX_US = 2;
@@ -2676,6 +2676,20 @@ void SnapcastClient::player_task_() {
           this->audio_listener_->on_query_audio(measured)) {
         this->playout_mutex_.lock();
         comparable = this->accounted_at_(measured.as_of_us, accounted_frames);
+        // A SNAPSHOT TAKEN INSIDE A BLOCKING WRITE IS NOT COMPARABLE. RECON drift read exactly
+        // -52245 us -- two chunks, 2 x 1152 frames -- on 40 % of reports all of 2026-08-30, always
+        // with the transfer buffer full (xfer=50000): the mixer had copied the slice, the ledger adds
+        // it when on_audio_write returns, and the pipeline is kept full by backpressure so writes
+        // block routinely. This "drift" armed the split repair, held the unmute anchor and was the
+        // ledger side of every TAGFAULT disagreement. The ledger was right; the comparison was made
+        // at the wrong instant.
+        {
+          const int64_t wb = this->write_begin_us_.load(std::memory_order_relaxed);
+          const int64_t we = this->write_end_us_.load(std::memory_order_relaxed);
+          if (comparable && wb != 0 && measured.as_of_us >= wb && (we < wb || measured.as_of_us <= we)) {
+            comparable = false;
+          }
+        }
         this->playout_mutex_.unlock();
       }
       if (comparable) {
@@ -6230,8 +6244,13 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
           rec.server_ts_us > 0 ? audio::RenderTag{static_cast<uint64_t>(rec.server_ts_us),
                                                  static_cast<uint32_t>((chunk_bytes_done + offset) / frame_bytes)}
                                : audio::RenderTag{});
+      // The write can block for up to 100 ms with part of the slice already copied downstream; the
+      // depth snapshot the mixer takes in that window counts bytes the ledger has not yet added.
+      // Recorded so the comparison can refuse snapshots taken inside a write (see fill_drift).
+      this->write_begin_us_.store(now_us(), std::memory_order_relaxed);
       size_t written = this->audio_listener_->on_audio_write(this->slice_buffer_.get() + offset, got - offset, 100,
                                                              rec.params);
+      this->write_end_us_.store(now_us(), std::memory_order_relaxed);
       offset += written;
       if (written > 0) {
         zero_writes = 0;

@@ -1042,6 +1042,8 @@ class SnapcastClient {
   uint32_t render_align_tick_{0};
   float render_align_frac_{0.0f};  // sub-microsecond remainder of align steps (see RALIGN)
   std::atomic<float> bias_kick_request_us_{0.0f};  // bench hook: bias change to deliver as a kick (see align_bias_kick_us)
+  std::atomic<int64_t> write_begin_us_{0};  // last on_audio_write() entry (player task); see the fill-drift comparison
+  std::atomic<int64_t> write_end_us_{0};    // its return; end < begin while a write is in progress
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
 
