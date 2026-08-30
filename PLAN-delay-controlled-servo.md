@@ -2110,3 +2110,16 @@ four rounds × 3.5 s. Final runtime A/B: `resync_gain 1.0` — each tag step is 
 the next decision, so damping only buys rounds. Whether the ledger step is lost or mis-measured is the
 first thing to find tomorrow (`push_chunk_` drop on the chunk after a silence insert; compare the wire
 at the ledger step's expected landing).
+
+### 2026-08-30 02:24–02:31 — `resync_gain 1.0` on build 55: >75 / 40 / **9** / 51 — and the halving named
+
+Runs 3 and 4 (residual above `resync_local_us`, no gate bound): ONE tag step (+5193, +4808), window
+closed converged 6.5 s later, wire inside 100 µs at +9 s (run 3). Runs 1 and 2 (below it): `+864 →
++430 → +222 → +108` at gain 1.0 — each step exactly half. The printed target is the gate's bound, and
+the bound is `|gd|`, which for two devices is by definition HALF the pairwise gap (mine − mean of both).
+The evidence the gate should bound by is the gap to the others: `gd · n/(n−1)`. Build 56.
+
+Floor after that: hard resync ≈ +2 s after the injection, first tag decision ≈ +1.8 s later, the step
+lands ≈ 3.5 s later, verify one round after → ~9 s. Under 5 s needs the step to land faster than the
+ring (drop at the pipeline end, as the fast splice effectively does) or a shallower ring — a design
+choice for tomorrow, not a tunable. Runs 4's −200 µs tail is the tag-vs-wire measurement floor again.
