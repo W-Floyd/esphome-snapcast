@@ -2308,3 +2308,11 @@ window compares true sample instants. Prediction: A's and B's deltas sum to ~0 (
 morning), the common bias march stops (A +80 µs in 20 min at gain 0.3), the wire mean unchanged (it
 was never affected by the common part). Both speakers reflashed together; the observer keeps its
 older beacon format and is handled by the short-packet path.
+
+### 2026-08-30 08:44–08:53 — build 62 (beacon sample age): the deltas sum to zero; the march is gone
+
+Per minute (wire median | A gd, bias | B gd, bias | sum): +7 | −1,−9 | −3,−3 | −4 · +5 | +1,−11 | +1,−6 | +2 ·
+−4 | 0,−12 | −4,+4 | −4 · −8 | −4,−4 | +3,−2 | −1 · +2 | +3,−8 | +4,−8 | +7 · −4 | −2,−4 | 0,−9 | −2 · +8 |
+−3,+1 | 0,−9 | −3 · +0.2 | −1,+2 | −1,−7 | −2 · +0.6 | +5,−7 | −1,−5 | +4. Delta sums −4…+7 (were −8…−15
+every cycle before), both biases inside ±12 µs for ten minutes (A had walked +80 in the previous 20).
+The wire mean is at 0 with ±8 µs per-minute wobble — the P-term meander, unchanged, as predicted.
