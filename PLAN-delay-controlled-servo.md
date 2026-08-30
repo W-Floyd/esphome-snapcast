@@ -2394,3 +2394,7 @@ cycle and subtracts the group mean, at most 2 µs per cycle (the cycles are unsy
 the differential a re-centre can open), delivered by the kick. Prediction: both biases stay near 0
 indefinitely (were marching +3 µs/min together), the wire unchanged (the common part never moved it),
 and the ±500 cap never approaches. Flashes after the build-66 grade completes.
+
+**Build 66, 10:12–10:28:** −1.2, (−11.5 spike: A's view of B +1036 for one cycle, no event logged), +3.5,
+−2.5, −2.2, +1.9, −2.4, −1.1, +1.8, −1.7, +1.0, +0.3, +3.5, −4.2, +0.2 µs; MAD 0.3–2.3. Delta sums −9…+6.
+Biases A +90 → +134, B +114 → +141: the common march at ~3 µs/min, which build 67 removes.
