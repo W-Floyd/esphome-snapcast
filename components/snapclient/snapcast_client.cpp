@@ -4475,6 +4475,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // ALIGN_KICK_MAX_PPM until D has been delivered (5 us in ~0.5 s at 10 ppm), and the P-term's
   // contribution at a 5 us error (0.04 ppm) is noise beside it. With the lag gone, align's loop is the
   // ~3.5 s tag visibility and a gain of ~0.3 per 10-s cycle is stable.
+  st.align_kick_us += this->bias_kick_request_us_.exchange(0.0f, std::memory_order_relaxed);  // bench hook
   if (st.align_kick_us != 0.0f) {
     const float want_ppm = -st.align_kick_us / dt_s;  // deliver it all this block if allowed
     const float kick_ppm = std::clamp(want_ppm, -ALIGN_KICK_MAX_PPM, ALIGN_KICK_MAX_PPM);
@@ -4809,6 +4810,23 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
       // shifted -339 us at 15:56 with nothing able to clear it short of a reboot.
       this->render_bias_us_.store(0, std::memory_order_relaxed);
     }
+  } else if (name == "align_bias_us" || name == "align_bias_kick_us") {
+    // BENCH HOOKS: set the render bias to an absolute value -- a known deadline step on one board.
+    // align_bias_us moves the deadline only (the PI delivers it at tau; measures the deadline->wire
+    // gain); align_bias_kick_us also queues the change as a kick (measures the kick path). Freeze
+    // align first (align_apply 0) or it will undo the step. 2026-08-30: the 28 % delivery figure
+    // could not be separated from a timebase event without this.
+    const int32_t before = this->render_bias_us_.load(std::memory_order_relaxed);
+    const int32_t after = static_cast<int32_t>(value);
+    this->render_bias_us_.store(after, std::memory_order_relaxed);
+    if (name == "align_bias_kick_us") {
+      float cur = this->bias_kick_request_us_.load(std::memory_order_relaxed);
+      while (!this->bias_kick_request_us_.compare_exchange_weak(cur, cur + static_cast<float>(after - before),
+                                                                std::memory_order_relaxed)) {
+      }
+    }
+    ESP_LOGW(TAG, "BENCH %s: bias %+" PRId32 " -> %+" PRId32 " us%s", name.c_str(), before, after,
+             name == "align_bias_kick_us" ? " (kicked)" : " (deadline only)");
   } else if (name == "align_apply") {
     // 0 = SHADOW: compute and log the step, apply nothing. The channel walked A's bias -159 ->
     // -339 us while the group delta GREW -124 -> -305 (15:43-15:56): self-reinforcing, sign still
@@ -5747,6 +5765,12 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
         // acting on a measurement that does not yet contain the previous correction.
         this->render_align_tick_++;
         const bool align_due = (this->render_align_tick_ % RENDER_ALIGN_EVERY_N_REPORTS) == 0;
+        // The pairing INPUTS, once per align cycle, on the speakers too (was observer-only): the
+        // 1-2 minute +10..+22 us wire excursions of 2026-08-30 12:26-12:48 rode delta readings whose
+        // two-board sum was -17..-21 with no event logged -- the output cannot diagnose itself.
+        if (align_due) {
+          this->tsf_sync_->log_phase_inputs(now_us());
+        }
         // Cap, gain and deadband are runtime tunables (servo_param align_max_us / align_gain /
         // align_deadband_us); align_max_us defaults to the YAML render_align_max (0 = off).
         const int32_t align_cap = this->tune_align_max_us_.load(std::memory_order_relaxed);

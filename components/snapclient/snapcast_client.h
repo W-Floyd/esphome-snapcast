@@ -1041,6 +1041,7 @@ class SnapcastClient {
   /// Report counter for rate-limiting the alignment correction; see RENDER_ALIGN_EVERY_N_REPORTS.
   uint32_t render_align_tick_{0};
   float render_align_frac_{0.0f};  // sub-microsecond remainder of align steps (see RALIGN)
+  std::atomic<float> bias_kick_request_us_{0.0f};  // bench hook: bias change to deliver as a kick (see align_bias_kick_us)
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
 
