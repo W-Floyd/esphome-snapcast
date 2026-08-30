@@ -2589,3 +2589,12 @@ re-entered mid-travel: −45.7 / −24.5 / +70.6 / +54.5 ms with the ledger unde
 corrections, → TAGFAULT → reconnect, five times on B this afternoon. Build 75 blanks the tags for
 `PHASE_TRANSIENT_US` (the measured travel horizon) at every kp event. Prediction: post-hole recovery
 without any TAGFAULT — hard resync, quiet tags for ~4 s, tags return agreeing with the ledger.
+
+### 2026-08-30 16:08 — B's second logger-ring crash; the Crystal line moves to the player task
+
+Same assert (`prvSendItemDoneNoSplit ringbuf.c:374`), same class: a once-a-second ESP_LOGD from the
+snap_net task (`TsfSync::update_group_diagnostics_` line 1060, the Crystal line) inside the ESPHome
+logger's thread-safe path. Demoted to VERBOSE there; the client now logs the identical format from the
+player task at align cadence, so the analyzer's `crystal_a/b_ppm` columns keep working. The snap_net
+task now emits no periodic DEBUG lines; if a third crash arrives, it names the next one. Rides into
+build 75.
