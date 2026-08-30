@@ -1986,3 +1986,24 @@ reads it is now steering toward a phantom:
 Cleared only by the build-47 reboot. What it needs (not tonight): a split judged on `err_tag − err_live`
 holding for N seconds *while the group depth agrees with the tags* → re-anchor the ledger from the tags
 (or reconnect) — the evidence is already in the SHADOW line; nothing acts on it.
+
+### 2026-08-30 00:42–00:51 — build 48 (ledger first step only): B 10 s / 10 s, A >75 / >75, and the reason for each
+
+Boot: no limit cycle (steps A 8, B 6; ledger 4/4). Injections: A **>75 s** (tail +170), B **10 s**, A **>75 s**
+(tail −330), B **10 s**. Zero TAGFAULTs.
+
+*B's two successes* are the first clean step-and-verify runs: ledger first step (+5188 / +1548), two tag
+steps, inside 100 µs at +10 s with a flat tail (+70, −75).
+
+*A's two failures* are the gate without evidence: `gd=unknown` on every A decision in the first run,
+and the residual (−235 by the tags, +170 on the wire) fell to the PI. Build 49 (per-block phase publish)
+is aimed at exactly this.
+
+**Overshoot inside the sequence, both boards.** After the ledger's first step (+2277) the next tag block
+read *higher* (+4068), was stepped (+3254), the next read +2286, stepped again (+1828), and the next
+read −235: the blocks used for the second and third steps still predated the earlier steps. The
+in-window blank is `min(tune_blank_ms, tune_resync_blank_ms)` = min(500, 1200) = **500 ms**, below the
+pipeline (~250 ms) plus one block (~650 ms) the comment promised. `RSKIP … since_act=-14 ms blank=500`
+says the same: the block being judged is older than the action. Build 50: the window uses
+`resync_blank_ms` outright. Prediction: one ledger step, one tag step, done — no third step, no sign
+flip, and the tail lands inside the noise instead of 200–300 µs off.
