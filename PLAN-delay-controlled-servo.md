@@ -2328,3 +2328,13 @@ RENDER_PHASE_UNKNOWN, so peers hold still while it steps home. Prediction: on th
 reconnect the other board's bias does not move (RALIGN deltas "unknown"/held), and the wire returns to
 0 as soon as the resyncing board's own steps land (~10 s) instead of after a four-minute align
 excursion.
+
+### 2026-08-30 09:07–09:10 — build 63 regressed the boot: nobody broadcast a phase
+
+Gating the beacon on "converged and window closed" meant that after a double boot neither board
+offered a phase: no group delta → no group-agreement unmute, no gate evidence, align idle → both
+crawled in on the PI, wire +528 µs for a minute (watchdog 09:08:18). The phase is untrustworthy only
+for the ring's travel time after a position step or a hard resync (~3.5 s, builds 51–55). **Build 64:**
+`in_transient` = a step or hard resync within the last 4 s (`kp_event_us`, `resync_step_at_us`);
+converged/window play no part. Prediction: boot behaves as 62 (lock ~+20–25 s, wire correlated ~+14 s),
+and a single-board reconnect still leaves the peer's bias untouched during the ~4 s of steps.
