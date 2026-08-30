@@ -2561,3 +2561,12 @@ even on snapshots the build-72 logic refuses. Every *consumer* is silent since t
 held 0, anchor waits 0, repairs 0, drift-excess 0, SHADOW splits ≥10 ms 0, on both boards — so the
 in-write exclusion works; only the print lies. Gate the diagnostic on `fill_comparable` in the next
 build (74, batched). A 90-min untouched grade of 73 started 14:26.
+
+### 2026-08-30 14:26 / 14:40 — with the ledger comparison fixed, the post-storm outlier is now the TAGS
+
+B's holes at 14:26 and 14:40 both ran the same sequence: starvation → hard resync → three tag-driven
+corrections leave err_tag at −45.7 / −24.5 ms while the ledger reads −0.8 ms → TAGFAULT → reconnect →
+re-trust. This morning the ledger was the liar (the in-write snapshot); since build 72 the ledger reads
+sane through these and the tags claim tens of ms. Next design item: what the tag stream measures in the
+first seconds after a starvation refill (anchor from a pre-storm chunk? DMA tags spanning the silence?)
+— the reconnect recovers in ~15 s, but three per afternoon is the remaining event class. TODO'd.

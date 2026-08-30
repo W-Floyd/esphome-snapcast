@@ -1946,3 +1946,4 @@ Earned expensively; ignoring these cost hours.
 - ~~Deadline-step test~~ done 13:14 (gain ≈ 1, kick whole); the 28 % figure is retracted.
 - Fast splice: extend the phase transient per chunk while active (the engage mark covers ~4 s only); the edit did not match the release-block text.
 - ~~1–2-min excursions~~ root-caused: deadline-source flaps (build 73 holds through them); PHASEIN stays on the speakers for anything left.
+- Post-storm TAG outlier: after a starvation refill err_tag reads tens of ms while the ledger is sane (B 14:26, 14:40); inspect the tag anchor across a hard resync/refill.
