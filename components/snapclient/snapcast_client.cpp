@@ -2690,13 +2690,28 @@ void SnapcastClient::player_task_() {
     // soon as tags post-date the previous action by resync_blank_ms, and with a 4x step: a 300 ms
     // injected starvation left 4.8 ms that took 4 s to walk down at one bounded action per 500 ms.
     const bool resync_window = now_us() < st.post_event_until_us;
-    const int64_t blank_us =
+    int64_t blank_us =
         // In the window the blank IS resync_blank_ms (pipeline ~250 ms + one block ~650 ms), not the
         // smaller of the two: min(500, 1200) = 500 ms let the second and third steps of every build-48
         // sequence act on blocks that predated the first (+2277 applied, next block read +4068).
         static_cast<int64_t>(resync_window ? this->tune_resync_blank_ms_.load(std::memory_order_relaxed)
                                            : this->tune_blank_ms_.load(std::memory_order_relaxed)) *
         1000;
+    // IN THE WINDOW THE BLANK IS AT LEAST THE STEP'S OWN VISIBILITY HORIZON: ring (the step is taken
+    // from the chunk entering it, ~1.7 s ahead) + pipeline (~250 ms) + one block (~650 ms), so the block
+    // that judges a step wholly post-dates it. Measured on the wire and on RSTEP (01:22-01:57, builds
+    // 51-53): a step reaches the tags 2.6-3 s after it is applied; every shorter blank judged the next
+    // block on stale audio -- doubled steps (48-50), half-realised steps (51), and an in-flight
+    // subtraction (52-53) whose binary aging could not follow a step that lands over a whole block.
+    // Computed from the live ring depth, not tuned: a deeper server buffer moves it by itself.
+    if (resync_window && frame_bytes > 0 && rec.params.sample_rate > 0) {
+      const int64_t ring_us_now = static_cast<int64_t>(
+          static_cast<uint64_t>(this->pcm_ring_->available()) * 1000000ULL / (frame_bytes * rec.params.sample_rate));
+      const int64_t horizon_now = ring_us_now +
+                                  st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
+                                  static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
+      blank_us = std::max(blank_us, horizon_now);
+    }
     // JUDGE ONLY AFTER THE MEASUREMENT CAN SHOW THE EFFECT. The action cadence (blank_us, 200 ms in
     // the resync window) is not the measurement lag (pipeline ~280 ms + one block ~650 ms): build 32
     // judged three actions inside one lag and faulted BOTH boards 20 s after boot on the normal
