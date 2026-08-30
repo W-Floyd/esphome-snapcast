@@ -2007,3 +2007,16 @@ pipeline (~250 ms) plus one block (~650 ms) the comment promised. `RSKIP … sin
 says the same: the block being judged is older than the action. Build 50: the window uses
 `resync_blank_ms` outright. Prediction: one ledger step, one tag step, done — no third step, no sign
 flip, and the tail lands inside the noise instead of 200–300 µs off.
+
+### 2026-08-30 00:52–00:59 — build 49 (render phase every block): 9 / 11 / 19 / 15 s
+
+First group delta at boot+14 s on both (was +21…+44 s); `gd` known on 175/175 A decisions and 174/175 B
+after the first seconds (build 48: unknown on every A decision). Injections: A 9 s (tail +16), B 11 s
+(−28), A 19 s (−100), B 15 s (−100). Zero TAGFAULTs. Every sequence still shows the stale-block second
+step (ledger +1470 → next tag block +2822 → stepped) and the resulting third/fourth corrective steps of
+opposite sign; build 50 carries the 1200 ms in-window blank for that.
+
+**Analyzer after a boot:** `best coef 0.00` for the first 86–117 s after every reboot tonight while both
+I2S clocks are measured and the boards, at first correlation, are within 4–250 µs. The instrument does
+not re-align its PCM decode promptly after an I2S restart; the post-boot wire is unmeasured for ~100 s.
+Operator's script — noted, not changed.
