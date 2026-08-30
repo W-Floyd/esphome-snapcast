@@ -2071,3 +2071,18 @@ a block — under a second — while the step is taken from the chunk entering t
 ~1.7 s ahead of the push). Every recorded step had aged out before the next decision, so nothing was
 subtracted and the sequences read like build 51's (`+1288 ledger → +1069 → +646 → +400 → +113`: the
 ledger step invisible 1.6 s later, half-visible at 2.9 s). Build 53: horizon = ring + pipeline + block.
+
+### 2026-08-30 01:47–01:58 — build 53 (ring horizon in the subtraction): >75 / 51 / >75 / >75 — worse, and instructive
+
+`pend=` now non-zero, but binary aging cannot represent a step that lands over a whole block: at 2.8 s
+the ledger step was counted as landed while the raw tag error had dropped only 65 % of it, and later
+decisions alternated between subtracting steps that had partly landed and counting none (`err=-571 …
+pend=+2062` refused; next block `pend=+0`, err +902, stepped again). Raw tag error also read ~1.1 ms
+above the ledger's at the first tag decision (3518 vs 2394): the small tag/ledger offset after a hard
+resync, on top of everything.
+
+Build 54 drops the cleverness: in the window the blank is at least ring + pipeline + block, computed
+from the live ring depth. One decision per ~2.7 s, each on a block that wholly post-dates the previous
+step. Prediction: ledger step → one tag step ~2.7 s later at ≈ 0.2 e → inside the arm ≈ 5.5 s after
+the hard resync, no sign flips; if it does not beat build 49 (9/11/19/15) the build-49 behaviour
+(1200 ms blank, no accounting) is the one to keep and the speed has to come from the first step's gain.
