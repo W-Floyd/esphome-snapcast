@@ -2268,3 +2268,19 @@ thread-safe send itself.
 **07:52:38 → server dead.** All three boards lost chunks; A's dead-session detector reconnected at +15 s,
 B bailed out at 12 s late; both reconnected 07:53:15 and received nothing — snapserver's stream stopped
 (source side). Build-59 grade cut short at 7 minutes.
+
+### 2026-08-30 07:52–08:05 — both speakers wedged after a 40 s server outage; the network went with them
+
+07:52:38 all three boards lost chunks. A: dead-session reconnect at +15 s; B: bailout. Both reconnected
+07:53:15–17, `Stream started`, `State changed to PLAYING` — and then: the mixer (`Stopped
+(bits=0x002002)` at 07:52:52) **never restarted**, I2S `written` frozen for the following 5 minutes, the
+player printed nothing after its `PLAYER STALLED … phase=idle(record queue), ring=520704` line, and the
+network task sat in `emit_pcm_`'s wait-for-ring-room loop (ring one chunk short of full) — no mDNS, no
+ping, no API, OTA impossible; replug only. The observer (older build) recovered normally. The STALLED
+line was cut by the 256-byte ceiling before `records=`, so whether the queue held records — the field
+the code comment calls decisive — was not printed. Not resolved tonight: what the player is blocked
+in (its mutex sections are all short; no "HELD BY SOMEONE ELSE" line). Build 61: `emit_pcm_` drops the
+chunk after 2 s so the network task survives and the stall/dead-session paths can act; STALLED report
+in two lines with records=, stream_active and iterations. The 'Render phase' log line (on B's 07:51
+logger-ring crash stack) is VERBOSE. Reproduction is a ≥40 s server hole; the next one will name the
+player's phase and the queue depth.
