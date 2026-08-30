@@ -277,6 +277,18 @@ knee. Tag-fault judgement waits 2 s and never fires in the first 20 s after enga
 faulted both boards 20 s after boot on the normal settling). Ledger (300 ms injection → <100 µs held
 5 s): build 31 12 s · 34 11/31 · 36 8/9/13/17 · 37 see PLAN. Boot to <100 µs: 31 27 s · 34 48 · 36 24.
 
+**THE RULE THAT EXPLAINS THE STAIRS (measured 22:58, build 37): any gain that only one board has
+converts common-mode error into differential motion.** After a one-board disturbance A ran its
+resync-window PI at kp 0.05 while B sat at 0.008; the same +30…+130 µs common deadline wander then
+produced (0.05 − 0.008) × 80 µs ≈ 3.4 ppm of *differential* trim, refreshed every block — the wire
+walked away from zero at 2–3 µs/s in block-sized stairs (`trimB − trimA` −7…−10 ppm against a
+crystal-set equilibrium of −5.5). Build 40 removes the in-window rate boost. Consequences: the rate
+loop's gain must be the same function of the error on every board (the knee's error-proportional
+boost is the residual asymmetry — tolerated only because knee 150 sits above the wander); resync
+is done by *position* corrections (bounded one-offs), never by a local rate boost; the
+attribution table that found this is worth reproducing for any future "why does it drift" —
+wire slope vs `trimB − trimA` vs coarse frames vs align biases, 3-s bins.
+
 **Cycle time** (wire |A−B| ≤ 20 µs held 20 s, from the reboot line; `scripts/bench/converge-time.py`):
 build 18 >450 s · 19 242 · 22 209 · 24 74 · 25 67 · 26 46. Boot→engage is ~15–20 s of that.
 
