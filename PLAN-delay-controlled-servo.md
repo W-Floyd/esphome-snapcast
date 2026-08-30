@@ -2469,3 +2469,16 @@ while B logged two events (fast splice / fallback) and A stepped its bias −26 
 is a transient the beacon rule does not yet cover (it is neither a window step nor a hard resync nor a
 deadline change: 1 frame per chunk for seconds). Build 70: engaging the fast splice sets the phase
 transient for its duration plus the horizon.
+
+### 2026-08-30 12:10–12:57 — build 70 (fast splice marks the transient): neither board chases a faulting peer
+
+Boot lock +28/+22 s. B's 12:16 TAGFAULT: A read +2492 (rejected), A's bias +8 → +9. A's 12:22 fault: B read
++1050 for three minutes, bias −17 → −4 (re-centre only). B's 12:49 fault: A −4 → −3; then B read A at
+−15.4 ms for two minutes (A's own recovery), rejected, bias +10 → +21. Wire back inside ±5 within
+~2 min of each. Quiet minutes 12:26–12:48: −4, −2, +3, +1, +0, (+8), −0, +3, (+13, +9, +13), +7, +5, +1,
++1, (+22), +9, +2, +7, +7, +3, +9, +2 — the bracketed excursions ride asymmetric delta readings (sums
+−17…−21) with no logged event; still unexplained, 1–2 min each.
+
+Rival-gated grade 12:12–12:57 (six holes/faults inside): median +2.5 µs, robust sd 9.7, 40/56/85 % inside
+5/10/20 µs; SF 1 s 0.29 · 10 s 2.3 · 30 s 6.3 · 60 s 10.6 · 120 s 12.6. Build 69's window (seven holes):
+median +0.9, sd 6.1, 56/84/96 %. `wire-sf.py` rewritten (its pairing produced impossible values).

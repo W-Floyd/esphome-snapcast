@@ -608,3 +608,6 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
   timebase event — repeat in a quiet hour. Server holes every 10–30 min remain the dominant disturbance.
 * Build 69 grade, 40 min with seven server holes: wire median +0.9 µs, robust sd 6.1, 84 % of samples
   inside ±10 µs; SF 1 s 0.24 / 60 s 6.7 / 120 s 10.3 µs. Biases inside ±18 and tracking the deltas.
+* Build 70: a fast splice marks the phase transient (engage); neither board chased a faulting peer in
+  three faults. Grade 12:12–12:57 (six holes): median +2.5 µs, robust sd 9.7, 85 % inside ±20 µs.
+  Unexplained: 1–2-min excursions to +10…+22 on asymmetric delta readings with no logged event.
