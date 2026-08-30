@@ -754,6 +754,14 @@
 > channel now only acts on offsets larger than the measurement's bias. Open: an observer's flaky
 > link should not be a consensus member at all — its every reconnect jolts the speakers.
 >
+> **20:34:51 A CRASHED — identical stack to the observer's 19:11 crash** (`xRingbufferSendComplete`
+> ← `TaskLogBuffer::send_message_thread_safe` ← `Logger::log_vprintf_`, ringbuf.c:374 assert). Two
+> boards in 80 min: the ESPHome thread-safe logger buffer under our volume — `RAW` alone is 382
+> lines per 10 s from the player task (38/s), and nothing parses it (the analyser reads RPRE, a
+> separate rare line). **Build 30 flashes now:** RAW → VERBOSE (compiled out at DEBUG), plus the
+> measured defaults (knee 150, align applied, cap 500, gain 0.1, step 4, deadband 15). A speaker
+> crash is a 20-s dropout and a membership jolt on the other; this outranks the graded window.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

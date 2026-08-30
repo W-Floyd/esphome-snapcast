@@ -2771,7 +2771,11 @@ void SnapcastClient::player_task_() {
         const int64_t r_pushed = this->pushed_frames_total_;
         const int64_t r_played_ts = this->played_last_ts_us_;
         this->playout_mutex_.unlock();
-        ESP_LOGD(TAG,
+        // VERBOSE, not DEBUG: 38 lines/s from the player task. Two boards crashed inside 80 min on
+    // 2026-08-29 (observer 19:11:49, A 20:34:51) in ESPHome's thread-safe logger buffer
+    // (Logger::log_vprintf_ -> TaskLogBuffer::send_message_thread_safe -> xRingbufferSendComplete
+    // assert, ringbuf.c:374) under this volume. Nothing on the bench parses RAW (RPRE is separate).
+    ESP_LOGV(TAG,
                  "RAW s_ts=%" PRId64 " pushed=%" PRId64 " played=%" PRId64 " played_ts=%" PRId64 " tsf=%" PRId64
                  " tsf_local=%" PRId64 " sw=%" PRId64 " rate=%" PRIu32,
                  rec.server_ts_us, r_pushed, r_played, r_played_ts, raw_tsf, raw_local, raw_width,
