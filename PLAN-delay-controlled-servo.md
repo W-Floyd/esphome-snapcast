@@ -2411,3 +2411,16 @@ itself off; (2) 10:46–47 a B deadline fallback/re-engage (a real phase jump, n
 by the 4-s transient rule: A saw −72, B saw +203, B stepped +100 in a minute, wire +120. **Build 68:**
 a `phase_transient_until_us` set by hard resyncs, window steps, AND deadline fallback/re-engage;
 align runs only while own |err_tag| is inside the unmute band.
+
+### 2026-08-30 10:56–11:01 — 28 % of the differential bias reaches the wire
+
+Per align cycle, differential bias applied (ΔbiasA − ΔbiasB) against wire movement over the following
+10 s, 29 cycles: slope **0.28**, Σbias −88 µs, Σwire −26 µs, sign right. The kick is delivered (A's
+measured rate +5.0 ppm for the ~1 s after each −5 µs step; +2.3, +2.4 ppm over two windows after
+another) and the deltas track the wire (gap ≈ 2 × gd), so the audio moves ~5 µs per kick and then
+~70 % of it comes back — by what, unresolved by reading (P-term at 5 µs is 0.04 ppm; the fast/coarse
+paths are far above; the deadline change reaches the tags one ring-travel later but that is a
+transient, not a reversal). Also: half the kicks are invisible in DLLOOP only because it logs every
+other block. **Experiment 11:08:** align frozen, A's bias zeroed via `align_max_us 0` (a −60 µs deadline
+step, no kick — the PI alone delivers it at τ = 120 s), wire per 30 s for four minutes; expected −60 on
+the wire if the deadline→wire gain is 1.0. Then cap restored.
