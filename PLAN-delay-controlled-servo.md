@@ -2424,3 +2424,17 @@ transient, not a reversal). Also: half the kicks are invisible in DLLOOP only be
 other block. **Experiment 11:08:** align frozen, A's bias zeroed via `align_max_us 0` (a −60 µs deadline
 step, no kick — the PI alone delivers it at τ = 120 s), wire per 30 s for four minutes; expected −60 on
 the wire if the deadline→wire gain is 1.0. Then cap restored.
+
+### 2026-08-30 11:08–11:16 — the single-board step was contaminated; build 68 first quarter-hour
+
+A's bias was +18 (not 60) when zeroed at 11:09:08 (`SERVOPARAM align_max_us=0`). Wire −15 → −20 → −23,
+then 11:10:10 a common timebase step (A re-opened on +400 and took a −7945 µs tag step; B fast-spliced
+−3.4 ms) — the wire swung +36 and drifted back to −31 by 11:14. Net −16 over five minutes against an
+expected −18, but with that event in the middle it is not a measurement of the deadline→wire gain.
+After restore, align brought the wire from −17 to −2 within 90 s with biases at ±4. Repeat in a quiet
+hour with a larger step (set `align_max_us` to a small cap to *create* a known bias first).
+
+Build 68 boot: lock +21/+25 s, both on group agreement. 11:05–11:07 wire −16, −15, −12 while the two
+biases rose together (A −27 → −3, B +28 → +45): a residual common march faster than the 2 µs/cycle
+re-centre, and B's bias moving against its own delta for two minutes (B gd +11 → steps −3, bias +17):
+not understood yet. 11:16 wire −3.7 MAD 0.5, biases +4/−4.
