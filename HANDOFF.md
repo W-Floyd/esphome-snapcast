@@ -582,3 +582,13 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
   of the player's silence still open. Logger: per-second ESP_LOGD from non-main tasks crashes the
   TaskLogBuffer ring (B 07:51) — 'Render phase' demoted; audit the rest.
 * Dither: A's bracket duty 0.97 vs B's 0.57 gives A a visible ~0.3 s bump at the same 0.85 ppm gap; cosmetic.
+
+## Builds 63–65 (2026-08-30 09:07–09:45)
+
+* A board broadcasts no render phase for the 4 s after a position step or hard resync (63 tried "window
+  open or unconverged" and silenced both boards at boot — no group delta, +528 µs crawl; 64 fixed the rule).
+  Peers no longer chase a reconnecting board (A's bias moved 63 → 71 → 65 during B's 09:33 reconnect,
+  vs −6 → −75 on build 62).
+* Build 64 quiet minutes: wire medians +0.1…+5.7 µs, MAD 0.3–1.9; delta sums ~0; recovery to ±3 within
+  ~2 min of a timebase event. Build 65 makes align gain 0.3 / deadband 1 / step 20 the compiled defaults;
+  a 45-min untouched grade started 09:45.

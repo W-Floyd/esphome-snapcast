@@ -1939,7 +1939,7 @@ Earned expensively; ignoring these cost hours.
 - ESPHome logger: non-main-thread ESP_LOGD from snap_net/speaker tasks crashes the TaskLogBuffer ring (three times tonight); audit remaining per-second lines from those tasks.
 
 ## 2026-08-30 09:00 — next
-- Make the align runtime values (0.3 / 1 / 20) compiled defaults once a 45-min quiet grade confirms them.
+- ~~Align runtime values → compiled defaults~~ done (build 65); read its 45-min grade.
 - The ±8 µs meander: P-term noise → `block_n` 64→128 or τ 120→240 (both cost response); measure the SF trade.
 - The wedge's player side: what blocks the player after a dead-session reconnect (mixer never restarted); reproduce with a ≥40 s server hole now that STALLED prints records=/iters.
 - Audit non-main-task ESP_LOGD lines (logger ring crashes); consider ESPHome logger task buffer size.
