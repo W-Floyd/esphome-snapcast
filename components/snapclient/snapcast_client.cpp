@@ -807,6 +807,9 @@ static constexpr int64_t UNMUTE_COMMON_US = 4000;
 // Rate bound for delivering a render_align bias change as position (see ALIGN KICK). 10 ppm moves
 // 10 us per second: inaudible as a rate, and an order of magnitude below the trim clamp.
 static constexpr float ALIGN_KICK_MAX_PPM = 10.0f;
+// Largest common-bias re-centring step per align cycle (see RALIGN): the devices' cycles are not
+// synchronised, so this bounds the differential a re-centre can open between two of them.
+static constexpr int32_t ALIGN_RECENTRE_MAX_US = 2;
 // After a position step or hard resync my measured render phase lags where the audio will be by the
 // ring's travel time (~3.5 s measured, builds 51-55); for that long the beacon carries no phase.
 static constexpr int64_t PHASE_TRANSIENT_US = 4000000;
@@ -5779,6 +5782,23 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             } else {
               ESP_LOGD(TAG, "RALIGN shadow: group %+" PRId32 " would step %+" PRId32 " us (bias held %+" PRId32 ")",
                        group_delta, step, bias);
+            }
+          }
+          // RE-CENTRE THE GROUP'S BIASES. A bias common to every device shifts every deadline equally
+          // and aligns nothing; it only spends the +-500 us cap. It arises from any systematic
+          // asymmetry in the deltas (2026-08-30: ~5 us after the sample-age fix, marching both biases
+          // +3 us/min). Each device publishes its bias in the beacon and subtracts the group mean,
+          // at most ALIGN_RECENTRE_MAX_US per cycle so the devices' unsynchronised cycles never open
+          // more than that between them; the deadline shift is delivered by the kick like any step.
+          this->tsf_sync_->set_render_bias_us(bias);
+          if (this->tune_align_apply_.load(std::memory_order_relaxed)) {
+            const int32_t gm = this->tsf_sync_->group_bias_mean_us(now_us());
+            if (gm != INT32_MIN && gm != 0) {
+              const int32_t adj = std::clamp<int32_t>(gm, -ALIGN_RECENTRE_MAX_US, ALIGN_RECENTRE_MAX_US);
+              bias -= adj;
+              this->render_bias_us_.store(bias, std::memory_order_relaxed);
+              st.align_kick_us += static_cast<float>(-adj);
+              this->tsf_sync_->set_render_bias_us(bias);
             }
           }
           ESP_LOGD(TAG, "RALIGN group %+" PRId32 " -> bias %+" PRId32 " us (cap %" PRId32 ")", group_delta, bias,

@@ -186,6 +186,27 @@ class TsfSync {
   /// @brief This device's own render phase, or RENDER_PHASE_UNKNOWN. Diagnostics: a delta is
   /// only absent because one SIDE is unknown, and without seeing both there is no way to tell
   /// which.
+  /// This device's render_align bias, published in the beacon so the group can re-centre (see
+  /// TsfPacket::render_bias_us). INT32_MIN until the client sets it.
+  void set_render_bias_us(int32_t bias_us) { this->pub_render_bias_us_.store(bias_us, std::memory_order_relaxed); }
+  /// Mean of the render_align biases across this device and every peer heard within PHASE_STALE_US
+  /// whose bias is known; INT32_MIN unless at least two devices contribute. Player task.
+  int32_t group_bias_mean_us(int64_t local_now_us) const {
+    const int32_t mine = this->pub_render_bias_us_.load(std::memory_order_relaxed);
+    if (mine == INT32_MIN) {
+      return INT32_MIN;
+    }
+    int64_t sum = mine;
+    int n = 1;
+    for (size_t i = 0; i < MAX_PEERS; i++) {
+      if (this->peer_[i].used && this->peer_[i].bias_us != INT32_MIN &&
+          local_now_us - this->peer_[i].bias_seen_us < PHASE_STALE_US) {
+        sum += this->peer_[i].bias_us;
+        n++;
+      }
+    }
+    return n >= 2 ? static_cast<int32_t>(sum / n) : INT32_MIN;
+  }
   void set_render_phase_broadcast(bool on) { this->render_phase_broadcast_.store(on, std::memory_order_relaxed); }
   int64_t render_phase_for_beacon_() const {
     return this->render_phase_broadcast_.load(std::memory_order_relaxed)
@@ -279,6 +300,7 @@ class TsfSync {
   /// transient (resync window open, not converged) keeps measuring its phase for its own gate but
   /// stops offering it to peers, so they hold still while it steps home. Player task writes.
   std::atomic<bool> render_phase_broadcast_{true};
+  std::atomic<int32_t> pub_render_bias_us_{INT32_MIN};  // our render_align bias for the beacon
   int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance
   int64_t last_diverge_log_us_{0};
   int64_t last_render_log_us_{0};
@@ -313,6 +335,9 @@ class TsfSync {
     // that, not to the phase's own value. RENDER_PHASE_UNKNOWN when the peer has not rendered.
     int64_t phase_us;
     int64_t phase_seen_us;
+    // The peer's render_align bias and when we last heard it (INT32_MIN = unknown). See TsfPacket.
+    int32_t bias_us;
+    int64_t bias_seen_us;
     // The peer's RAW published server<->TSF line. A line, not a point, so it is evaluated at a
     // common instant rather than needing to have been sampled at one.
     bool map_valid;

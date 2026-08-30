@@ -383,6 +383,11 @@ struct __attribute__((packed)) TsfPacket {
   // sum to zero), and render_align marched both deadlines later together at 15 us/min. Appended
   // last so an older sender's shorter packet still parses (see the short-packet defaults on receive).
   uint16_t render_phase_age_ms;
+  // This device's render_align bias (us), INT32_MIN = unknown / older sender. A bias common to every
+  // device shifts every deadline equally and carries no alignment information; each device subtracts
+  // the group mean so only the differential survives (2026-08-30: a residual ~5 us asymmetry in the
+  // pairing marched both biases +3 us/min toward the +-500 cap).
+  int32_t render_bias_us;
 };
 
 // Fields from render_phase_us onward are the newest additions, so an older sender's packet is
@@ -555,6 +560,7 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
         pkt.stream_id_hash = 0;
       }
       pkt.render_phase_age_ms = 0xFFFF;  // older sender: pair by receipt, as before
+      pkt.render_bias_us = INT32_MIN;
     }
     if (pkt.magic != TSF_MAGIC || pkt.version != TSF_VERSION) {
       continue;
@@ -617,6 +623,10 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     peer->seen_us = local_now_us;
     peer->pipeline_us = pkt.pipeline_us;
     peer->crystal_ppm = pkt.crystal_ppm;
+    if (pkt.render_bias_us != INT32_MIN) {
+      peer->bias_us = pkt.render_bias_us;
+      peer->bias_seen_us = local_now_us;
+    }
     // An incomparable phase is dropped, not recorded as UNKNOWN: record_peer_phase_ deliberately
     // keeps a peer's last phase when it reports UNKNOWN, so overwriting would be a no-op anyway,
     // and what we want is for this peer never to enter the statistic at all.
@@ -693,6 +703,8 @@ TsfSync::Peer *TsfSync::find_peer_(const uint8_t mac[6], int64_t local_now_us) {
       p = Peer{};
       memcpy(p.mac, mac, 6);
       p.used = true;
+      p.bias_us = INT32_MIN;  // unknown until this peer reports one
+      p.bias_seen_us = 0;
       p.phase_us = RENDER_PHASE_UNKNOWN;
       p.pipeline_us = PIPELINE_UNKNOWN;
       p.crystal_ppm = NAN;
@@ -1122,6 +1134,7 @@ void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_
   pkt.pipeline_us = this->pipeline_us_.load(std::memory_order_relaxed);
   pkt.render_phase_us = this->render_phase_for_beacon_();
   pkt.render_phase_age_ms = this->render_phase_age_ms_();
+  pkt.render_bias_us = this->pub_render_bias_us_.load(std::memory_order_relaxed);
   pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
 
   struct sockaddr_in dest = {};
@@ -1230,6 +1243,7 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     pkt.pipeline_us = depth;  // PIPELINE_UNKNOWN is INT32_MIN, which passes through unchanged
     pkt.render_phase_us = this->render_phase_for_beacon_();
     pkt.render_phase_age_ms = this->render_phase_age_ms_();
+    pkt.render_bias_us = this->pub_render_bias_us_.load(std::memory_order_relaxed);
   }
   struct sockaddr_in dest = {};
   dest.sin_family = AF_INET;
