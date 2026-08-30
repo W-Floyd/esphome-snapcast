@@ -526,3 +526,13 @@ survives a power cycle; one instance is not a rate.
 * **Grade the wire from the CSV, not from plots.** `scripts/bench/wire-window.py` reads `test.csv`
   with the rival gate; the analyser writes NaN rows on PCM-lock loss.
 
+
+## Build 44 (2026-08-29 23:46) — gate sign, and the wire's sign
+
+* The resync group-delta gate compared the wrong signs in build 43 and refused every step on which
+  err_tag and the group render delta agreed (injection recoveries 12 / >75 / 57 / 69 s). Fixed:
+  `delta > 0` and `err_tag > 0` are both LATE; `+bias` = plays later. Derivations in PLAN 23:27–23:50.
+* **The analyser's probe b is on board A (e985e8).** `test.csv` `offset_ns` positive = board B
+  (f04d74, b.log) EARLIER, the opposite of the header's wording; the CSV's firmware columns are by log.
+  Measured from the rate-attribution table (`fs_b − fs_a` vs requested trim differential), not inferred.
+  Every earlier "A early / B late" reading of the wire in HANDOFF/PLAN should be read swapped.
