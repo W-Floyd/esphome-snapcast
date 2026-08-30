@@ -879,6 +879,16 @@
 > in-window coarse arm at 100 µs when the error has PERSISTED one measurement lag (two blocks) —
 > the same step-and-verify principle, not a lower magnitude threshold.
 >
+> **Build 41 boot (23:14:47, knee off) — the sawtooth, attributed:** ±260…500 µs jumps (A "corrected
+> −22 frames" = −500 µs at 23:18:33 etc.) with −1.7 µs/s ramps between (symmetric PIs at tau 120
+> draining A −21 / B +140 µs). **The jumps are A's in-window steps on its own err_tag, which after a
+> boot into a running group is mostly the ±150 µs COMMON deadline wander** — a one-board position
+> step on a common error is a differential error; B, just under the arm, did nothing. Position form
+> of the gain-asymmetry rule. **Build 43:** an in-window step above `resync_local_us` (300) acts on
+> err_tag (local by construction); below it the GROUP render delta must agree in sign and the step
+> is the smaller of the two; no differential evidence → no step, the symmetric PI handles it. Build
+> 42's 100 µs arm / one-step-per-block is included but now gated this way.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

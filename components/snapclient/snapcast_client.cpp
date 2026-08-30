@@ -3042,11 +3042,31 @@ void SnapcastClient::player_task_() {
       // DAMPED in the resync window: the block error lags the audio by a block, so correcting all
       // of it each step rang (build 34, 300 ms injection on A: -4717 -> +4125 -> -1251 -> +740 us).
       // Correcting resync_gain (60 %) of it converges in three steps without the overshoot.
-      const int64_t coarse_target_us = coarse_on_tags ? coarse_err_us : median_err_us;
+      int64_t coarse_target_us = coarse_on_tags ? coarse_err_us : median_err_us;
+      // A ONE-BOARD POSITION STEP ON A COMMON ERROR IS A DIFFERENTIAL ERROR. After a boot into a
+      // running group err_tag is mostly the +-150 us common deadline wander, and A's window steps on
+      // it produced a +-260..500 us sawtooth on the wire (build 41, 23:15-23:19) while B, just under
+      // the arm, did nothing. Errors above resync_local_us are local by construction (the wander
+      // never reaches them) and step on err_tag; below it the step needs the GROUP render delta --
+      // the on-device differential measurement -- to agree in sign, and moves by the smaller of the
+      // two. group delta > 0 = early; err_tag < 0 = early.
+      bool coarse_step_ok = true;
+      if (resync_window && coarse_on_tags &&
+          std::abs(coarse_target_us) < this->tune_resync_local_us_.load(std::memory_order_relaxed)) {
+        const int32_t gd = this->tsf_sync_ != nullptr ? this->tsf_sync_->render_group_delta_us() : INT32_MIN;
+        if (gd == INT32_MIN || std::abs(gd) > 500000 || ((gd > 0) != (coarse_target_us < 0)) ||
+            std::abs(gd) < this->tune_resync_splice_us_.load(std::memory_order_relaxed)) {
+          coarse_step_ok = false;  // no differential evidence: leave it to the (symmetric) PI
+        } else {
+          coarse_target_us = coarse_target_us < 0 ? -std::min<int64_t>(-coarse_target_us, std::abs(gd))
+                                                  : std::min<int64_t>(coarse_target_us, std::abs(gd));
+        }
+      }
       const int64_t coarse_step_us =
-          resync_window ? static_cast<int64_t>(static_cast<float>(coarse_target_us) *
-                                               this->tune_resync_gain_.load(std::memory_order_relaxed))
-                        : coarse_target_us;
+          !coarse_step_ok ? 0
+          : resync_window ? static_cast<int64_t>(static_cast<float>(coarse_target_us) *
+                                                 this->tune_resync_gain_.load(std::memory_order_relaxed))
+                          : coarse_target_us;
       const int32_t adjust_frames =
           static_cast<int32_t>(coarse_step_us * static_cast<int64_t>(rec.params.sample_rate) / 1000000);
       // RESYNC WINDOW = STEP AND VERIFY. One correction of the whole measured error per measurement
@@ -4519,6 +4539,9 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_win_s") {
     if (!(value >= 0.0f && value <= 600.0f)) return false;
     this->tune_resync_win_s_.store(value, std::memory_order_relaxed);
+  } else if (name == "resync_local_us") {
+    if (!(value >= 100.0f && value <= 5000.0f)) return false;
+    this->tune_resync_local_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "resync_close_s") {
     if (!(value >= 1.0f && value <= 60.0f)) return false;
     this->tune_resync_close_s_.store(value, std::memory_order_relaxed);
