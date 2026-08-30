@@ -2351,3 +2351,14 @@ Steady-state score at this point: mean pinned at 0 by align (gain 0.3, deadband 
 sample-age pairing, transient-quiet beacons); the residual is the ±3–8 µs per-minute meander from
 P-term noise plus the timebase's own events. Build 65 makes the runtime align values the compiled
 defaults and starts a 45-min untouched grade.
+
+### 2026-08-30 09:43 — build 65, a server storm 4 min after boot, and a 10 ms ledger split on A
+
+09:43:24 both boards took a storm (A 30 hard resyncs, B 2). Window steps: B `+38044 → +24910 → +11749`
+(576-frame steps, one per block) closed at 09:43:39; A `+3252 → −14118 → −862 → −157` closed 09:43:52.
+Wire: −1148 (median, during) → −95 → −41 → −9 → +6 over the following 60 s — the last 100 µs is
+align's 0.3/cycle (95 → 66 → 46 → 32 → 23), i.e. ~40 s; the gate cannot see a residual that small.
+Afterwards A carries `RECON drift=10000` **constant** and `SHADOW err_tag −100 / err_live +9900`: the
+ledger believes 10 ms more audio is queued than is measured — one DMA block — the accounting-split
+family again, this time steady rather than flipping. Audio is on the tags and is fine (wire ±10); it
+becomes a fault only if the tags go stale. Recorded; not acted on during the 45-min grade.
