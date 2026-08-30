@@ -3074,6 +3074,26 @@ void SnapcastClient::player_task_() {
       // of it each step rang (build 34, 300 ms injection on A: -4717 -> +4125 -> -1251 -> +740 us).
       // Correcting resync_gain (60 %) of it converges in three steps without the overshoot.
       int64_t coarse_target_us = coarse_on_tags ? coarse_err_us : median_err_us;
+      // SUBTRACT THE STEPS STILL IN FLIGHT. Measured 01:23-01:29 (build 51, wire vs RSTEP): every step
+      // arrives on the wire 1:1 -- but ~2 s after it is applied, because a drop is taken at PUSH time
+      // and the ring holds ~1.7 s ahead of the DAC. A 1200 ms blank therefore judged the next block
+      // BEFORE the step existed there (builds 48-50: +2277 applied, next block +4068, stepped again);
+      // 2000 ms saw about half of it. The fast splice has carried this accounting since build 3x
+      // (splice_hist / horizon_chunks); the coarse target now does too: pending = steps applied within
+      // ring depth + one block, and the target is what the tags will read once they have landed.
+      int64_t pending_us = 0;
+      if (resync_window && coarse_on_tags) {
+        const int64_t horizon_us =
+            st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
+            static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
+        const int64_t now_p = now_us();
+        for (size_t i = 0; i < ServoState::WIN_STEPS; i++) {
+          if (st.win_step_at_us[i] != 0 && now_p - st.win_step_at_us[i] < horizon_us) {
+            pending_us += st.win_step_us[i];
+          }
+        }
+        coarse_target_us -= pending_us;
+      }
       // A ONE-BOARD POSITION STEP ON A COMMON ERROR IS A DIFFERENTIAL ERROR. After a boot into a
       // running group err_tag is mostly the +-150 us common deadline wander, and A's window steps on
       // it produced a +-260..500 us sawtooth on the wire (build 41, 23:15-23:19) while B, just under
@@ -3119,12 +3139,13 @@ void SnapcastClient::player_task_() {
       if (resync_window) {
         const int32_t gd_log = this->tsf_sync_ != nullptr ? this->tsf_sync_->render_group_delta_us() : INT32_MIN;
         if (gd_log == INT32_MIN) {
-          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=unknown ok=%d step=%+" PRId64 " adj=%+" PRId32,
-                   coarse_target_us, coarse_on_tags ? "tag" : "ledger", coarse_step_ok ? 1 : 0, coarse_step_us, adjust);
+          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=unknown ok=%d step=%+" PRId64 " adj=%+" PRId32 " pend=%+" PRId64,
+                   coarse_target_us, coarse_on_tags ? "tag" : "ledger", coarse_step_ok ? 1 : 0, coarse_step_us, adjust,
+                   pending_us);
         } else {
-          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=%+" PRId32 " ok=%d step=%+" PRId64 " adj=%+" PRId32,
+          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=%+" PRId32 " ok=%d step=%+" PRId64 " adj=%+" PRId32 " pend=%+" PRId64,
                    coarse_target_us, coarse_on_tags ? "tag" : "ledger", gd_log, coarse_step_ok ? 1 : 0, coarse_step_us,
-                   adjust);
+                   adjust, pending_us);
         }
       }
       if (adjust > 0) {
@@ -3136,6 +3157,10 @@ void SnapcastClient::player_task_() {
       }
       if (resync_window && adjust != 0) {
         st.resync_step_at_us = now_us();
+        st.win_step_us[st.win_step_idx] =
+            static_cast<int64_t>(adjust) * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
+        st.win_step_at_us[st.win_step_idx] = st.resync_step_at_us;
+        st.win_step_idx = (st.win_step_idx + 1) % ServoState::WIN_STEPS;
       }
       st.steer_dir = 0;
     } else if (st.err_window_filled == MEDIAN_WINDOW) {
@@ -4187,6 +4212,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     st.post_event_until_us =
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
+    std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
     st.resync_inside_since_us = 0;
     ESP_LOGI(TAG, "Delay loop: resync window re-opened on a %+.0f us step t=%" PRId64, e, now);
   }
@@ -4259,6 +4285,7 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     st.post_event_until_us =
         now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
+    std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
     ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
              st.trim_integral_ppm, st.dl_err_us, now);
   }
@@ -4550,6 +4577,7 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
   st.post_event_until_us =
       now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
+    std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
   // Every event that re-arms the gain schedule -- a hard resync, a timebase re-anchor -- also
   // displaced audio or stepped the deadline mapping, so the tags of audio already in flight
   // describe the OLD placement. Blank the delay loop's tag stream for one pipeline depth, same as

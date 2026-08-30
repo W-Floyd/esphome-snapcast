@@ -927,6 +927,13 @@ class SnapcastClient {
     int64_t resync_last_block_us{0};    // dl_err_at_us of the block the last in-window step used (one block, one step)
     int64_t rskip_log_at_us{0};         // block the last RSKIP line described (one line per block)
     int64_t resync_step_at_us{0};       // last in-window position step of ANY source (ledger steps wait out the blank too)
+    /// In-window position steps still on their way to the DAC. A drop is applied at PUSH time and the
+    /// ring holds ~1.7 s of audio ahead of the DAC, so a step is invisible to the tags for ring depth
+    /// + pipeline; the coarse target subtracts what is pending instead of waiting for it.
+    static constexpr size_t WIN_STEPS = 8;
+    int64_t win_step_us[WIN_STEPS]{};
+    int64_t win_step_at_us[WIN_STEPS]{};
+    size_t win_step_idx{0};
     /// No NVS integral was restored at boot: seed from the TSF crystal estimate at first engage
     /// and run the fast boot Ti; a fresh board otherwise winds ~56 ppm through Ki over 10+ min.
     bool dl_cold_start{true};
