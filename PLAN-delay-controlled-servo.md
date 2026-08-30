@@ -2234,3 +2234,26 @@ after each step (0.04 ppm at 5 µs — should be invisible).
 0.83 ppm; B 29/169..81/472, 0.88 ppm) — the difference is duty: A 0.97 (one opposite tick in ~33 → a
 ~0.3 s repeating bump), B 0.57 (toggles every couple of 10-ms ticks). Same 0.85 ppm × 10 ms ≈ 8 ns per
 toggle; cosmetic on the fs trace. A second-order or dithered sigma-delta would whiten it.
+
+### 2026-08-30 07:42–07:55 — build 59: the kick works; both biases march together; B crashed (ringbuf assert)
+
+**Kick, verified in DLLOOP:** B 07:50:03 trim +47.24 against integral +51.35 (−4.1 ppm for one block
+after a +2 µs bias step), 07:50:33 +46.89; A 07:49:33 +48.90 vs +56.26 after a larger step. Sign right
+(bias up → slower → audio later).
+
+**But both biases rise together** (A +28 → +32, B +17 → +38 in two minutes) because **both group deltas
+read negative** — A −35…−4, B −1…−11; their sum −36, −9, −13, −15, −7, −6, −4 where two devices' deltas
+must sum to zero. Each board sees the other as ~8 µs *later* than itself. Candidate mechanism: the
+pairing uses the beacon's *receive* time (`phase_seen_us`) against my *sample* time; the peer's sample
+can be up to ~1.6 s older than its receipt, and the shared mapping ramps at 2–3 ppm most of the time
+(`Offset ramp +2.4…+3.2 ppm`), so an older phase reads later by ramp × age ≈ 3–5 µs — on both sides. A
+common-mode march of the deadline (15 µs/min at gain 0.3) that ends at the ±500 µs cap. Fix: carry the
+sample age in the beacon, pair on true sample instants, extrapolate by the ramp. Until then the sum of
+deltas is the health check; a common march does not move the wire, but it will saturate align.
+
+Wire, per minute, gain 0.3: +10.6, +11.1, +6.3, +4.9, (−13.6 during a fallback), +8.4, +4.1 — mean
+closing but not at the predicted rate, consistent with the differential part of the steps being a
+fraction of the common part.
+
+**B crash 07:51:26:** `assert failed: prvSendItemDoneNoSplit ringbuf.c:374`, log rate ~5 lines/s at the
+time (not the 38/s logger case). Backtrace decode pending the ELF. Then a 12 s server hole → bailout.
