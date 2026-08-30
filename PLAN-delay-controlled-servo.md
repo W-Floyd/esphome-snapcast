@@ -767,6 +767,11 @@
 > +8 → +11 against a −16…−26 delta). Cycle-time ledger: 18 >450 · 19 242 · 22 209 · 24 74 · 25 67 ·
 > 26 46 · 30 73 (defaults only). 60-min hands-off grade of the defaults follows (20:47–21:47).
 >
+> **21:04:53 server-wide starvation → A genuine TAGFAULT (−12.8 ms vs ledger −0.8) → build 30
+> reconnected in 3 s → SHADOW diff −98 µs by 21:05:15, −5…−29 thereafter → wire +4.4 µs at 21:06.**
+> The fault path end to end: ~12 s of disruption for the class that cost 40 minutes at 12:38 and
+> 3 minutes at 16:38.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is
