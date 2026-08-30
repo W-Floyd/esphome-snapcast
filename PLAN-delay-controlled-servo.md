@@ -2096,3 +2096,17 @@ mean is wholly post-step only a full block after the landing: horizon = ring + p
 blocks (build 55). Also 55: the ledger's first step is arithmetic and takes gain 1.0; the 0.8 damping
 stays on the tag steps, which act on the lagged measurement. Prediction: ledger step → ~3.4 s → one tag
 step of ≈ tag/ledger offset (~1–1.7 ms tonight) × 0.8 → inside the arm ≈ 7 s after the hard resync.
+
+### 2026-08-30 02:13–02:24 — build 55 (two-block horizon, ledger gain 1.0): >75 / 65 / 46 / 64 — the ledger's step never reaches the tags
+
+Clean cadence now (one decision per ~3.5 s, every tag step fully realised by the next: `+2498 → step
++1998 → +311`, `+4545 → +3636 → +509`). But the ledger's first step is invisible to the tags even a
+full horizon later: `ledger +1938` → tags +2498; `ledger +4570` → tags +4545; `ledger +4393` → +4426;
+`ledger +1698` → +2179. Either the frames it drops never reach the audio the tags measure, or the
+ledger's error after an *early* hard resync (silence inserted) describes different audio than the
+tags' — in both readings it is the ~1.5–2 ms tag/ledger offset seen after every hard resync tonight,
+and every sequence pays one extra 3.5 s round for it. Then 0.8-gain tag steps descend geometrically:
+four rounds × 3.5 s. Final runtime A/B: `resync_gain 1.0` — each tag step is now fully realised before
+the next decision, so damping only buys rounds. Whether the ledger step is lost or mis-measured is the
+first thing to find tomorrow (`push_chunk_` drop on the chunk after a silence insert; compare the wire
+at the ledger step's expected landing).
