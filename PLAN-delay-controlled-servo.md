@@ -899,6 +899,13 @@
 > (re-open), 43 (group-delta gating below 300). **Fallback without a reflash:** `resync_splice_us 300`
 > — the window's floor becomes "local by construction", resync ~10 s.
 >
+> **23:22:03 (build 41): a COMMON +300…400 µs deadline step** — B's err +223 → +413 (window re-opened,
+> B stepped −14 and −10 frames = −540 µs), and A's err rose +194 → +277 two seconds later with no
+> action. B's one-board step on a common step put −330 µs on the wire. So "local by construction"
+> does not hold at 300 µs: common timebase steps reach 400. `resync_local_us` → 2000 (only
+> starvation-class errors skip the group-delta gate); below that every in-window step needs the
+> differential measurement to agree. Included in build 43's compile if it makes 23:27.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

@@ -1576,7 +1576,7 @@ class SnapcastClient {
   std::atomic<float> tune_resync_reopen_us_{400.0f};  // a block error past this re-opens the window
   std::atomic<int32_t> tune_resync_splice_us_{100};  // in-window coarse arm, one step per block (build 42); 150 left 50-115 us residuals to tau 120
   std::atomic<float> tune_resync_close_s_{5.0f};     // inside the arm threshold this long -> window closes
-  std::atomic<int32_t> tune_resync_local_us_{300};   // below this an in-window step needs the group delta to agree (the common wander lives here)
+  std::atomic<int32_t> tune_resync_local_us_{2000};  // below this an in-window step needs the group delta to agree: common TIMEBASE STEPS reach +400 us (23:22:03, both boards), only starvation-class errors are local by construction
   std::atomic<int32_t> tune_resync_blank_ms_{1200}; // step-and-verify cadence: the judging block must START after the step (block 0.65 s + pipeline 0.28 s)
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
