@@ -3034,7 +3034,14 @@ void SnapcastClient::player_task_() {
                         : (coarse_on_tags ? static_cast<int64_t>(FAST_SPLICE_MAX_FRAMES) * 1000000 /
                                                 static_cast<int64_t>(rec.params.sample_rate)
                                           : SOFT_CORRECTION_AGGRESSIVE_US)) &&
-               coarse_ok && (!resync_window || !coarse_on_tags || st.dl_err_at_us != st.resync_last_block_us)) {
+               coarse_ok && (!resync_window || !coarse_on_tags || st.dl_err_at_us != st.resync_last_block_us) &&
+               // A LEDGER step in the window waits out the blank too. Build 45's RSTEP showed the
+               // ledger path re-stepping the same error EVERY CHUNK -- err -1475, -3470, -5465,
+               // -7461, -9454 within one second (00:14:58) -- because the prediction cannot show a
+               // step until the pipeline has played through it; five steps landed on one error and
+               // it came back +26272. The tag path had one-block-one-step; the ledger had nothing.
+               (!resync_window || coarse_on_tags || st.resync_step_at_us == 0 ||
+                now_us() - st.resync_step_at_us >= blank_us)) {
       // In the window a tag-based step needs the error to have PERSISTED across a block boundary:
       // the block used for the previous decision may not be used again (one block, one step), and
       // with the arm at 100 us this is what keeps the +-60 us block noise from being stepped on.
@@ -3113,6 +3120,9 @@ void SnapcastClient::player_task_() {
       } else if (adjust < 0) {
         st.soft_inserted_frames += -adjust;
         this->push_silence_(-adjust, rec.params);
+      }
+      if (resync_window && adjust != 0) {
+        st.resync_step_at_us = now_us();
       }
       st.steer_dir = 0;
     } else if (st.err_window_filled == MEDIAN_WINDOW) {
@@ -5340,16 +5350,14 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // (A: median +5120 us, values near 0 half the time and near +9.5 ms the other half) and
           // unusable for steering. It still receives and logs everyone else's (PHASEIN).
           if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN && !this->config_.tsf_observer) {
-            // PUBLISH THE SETTLED PHASE, NOT THE INSTANTANEOUS ONE. render_align moves the deadline;
-            // the audio follows through the PI with tau = 120 s, so a raw phase keeps reporting the
-            // gap for two minutes after the bias that will close it has already been applied, and
-            // align -- an integrator -- keeps stepping into it (00:03-00:05: A's bias +116 -> +210
-            // against a group delta pinned at -50..-64, wire barely moving, err_tag -150..-250
-            // carrying the whole pending correction). err_tag is exactly the part of this phase the
-            // PI is about to remove, so phase - err_tag is where this frame's successors will render
-            // once it has. Same for the resync gate, which reads the same delta.
-            const int64_t settled_phase = measured_phase - (st.dl_have_err ? st.dl_err_us : 0);
-            this->tsf_sync_->set_render_phase_us(settled_phase, phase_local);
+            // THE RAW PHASE, NOT A "SETTLED" ONE. Build 45 published phase - err_tag so that align (which
+            // moves the deadline and then waits tau = 120 s for the PI to move the audio) would stop
+            // stepping into a gap already corrected. It also zeroed the resync gate's evidence by
+            // construction -- a board 1443 us early reported a group delta of +45 and every tag step
+            // was refused (00:15, RSTEP src=tag ok=0) -- because the gate asks the opposite question:
+            // is this error differential NOW. Align's lag needs the peers' err_tag, not ours alone;
+            // that is a beacon-format change, not a subtraction here.
+            this->tsf_sync_->set_render_phase_us(measured_phase, phase_local);
           } else {
             this->tsf_sync_->set_render_phase_us(TsfSync::RENDER_PHASE_UNKNOWN);
           }
