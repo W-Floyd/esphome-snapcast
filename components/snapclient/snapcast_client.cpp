@@ -3237,7 +3237,12 @@ void SnapcastClient::player_task_() {
         for (size_t i = 0; i < ServoState::WIN_STEPS; i++) {
           if (st.win_step_at_us[i] == 0 || now_p - st.win_step_at_us[i] > 6000000)
             continue;
-          if (this->played_frames_total_ < st.win_step_land_frame[i] + block_frames)
+          // TWO blocks of margin, not one (build 54's lesson, re-learned at 18:16:23): the block
+          // average is wholly post-landing only a full block after the landing, and the decision
+          // falls mid-block. Post-resync the pipe is drained, landing is ~12 ms out, and a one-block
+          // margin expired exactly at the next decision: +1429 stepped, 0.64 s later pend=+0 and
+          // +992 stepped again on the same displacement -> -1163 overshoot.
+          if (this->played_frames_total_ < st.win_step_land_frame[i] + 2 * block_frames)
             pending_us += st.win_step_us[i];
         }
         coarse_target_us -= pending_us;
