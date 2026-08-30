@@ -1044,6 +1044,13 @@ class SnapcastClient {
   std::atomic<float> bias_kick_request_us_{0.0f};  // bench hook: bias change to deliver as a kick (see align_bias_kick_us)
   std::atomic<int64_t> write_begin_us_{0};  // last on_audio_write() entry (player task); see the fill-drift comparison
   std::atomic<int64_t> write_end_us_{0};    // its return; end < begin while a write is in progress
+  // Ring of the last write windows: the depth snapshot can be 50-60 ms old and fall inside a window
+  // that had already ENDED by the time the comparison ran, which the single begin/end pair missed
+  // (17 % of comparable reports still carried the two-chunk artefact, 2026-08-30 16:38).
+  static constexpr size_t WRITE_WIN_RING = 8;
+  int64_t write_win_begin_[WRITE_WIN_RING]{};
+  int64_t write_win_end_[WRITE_WIN_RING]{};
+  size_t write_win_idx_{0};
   /// Reads @p bytes from the PCM ring and discards them.
   void discard_ring_bytes_(size_t bytes);
 

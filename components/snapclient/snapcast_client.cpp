@@ -1253,8 +1253,13 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // Late-stamped catch-up burst incoming (see FEEDBACK_GAP_BLANK_US): every tagged arrival
       // for the next stretch carries a render instant off by up to the stall. Already under
       // playout_mutex_ here, so write the blank directly rather than through mark_kp_event_.
+      // The travel horizon, not blank_ms: the refill after a render gap carries the same
+      // ring-of-old-deadline audio as a hard resync (A TAGFAULTed +11.8 ms through this path at
+      // 16:59:21 with the resync-path blank already fixed).
       this->dl_blank_until_us_ =
-          timestamp_us + static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000;
+          timestamp_us +
+          std::max<int64_t>(static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000,
+                            PHASE_TRANSIENT_US);
       this->dl_acc_n_ = 0;
       this->dl_acc_sum_us_ = 0.0;
     }
@@ -2689,6 +2694,18 @@ void SnapcastClient::player_task_() {
           if (comparable && wb != 0 && measured.as_of_us >= wb && (we < wb || measured.as_of_us <= we)) {
             comparable = false;
           }
+          // The snapshot can be 50-60 ms old and fall inside a write window that had already ended
+          // by now -- the live pair above then misses it (17 % of comparable reports still carried
+          // the two-chunk artefact). Check the recent completed windows too.
+          if (comparable) {
+            for (size_t i = 0; i < WRITE_WIN_RING; i++) {
+              if (this->write_win_begin_[i] != 0 && measured.as_of_us >= this->write_win_begin_[i] &&
+                  measured.as_of_us <= this->write_win_end_[i]) {
+                comparable = false;
+                break;
+              }
+            }
+          }
         }
         this->playout_mutex_.unlock();
       }
@@ -3959,6 +3976,10 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       this->playout_valid_ = false;
       this->played_frames_total_ = 0;
       this->pushed_frames_total_ = in_flight_frames;
+      // The reseed moves the prediction the tag anchor extrapolates from; tags rendering pre-drain
+      // audio for the next ring travel read the displacement (A, 16:59:05: err_tag +16.6 ms vs
+      // ledger +6.6 five seconds after this line ran). Blank them for the same horizon as a step.
+      this->dl_blank_until_us_ = std::max(this->dl_blank_until_us_, now_us() + PHASE_TRANSIENT_US);
       this->fb_samples_ = 0;
       // The counters just jumped; anything remembered against them is now meaningless. Seed the
       // histories at this instant so the next reading has something honest to compare against.
@@ -6271,10 +6292,16 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
       // The write can block for up to 100 ms with part of the slice already copied downstream; the
       // depth snapshot the mixer takes in that window counts bytes the ledger has not yet added.
       // Recorded so the comparison can refuse snapshots taken inside a write (see fill_drift).
-      this->write_begin_us_.store(now_us(), std::memory_order_relaxed);
+      const int64_t wb = now_us();
+      this->write_begin_us_.store(wb, std::memory_order_relaxed);
       size_t written = this->audio_listener_->on_audio_write(this->slice_buffer_.get() + offset, got - offset, 100,
                                                              rec.params);
-      this->write_end_us_.store(now_us(), std::memory_order_relaxed);
+      const int64_t we = now_us();
+      this->write_end_us_.store(we, std::memory_order_relaxed);
+      // Completed windows go into the ring (player task writes, player task reads in the report).
+      this->write_win_begin_[this->write_win_idx_] = wb;
+      this->write_win_end_[this->write_win_idx_] = we;
+      this->write_win_idx_ = (this->write_win_idx_ + 1) % WRITE_WIN_RING;
       offset += written;
       if (written > 0) {
         zero_writes = 0;
