@@ -1259,7 +1259,7 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       this->dl_blank_until_us_ =
           timestamp_us +
           std::max<int64_t>(static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000,
-                            PHASE_TRANSIENT_US);
+                            this->travel_horizon_us_());
       this->dl_acc_n_ = 0;
       this->dl_acc_sum_us_ = 0.0;
     }
@@ -2864,6 +2864,19 @@ void SnapcastClient::player_task_() {
     }
     const bool coarse_on_tags = tags_fresh && now_us() >= st.tag_fault_until_us;
     const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
+    // Is the LEDGER reading stable enough to step on? During a refill burst it bounces tens of ms
+    // chunk to chunk (17:41:53: +41.8, +27.7, +36.4, +42.2 ms on consecutive chunks) and a first step
+    // taken then left 1-14 ms for extra correction rounds (build 77 injections: 20/15/10/32 s, the
+    // variance entirely in this). Two consecutive readings within 20 % (or 500 us) mark it stable.
+    if (std::abs(error_us - st.ledger_prev_err_us) <
+        std::max<int64_t>(std::abs(error_us) / 5, 500)) {
+      if (st.ledger_stable_streak < 250) {
+        st.ledger_stable_streak++;
+      }
+    } else {
+      st.ledger_stable_streak = 0;
+    }
+    st.ledger_prev_err_us = error_us;
     const bool coarse_ok =
         !coarse_on_tags || st.coarse_act_us == 0 || st.dl_err_at_us > st.coarse_act_us + blank_us;
     // In the window, an error above the arm that takes NO step is the case that needs explaining
@@ -3162,7 +3175,11 @@ void SnapcastClient::player_task_() {
                // blanks the tags for a moment, the ledger steps in that moment, the tags come back and
                // step on the ledger's step. Freshness flickers; "has anything stepped in this window"
                // does not. resync_step_at_us is zeroed wherever the window opens.
-               (!resync_window || coarse_on_tags || st.resync_step_at_us == 0)) {
+               (!resync_window || coarse_on_tags ||
+                // ... the first step, on a STABLE reading: during a refill burst the ledger bounces
+                // tens of ms chunk-to-chunk (17:41:53) and a step taken then left 1-14 ms of residual
+                // for extra rounds -- the whole variance of build 77's 20/15/10/32 s injections.
+                (st.resync_step_at_us == 0 && st.ledger_stable_streak >= 2))) {
       // In the window a tag-based step needs the error to have PERSISTED across a block boundary:
       // the block used for the previous decision may not be used again (one block, one step), and
       // with the arm at 100 us this is what keeps the +-60 us block noise from being stepped on.
@@ -3714,6 +3731,16 @@ void SnapcastClient::player_task_() {
     // Newest depth, kept for sizing the splice in-flight horizon (whole chunks, so ledger noise
     // and even a multi-ms bias are sub-quantum here).
     st.pipe_depth_frames = this->pushed_frames_total_ - this->played_frames_total_;
+    if (rec.params.sample_rate > 0) {
+      this->pipe_depth_us_.store(st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate),
+                                 std::memory_order_relaxed);
+      const uint32_t fb_h = rec.params.frame_bytes();
+      if (fb_h > 0 && this->pcm_ring_ != nullptr) {
+        this->ring_depth_us_.store(static_cast<int64_t>(this->pcm_ring_->available()) * 1000000 /
+                                       (static_cast<int64_t>(fb_h) * rec.params.sample_rate),
+                                   std::memory_order_relaxed);
+      }
+    }
     this->playout_mutex_.unlock();
     st.depth_samples++;
 
@@ -3979,7 +4006,7 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       // The reseed moves the prediction the tag anchor extrapolates from; tags rendering pre-drain
       // audio for the next ring travel read the displacement (A, 16:59:05: err_tag +16.6 ms vs
       // ledger +6.6 five seconds after this line ran). Blank them for the same horizon as a step.
-      this->dl_blank_until_us_ = std::max(this->dl_blank_until_us_, now_us() + PHASE_TRANSIENT_US);
+      this->dl_blank_until_us_ = std::max(this->dl_blank_until_us_, now_us() + this->travel_horizon_us_());
       this->fb_samples_ = 0;
       // The counters just jumped; anything remembered against them is now meaningless. Seed the
       // histories at this instant so the next reading has something honest to compare against.
@@ -4196,6 +4223,21 @@ void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord
 // log_sync_report_ (which also logs RENDERTAG/inferred); this one runs per delay-loop block so the
 // group delta has a fresh pairing every beacon. Publishes UNKNOWN rather than a stale value: the
 // freshness gate is the same 100 ms / blank rule, for the reasons documented at the report site.
+// How long a position change takes to become visible to the tags: ring fill + pipeline + two delay-loop
+// blocks (measured 2.6-3.5 s, builds 51-55; the second block is what makes the judging block wholly
+// post-change). Computed from the live depths so a deeper server buffer moves it by itself; falls back
+// to the fixed 4 s when the mirrors are cold. Clamped: below 1 s nothing travels that fast, above 5 s
+// something is mis-measured and a fixed bound beats an unbounded blank.
+int64_t SnapcastClient::travel_horizon_us_() const {
+  const int64_t ring = this->ring_depth_us_.load(std::memory_order_relaxed);
+  const int64_t pipe = this->pipe_depth_us_.load(std::memory_order_relaxed);
+  if (ring <= 0 && pipe <= 0) {
+    return PHASE_TRANSIENT_US;
+  }
+  const int64_t blocks = 2 * static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
+  return std::clamp<int64_t>(ring + pipe + blocks, 1000000, 5000000);
+}
+
 void SnapcastClient::publish_render_phase_(bool steady) {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
   if (this->tsf_sync_ == nullptr || this->config_.tsf_observer) {
@@ -4796,7 +4838,7 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
   // same measured horizon the beacon quieting uses.
   this->dl_blank_until_us_ =
       now + std::max<int64_t>(static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000,
-                              PHASE_TRANSIENT_US);
+                              this->travel_horizon_us_());
   this->dl_acc_n_ = 0;
   this->dl_acc_sum_us_ = 0.0;
   this->playout_mutex_.unlock();

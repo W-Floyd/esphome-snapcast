@@ -930,6 +930,8 @@ class SnapcastClient {
     int64_t rskip_log_at_us{0};         // block the last RSKIP line described (one line per block)
     int64_t resync_step_at_us{0};       // last in-window position step of ANY source (ledger steps wait out the blank too)
     int64_t phase_transient_until_us{0};  // my render phase does not describe my audio until then (steps, hard resyncs, deadline source changes)
+    int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
+    uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
     float align_kick_us{0.0f};  // render_align bias change not yet delivered as position (ALIGN KICK)
     /// In-window position steps still on their way to the DAC. A drop is applied at PUSH time and the
     /// ring holds ~1.7 s of audio ahead of the DAC, so a step is invisible to the tags for ring depth
@@ -1042,6 +1044,8 @@ class SnapcastClient {
   uint32_t render_align_tick_{0};
   float render_align_frac_{0.0f};  // sub-microsecond remainder of align steps (see RALIGN)
   std::atomic<float> bias_kick_request_us_{0.0f};  // bench hook: bias change to deliver as a kick (see align_bias_kick_us)
+  std::atomic<int64_t> pipe_depth_us_{0};   // pushed-minus-played, us; mirrored per block for travel_horizon_us_()
+  std::atomic<int64_t> ring_depth_us_{0};   // pcm ring fill, us; mirrored per chunk for travel_horizon_us_()
   std::atomic<int64_t> write_begin_us_{0};  // last on_audio_write() entry (player task); see the fill-drift comparison
   std::atomic<int64_t> write_end_us_{0};    // its return; end < begin while a write is in progress
   // Ring of the last write windows: the depth snapshot can be 50-60 ms old and fall inside a window
@@ -1086,6 +1090,7 @@ class SnapcastClient {
   /// THREAD CONTEXT: player task.
   void delay_loop_update_(ServoState &st);
   void publish_render_phase_(bool steady);  // per-block render phase to the group; UNKNOWN while in transient
+  int64_t travel_horizon_us_() const;  // ring + pipeline + two blocks: how long a position change takes to reach the tags
 #endif
 
   /// Forces one repair cycle after a re-lock, if configured; a no-op otherwise. Called once per
