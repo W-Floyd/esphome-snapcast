@@ -3059,8 +3059,13 @@ void SnapcastClient::player_task_() {
       // "with -8 ms still standing", declared a measurement fault (a rule written for the
       // prediction), stood down 4 s, re-armed, and repeated -- B sat 8-10 ms early for 5+ minutes
       // (2026-08-29 11:20-11:25) while the analyser found no shared audio inside its window.
-      if (coarse_on_tags) {
+      // A LEDGER step in the window blanks the tag path too. Build 50: hard resync, ledger step
+      // +1220 at t+1.8 s, tag step +1643 at t+2.7 s on a block that predated the ledger step (blank
+      // 1200 ms was only applied between TAG steps), then two corrective steps of the other sign.
+      if (coarse_on_tags || resync_window) {
         st.coarse_act_us = now_us();
+      }
+      if (coarse_on_tags) {
         st.coarse_act_err_us = coarse_err_us;
       }
       // Post-stall catch-up: frames/32 bursts (~33 ms/s convergence) so a backlog
