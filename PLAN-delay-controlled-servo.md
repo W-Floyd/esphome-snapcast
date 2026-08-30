@@ -2398,3 +2398,16 @@ and the ±500 cap never approaches. Flashes after the build-66 grade completes.
 **Build 66, 10:12–10:28:** −1.2, (−11.5 spike: A's view of B +1036 for one cycle, no event logged), +3.5,
 −2.5, −2.2, +1.9, −2.4, −1.1, +1.8, −1.7, +1.0, +0.3, +3.5, −4.2, +0.2 µs; MAD 0.3–2.3. Delta sums −9…+6.
 Biases A +90 → +134, B +114 → +141: the common march at ~3 µs/min, which build 67 removes.
+
+### 2026-08-30 10:29–10:53 — build 67: re-centring holds the biases near 0; two more transients align must ignore
+
+Biases stayed inside A −8…+23 / B −38…+12 through the quiet minutes (build 66: +90 → +134 / +114 → +141
+over the same span) — the common march is gone. Quiet wire 10:32–10:37: +14, +9, +6, +5, +4 (closing
+from a +22 boot offset more slowly than the deltas imply; noted). Events: 10:38 server hole → both
+TAGFAULT → both `Tags re-trusted` by 10:40 → wire from +83 to ±5 in ~2.5 min. Two things align still
+did wrong: (1) during A's own TAGFAULT recovery (tags distrusted, err_tag tens of ms) A kept aligning —
+`st.converged` never cleared — and walked its bias −73 → −103 against a delta measured while it was
+itself off; (2) 10:46–47 a B deadline fallback/re-engage (a real phase jump, not a step) is not covered
+by the 4-s transient rule: A saw −72, B saw +203, B stepped +100 in a minute, wire +120. **Build 68:**
+a `phase_transient_until_us` set by hard resyncs, window steps, AND deadline fallback/re-engage;
+align runs only while own |err_tag| is inside the unmute band.
