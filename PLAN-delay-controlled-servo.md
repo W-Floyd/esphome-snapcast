@@ -795,6 +795,14 @@
 > **22:13 B replugged (operator) — serial back after seven hours; build 30 confirmed on B.** 22:12:08
 > server-wide starvation just before it: observer TAGFAULT → reconnect (build 30 path), A no fault.
 >
+> **New target (operator, 22:14): |A−B| < 100 µs within 5 s of a disturbance.** Baseline at 1-s
+> resolution: A's 21:05 reconnect reached it at **+25 s** (from +204 µs at PI pace — below the 1 ms
+> splice threshold nothing but the PI acts); B's 22:13 boot from +490 µs not within 75 s. **Build 31:**
+> a resync window (`resync_win_s` 30) opened at engage, at every `mark_kp_event_` and at reconnect,
+> inside which the fast splice arms at `resync_splice_us` (100) with no 4-s persistence wait. One
+> frame per chunk is 0.85 ms/s, so 500 µs closes in ~0.6 s + pipeline 0.3 s + one block's lag.
+> Steady state keeps 1 ms / 4 s so the common wander is never spliced.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

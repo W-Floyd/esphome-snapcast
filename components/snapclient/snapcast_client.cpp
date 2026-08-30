@@ -4058,6 +4058,8 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
 #endif
     st.dl_active = true;
     st.dl_engaged_since_us = now;
+    st.post_event_until_us =
+        now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
     ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
              st.trim_integral_ppm, st.dl_err_us, now);
   }
@@ -4185,7 +4187,16 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
 // THREAD CONTEXT: player task. See FAST_SPLICE_RELEASE_US for the argument.
 int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sample_rate,
                                      bool hold, uint32_t horizon_chunks, bool measured) {
-  const int64_t threshold = static_cast<int64_t>(this->config_.fast_splice_threshold_us);
+  // RESYNC WINDOW (ServoState::post_event_until_us): right after an event the error is a known
+  // displacement, not wander, so the splice arms at resync_splice_us and immediately; in steady
+  // state the configured threshold and the persistence wait keep it off the common wander.
+  const bool post_event = now_us() < st.post_event_until_us;
+  const int64_t cfg_threshold = static_cast<int64_t>(this->config_.fast_splice_threshold_us);
+  const int64_t threshold =
+      post_event && cfg_threshold > 0
+          ? std::min<int64_t>(cfg_threshold, this->tune_resync_splice_us_.load(std::memory_order_relaxed))
+          : cfg_threshold;
+  const int64_t persist_us = post_event ? 0 : FAST_SPLICE_PERSIST_US;
   const int64_t frame_us = sample_rate > 0 ? 1000000 / static_cast<int64_t>(sample_rate) : 0;
   int32_t applied = 0;
 
@@ -4231,13 +4242,13 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sa
       // moment the error drops back, so a transient never accumulates credit toward engaging.
       if (st.fast_splice_seen_us == 0) {
         st.fast_splice_seen_us = now_us();
-      } else if (now_us() - st.fast_splice_seen_us >= FAST_SPLICE_PERSIST_US) {
+      } else if (now_us() - st.fast_splice_seen_us >= persist_us) {
         st.fast_splice_active = true;
         st.fast_splice_frames = 0;
         applied = effective_us > 0 ? 1 : -1;
-        ESP_LOGI(TAG, "Fast splice engaged: %" PRId64 " us standing for %" PRId64
+        ESP_LOGI(TAG, "Fast splice engaged%s: %" PRId64 " us standing for %" PRId64
                       " s, correcting by position at one frame (%" PRId64 " us) per chunk t=%" PRId64,
-                 effective_us, FAST_SPLICE_PERSIST_US / 1000000, frame_us, now_us());
+                 post_event ? " (resync window)" : "", effective_us, persist_us / 1000000, frame_us, now_us());
       }
     } else {
       st.fast_splice_seen_us = 0;
@@ -4334,6 +4345,8 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
              TRIM_KP_ACQUIRE_PPM_PER_US, why, TRIM_KP_RUN_PPM_PER_US, TRIM_KP_DECAY_SPAN_S, now);
   }
   st.kp_event_us = now;
+  st.post_event_until_us =
+      now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
   // Every event that re-arms the gain schedule -- a hard resync, a timebase re-anchor -- also
   // displaced audio or stepped the deadline mapping, so the tags of audio already in flight
   // describe the OLD placement. Blank the delay loop's tag stream for one pipeline depth, same as
@@ -4418,6 +4431,12 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "align_step_us") {
     if (!(value >= 1.0f && value <= 200.0f)) return false;
     this->tune_align_step_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "resync_win_s") {
+    if (!(value >= 0.0f && value <= 600.0f)) return false;
+    this->tune_resync_win_s_.store(value, std::memory_order_relaxed);
+  } else if (name == "resync_splice_us") {
+    if (!(value >= 20.0f && value <= 5000.0f)) return false;
+    this->tune_resync_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "autotune") {
     this->tune_autotune_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "persist") {

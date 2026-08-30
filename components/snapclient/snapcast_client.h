@@ -918,6 +918,11 @@ class SnapcastClient {
     int64_t tag_fault_until_us{0};
     /// Consecutive TAGFAULTs with no split repair between them; two escalate to a reconnect.
     uint8_t tag_fault_streak{0};
+    /// RESYNC WINDOW: until this instant the fast splice arms at resync_splice_us with no persistence
+    /// wait. Set at engage, at every mark_kp_event_ (hard resync, re-anchor, split repair) and at a
+    /// reconnect. Measured 2026-08-29 without it: A's 21:05 reconnect took 25 s to |wire| < 100 us
+    /// (from +204 us at PI pace, below the 1 ms splice threshold); B's 22:13 boot > 75 s from +490.
+    int64_t post_event_until_us{0};
     /// No NVS integral was restored at boot: seed from the TSF crystal estimate at first engage
     /// and run the fast boot Ti; a fresh board otherwise winds ~56 ppm through Ki over 10+ min.
     bool dl_cold_start{true};
@@ -1558,6 +1563,10 @@ class SnapcastClient {
   std::atomic<int32_t> tune_align_reject_us_{500};  // pairs beyond this are not a measurement
   std::atomic<int32_t> tune_align_step_us_{4};      // per due report (~10 s): 0.4 ppm at most
   std::atomic<bool> tune_align_apply_{true};        // false = shadow: log the step, move nothing
+  /// Resync window (s) after an event, and the splice threshold (us) inside it. Target: |A-B| < 100 us
+  /// within 5 s of a disturbance.
+  std::atomic<float> tune_resync_win_s_{30.0f};
+  std::atomic<int32_t> tune_resync_splice_us_{100};
   std::atomic<int32_t> tune_block_n_{64};
   /// -1 = use config_.fast_splice_threshold_us.
   std::atomic<int32_t> tune_splice_us_{-1};
