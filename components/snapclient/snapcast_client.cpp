@@ -805,6 +805,9 @@ static constexpr int64_t UNMUTE_COMMON_US = 4000;
 // Rate bound for delivering a render_align bias change as position (see ALIGN KICK). 10 ppm moves
 // 10 us per second: inaudible as a rate, and an order of magnitude below the trim clamp.
 static constexpr float ALIGN_KICK_MAX_PPM = 10.0f;
+// After a position step or hard resync my measured render phase lags where the audio will be by the
+// ring's travel time (~3.5 s measured, builds 51-55); for that long the beacon carries no phase.
+static constexpr int64_t PHASE_TRANSIENT_US = 4000000;
 // A bound on that wait. Silence is also a defect: if the anchor never settles -- a mixer reporting
 // a depth that does not describe the whole pipeline, say -- unmuting late but audible beats staying
 // quiet, and the log line says which happened. Long enough for the ~3.3 s drift window to fill
@@ -4259,7 +4262,14 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // reports, unknown for the first 20-40 s after a boot, and the resync gate refusing for want of
   // evidence (build 48 boot, 00:43: RSTEP gd=unknown). Every ~0.65 s block on each board puts ~5
   // samples inside each 3.3 s and a pairing inside every beacon interval.
-  this->publish_render_phase_(st.converged && now >= st.post_event_until_us);
+  // "In transient" = a position step or hard resync landed within the last PHASE_TRANSIENT_US -- the
+  // interval in which my measured phase does not yet describe where my audio will be. NOT "window
+  // open" and NOT "unconverged": build 63 used those and at boot neither board broadcast anything,
+  // so there was no group delta for the gate or the group-agreement unmute, and both crawled in on
+  // the PI (+528 us on the wire for a minute, 09:08).
+  const bool in_transient = (st.kp_event_us != 0 && now - st.kp_event_us < PHASE_TRANSIENT_US) ||
+                            (st.resync_step_at_us != 0 && now - st.resync_step_at_us < PHASE_TRANSIENT_US);
+  this->publish_render_phase_(!in_transient);
 
   // ABOVE THE SPLICE THRESHOLD, SPLICE; BELOW IT, TRIM -- the plan's rule, and the trim half of
   // it: position errors at the millisecond scale belong to the fast path, and a rate loop asked
@@ -5554,7 +5564,12 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // -- in the group's weighted mean that made the speakers' render_group_delta bimodal
           // (A: median +5120 us, values near 0 half the time and near +9.5 ms the other half) and
           // unusable for steering. It still receives and logs everyone else's (PHASEIN).
-          this->tsf_sync_->set_render_phase_broadcast(st.converged && now_us() >= st.post_event_until_us);
+          {
+            const int64_t t_now = now_us();
+            const bool in_transient = (st.kp_event_us != 0 && t_now - st.kp_event_us < PHASE_TRANSIENT_US) ||
+                                      (st.resync_step_at_us != 0 && t_now - st.resync_step_at_us < PHASE_TRANSIENT_US);
+            this->tsf_sync_->set_render_phase_broadcast(!in_transient);
+          }
           if (measured_phase != TsfSync::RENDER_PHASE_UNKNOWN && !this->config_.tsf_observer) {
             // THE RAW PHASE, NOT A "SETTLED" ONE. Build 45 published phase - err_tag so that align (which
             // moves the deadline and then waits tau = 120 s for the PI to move the audio) would stop
