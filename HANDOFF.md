@@ -536,3 +536,17 @@ survives a power cycle; one instance is not a rate.
   (f04d74, b.log) EARLIER, the opposite of the header's wording; the CSV's firmware columns are by log.
   Measured from the rate-attribution table (`fs_b − fs_a` vs requested trim differential), not inferred.
   Every earlier "A early / B late" reading of the wire in HANDOFF/PLAN should be read swapped.
+
+## Builds 45–50 (2026-08-30 00:14–01:00) — the resync window made to work, one line at a time
+
+`RSTEP`/`RSKIP` (one line per in-window block: target, source, group delta, verdict, step) found, in
+order: the ledger stepping every chunk (no throttle), the ledger and the tags stepping on each other
+(1-Hz ±4.5 ms limit cycle), the gate starved of evidence (group delta paired by coincidence, unknown
+for 20–40 s after boot), and the in-window blank being 500 ms instead of the promised 1200. Fixes:
+ledger takes only the first step of a window (48), render phase published every block (49), blank =
+`resync_blank_ms` (50). Injection recovery to <100 µs held 5 s: build 49 **9 / 11 / 19 / 15 s**.
+
+Open, with evidence in PLAN: the 51 ms `RECON drift` flip whenever the mixer transfer buffer reads
+full; post-storm tag/ledger splits that nothing acts on (SHADOW shows them; TAGFAULT's judge only
+watches coarse actions); align's lag (deadline actuator, audio sensor, PI τ between — needs peers'
+err_tag in the beacon); the analyzer's ~100 s blindness after an I2S restart.

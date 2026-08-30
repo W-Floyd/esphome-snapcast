@@ -1921,3 +1921,10 @@ Earned expensively; ignoring these cost hours.
 - **Two boards following the same leader can be differenced.** `delta(b) − delta(a)` from the
   `Render phase` line is the cheapest on-device stand-in for the analyser, and the medians need
   ~70 samples each before they mean anything (single samples carry ±100 µs).
+
+## 2026-08-30 01:00 — next
+- Grade build 50 (1200 ms in-window blank): expect one ledger + one tag step per injection, no sign flip.
+- Name the double-counted term in the 51 ms depth flip (`xfer=50000` ⇔ `drift=−51 ms`, mixer_speaker.cpp ~688).
+- Act on the SHADOW split: re-anchor the ledger from the tags when `err_tag − err_live` stands while the group depth agrees with the tags.
+- Align: carry err_tag in the TSF beacon so the group delta can be settled-phase; then gain 0.5 is safe.
+- Steady-state re-grade (45 min, no reflash) on the build that ends the night.
