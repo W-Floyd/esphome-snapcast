@@ -3041,7 +3041,13 @@ void SnapcastClient::player_task_() {
                // step until the pipeline has played through it; five steps landed on one error and
                // it came back +26272. The tag path had one-block-one-step; the ledger had nothing.
                (!resync_window || coarse_on_tags || st.resync_step_at_us == 0 ||
-                now_us() - st.resync_step_at_us >= blank_us)) {
+                now_us() - st.resync_step_at_us >= blank_us) &&
+               // WHILE TAGS ARE FRESH THE LEDGER DOES NOT STEP IN THE WINDOW. Build 46 boot (00:27:50):
+               // tag step -2680, ledger step +3592, tag -2732, ledger +3656 ... a +-4.5 ms limit cycle
+               // at 1 Hz, each source stepping on the other's step before the pipeline had shown it.
+               // The ledger's role in the window is the FIRST step after a hard resync, when the tags
+               // are blanked; once they are back it is the tags' error the step-and-verify is on.
+               (!resync_window || coarse_on_tags || !tags_fresh)) {
       // In the window a tag-based step needs the error to have PERSISTED across a block boundary:
       // the block used for the previous decision may not be used again (one block, one step), and
       // with the arm at 100 us this is what keeps the +-60 us block noise from being stepped on.

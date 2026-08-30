@@ -1939,3 +1939,29 @@ phase takes τ out of align's loop (and out of the resync gate, which reads the 
 on every board. err_tag is what the PI is about to remove by definition, so no new tunable. Prediction:
 group deltas fall within one or two align cycles of a bias step instead of ~120 s, so gain 0.5 becomes
 usable, and the boot/injection tails that were align-limited close in tens of seconds.
+
+### 2026-08-30 00:14–00:29 — builds 45/46: what RSTEP showed the first time it ran
+
+**Build 45** (RSTEP/RSKIP + settled-phase publish): boot wire ±500 µs; injections >75 / >75 / >75 / >75 s.
+`RSTEP src=tag gd=+45 ok=0` against err −1443: publishing `phase − err_tag` makes the group delta ≈ 0
+whenever the error is what the PI will remove — the gate's evidence, zeroed by construction. Reverted
+in 46; align's lag needs the peers' err_tag (a beacon field), not a local subtraction.
+
+**Ledger steps in the window had no throttle.** A, 00:14:58: `err −1475, −3470, −5465, −7461, −9454`
+on consecutive chunks, then `+26272` — one error stepped five times before the pipeline showed the
+first. 97 ledger steps > 2 ms on A, 154 on B, in three minutes. Tag steps taken: A 3, B 0 (gd unknown
+163/236 times at boot — the phases pair slowly after a double reboot). Build 46: ledger steps wait out
+the blank like tag steps.
+
+**Build 46 boot (00:27:50):** a 1-Hz ±4.5 ms limit cycle on A — `tag −2680, ledger +3592, tag −2732,
+ledger +3656 …` — the two sources alternately stepping on each other's step. Stopped at 00:28:48 with
+`resync_win_s 0` on both (window never opens; normal coarse thresholds + fast splice, the build-39
+behaviour). Build 47: while tags are fresh the ledger does not step in the window at all; its role is
+the first step after a hard resync, when tags are blanked.
+
+**The 51 ms flip (open, instrument).** `RECON drift` = −51 ms exactly when the mixer's transfer buffer
+reads full (`xfer=50000`), 0 otherwise; 40 % of reports, both boards, all night. Measured depth =
+transfer-buffer available + sink in-flight + sink audio (mixer_speaker.cpp ~688); the full-buffer case
+carries ~51 ms the accounting does not. With tags live it is harmless; after a TAGFAULT it is the
+ledger the board steers on for 180 s — B's 56 ms phantom hard resync at 00:14:04. Two fixes owed: name
+the double-counted term; re-trust tags on agreement, not on a timer.
