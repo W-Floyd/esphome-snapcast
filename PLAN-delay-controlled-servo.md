@@ -744,6 +744,16 @@
 > Steady-state ledger (wire robust sd): build 14 8.9 → 17 4.9 → 21 21 (knee 25, wrong regime) →
 > 27 16.8 (shadow) → 29 applied 5.0 → 4.0.
 >
+> **60-min hands-off, align cap 500 (19:32–20:32):** n=31,429, median +2.3 µs, robust sd 6.95 µs
+> — the first 15 min carry the observer's 19:33 crash-rejoin jolt (+89 µs at 19:35, back inside ±10
+> by 19:45: a consensus membership change lands on the speakers as a differential transient);
+> from 19:50 every 5-min median is within −3.5…+9.9 µs at 1.3–6 µs spread. **Zero A events for
+> the hour.** Defect: A's bias creeps +316 → +383 (~1.1 µs/min) nulling a −7…−14 µs exchanged
+> delta while the wire sits at +2 — the channel integrates the exchanged phase's own ~10 µs bias
+> and would pin at the cap in ~2 h. Deadband 3 → **15 µs** (20:33, and the compiled default): the
+> channel now only acts on offsets larger than the measurement's bias. Open: an observer's flaky
+> link should not be a consensus member at all — its every reconnect jolts the speakers.
+>
 > **Correction to the "group-wide" delivery pauses (2026-08-29 morning census, 11:00–11:40):** ring
 > ran dry 21× on B, 7× on A, **0× on the observer**. Last night all three dipped together; this
 > morning it is B-dominated and the observer sees nothing — so at least part of the problem is

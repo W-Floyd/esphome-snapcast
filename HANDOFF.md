@@ -252,8 +252,10 @@ All committed on `main`; `PLAN-delay-controlled-servo.md` carries the blow-by-bl
 18:00–18:45 (cap 150): n=27,126, wire median +2.7 µs, robust sd 5.0 µs, p2p 27.8 µs; 18:46–19:31
 (cap 300): n=25,155, **median +4.2 µs, robust sd 4.0 µs, p2p 46.9 µs**, 3-min medians 0…+11 µs,
 1-s change 0.19 µs, every 3-min median within ±8 µs, zero events. Build 30 (committed `aaba353`,
-not yet flashed) makes that the compiled default: knee 150, align applied, cap 300, gain 0.1,
-step 4, deadband 3. The channel removes a standing offset at ~4 µs per 10-s report; events
+not yet flashed) makes that the compiled default: knee 150, align applied, cap 500, gain 0.1,
+step 4, deadband 15 (the exchanged phase carries a ~10 µs bias of its own; a 3 µs deadband made the
+bias creep ~1 µs/min forever). 19:32–20:32 (cap 500, deadband 3): median +2.3 µs, quiet-part 5-min
+medians within ±10 µs, zero A events; the observer's crash-rejoin at 19:33 jolted the wire +89 µs. The channel removes a standing offset at ~4 µs per 10-s report; events
 (starvations, bailouts) re-create 50–100 µs offsets every ~10 min on a bad hour, so the two
 numbers to watch are the event census and the 3-min medians.
 
