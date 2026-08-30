@@ -2438,3 +2438,13 @@ Build 68 boot: lock +21/+25 s, both on group agreement. 11:05–11:07 wire −16
 biases rose together (A −27 → −3, B +28 → +45): a residual common march faster than the 2 µs/cycle
 re-centre, and B's bias moving against its own delta for two minutes (B gd +11 → steps −3, bias +17):
 not understood yet. 11:16 wire −3.7 MAD 0.5, biases +4/−4.
+
+### 2026-08-30 11:06 — the accumulator carried clamped excess: build 69
+
+B, 11:06:39: one transient delta of −206 (A's phase, unflagged) → 0.3 × 206 = 62 → stepped the 20 µs cap
+and *kept 42 in the fractional accumulator* (it subtracted the clamped step, not the integer part) →
++20, +20 on the next two cycles against deltas of +1 and +14 (bias +27 → +45 → +52). Every "bias moving
+against its own delta" since build 57 and part of the 28 % delivery figure trace to this: biases were
+moving on stale remainders while the deltas — and the wire — said otherwise. Build 69 discards the
+integer part after clamping; the fraction alone carries over. Prediction: bias trails follow the
+deltas cycle by cycle; the wire-vs-bias slope rises toward 1.
