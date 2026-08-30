@@ -2047,3 +2047,19 @@ B's tails (−144, −190 for 40–70 s) are below the 100 µs arm by the tags' 
 while the wire still shows 150–190: the same tag-vs-wire ~60–100 µs residual as build 50, handed to
 align/PI. Not a threshold problem; a measurement-accuracy floor for both the tag error and the group
 delta at this timescale.
+
+### 2026-08-30 01:22–01:31 — runtime A/B `resync_blank_ms 2000` on build 51: the "half-realised step" was ring depth
+
+Four injections with a 2 s blank: 63 / >75 / 67 / >75 s — slower (cadence halved, tails unchanged), and the
+descent still `+290 → +169 → +107`. Then the wire, step by step against RSTEP (`adj` frames × 22.7 µs):
+adj 10 → wire moved 233 µs; adj 5 → 118; adj 3 → 117; adj 4 → 138; adj 7 → 280; adj 4 → 164; and each
+big first step (85, 94, 118 frames) appears as exactly 1930 / 2130 / 2674 µs — **1:1, every step, ~2 s
+after it was applied.** The drop is taken from the chunk being PUSHED, and the ring holds ~1.7 s of
+audio ahead of the DAC (`buffered 1724 ms`), so the tags cannot see a step for ring depth + pipeline.
+The 1200 ms blank judged the next block before the step existed there — builds 48–50's doubled second
+step and sign flips — and 2000 ms saw about half of it. Not a gain, not a units error (checked
+`push_chunk_`: skip = frames × frame_bytes), a horizon. The analyser adds ~1 s of its own.
+
+**Build 52:** the coarse target subtracts the in-window steps applied within ring depth + one block
+(`pend=` on RSTEP). Prediction: second step ≈ 0.16 e, third ≈ 0.03 e; inside the arm three steps after
+the hard resync (~4 s), no sign flips. The same accounting the fast splice has had since `splice_hist`.
