@@ -2463,3 +2463,9 @@ A −30 / B +26 for one cycle). Quiet-minute MAD 0.4–1.6 µs. Delta sums ±6 e
 function: 1 s 0.24 · 10 s 2.1 · 30 s 4.7 · 60 s 6.7 · 120 s 10.3 µs (build 30, a quiet window: 0.24 /
 1.6 / 3.5 / 5.3 / 8.1). `wire-sf.py` is not rival-gated and reported robust sd 138 for the same span —
 the event rows; graded with the gated computation above instead.
+
+**Build 69, 12:03–12:07:** +40 (no event logged), +1, −5, +12, −24. At 12:05 A's view of B read −158
+while B logged two events (fast splice / fallback) and A stepped its bias −26 → −42 — a **fast splice**
+is a transient the beacon rule does not yet cover (it is neither a window step nor a hard resync nor a
+deadline change: 1 frame per chunk for seconds). Build 70: engaging the fast splice sets the phase
+transient for its duration plus the horizon.
