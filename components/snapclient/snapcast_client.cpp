@@ -5639,9 +5639,16 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           const int32_t max_step = this->tune_align_step_us_.load(std::memory_order_relaxed);
           if (std::abs(group_delta) > this->tune_align_deadband_us_.load(std::memory_order_relaxed) &&
               std::abs(group_delta) <= reject) {
-            const int32_t step =
-                std::clamp<int32_t>(static_cast<int32_t>(-group_delta * this->tune_align_gain_.load(std::memory_order_relaxed)),
-                                    -max_step, max_step);
+            // FRACTIONAL ACCUMULATION. gain x delta truncated to whole microseconds made anything
+            // under 1/gain of delta a zero step: at gain 0.1 a standing 8 us (A, 06:00-07:00, the
+            // wire's -10 us mean, seen by the delta every cycle) was never corrected. The fraction
+            // carries over so small gains act on small deltas at the rate they imply -- gain must be
+            // SMALL here (~0.03/cycle): the correction reaches the audio through the PI's tau = 120 s,
+            // and 0.1 per 10 s on that lag hunted at +-100 us (2026-08-29 evening).
+            this->render_align_frac_ += -static_cast<float>(group_delta) * this->tune_align_gain_.load(std::memory_order_relaxed);
+            const int32_t step_i = static_cast<int32_t>(this->render_align_frac_);  // toward zero
+            const int32_t step = std::clamp<int32_t>(step_i, -max_step, max_step);
+            this->render_align_frac_ -= static_cast<float>(step);
             if (this->tune_align_apply_.load(std::memory_order_relaxed)) {
               bias = std::clamp<int32_t>(bias + step, -cap, cap);
               this->render_bias_us_.store(bias, std::memory_order_relaxed);
