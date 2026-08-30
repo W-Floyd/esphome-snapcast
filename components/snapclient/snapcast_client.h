@@ -1552,7 +1552,7 @@ class SnapcastClient {
   /// (0 = off; seeded from YAML render_align_max), gain per due report, deadband in us.
   // Defaults = the 2026-08-29 18:00-18:45 operating point: 45 min, wire median +2.7 us, robust sd
   // 5.0 us, 1-s change 0.19 us, zero events, with the channel applied at the measured sign.
-  std::atomic<int32_t> tune_align_max_us_{300};
+  std::atomic<int32_t> tune_align_max_us_{500};  // 300 was reached within ~2 h by the ~1 us/min creep against the exchanged phase bias
   std::atomic<float> tune_align_gain_{0.1f};
   std::atomic<int32_t> tune_align_deadband_us_{3};
   std::atomic<int32_t> tune_align_reject_us_{500};  // pairs beyond this are not a measurement
