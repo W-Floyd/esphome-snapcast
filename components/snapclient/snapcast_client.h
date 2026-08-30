@@ -1582,7 +1582,7 @@ class SnapcastClient {
   /// Resync window (s) after an event, and the splice threshold (us) inside it. Target: |A-B| < 100 us
   /// within 5 s of a disturbance.
   std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)
-  std::atomic<float> tune_resync_gain_{0.8f};    // fraction of the measured error corrected per step (clean block)
+  std::atomic<float> tune_resync_gain_{1.0f};    // fraction of the measured error corrected per step (clean block)
   std::atomic<float> tune_resync_reopen_us_{400.0f};  // a block error past this re-opens the window
   std::atomic<int32_t> tune_resync_splice_us_{100};  // in-window coarse arm, one step per block (build 42); 150 left 50-115 us residuals to tau 120
   std::atomic<float> tune_resync_close_s_{5.0f};     // inside the arm threshold this long -> window closes

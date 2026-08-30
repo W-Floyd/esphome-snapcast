@@ -3139,8 +3139,16 @@ void SnapcastClient::player_task_() {
             std::abs(gd) < this->tune_resync_splice_us_.load(std::memory_order_relaxed)) {
           coarse_step_ok = false;  // no differential evidence: leave it to the (symmetric) PI
         } else {
-          coarse_target_us = coarse_target_us < 0 ? -std::min<int64_t>(-coarse_target_us, std::abs(gd))
-                                                  : std::min<int64_t>(coarse_target_us, std::abs(gd));
+          // THE EVIDENCE IS THE GAP TO THE OTHERS, NOT THE DELTA TO THE MEAN. The group delta is
+          // mine - mean(all, me included): with two devices it is HALF the pairwise gap by design (each
+          // corrects half and they meet). Bounding a one-board step by it halved every step -- 02:25,
+          // gain 1.0: +864 -> +430 -> +222 -> +108, four rounds of 3.5 s where +1643 was standing and
+          // one step would have done (runs 3 and 4, above the local threshold, converged in one). The
+          // gap to the others' mean is delta * n / (n - 1).
+          const int32_t n = this->tsf_sync_->consensus_n();
+          const int64_t gap = n > 1 ? static_cast<int64_t>(std::abs(gd)) * n / (n - 1) : std::abs(gd);
+          coarse_target_us = coarse_target_us < 0 ? -std::min<int64_t>(-coarse_target_us, gap)
+                                                  : std::min<int64_t>(coarse_target_us, gap);
         }
       }
       // The damping (resync_gain) is for the TAG steps, which act on a lagged, block-averaged
