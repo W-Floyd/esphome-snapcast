@@ -2448,3 +2448,12 @@ against its own delta" since build 57 and part of the 28 % delivery figure trace
 moving on stale remainders while the deltas — and the wire — said otherwise. Build 69 discards the
 integer part after clamping; the fraction alone carries over. Prediction: bias trails follow the
 deltas cycle by cycle; the wire-vs-bias slope rises toward 1.
+
+### 2026-08-30 11:19–12:02 — build 69 (accumulator fix): biases track the deltas; 40 min at |wire| ≲ 5 µs
+
+Boot lock +23 s (A, group agreement) / +21 s (B). Biases now follow the deltas cycle by cycle and stay
+inside ±18 the whole 40 min (A +18 → +1 as its delta went +4 → 0; B the mirror). Per-minute wire
+medians: +7, +8, +8, +5, −1, +4, +1, +6, +2, −2, −0, −4, −5, +0, +6 | −7, −10, −5, +4, +2, −8, +20, +9,
++3, −1, +1, +4, +9 | −5, −8, −1, −2, +15, +10, +10, −1, +1, −7, −8, −3 µs — the ±8…20 excursions all
+coincide with event counts (server holes at 11:36, 11:52, 11:55–57, 12:02) or a transient delta (11:44
+A −30 / B +26 for one cycle). Quiet-minute MAD 0.4–1.6 µs. Delta sums ±6 except during those.
