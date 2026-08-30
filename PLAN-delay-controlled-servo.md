@@ -1893,3 +1893,31 @@ same two minutes and the boards' requested rate differential matched it bin for 
 P-terms (kp 0.008 → 3 ppm at 400 µs) acting on errors that differed by 100–150 µs for a block-lag
 after a one-board position step, then the differential PI's τ = 120 s step response. Not an actuator
 fault; not the integrals (both moved +0.3 ppm together).
+
+### 2026-08-30 00:00–00:05 — build 44 injections; align was the rate limit on the slow zero-crossing; an 18 ms timebase jolt
+
+**Build 44 injections** (gate sign fixed): A 21 s, B **>75 s (flat at +1190)**, A 11 s, B 31 s. B's
+23:51 episode: err −1400 with gd −1190 (agree) but no step for 17 s because the delay loop was OUT OF
+RANGE (≥ 1000 µs holds the integral and returns before `dl_err_us` is refreshed for the coarse path);
+then one +61-frame insert (1383 µs, more than the 553 µs then standing — the target was a block stale)
+put B at +600 late, where it sat 45 s with **no step and nothing in the log saying which guard held
+it**. Build 45 adds `RSTEP`/`RSKIP` — one line per in-window block: target, source, gd, ok, step,
+adjust, and for a skipped block whether it was the blank or the one-step-per-block rule.
+
+**"It crosses zero so slowly" (operator, 23:58).** The wire's crossing rate was 0.5 µs/s. Two actuators
+own the differential: the PI (τ = 120 s, symmetric, and it drives err_tag → 0 on *each* board, which
+does not make the wire zero) and render_align, the only actuator that moves the two boards' zero-points
+relative to each other — capped at `align_step_us` 4 per 10-s cycle = **0.4 µs/s**, which is the slope
+that was being watched. Set at runtime 00:01:09 on both: `align_gain 0.5`, `align_step_us 20`. Within
+40 s B's bias went +31 → +91 in 20-µs steps, group deltas shrank (B −60 → −40, A +32 → +16) and the
+wire closed at ~1.2 µs/s. Symmetric by construction (each board moves half its group delta); the cost
+is the exchanged phase's ~10 µs noise × 0.5 into the deadline, held out by the 15 µs deadband. Both
+boards' RALIGN signs read consistently with the corrected wire mapping (A late/B early ↔ wire +).
+Not yet a compiled default; grade steady state first.
+
+**00:00:12 timebase jolt, group-wide.** All three boards — observer included — saw −17.8 ms at the same
+instant (`Consensus spread 1484 µs`, `Offset ramp +49.91 ppm (map −6.72)`), fast-spliced, hit the
+128-frame bound "with −10.7 ms still standing", handed back to the PI, and the mapping returned by
+00:00:22 (`map +40.56`; B re-opened its window on −628). The observer drives no DAC, so this is the
+shared TSF→server mapping stepping, not playout — the consensus-jolt open item, now with a size: 18 ms
+for ~10 s. The wire moved only ~+130 because both speakers moved together.
