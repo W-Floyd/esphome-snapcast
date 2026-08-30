@@ -1047,7 +1047,10 @@ void TsfSync::update_group_diagnostics_(int64_t local_now_us) {
     // t= is esp_timer microseconds since boot, the same clock the snapclient diagnostics stamp
     // with, so both components' series land on one axis, and the SPACING between points is the
     // device's own rather than the host's.
-    ESP_LOGD(TAG, "Render phase mine %+" PRId64 " group(%zu) delta %+" PRId64 " us t=%" PRId64, mine_phase,
+  // VERBOSE, not DEBUG: this line is emitted from the snap_net task once a second, and B crashed at
+  // 07:51:26 (2026-08-30) inside the logger's TaskLogBuffer ring (ringbuf.c:367 assert) with exactly
+  // this call on the stack -- the non-main-thread log path is the fragile one. RALIGN carries the delta.
+    ESP_LOGV(TAG, "Render phase mine %+" PRId64 " group(%zu) delta %+" PRId64 " us t=%" PRId64, mine_phase,
              phase_n, mine_phase - static_cast<int64_t>(llround(group)), local_now_us);
   }
 
