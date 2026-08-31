@@ -1,0 +1,604 @@
+# PLAN — timing architecture v2
+
+Written 2026-08-31 against `d9224e4`. `TIMING.md` describes what the code does now; this proposes
+what it should become and the order to get there.
+
+Marking, per `CLAUDE.md`: **[C]** is checkable in the source and cited. **[M]** needs the bench and
+is written as a test with a pass condition, never as a conclusion. Nothing here is a bench finding.
+
+---
+
+## 0. The thesis
+
+The system has three actuators, six error signals and eleven time-gates because it grew one fix at
+a time. But the *physics* has only three kinds of error, and they do not overlap:
+
+| Physical error | Correct actuator | Why nothing else |
+|---|---|---|
+| **Frequency** — the two DACs run at different rates (~0.33 ppm differential) | rate trim | a position correction against a rate error is a limit cycle by construction |
+| **Displacement** — a step: a join, a refill, a hard resync, a timebase adoption | position (frames) | a rate actuator at τ = 120 s takes minutes to move a millisecond |
+| **Reference offset** — my idea of the group's timeline is biased | the *deadline* | correcting it with either actuator makes the bias indistinguishable from a real error |
+
+**The v2 architecture is that table, made literal.** One owner per row, one signal feeding each,
+and an explicit arbiter deciding which row this chunk belongs to. Everything currently in the file
+is either one of those three, or arbitration between two accounts of the same audio.
+
+The reduction is not "delete layers". It is: **make the classification explicit, and let each
+actuator own exactly one physical error.** Today the classification is implicit in a chain of
+eleven latches, which is why it is hard to reason about and why a gain that only one board takes
+can leak common-mode error into differential motion.
+
+### The one thing that must happen first
+
+**The reference does not yet agree with the wire.** The exchanged render phase under-measures a
+real differential by ~8× (measured 2026-08-30, builds 84–86: rival-clean wire −1.5 ms against
+≤0.2 ms in pairwise phases). Every inter-device control decision — the boost clamp,
+`render_align`, the window step's sanity check, the unmute group-agreement gate — reads that
+number. **No control change can be graded while the referee inside the device disagrees with the
+wire**, and a plan that reorganises the controller first is reorganising against a broken
+measurement.
+
+Stage 1 is therefore not a refactor. It is, however, now much cheaper than it looked: reading the
+fork **excludes the standing suspect** (the stamp is a genuine TX-done ISR capture) and a factor
+of 2 turns out to be a deliberate design property being compared against the wrong reference. See
+§4.
+
+---
+
+## 1. Target architecture
+
+```
+                 ┌─────────────────────────────────────────────┐
+   tags ───────▶ │  ErrorView                                  │
+   ledger ─────▶ │    { us, source, age_us, trusted }          │  one selector, one place
+   group delta ▶ │    + class: RATE | STEP | BIAS | NONE       │
+                 └──────────────────┬──────────────────────────┘
+                                    │
+                 ┌──────────────────┴──────────────────────────┐
+                 │  Arbiter — one function, one switch         │
+                 │  picks the actuator, records the decision   │
+                 └───┬───────────────┬──────────────────┬──────┘
+                     │               │                  │
+              ┌──────▼─────┐  ┌──────▼──────┐   ┌───────▼───────┐
+              │ RATE       │  │ POSITION    │   │ DEADLINE      │
+              │ PI on      │  │ one in-flight│  │ slow bias,    │
+              │ err_tag    │  │ ledger,      │  │ group-        │
+              │ symmetric  │  │ serial       │  │ recentred     │
+              │ gain only  │  │ step-&-verify│  │ NO rate kick  │
+              └────────────┘  └─────────────┘   └───────────────┘
+```
+
+Five rules, and every one of them is a rule the current code breaks somewhere:
+
+1. **One writer per actuator.** Rate already has one. Position gets one (today: four sites).
+   Deadline gets one and loses its second delivery path (today: the align kick makes it two).
+2. **One in-flight ledger**, frame-exact, shared by every position policy. Today the splice and
+   the window step each keep their own and hard resync keeps none, so a correction can be applied
+   twice because neither knew about the other's.
+3. **Every gain is the same function of the error on every board.** Not "symmetric in form" —
+   *identical in value for identical inputs*. A function of `|e|` is symmetric in form and still
+   produces differential motion, because each board reads a slightly different `e` from the same
+   common wander. Only functions of a genuinely shared quantity (`|gd|`, which is the same number
+   on both boards) qualify.
+4. **No evidence → tracking gain, never maximum gain.** Already the rule for the boost after
+   `d9224e4`; generalise it. Absent, stale and sentinel are three states and none of them is zero.
+5. **A timebase move is an input, not a disturbance.** When the consensus steps or the deadline
+   source switches, the size of the move is *known*. Feed it forward into the position ledger
+   instead of letting the loop discover it as error over the next several blocks.
+
+Rule 5 is the one that buys most of the robustness the goal asks for, and it is new.
+
+---
+
+## 2. Where the goals are actually won
+
+| Goal | The term that decides it | Stage |
+|---|---|---|
+| Easier to reason through | one selector, one arbiter, one horizon function, one decision log line | 2, 3, 4 |
+| Robust to joining/leaving speakers | rule 5: feed the known timebase step forward; never let a source switch arrive as 29 ms of "error" | 5 |
+| Robust to Wi-Fi disruption | hold-don't-revert (already right) + rule 4 generalised + a bounded, announced fallback | 5, 6 |
+| Converges quickly | feed-forward, not gain: crystal seed, NVS integral, known-displacement steps | 6 |
+| Tightest sync delta | a reference that agrees with the wire (Stage 1), then differential rate feed-forward gated on SF_d, then no per-board gain left standing | 1, 8b, 8c |
+| Nothing silently asymmetric | rule 3, audited with the **peer's** decision logged beside our own | 8c |
+
+Note what is *not* on this list: raising a gain. The residual is variance, not lag (measured:
+consecutive-difference σ/σ = 1.32–1.43 against √2 for white noise), so more gain makes it worse.
+Every convergence win below is feed-forward or a better measurement.
+
+---
+
+## 3. Stage 0 — the two things to fix before anything else
+
+Neither is a refactor; both are live defects found while reading.
+
+**0a. `render_align_max: 0` does not disable render_align. [C]**
+[L919](components/snapclient/snapcast_client.cpp#L919) only copies the YAML value into
+`tune_align_max_us_` when it is `> 0`, and the member default is 500
+([snapcast_client.h:1647](components/snapclient/snapcast_client.h#L1647)). The bench yaml sets
+`0ms`, `HANDOFF.md` records render_align as disabled, and the comment at
+[L6254](components/snapclient/snapcast_client.cpp#L6254) says "0 = off". It has been running at a
+500 µs cap with `align_apply` true. Fix the seeding to store unconditionally.
+
+Consequence to state plainly: **every measurement taken while the operator believed align was off
+was taken with a third controller live**, including the quiet-window numbers in `HANDOFF.md`.
+Re-baseline before grading anything against them.
+
+**0b. `fast_splice_`'s docblock contradicts its code. [C]** The opening comment says the splice
+"arms at `resync_splice_us` and immediately" inside the resync window; the code sets
+`threshold = post_event ? 0 : cfg_threshold` and gates the whole body on `threshold > 0`
+([L4934](components/snapclient/snapcast_client.cpp#L4934)), so the splice is *off* in the window.
+The second comment three lines down says so correctly. Delete the stale sentence — a review
+already read the wrong one and reported it as behaviour.
+
+---
+
+## 4. Stage 1 — find the reference's missing factor (blocking)
+
+**Nothing downstream can be graded until this closes.** But the question is now much narrower than
+it was, because two of the three candidates are eliminated by source reading.
+
+### What is already excluded [C]
+
+**The stamp is a hardware capture.** Read in the fork (`speaker-render-latency`, `dd14d50`):
+`esp_timer_get_time()` is taken inside the I2S TX-done ISR `i2s_on_sent_cb` (`IRAM_ATTR`,
+[i2s_audio_speaker.cpp:336](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp#L336)),
+queued per completed DMA descriptor, paired 1:1 with its write record, and reduced by the
+descriptor's trailing silence
+([i2s_audio_speaker_standard.cpp:285](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp#L285)).
+The mixer forwards it **unchanged** to the tagging source only
+([mixer_speaker.cpp:475](../esphome/esphome/components/mixer/speaker/mixer_speaker.cpp#L475)).
+There is no pivot, no EWMA, no model anywhere in the path.
+
+**The phase derivation adds nothing modelled.** `publish_render_phase_sample_`
+([L4397-L4423](components/snapclient/snapcast_client.cpp#L4397-L4423)) walks back `frames` from
+that stamp, converts through a fresh TSF sandwich, and subtracts the tag's own server time.
+
+So `HANDOFF.md`'s standing suspect — the tag/feedback stamping — **is exonerated**, and the
+proposal to "make the render phase honest with a TX-done timestamp" is a proposal to build what
+already exists. Record it as answered; do not re-derive it.
+
+### What accounts for a factor of 2 [C]
+
+`render_group_delta_us` includes **our own phase in the group** (`vals[0] = 0.0`), and
+`robust_mean` short-circuits to the plain mean for `n < 3`
+([tsf_sync.cpp:794-802](components/clock_sync/tsf_sync.cpp#L794-L802)). With two publishing
+speakers — and the observer publishes none, `publish_render_phase_` returns early on
+`tsf_observer` ([L4378](components/snapclient/snapcast_client.cpp#L4378)) — the delta is exactly
+**half** the A–B disagreement. That is correct for control: each device corrects half the gap and
+they meet in the middle. It is wrong for *grading*, and the neighbouring
+`update_group_diagnostics_` excludes self for precisely this reason, in a comment that says a
+two-device pair would otherwise "read half its true disagreement"
+([tsf_sync.cpp:1078](components/clock_sync/tsf_sync.cpp#L1078)).
+
+**[M] First thing to check, and it is free:** whether the "≤0.2 ms" in the 08-30 comparison came
+from `render_group_delta_us` (halved) or from raw pairwise `peer.phase_us − mine` (not halved). If
+the former, ~2× of the ~8× is this and is not a defect at all.
+
+### What remains
+
+After the stamp and the self-inclusion, **~4× is genuinely unexplained.** The remaining candidates,
+in the order they cost least to test:
+
+1. **The drift extrapolation.** Each peer's phase is extrapolated to our sample instant by
+   `map_drift_ppm_ × pair_gap` ([tsf_sync.cpp:1042](components/clock_sync/tsf_sync.cpp#L1042)).
+   A wrong drift rate or a wrong `pair_gap` sign scales the delta directly.
+2. **`PHASE_STALE_US` / pairing selection bias.** Pairs that survive the 300 ms window may not be
+   a fair sample of the disagreement — if the phase moves most during exactly the intervals that
+   fail to pair, the survivors under-report by construction. This is the CLAUDE.md
+   "a search narrow enough to confirm an expectation" shape, applied to a data selector.
+3. **`RENDER_TAG_MAX_AGE_US` (100 ms) plus transient gating.** A board that is moving publishes
+   `RENDER_PHASE_UNKNOWN`; if the differential is largest while moving, the exchange systematically
+   samples the quiet part of the distribution.
+
+Note that (2) and (3) are both *selection* effects, not measurement errors, and neither is fixed by
+averaging harder. That distinction decides the fix.
+
+**[M] Test:** shadow-log the pairing inputs per computed delta — one short fixed-field line
+(`GDIN`: `mine`, `peer`, `pair_gap`, `drift_ppm`, `extrap`, `n`, the raw pairwise difference
+*before* self-inclusion), no variable-length tail. Grade against the analyser over a window
+containing a known differential.
+
+**Pass condition:** the raw pairwise difference tracks the rival-clean wire at slope 1.0 ± 0.15
+over ≥ 6 disjoint 5-minute blocks. Report the halved control-path delta beside it, so the two are
+never confused again.
+
+**Do not skip to Stage 8 on the strength of an averaging argument.** Averaging a signal that is
+wrong by 4× produces a precise wrong number, and the 30 Hz averaged own-phase ring already exists
+([tsf_sync.h:136](components/clock_sync/tsf_sync.h#L136)) — it is not the missing piece.
+
+### One thing to fix regardless [C]
+
+`|gd|` is used as a **magnitude bound** on the PI's boost, as
+`min(|e|, |gd|·n_cons/(n_cons−1))` ([L4646](components/snapclient/snapcast_client.cpp#L4646)).
+The `n/(n−1)` factor is the self-inclusion correction — it un-halves the delta — and at `n = 2` it
+is exactly 2. **But `n` there is `consensus_n()`, which counts MAPPING contributors, while the
+delta is averaged over PHASE contributors, and those are not the same set. [C]**
+
+`consensus_n_` is set from the count of lines with a valid, fresh *mapping*
+([tsf_sync.cpp:876-888](components/clock_sync/tsf_sync.cpp#L876-L888)). The observer beacons a
+mapping — `observer-supermini.yaml` inherits `tsf_sync: true` from the base package and only adds
+`tsf_observer: true` — but publishes **no phase** ([L4378](components/snapclient/snapcast_client.cpp#L4378)).
+So on the bench `consensus_n = 3` while the phase group is `n = 2`: the boost applies
+`3/2 = 1.5×` where the correct un-halving is `2×`.
+
+The bound is therefore **25 % too tight**, and the error grows with every mapping-only member.
+Direction is conservative — too tight means tracking gain where the boost was warranted, not a
+runaway — but it is wrong, it is silent, and it means the bench's boost behaviour is not the
+behaviour a speakers-only group would get. Fix: have `tsf_sync` expose the phase-contributor count
+used to compute the delta, and let this consumer read that.
+
+**[M] Then check every other consumer for the same factor:** the window step's `resync_local_us`
+sanity check and the unmute group-agreement gate both compare `|gd|` against thresholds expressed
+in wire microseconds. If they do not carry the un-halving, they are comparing a half-gap against a
+full-gap threshold and are 2× too permissive on a pair.
+
+---
+
+## 5. Stage 2 — one decision line (prerequisite for every later stage)
+
+Attribution is currently spread across `RSTEP`, `RSKIP`, `DLLOOP`, `FRAMEINV`, `TRIMDBG`,
+`RALIGN`, `BOOSTBLIND`, `BOOSTHOLD` and the split `Sync:`/`SYNCX` report, and the ladder's
+*refusals* are almost invisible — `gate_seen` exists for exactly one gate, because that lesson was
+already paid for once.
+
+Add `DECIDE`: **fixed field count, no variable-length tail** (the 256-byte ceiling), throttled to
+≤ 2 Hz plus every non-idle decision, emitted from a single point after the ladder.
+
+```
+DECIDE src=tag|ledger|none cls=rate|step|bias|none gate=<first refusing gate>
+       act=none|trim|splice|step|resync frames=%+d pend=%+d gd=%+d|unknown t=%lld
+```
+
+**Pass condition:** over a quiet 30-minute window every chunk is accounted for by exactly one
+`act` and one `gate`, and the counts reconcile with `soft_dropped_frames`,
+`soft_inserted_frames` and `hard_resyncs`. **If that reconciliation fails, `TIMING.md`'s
+description of the ladder is wrong and this plan is built on a wrong map** — that is the point of
+running it first.
+
+Parser: extend `dl-window.py`. Verify the regex against a truncated line and an absent field
+before flashing; never require a trailing field.
+
+---
+
+## 6. Stage 3 — one selector and one horizon (pure refactors, no behaviour change)
+
+Two independent collapses, both shadow-verified before anything is swapped. They are one stage
+because neither changes behaviour and both must be in place before the arbiter of Stage 4.
+
+### 3a. One error selector
+
+```c++
+enum class ErrSource { Tag, Ledger, None };
+enum class ErrClass  { Rate, Step, Bias, None };
+struct ErrorView {
+  int64_t  us;
+  ErrSource src;
+  int64_t  age_us;
+  bool     trusted;      // subsumes tag_fault_until_us, DL_ERR_STALE_US, tags_fresh
+  ErrClass cls;          // set by the arbiter, see Stage 4
+};
+ErrorView active_error(const ServoState &st) const;
+```
+
+Today `coarse_on_tags`, `tag_err_live`, `tags_fresh` and `now < tag_fault_until_us` are recomputed
+independently at the hard-resync branch, the window step, the fast splice, the tag-fault judge,
+the split repair's disarm ([L5747](components/snapclient/snapcast_client.cpp#L5747), which spells
+the test out in full a third time) and the unmute gate — each with slightly different staleness
+handling. **[C]**
+
+**Verification:** run both selectors live, log a mismatch counter, change nothing. Bar: zero
+mismatches over a session including an injected starvation and an `inject_split`. Only then swap
+the consumers.
+
+### 3b. One visibility horizon
+
+"How long until a correction shows up in the measurement" is encoded **five ways**, four of which
+are the same physical quantity from the same inputs with different clamps: `blank_ms` (500 ms),
+`resync_blank_ms` (1200 ms), the per-chunk computed `ring + pipeline + 2·block`,
+[travel_horizon_us_](components/snapclient/snapcast_client.cpp#L4366) (`ring + pipe + 2·block_n`,
+clamped 1–5 s), and the flat `PHASE_TRANSIENT_US` (4 s). **[C]** This is `TIMING.md` §11's
+"constants that encode a relationship" failure one level up: they are written as independent
+literals and will drift apart the first time `block_n`, the ring depth or the codec changes.
+
+```c++
+enum class Horizon { TagBlank, CoarseBlank, PhaseTransient, SpliceInFlight };
+int64_t visibility_horizon_us(Horizon purpose) const;   // ring + pipe + k·block, per-purpose k and clamp
+```
+
+All five encodings become one function differing only in `k` and clamp, each documented with what
+it is waiting for.
+
+**Verification: shadow first.** Log old and new side by side for one session and change nothing.
+Bar: the new function reproduces each old value within that value's own clamp on ≥ 99 % of chunks,
+and every divergence is explained before any consumer is swapped. `PHASE_TRANSIENT_US` is the one
+likely to *not* reproduce — it is a flat 4 s and the others are live — so decide deliberately
+whether it becomes live or stays flat, and write down which.
+
+---
+
+## 7. Stage 4 — one position arbiter, one in-flight ledger
+
+One function that, given the `ErrorView`, the gates and the pending-motion ledger, returns the
+frames to move this chunk. Hard resync, window step, bang-bang and fast splice become four
+*policies* inside it, not four sites.
+
+**The in-flight ledger is the window step's**, which is the better of the two: frame-exact landing
+markers tested against `played_frames_total_` with a two-block margin, and a sign guard so the
+subtraction can never manufacture a wrong-way step. The splice's chunk-horizon estimate is
+replaced by it. Hard resync records into it too — today it records into neither, which is why a
+resync followed by a window step can double-count.
+
+Serial step-and-verify becomes the rule for *all* position motion, not just in-window motion:
+never step while a step is in flight.
+
+**Bar:** `resync-test.py` post-hole convergence unchanged (< 100 µs within 10 s of a 300 ms
+injection, held 5 s) and `converge-time.py` boot-to-lock unchanged, both n ≥ 4 per board. This is
+where the WS3.1 invariant instrumentation stops being three copy-pasted blocks.
+
+---
+
+## 8. Stage 5 — membership and disruption as *inputs*
+
+This is the robustness stage, and it is where v2 differs most from what exists.
+
+### 5a. Feed the timebase move forward
+
+Today a consensus adoption or a deadline-source switch moves the deadline under the audio and the
+loop discovers it as error, several blocks later, through a signal it has just been told to
+distrust. The worst measured case is a source switch with the two mappings **29 ms apart**: the
+deadline and the published phase both stepped 29 ms, the delay loop correctly refused it for a
+minute, and the coarse machinery walked the audio over audibly.
+
+But the size of the move is **known at the instant it happens** — it is `new_offset − old_offset`.
+Feed it directly into the position ledger as a pending displacement:
+
+* the arbiter starts from the known step instead of rediscovering it;
+* the tag blank and the kp-event re-arm stay (the *measurement* is still invalid across the move);
+* `RENDER_PHASE_UNKNOWN` is published across the transient, as now.
+
+**[M] Test:** `inject_split`-style hook that forces a source switch of a chosen size. Pass: audio
+displacement ≤ 1 frame for a forced switch of 1 ms, and convergence within 10 s for 30 ms, against
+today's baseline for both.
+
+### 5b. Grade a join and a leave as first-class events
+
+A membership change is currently measured only as collateral: `|median error|` 154 µs within 15 s
+of one, against 93 µs elsewhere (p90 674 vs 286). Make it a graded test rather than a known cost.
+
+**[M] Protocol:** with two boards settled and the analyser running, bring a third in and out on a
+timer, `n ≥ 8` each way. Report wire p2p and time-to-return-inside-±10 µs. Bar for v2: **no
+audible correction on either settled board**, and return inside 10 s. The mechanism that should
+deliver it is 5a — a join changes the mean by a known amount and every device steps to the same
+place at the same time, so with feed-forward the move is common-mode and the wire should barely
+move.
+
+### 5c. Bound and announce the fallback
+
+The PI already holds rather than steering when the deadline is on the local Kalman fallback while
+peers exist — correct, and the reasoning (the clock-offset estimator sits *inside* `err_tag`) is
+sound. Two additions:
+
+* **Bound the hold.** An indefinite hold at the learned crystal offset is right for minutes and
+  wrong for hours. State the horizon explicitly and log the transition when it is passed.
+* **Announce it.** A device on the fallback should publish `RENDER_PHASE_UNKNOWN` and a flag, so
+  peers know its phase is not comparable rather than averaging it in. **[C]** Check whether it
+  already does; if it does, say so in one place and delete the question.
+
+### 5d. Rule 4, generalised
+
+Audit every consumer of a possibly-absent signal for the absent/stale/zero distinction. The boost
+now gets this right in three stages after `d9224e4` (fresh → held-as-bound within 30 s → tracking
+gain). The window step's `gd` sanity check, the unmute group-agreement gate and `render_align`
+each make the same decision independently. Each should read one helper with the same three-state
+answer.
+
+---
+
+## 9. Stage 6 — convergence by feed-forward
+
+Boot state is path-dependent today: NVS integral, NVS align bias, cold-start TSF crystal seed,
+fast boot Ti, and different gain schedules on the restored vs cold paths. **[C]** That is four
+sources of initial condition, and it means convergence times are only comparable between boards
+with the same NVS history — which quietly invalidates most A/B comparisons of boot behaviour.
+
+**Target:** one documented initial-condition rule.
+
+* **Rate** initial condition: NVS integral if present and finite, else the TSF crystal seed, else
+  zero. One expression, one log line naming which was used. (Both already exist; the branching is
+  the problem, not the sources.)
+* **Position** initial condition: the resync window, from the measured displacement, with
+  step-and-verify. Already right — keep.
+* **Bias** initial condition: NVS, refused outside the cap. Already right — keep.
+* Delete the cold/restored gain-schedule split, or state in one place why it must stay and what it
+  costs in comparability.
+
+**Bar:** `converge-time.py`, n ≥ 4 per board, from *both* a cold NVS and a warm one, reported
+separately. Today ~10–14 s post-injection including the 5 s hold; boot-to-lock should be stated
+the same way and not regress.
+
+---
+
+## 10. Stage 7 — delete what the census says is dead
+
+Every row is a **question answered from Stage 2's census over a week of logs**, not a decision.
+Deleting an unfired path is free; deleting a rarely-fired one is not. Anything with a nonzero
+census stays and gets a comment saying what fired it and when.
+
+| Candidate | Question | Delete if |
+|---|---|---|
+| Bang-bang soft steer | does it fire at all on S3 with the rate lock healthy? **[C]** says it cannot — `trim_holds` is false only when the lock fails | zero firings; keep behind the no-rate-lock path only |
+| Accounting-split repair | does it fire outside a TAGFAULT? It is *disarmed whenever tags are live*, and TAGFAULT *pre-arms* it — so it may run only in the state its own trigger cannot diagnose | no firings outside a TAGFAULT → fold into the fault handler |
+| The align kick | it delivers a *position* error as a *rate* command, concurrently with the PI's own response to the same deadline move | see Stage 8 — it should not survive v2 in this form |
+| `reanchor_after_relock_` | off by default already; does the forced repair measurably improve post-relock alignment on the wire? | no difference at n ≥ 8 relocks |
+| Autotune | one-sided, default off, never validated | keep off; delete once Stage 8 lands a symmetric gain rule |
+| `fill_corr` | measured, never applied, **by design** — applying it was the largest audible defect ever measured here | keep as a diagnostic, mark it so in exactly one place |
+| `r_push` epoch machinery | 31–35 % out of range by its own counter | keep only if a consumer is planned |
+
+### The ledger's remaining role
+
+After Stages 3–7 the prediction is used for exactly five things: the tags-absent fallback, the
+tag-fault judge, the stale bailout, the unmute anchor, and the splice horizon — the last as a
+*length* in whole chunks, which is bias-immune by construction (a bias of a few ms is a fraction
+of one chunk).
+
+**[M] The question worth asking, and not before Stage 7:** can the tags-absent fallback be
+replaced by *"hold the last trim, do not move position"* plus the existing stale bailout? That is
+the honest response to having no measurement, and it would remove the ledger from the control path
+entirely, leaving it as diagnosis — which collapses the tag/ledger arbitration that §0 identifies
+as the largest structural cost in the file.
+
+**Shadow it, do not cut it.** Log what the fallback *would* do across a month of real tag outages
+before removing anything. And do not attempt it before Stage 7: the fallback is what several gates
+fall back *to*, and a census taken before those gates change measures the old system.
+
+---
+
+## 11. Stage 8 — the deadline actuator, and the tightest delta
+
+Two changes, both gated on Stage 1 having produced an honest reference.
+
+### 8a. Retire the align kick
+
+`render_align` writes two actuators: it moves the deadline, then delivers the same correction
+again as a rate command capped at 1.5 ppm. The kick exists because the PI takes τ to walk the
+audio to a moved deadline, which is a real problem — but the answer is a *position* move, not a
+rate one. With Stage 4's arbiter and one in-flight ledger, a bias step of D µs is exactly a
+pending displacement of D µs, delivered frame-exactly and verified, and the PI never sees it as
+error at all.
+
+**[M] Test, already half-built:** `servo_param align_bias_us` measures the deadline→wire gain and
+`align_bias_kick_us` the kicked form. Compare both against a third, position-delivered form at the
+same magnitude, wire-graded, n ≥ 6 steps each. Pass: position delivery reaches the same wire
+displacement with fewer µs of overshoot and no trim excursion.
+
+### 8b. Differential rate feed-forward — but decide it, do not assume it
+
+The steady-state floor is set by ~0.33 ppm of differential rate noise: at 0.33 ppm a 1 µs error
+accrues in ~3 ms, against a fine-loop τ of 120 s. That is a ~40000× bandwidth gap and **no gain
+increase closes it.** Only two things can: stop generating the 0.33 ppm, or cancel it by
+feed-forward.
+
+Which one applies is a single measurement, and it has not been run:
+
+```
+d = fs_diff − trim_diff       (per-capture, from the analyser CSV)
+SF(d) ≈ SF(trim_diff)   → the loop's own response IS the plateau; τ/Ti reopens
+SF(d) ≈ 0               → the plateau is downstream; the loop cannot reject it,
+                          and feed-forward against the LOOP-DERIVED crystal is the path
+```
+
+**Run SF_d before writing any code for this stage.** The test is already written —
+`scripts/bench/sf-d.py` — and it takes the achieved differential rate from the *wire slope*, not
+from `fs_b − fs_a` (per-capture offset noise ~32 ns gives a 30 s slope ~1e-4 ppm, ~400× better
+than the frequency columns). Do not rebuild it, and do not substitute a correlation test:
+`corr(fs, trim) → −1` whatever the actuator does, because that is the feedback identity.
+
+If it says feed-forward: the term to feed
+forward is the *loop-derived* crystal (the integral, which is exactly that), not the TSF-derived
+one — the two disagree by 2.6 ppm in the differential (R9.4), and the TSF-derived one is the
+wrong number. The integral must keep running underneath as the safety net, because a crystal
+drifts with temperature.
+
+**Bar for the whole stage:** over ≥ 30 min and ≥ 6000 rival-clean samples — ≥ 6 disjoint
+1000-sample blocks with median block-p2p ≤ 1 µs and worst ≤ 2 µs; ≥ 6 disjoint 5-minute blocks
+with |mean| ≤ 0.2 µs and SE ≤ 0.1 µs **computed from block-means variance, not `sd/√n`**
+(consecutive samples from one pipeline are not independent, so `sd/√n` is a lower bound, not the
+standard error).
+
+---
+
+### 8c. The gain-symmetry audit
+
+Rule 3 stated as a closing task, because it is the rule this project has broken most often and the
+only one whose violations are invisible from a single board's log.
+
+Enumerate **every term in the trim that is a function of anything not common to both boards**, and
+for each state the differential motion it can generate for a given common-mode input:
+
+| Term | Common or per-board? | Status |
+|---|---|---|
+| the error-magnitude knee (25 µs) | per-board — each board reads its own `e` | tolerated only because the `gd` bound clamps it; **the bound is the symmetry mechanism, not the knee** |
+| the gd boost and its held-gd fallback | `|gd|` is the same number on both boards → symmetric | correct shape (`d9224e4`); verify the `n` fix from §4 |
+| `align_kick` | per-board | retired by 8a |
+| the resync-window floor τ | per-board — one board's window can be open while the peer's is shut | measured 2026-08-29 22:58 at 2–4 ppm differential, 2–3 µs/s of wire walk for 30 s |
+| the cold/restored Ti split | per-board, depends on NVS history | Stage 6 collapses it |
+
+**[M] The audit is not checkable from one board's log, and that is the point.** Log every boost
+decision with **what the peer's corresponding decision was** — its `e`, its `gd`, its resulting
+`kp`. Without that, "the gains were symmetric" is an assumption, not a measurement, and the
+09:58:57 episode (A boosted ×12.5 to kp 0.104 while B stayed at 0.008 — ~6 ppm differential,
+~120 µs on the wire, 40 s to unwind) is exactly what it looks like when the assumption is wrong.
+The observer is the natural place to correlate this: it emits `PHASEIN`, the group-consensus
+*inputs*, naming which peer moved, and the group delta's output cannot diagnose itself.
+
+**Bar:** `structure-function.py` 1 s structure function no worse than 0.30 µs, and the 3-minute
+medians within ±8 µs, over a quiet hour — the numbers `HANDOFF.md` records for build 30.
+
+---
+
+## 12. Order, and what may not be combined
+
+```
+0   live defects (align seeding, stale comment)      ── minutes, no measurement needed
+1   the reference's missing ~4x                      ── BLOCKING; nothing downstream grades without it
+2   DECIDE line + parser                             ── prerequisite for 4, 7, 8c
+3a  one error selector          (pure refactor)      ── shadow, zero-mismatch bar
+3b  one visibility horizon      (pure refactor)      ── shadow, >=99% reproduction bar
+4   one position arbiter        (structure)          ── convergence bars unchanged
+5   membership & disruption as inputs (behaviour)    ── the robustness goal
+6   convergence by feed-forward (behaviour)          ── the speed goal
+7   delete by census; then shadow the ledger fallback ── needs a week of 2's logs
+8a  retire the align kick       (behaviour)          ── position delivery replaces a rate command
+8b  differential rate feed-forward                   ── the tightness goal; SF_d decides its shape
+8c  gain-symmetry audit                              ── closes rule 3; needs the peer's decision logged
+```
+
+**No stage changes control law and structure in the same build.** 3a and 3b are refactors and must
+demonstrate identical behaviour before 5 and 6 change any. 7 comes after 5 and 6 because the
+fallback paths are what several gates fall back *to*, and a census taken before those change
+measures the old system. 8c comes last because it audits the gains that 5, 6 and 8b introduce, not
+only the ones that exist today.
+
+**Stage 1 genuinely blocks.** If the remaining ~4× cannot be explained, say so and cap the goal at
+what a 4×-attenuated reference can deliver, rather than proceeding and attributing the residual to
+the controller.
+
+---
+
+## 13. Bench protocol, for every stage
+
+Unchanged from what already works, restated so no stage skips it:
+
+1. `scripts/bench/preflight.py` — refuses unless all boards are latency 0 on the same stream.
+2. **One build, one `./reflash-speakers.sh`, then leave it alone.** A reflash is five consensus
+   membership changes; thirteen in one session made the operator the dominant disturbance and most
+   of the "events" chased were self-inflicted.
+3. Verify the running build over the API (`device_info.compilation_time`). Never from "OTA
+   successful" — a replug 40 s after an OTA reboot silently rolled both boards back once, and a
+   persist gate then "did not work" for a whole build because the build was not running.
+4. Grade from the CSV: `dod-grade.py` and `structure-function.py` (rival-gated), `dl-window.py` (byte-offset anchored,
+   `--log-tail-mb 60`). Never from plots, never from `[HH:MM:SS]` greps — the logs span days and
+   carry no date.
+5. **Check `rival` before trusting any skew number.** MLS44 gives ~0.03; a run at 0.94 means
+   whole-frame errors are masquerading as findings.
+6. Headline tests per stage: `inject_split(+1000)` (audio must not move), `inject_starvation(300)`
+   (< 100 µs within 10 s, held 5 s), a forced source switch (Stage 5a), a join/leave cycle
+   (Stage 5b), boot-to-lock from both cold and warm NVS, and a quiet-hour structure function.
+7. Prefer runtime `servo_param` A/B over a reflash wherever the change is a parameter. Two of the
+   best results on this bench (knee 25 / τ_min 5) were found that way and only then compiled in.
+
+---
+
+## 14. What not to touch
+
+* **The rate actuator and its dither.** Single owner, documented invariant, ~10 ns residual.
+* **"Publish only your own raw line, never the consensus."** Feeding the mean back is positive
+  feedback and the whole group can walk while every device agrees.
+* **Deterministic adoption — stepped, not slewed.** The slew was tried; it made adoption
+  path-dependent and cost 2.7× on sd. Stepping is safe *because* it is deterministic.
+* **`fill_corr` remaining unapplied.** Applying it produced the 10 ms / 52 ms offsets.
+* **`MEDIAN_WINDOW = 31`.** The residual is variance, not lag; shortening it has been tried and
+  reverted.
+* **The nominal prediction slope.** Predicting with the realised slope is arithmetically better
+  and destabilised the loop in two minutes; the slope's insensitivity to trim is load-bearing.
+* **Anything in Stage 7's table with a nonzero census.**

@@ -1,12 +1,32 @@
 # Timing architecture
 
-How a chunk gets from a snapserver timestamp to a speaker cone at the same instant on
-every device, and which quantities are measurable. Every figure is measured on a
-four-device fleet unless marked otherwise.
+How a chunk gets from a snapserver timestamp to a speaker cone at the same instant on every
+device, and which quantities are measurable.
 
-The short version: there is **one control loop**, closed on a **prediction** of when
-audio will render, and the most important property of the design is that *an error in
-that prediction is invisible to the loop*. Most of this document explains that sentence.
+**This document describes the code as built at `d9224e4` (2026-08-31).** Where a claim is
+checkable in the source it is cited; where it rests on a bench measurement it says so, with the
+date. `PLAN-timing-v2.md` proposes how to reduce what is described here; this file does not
+propose anything.
+
+The short version, and it is no longer the sentence this document used to open with:
+
+> The loop is closed on a **measured** render error (`err_tag`), not on a prediction. The
+> prediction survives as a *scheduling* comparison — hard resync, stale bailout, the splice
+> fallback when tags are absent — and the two coexist, which is where most of the remaining
+> complexity lives.
+
+---
+
+## 0. What changed since the previous revision of this file
+
+Four statements in the old text are now wrong, and each mattered:
+
+| Old text | Now |
+|---|---|
+| "one control loop, closed on a **prediction**" | the rate loop closes on the measured tag error; the prediction is a demoted second signal ([L4426](components/snapclient/snapcast_client.cpp#L4426)) |
+| "`Kp = 0.5 ppm/µs`, `Ki = Kp²/4`" | `Kp = 1/τ_eff` with τ ≥ 5 s, `Ki = Kp/Ti`, `Ti = 600 s`. `Ki = Kp²` was tried and **rejected** — 57 ppm p-p integral swing ([L4766](components/snapclient/snapcast_client.cpp#L4766)) |
+| "the adopted mapping is **slewed, never stepped**" | the adoption slew was **removed**: it made the consensus path-dependent and cost 2.7× on sd (9.72 vs 3.6). Adoption is a deterministic step ([tsf_sync.cpp:237](components/clock_sync/tsf_sync.cpp#L237)). The *publish* slew stays |
+| "one control loop … three tiers" | three actuators (rate, position, deadline), six error signals, eleven time-gates |
 
 ---
 
@@ -19,56 +39,107 @@ that prediction is invisible to the loop*. Most of this document explains that s
 | **Local time** | this device's `esp_timer` | No |
 | **DAC clock** | the I2S bit clock, from a PLL through a fractional divider | No |
 
-Render server time *T* at the same physical instant everywhere: express the deadline in
-a shared clock, then steer the DAC clock so audio lands on it.
+Render server time *T* at the same physical instant everywhere: express the deadline in a shared
+clock, then steer the DAC clock so audio lands on it.
 
 ### Why TSF rather than each device's own estimate
 
-Each client Kalman-filters NTP-style exchanges into an offset estimate that wanders
-±100–300 µs, **uncorrelated between devices** — precisely the error that moves a stereo
-image, since only *relative* timing is audible.
+Each client Kalman-filters NTP-style exchanges into an offset estimate that wanders ±100–300 µs,
+**uncorrelated between devices** — precisely the error that moves a stereo image, since only
+*relative* timing is audible.
 
-TSF sidesteps it. Every member multicasts its **own** raw TSF→server mapping once a second
-and adopts the (robustly weighted) **mean** of everyone's, its own included, so the group
-computes deadlines from one shared line and the mapping's own error is common-mode and
-cancels. What remains per-device is only local TSF read noise.
+TSF sidesteps it. Every member multicasts its **own raw** TSF→server mapping once a second
+(`BEACON_INTERVAL_US = 1 s`, [tsf_sync.cpp:113](components/clock_sync/tsf_sync.cpp#L113)) and
+adopts the robustly weighted **mean** of everyone's, its own included, so the group computes
+deadlines from one shared line and the mapping's own error is common-mode and cancels. What
+remains per-device is local TSF read noise.
 
-**Leaderless, by consensus averaging.** There is no election: TSF is already a shared
-broadcast timebase that the AP does not participate in, and the leader existed only to
-publish a number — which does not require electing anyone. Averaging also beats inheriting:
-noise falls as √N, nothing is handed over so there is no reference discontinuity to correct
-around, and a device rebooting shifts the mean slightly instead of collapsing the timebase.
-Leadership had been changing six times in seventeen minutes on a two-device group, and every
-quantity referenced to the leader moved with it.
+**Leaderless, by consensus averaging.** No election. Averaging beats inheriting: noise falls as
+√N, nothing is handed over so there is no reference discontinuity, and a device rebooting shifts
+the mean slightly instead of collapsing the timebase. Leadership had been changing six times in
+seventeen minutes on a two-device group. Measured 2026-08-28, three devices: median −3.75 µs,
+sd 4.32, MAD 2.19, zero churn.
 
-Two invariants hold it up, both of whose failures would look healthy from inside the device:
-a member publishes only its **own raw** estimate, never the consensus (feeding it back is
-positive feedback that lets the whole group walk while everyone agrees); and the adopted
-mapping is **slewed, never stepped** (membership changes move the mean, and a stepped
-timebase is a hard resync).
+**Two invariants, and the second one is the opposite of what this document used to say:**
 
-Consensus, the adoption slew and the Kalman fallback: `components/clock_sync/tsf_sync.h`.
-Measured: the four devices agree on the server-versus-TSF rate within 2 ppm (−16.7 to
-−18.5 ppm), an independent check that they share one timebase.
+1. A member publishes only its **own raw** estimate, never the consensus. Feeding the adopted
+   mean back is positive feedback — the whole group can walk while every device agrees
+   ([tsf_sync.h:50](components/clock_sync/tsf_sync.h#L50)).
+2. The adopted mapping is **stepped, not slewed**, and stepping is safe *because* the consensus
+   is deterministic: every device holding the same estimate set computes the same mean and steps
+   to the same place at the same time, so the move is common-mode. A slew makes adoption depend
+   on each device's own history, which destroys exactly that cancellation — measured at 2.7× on
+   sd ([tsf_sync.h:54-58](components/clock_sync/tsf_sync.h#L54-L58),
+   [tsf_sync.cpp:237](components/clock_sync/tsf_sync.cpp#L237)). The device's **own published
+   line** is still slew-limited toward its live Kalman estimate, which is a different thing:
+   it low-passes this device's jitter before anyone else averages it
+   ([tsf_sync.cpp:201](components/clock_sync/tsf_sync.cpp#L201)).
+
+The one residual path-dependence: devices differ only while they hold different estimate *sets*,
+bounded by the beacon interval.
+
+### The second exchange: render phase
+
+Separate from the timebase, and easy to confuse with it. Each device publishes its **render
+phase** — the TSF instant at which it renders server audio time zero — and receives peers'. The
+pairwise difference is `render_group_delta_us()`, "am I early or late relative to the group".
+
+* Phases are **sampled per tagged chunk (~94 Hz)** and exchanged in phase-only multicast packets
+  at `phase_tx_hz` ([tsf_sync.h:233](components/clock_sync/tsf_sync.h#L233)). This is *not* the
+  1 Hz mapping beacon.
+* Pairing requires the two phases to have been sampled within `PHASE_PAIR_WINDOW_US = 300 ms`
+  ([tsf_sync.h:375](components/clock_sync/tsf_sync.h#L375)) — a phase is an absolute TSF-vs-server
+  offset that drifts continuously, so differencing a fresh peer phase against a stale local one
+  injects drift × staleness (~165 µs at 3.3 s and 50 ppm).
+* Publishing is **gated on freshness and on transient**: a device that has just stepped its
+  position publishes `RENDER_PHASE_UNKNOWN` rather than a phase that does not yet describe where
+  its audio will be ([L4396](components/snapclient/snapcast_client.cpp#L4396),
+  `PHASE_TRANSIENT_US = 4 s`).
+
+**The group delta on a pair is half the pairwise disagreement, by construction. [C]** Our own
+phase is included in the group (`vals[0] = 0.0`), and `robust_mean` short-circuits to the plain
+mean for `n < 3` ([tsf_sync.cpp:794-802](components/clock_sync/tsf_sync.cpp#L794-L802)), so with
+two publishing speakers `gd = −(A−B)/2`. That is deliberate — each device corrects half the gap
+and they meet in the middle instead of one chasing the other — but it means **`|gd|` must never be
+compared directly against a wire differential without the factor.** The neighbouring
+`update_group_diagnostics_` excludes self for exactly this reason and says so
+([tsf_sync.cpp:1078](components/clock_sync/tsf_sync.cpp#L1078)); the control-path delta does not.
+
+The observer publishes no phase at all (`publish_render_phase_` returns early when
+`tsf_observer` is set, [L4378](components/snapclient/snapcast_client.cpp#L4378)), so the phase
+group on the bench is `n = 2` always.
+
+> **[C] `consensus_n()` is not that `n`.** It counts contributors with a valid, fresh **mapping**
+> ([tsf_sync.cpp:876-888](components/clock_sync/tsf_sync.cpp#L876-L888)), and the observer beacons
+> a mapping — `observer-supermini.yaml` inherits `tsf_sync: true` from the base package. So on the
+> bench `consensus_n = 3` while the phase group is 2. The PI's boost bound un-halves `gd` with
+> `n_cons/(n_cons−1)` ([L4646](components/snapclient/snapcast_client.cpp#L4646)), which gives
+> 1.5 where 2 is correct: the bound is 25 % too tight, silently, and only on groups containing a
+> mapping-only member.
+
+**Known defect, blocking the tight-sync goal.** Measured 2026-08-30 (builds 84–86): the exchanged
+phase values **under-measure a real differential by ~8×** — a matched window read −1.5 ms on the
+rival-clean wire against ≤0.2 ms in pairwise beacon phases. Pairing and consensus were exonerated
+at the time, and `HANDOFF.md` names the tag/feedback stamping as the suspect. **That suspect is
+now excluded by source reading (§2), and a factor of 2 is the self-inclusion above** — so ~4×
+remains genuinely unexplained. Any conclusion drawn from the group delta's *magnitude* inherits it.
 
 ### Reading TSF: the sandwich
 
-`esp_wifi_get_tsf_time()` is bracketed by two `esp_timer` reads, midpoint paired with the
-TSF value, bracket width reported per sample.
+`esp_wifi_get_tsf_time()` is bracketed by two `esp_timer` reads, midpoint paired with the TSF
+value, bracket width reported per sample.
 
-Width is **~42–50 µs, highly consistent** (7 µs spread) — not jitter but the deterministic
-cost of the call. So a threshold below ~42 µs is unachievable and only burns retries; and
-because the width is consistent the latch point is consistent, making the midpoint bias
-common to identical devices. Only the *variation*, a few µs, matters.
-
-One device reads 83 µs median with excursions to 122 µs. Best-of-N sampling hid that
-entirely, so retry count is not a free parameter.
+Width is **~42–50 µs, highly consistent** (7 µs spread) — not jitter but the deterministic cost of
+the call. A threshold below ~42 µs is unachievable and only burns retries; because the width is
+consistent the latch point is consistent, making the midpoint bias common to identical devices.
+Only the *variation*, a few µs, matters. One device reads 83 µs median with excursions to 122 µs;
+best-of-N sampling hid that entirely, so retry count is not a free parameter.
 
 ---
 
 ## 2. The pipeline
 
-Five buffers between network and pin; the total is what the loop must predict.
+Five buffers between network and pin.
 
 ```
 snapserver ──network──▶ PCM ring buffer          (client, ~1.7 s)
@@ -82,108 +153,320 @@ snapserver ──network──▶ PCM ring buffer          (client, ~1.7 s)
                         pin ──▶ DAC ──▶ amp ──▶ driver ──▶ air
 ```
 
-A chunk is **one codec block**, not a duration of our choosing: FLAC gives 1152 frames,
-measured at 26.2 ms at 44.1 kHz. It follows the encoder, so it changes with codec and
-rate — and several loop constants are expressed per chunk.
+A chunk is **one codec block**, not a duration of our choosing: FLAC gives 1152 frames, measured
+at 26.2 ms at 44.1 kHz. It follows the encoder, so it changes with codec and rate — and several
+loop constants are expressed per chunk.
 
-### Reporting the fill
+### Two accounts of the same audio
 
-The client maintains `accounted = pushed − played`. That is an **accumulator**: two
-counters, no self-correcting term, so a frame miscounted once stays miscounted.
+**The ledger.** `accounted = pushed − played`, two counters with no self-correcting term, so a
+frame miscounted once stays miscounted. Against it the client queries what the pipeline actually
+holds (`Speaker::buffered_bytes`, which returns `false` when a platform cannot report — distinct
+from reporting zero; `i2s_audio` reports ring plus the full DMA span including silence padding;
+`mixer` reports its source queue plus the task-local transfer buffer). With all stages reported,
+`accounted` and observed `fill` agree within ~10 ms.
 
-Against it we can query what the pipeline actually holds. Every layer computed that number
-and discarded it at the API boundary (`has_buffered_data()` returned `available() > 0`),
-so this needed upstream additions:
+**The render tags.** Each buffer of audio carries a `RenderTag` (server timestamp + frame offset);
+when it completes, `notify_audio_played_tagged` computes
+`err_tag = first_frame_local − deadline(that frame's server time)`
+([L1190-L1225](components/snapclient/snapcast_client.cpp#L1190-L1225)). Untagged audio — silence,
+splices, repeated frames, announcement blends — is skipped by design: there is nothing to measure.
 
-- `Speaker::buffered_bytes(size_t &)` — returns `false` when a platform cannot report,
-  deliberately distinct from reporting zero.
-- `i2s_audio` reports its ring **plus the full DMA descriptor span**, including silence
-  padding: lockstep writes record only *real* frames, so padding never reaches the
-  played-frames callback, yet still takes time to clock out.
-- `mixer` reports its source queue **plus the output transfer buffer** — task-local and
-  therefore unreachable, and exactly the ~50 ms residual left after counting DMA.
-- `MediaSourceListener::buffered_bytes` carries the query across the boundary the writes
-  cross.
+**The tag stamp is a hardware capture, not a model. [C]** Verified in the fork
+(`speaker-render-latency`, `dd14d50`): `esp_timer_get_time()` is read inside the I2S TX-done ISR
+`i2s_on_sent_cb` (`IRAM_ATTR`,
+[i2s_audio_speaker.cpp:336](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp#L336))
+and queued per completed DMA descriptor. The task pairs each event 1:1 with its write record and
+subtracts the descriptor's trailing silence —
+`adjusted_ts = write_timestamp − frames_to_microseconds(silence_frames)`
+([i2s_audio_speaker_standard.cpp:285](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp#L285))
+— so it is the instant *that descriptor's real audio finished*, not a pivot EWMA. Untagged
+descriptors report nothing rather than a fabricated tag. The mixer forwards the stamp **unchanged**
+to the source that tagged the audio, and only that one
+([mixer_speaker.cpp:475](../esphome/esphome/components/mixer/speaker/mixer_speaker.cpp#L475)).
 
-With all stages reported, `accounted` and observed `fill` agree within ~10 ms.
+`publish_render_phase_sample_` then derives the phase from that stamp alone
+([L4397-L4423](components/snapclient/snapcast_client.cpp#L4397-L4423)):
+`render_tsf − render_server`, where `render_tsf` walks back `frames` from `adjusted_ts` and
+converts through a fresh TSF sandwich, and `render_server` is the tag's own server time. Freshness
+gate `RENDER_TAG_MAX_AGE_US = 100 ms`; outside it, `RENDER_PHASE_UNKNOWN`. **No modelled quantity
+enters the render phase.**
 
----
+These are two independent routes to the same physical quantity, and that is deliberate: a loop
+closed on a prediction cannot see an error in the prediction. Evidence they are independent:
+`inject_split` moves `err_tag` by 1.02–1.05× the injected truth while the ledger-derived error,
+servo-nulled, cannot see it at all ([L1216](components/snapclient/snapcast_client.cpp#L1216)).
 
-## 3. The control loop
+One constraint inherited from the fork: `RenderTag` distance arithmetic is in frames of one
+stream, so **a stage that changes the frame count (a resampler) cannot carry tags**
+([audio.h:54](../esphome/esphome/components/audio/audio.h#L54)). A resampler in the path means no
+tags, which means no measured error — `tags=0` is a configuration answer, not a fault.
 
-Per chunk, in the player task:
-
-```
-deadline  = server_ts + buffer_ms − latency − shared_offset      (shared clock)
-predicted = feedback_pivot_time + (pushed − pivot_frames)/rate   (when it will render)
-error     = predicted − deadline
-```
-
-`error > 0` means late. The loop drives it to zero, in order of preference:
-
-1. **Rate lock** (`rate_lock.{h,cpp}`) — steers the I2S MCLK fractional divider, so
-   corrections are pure rate changes with no waveform discontinuity. Continuous PI, no
-   deadband. The steady-state mechanism.
-2. **Frame splices** — insert or drop frames where the rate lock is unavailable or the
-   error is far outside the fine band. Coarse but fast.
-3. **Hard resync** — whole chunks beyond `hard_resync_threshold`. Audible; real
-   disturbances only.
-
-### The rate lock and its baseline
-
-MCLK = SRC / (N + b/a), the fraction in one 32-bit register so it swaps atomically. The
-integer part is never written live: that needs IDF's "double division" workaround, which
-bursts MCLK ~6.5× and is unusable on a running channel.
-
-Trims are *relative to a baseline*, so a wrong baseline is a DC offset the servo must
-cancel out of its own authority. For 44.1 kHz × 256 from 160 MHz the ideal divider is
-`6250/441 = 14 + 76/441` — exactly representable, so where the driver picks a worse
-approximation we recompute and use the ideal.
-
-Learned the hard way: after the first trim the register holds *our* value, not the
-driver's. Re-reading it as a baseline reinterprets the servo's learned offset as driver
-error. The code detects this by comparing against the last value it wrote.
-
-### Gains
-
-```
-Kp    = 0.5 ppm/µs
-Ki    = Kp²/4                              (critically damped; computed, not written)
-clamp = clamp(Kp × converge_fine, 500, 2000) ppm
-```
-
-The clamp is **derived, not chosen**. The PI takes over at `converge_fine`, so to behave
-linearly anywhere in that band the output must express the proportional term at the
-handoff: `clamp ≥ Kp × converge_fine`. A fixed 500 ppm against the 2 ms default violated
-that by 2×, leaving the upper half of the fine band saturated *by construction* — every
-recovery entered the PI stage already railed.
-
-Bandwidth is set by **disturbance tracking, not settling**. The loop trails a ramp by
-`rate/Kp`, and lag bounds Kp for phase margin. Measured lag ≈ 0.85 s, dominated by the
-feedback-pivot EWMA (α = 1/64 over 10.000 ms callbacks ≈ 0.64 s).
+The cost of keeping both is arbitration, and that cost is the dominant structural complexity in
+the file — every consumer of "the error" carries its own selector, staleness rule and fallback.
 
 ---
 
-## 4. What is measurable, and the blind spot
+## 3. The six error signals
 
-`error = predicted − deadline` is computed from `predicted`. **If `predicted` is wrong,
-the loop steers real audio to the wrong time and reports zero error** — metric and audio
-displaced together. A loop closed on a reference cannot see an error in that reference.
+| # | Signal | Where | Cadence | Consumers |
+|---|---|---|---|---|
+| 1 | `error_us = predicted − deadline` (**ledger**) | [L2808](components/snapclient/snapcast_client.cpp#L2808), [predict_next_play_us_](components/snapclient/snapcast_client.cpp#L6397) | per chunk (~26 ms) | hard resync, window step, stale bailout, resync trace, tag-fault judge |
+| 2 | `median_err_us` — 31-sample median of #1 | per chunk | per chunk | bang-bang steer, PI gate, unmute gate, splice fallback |
+| 3 | `err_tag` — per-arrival **measured** render error | [notify_audio_played_tagged](components/snapclient/snapcast_client.cpp#L1190) | per tagged DMA completion (~94 Hz) | accumulates into #4 |
+| 4 | `dl_err_us` — block mean of #3 over `block_n = 64` | [delay_loop_update_](components/snapclient/snapcast_client.cpp#L4426) | ~1.5 Hz (≈0.65 s) | **the PI**, coarse decisions, fast splice, window step |
+| 5 | `render_group_delta_us` — my phase vs peer mean | [tsf_sync.h:163](components/clock_sync/tsf_sync.h#L163) | per block / per report | `render_align`, the PI's boost clamp, window-step sanity, unmute |
+| 6 | accounting split — `accounted` vs measured `fill` | [L5642](components/snapclient/snapcast_client.cpp#L5642) | 33-sample median per report | split repair, unmute anchor, splice hold |
 
-Measured consequence: devices 10 ms and 52 ms out of alignment, plainly audible, while
-every on-device metric read clean — medians inside 90 µs, no resyncs, drift small.
+`predict_next_play_us_` uses the **nominal** slope, not the realised one. Predicting with
+`nominal/(1+applied_ppm)` was arithmetically better and destabilised the loop within two minutes
+on hardware (trim +50 → +165 ppm, median oscillating): the nominal slope's *insensitivity to
+trim* is load-bearing, keeping the controller's output out of its own error signal
+([L6398-L6420](components/snapclient/snapcast_client.cpp#L6398-L6420)).
+
+---
+
+## 4. The three actuators
+
+### (a) Rate — the I2S fractional divider
+
+**One writer**, `rate_lock_->set_trim_ppm()`, programmed every chunk
+([L3501](components/snapclient/snapcast_client.cpp#L3501)) — that line *is* the hold. MCLK =
+SRC / (N + b/a), the fraction in one 32-bit register so it swaps atomically. The integer part is
+never written live (IDF's "double division" workaround bursts MCLK ~6.5× and is unusable on a
+running channel). Sigma-delta dither between bracketing ratios at the speaker callback cadence;
+residual ~10 ns.
+
+Trims are *relative to a baseline*, so a wrong baseline is a DC offset the servo must cancel out
+of its own authority. For 44.1 kHz × 256 from 160 MHz the ideal divider is `6250/441 = 14 + 76/441`
+— exactly representable, so where the driver picks a worse approximation we recompute. After the
+first trim the register holds *our* value; re-reading it as a baseline would reinterpret the
+servo's learned offset as driver error, so the code compares against the last value it wrote.
+
+**This actuator is clean** — single owner, documented invariant, measured residual ~10 ns. It is
+the one part of the system not implicated in anything below.
+
+Five sites assign `st.trim_applied_ppm`: PI output ([L4775](components/snapclient/snapcast_client.cpp#L4775)),
+the align kick ([L4792](components/snapclient/snapcast_client.cpp#L4792)), in-range hold with
+decaying P ([L4475](components/snapclient/snapcast_client.cpp#L4475)), out-of-range integral-only
+hold ([L4562](components/snapclient/snapcast_client.cpp#L4562)), and the muted out-of-band branch
+([L3531](components/snapclient/snapcast_client.cpp#L3531)).
+
+### (b) Position — frames added or dropped
+
+The per-chunk ladder is a **single `if / else if` chain**, so at most one of these acts on a given
+chunk. This is worth stating plainly because it is easy to misread the file as four concurrent
+correctors:
+
+| Site | Line | Signal | Arming |
+|---|---|---|---|
+| Hard resync, late | [L3163](components/snapclient/snapcast_client.cpp#L3163) | #4 if tags live else #1 | `> hard_resync_threshold`; drops whole chunks and `continue`s |
+| Hard resync, early | [L3197](components/snapclient/snapcast_client.cpp#L3197) | same | `< −hard_resync_threshold`; inserts silence |
+| Coarse window step | [L3230](components/snapclient/snapcast_client.cpp#L3230)–[L3430](components/snapclient/snapcast_client.cpp#L3430) | #4 or #1, sanity-checked against #5 | resync window only, serial step-and-verify, frame-exact landing |
+| Bang-bang steer **or** fast splice | [L3536](components/snapclient/snapcast_client.cpp#L3536) / [L3560](components/snapclient/snapcast_client.cpp#L3560) | #2 / (#4 if fresh else #2) | the two halves of one `if/else` on `!trim_holds && !coarse_on_tags` |
+
+**The bang-bang steer is unreachable on S3 with the rate lock healthy.** `trim_holds` is the
+return of `set_trim_ppm`, so the branch condition is false whenever the lock is programmed, and
+when `coarse_on_tags` is true it is skipped outright. It survives as the no-rate-lock fallback.
+
+**The fast splice is off inside the resync window.** `threshold = post_event ? 0 : cfg_threshold`
+and the whole body is gated on `threshold > 0`
+([L4934](components/snapclient/snapcast_client.cpp#L4934)) — inside the window the coarse
+step-and-verify owns position, so the two never act on the same block error. The function's own
+opening comment still describes the older "arms at `resync_splice_us`" behaviour and is stale;
+believe the code.
+
+Outside the window the splice needs `|err| ≥ threshold` held for `FAST_SPLICE_PERSIST_US = 4 s`
+to arm, releases inside `min(300 µs, threshold/2)`, and is bounded at 128 frames. Default
+threshold is **0 — the splice is off unless configured**; the bench yaml sets `1ms`.
+
+**Two in-flight accountings, no shared arbiter.** The splice subtracts `splice_hist` over a
+horizon in chunks; the window step subtracts `win_step_us` with frame-exact landing markers
+(a step has landed when `played_frames_total_` passes the push index it was applied at, plus a
+two-block margin). Neither knows about the other's pending corrections; hard resync records into
+neither.
+
+### (c) Deadline — `render_align`
+
+A third controller with its own gain, deadband, reject threshold, step cap, group re-centring
+term and NVS persistence ([L6213-L6330](components/snapclient/snapcast_client.cpp#L6213-L6330)).
+It acts on signal #5 and moves the deadline (`render_bias_us_`), applied only on the shared-TSF
+path — without a shared mapping two devices' phases are not comparable.
+
+It then **also** injects an "align kick": the bias delta is delivered as a direct rate command
+(`ALIGN_KICK_MAX_PPM = 1.5`) rather than waiting τ for the PI to walk the audio there
+([L4776-L4792](components/snapclient/snapcast_client.cpp#L4776-L4792)). So one controller writes
+two actuators. The sign was established **by measurement, not derivation**: a positive bias makes
+this board play earlier, so `bias -= delta × gain`; an earlier build flipped it from a polluted
+run and made early boards earlier.
+
+> **[C] Live discrepancy worth knowing about.** `example/snapclient-base.yaml` sets
+> `render_align_max: 0ms` and `HANDOFF.md` records render_align as disabled — but
+> [L919](components/snapclient/snapcast_client.cpp#L919) only copies the YAML value into
+> `tune_align_max_us_` **when it is > 0**, and the member's default is 500. A YAML value of 0
+> therefore leaves render_align running at a 500 µs cap. The comment at
+> [L6254](components/snapclient/snapcast_client.cpp#L6254) claims "0 = off". Either the seeding
+> or the comment is wrong; the bench has been running the loop it believed was off.
+
+---
+
+## 5. The delay loop (the actual control loop)
+
+`delay_loop_update_` ([L4426](components/snapclient/snapcast_client.cpp#L4426)), at most one PI
+step per completed block of `block_n = 64` tag arrivals (≈0.65 s).
+
+```
+e        = mean(err_tag over the block)
+τ_eff    = τ / boost,   boost = clamp(boost_err / knee, 1, τ/τ_min)
+Kp       = 1 / τ_eff
+Ki       = Kp / Ti                          (Ti NOT boosted — see below)
+integral += Ki · e · dt                     (conditional, anti-windup)
+trim      = clamp(Kp·e + integral, ±clamp)
+trim     += align_kick                      (≤ 1.5 ppm)
+```
+
+| Term | Default | Why |
+|---|---|---|
+| `τ` | 120 s | floor; the boost stiffens it |
+| `Ti` | 600 s | `Ti = τ` (i.e. `Ki = Kp²`) swung the integral ~57 ppm p-p chasing common-mode wander |
+| `knee` | 25 µs | A/B 2026-08-30 18:42: 30–50 s tails at flat τ died in ~4 s |
+| `τ_min` | 5 s | boost floor |
+| `clamp` | `clamp(0.5 · converge_fine, 500, 2000)` ppm | derived: the output must be able to express the P term at the handoff, or the top of the fine band is saturated by construction |
+
+**The boost clamps on the differential, not the magnitude.** Boosting on `|e|` is symmetric and
+still moves a pair apart: common timeline wander ramps both boards' `e` together, each board's
+slightly different local reading gets multiplied by the gain, and `Kp·(e_A − e_B)` becomes 2–5 ppm
+of differential trim — the ±30–50 µs steady-state sawtooth measured 2026-08-30 21:01. The
+differential evidence is the group delta (`|gd|` is the same number on both boards, so the
+schedule stays symmetric), so the boost runs on `min(|e|, |gd|·n/(n−1))`
+([L4646](components/snapclient/snapcast_client.cpp#L4646)).
+
+**Unknown `gd` is not the same as being alone** (`d9224e4`). The old fallback boosted on `|e|`
+whenever `gd == INT32_MIN`, regardless of peer count — so a board with a healthy pair that merely
+dropped `gd` for one decision got full boost on a *common* error. Measured 09:58:57: A boosted
+×12.5 to Kp 0.104 and moved +57 → +88 ppm in one block while B, whose `gd` was valid, stayed at
+Kp 0.008 — ~6 ppm differential, ~120 µs on the wire, 40 s to ramp back. `gd` goes unknown on
+~2.7 % of decisions on both boards and it is **bursty**. Now three stages:
+
+1. fresh `gd` → bound the boost with it;
+2. `gd` stale but within `BOOST_GD_HOLD_US = 30 s` → use the held value as a *magnitude bound*
+   (a delta tens of seconds old still answers "differential or common", which is the only
+   question asked of it);
+3. older, or never computed, with peers present → **tracking gain**. The correct response to no
+   evidence is not maximum gain.
+
+Full boost survives only at `consensus_n ≤ 1` — genuinely alone, nothing to disturb.
+
+**No per-board gain anywhere else.** The rule, from 2026-08-29 22:58: *any gain only one board has
+converts common-mode error into differential motion.* A resync-window boost on one board (Kp 0.05
+inside its window vs 0.008 outside on the peer) turned the same +30…+130 µs common wander into
+2–4 ppm of differential trim and walked the wire at 2–3 µs/s for 30 s.
+
+**Hold, never revert.** Three exit paths hold rather than releasing the actuator:
+
+* tags stale → hold the integral and **decay P toward it over τ**. Holding the integral alone
+  dropped P instantly, and with P ≈ 25 ppm of legitimate response to wander that the peer kept
+  applying, every ~1 s mapping flap became a differential rate step and ~130 µs of wire skew.
+* deadline on the local Kalman fallback while peers exist → hold. The clock-offset estimator sits
+  *inside* `err_tag`, so on the shared mapping its wander is common-mode and harmless; on the
+  fallback it is per-device and steering on it misaligns.
+* `|e| ≥ splice_threshold` (out of range) → hold the **integral only**. Out of range is by
+  definition mid-transient, so the last demanded trim carries a P term computed against an error
+  the fast path is about to remove. If the integral has drifted > 20 ppm from its own 300 s EMA,
+  snap to the EMA.
+
+**`dl_oor` is asserted at a single point that always executes** and cleared only on the one path
+reaching a good in-range block — CLAUDE.md's accumulator rule, applied verbatim after setting it
+in the out-of-range branch alone latched it through every other early return.
+
+### Boot
+
+Four sources of initial condition, and they do not compose:
+
+* **NVS integral** — the 300 s EMA of the integral is persisted and restored. The integral is the
+  learned crystal offset; re-seeding it from the applied trim was measured re-engaging at
+  "+0.00 ppm" after a mute cycle, accruing 1 ms in ~18 s (the audible flutter).
+* **NVS align bias**, refused if outside the current cap.
+* **Cold-start TSF crystal seed** — a fresh board with no NVS integral would wind ~56 ppm through
+  Ki over 10+ minutes at Ti 600. The TSF crystal estimate is the same hardware property measured
+  against the radio within seconds of boot and sits ~14 ppm from what the DAC needs.
+* **Fast boot Ti** (`DL_TI_BOOT_S = 20 s` for the first 180 s, cold start only).
+
+Convergence-time measurements are therefore only comparable between boards with the same NVS
+history.
+
+---
+
+## 6. The resync window
+
+After an event the error is a **known displacement**, not wander, and rate control at τ = 120 s is
+the wrong instrument for it. `post_event_until_us` opens a window (`resync_win_s = 60 s`) in which
+position corrections do the work by **serial step-and-verify**:
+
+* one step at a time — never step while a step is in flight, tested frame-exactly against
+  `played_frames_total_` with a two-block margin (build 79/83; the earlier `err − pend` arithmetic
+  was unstable at boot, and instantaneous ring+pipe+block under-read while the ring was drained
+  post-hole, so every step was re-stepped in full);
+* `resync_gain = 1.0` of the measured error per clean block;
+* below `resync_local_us = 2000 µs` a step additionally **needs the group delta to agree** —
+  common timebase steps reach ±400 µs on both boards simultaneously, and only starvation-class
+  errors are local by construction;
+* the window closes after `resync_close_s = 5 s` inside `resync_splice_us = 100 µs`, and reopens
+  on a block error past `resync_reopen_us = 400 µs`.
+
+Measured (builds 77–81, 2026-08-30): 300 ms injections converge in **10–14 s including the 5 s
+hold**, i.e. < 100 µs at +5…+9 s, with zero TAGFAULTs. The remaining variance was the ledger's
+first step landing on mid-refill readings; build 78 made it wait for two consecutive readings
+within 20 % (500 µs floor), landing every first step at +1.9 s.
+
+---
+
+## 7. The gate lattice
+
+Eleven independently maintained time-latches:
+
+`post_event_until_us` · `tag_fault_until_us` · `phase_transient_until_us` · `dl_blank_until_us_`
+(five write sites) · `coarse_act_us` + `blank_us` · `resync_step_at_us` · `last_repair_us` +
+`FAST_SPLICE_REPAIR_HOLDOFF_US` (30 s) · `drift_excess_since_us` + `DRIFT_REPAIR_HOLD_US` (3 s) ·
+`fast_splice_seen_us` + `FAST_SPLICE_PERSIST_US` (4 s) · feedback-gap blank (`gap_blank_ms`) ·
+`unmute_anchor_wait_us`.
+
+Plus the booleans: `converged`, `dl_active`, `dl_oor`, `tags_fresh`, `coarse_on_tags`,
+`tag_err_live`, `trim_holds`, `rate_lock_ok`, `steer_dir`, `fast_splice_active`,
+`deadline_on_shared_tsf`, `boost_blind`.
+
+**The "visibility horizon" — how long until a correction shows up in the measurement — is encoded
+five ways**: `blank_ms` (500 ms), `resync_blank_ms` (1200 ms), the per-chunk computed
+`ring + pipeline + 2·block`, `travel_horizon_us_` (`ring + pipe + 2·block_n`, clamped 1–5 s), and
+the flat `PHASE_TRANSIENT_US` (4 s). Four of the five are the same physical quantity from the same
+inputs with different clamps. This is `TIMING.md` §11's "constants that encode a relationship"
+failure, one level up.
+
+---
+
+## 8. What is measurable, and the blind spots
+
+`error = predicted − deadline` is computed from `predicted`. **If `predicted` is wrong, the loop
+steers real audio to the wrong time and reports zero error.** Measured consequence: devices 10 ms
+and 52 ms out of alignment, plainly audible, while every on-device metric read clean.
+
+Closing the rate loop on `err_tag` removes that blind spot *for the rate loop*. It does not remove
+it from the paths still reading the prediction, and it introduces a second one: the render phase
+is derived from the same tag stamping, and that stamping is currently suspect (§1, ~8×
+under-measurement).
 
 | Instrument | Sees | Blind to |
 |---|---|---|
 | `median` in the sync report | tracking error against *this device's* prediction | any error in the prediction itself |
+| `dl_err` / `err_tag` | measured render error of tagged audio | anything untagged; a fault in the tag stamping |
+| `render_group_delta` | this device's phase vs the peer mean | a fault shared by the whole group; currently under-reads ~8× |
 | `pipeline` / `fill` / `drift` | accumulator vs observed pipeline content | anything downstream of the reported stages |
-| `depth ±N ms` (TSF beacon) | this device's depth vs the peer mean | a fault shared by the whole group |
-| **`raw-sync.py`** | **actual inter-device rendering, from raw observations** | anything past the I2S pin |
+| **`raw-sync.py`** | inter-device rendering from raw observations | anything past the I2S pin |
+| **logic analyser** (`scripts/i2s-skew.py`) | **the actual wire**, ~26 ns per-capture precision | nothing that matters; this is the referee |
 
 ### raw-sync.py
 
-One `RAW` line per sync report, containing **only direct observations** — no servo state,
-no prediction:
+One `RAW` line per chunk containing **only direct observations** — no servo state, no prediction:
 
 ```
 RAW s_ts=… pushed=… played=… played_ts=… tsf=… tsf_local=… sw=… rate=…
@@ -192,119 +475,147 @@ server_time_of_last_rendered_frame = s_ts − (pushed − played) × 1e6 / rate
 tsf_time_of_that_frame             = played_ts + (tsf − tsf_local)
 ```
 
-`(played, played_ts)` is ground truth from the DAC feedback; `(s_ts, pushed)` anchors the
-frame count to server audio time, the same number on every device for the same audio;
-`(tsf, tsf_local)` converts to the one clock the devices provably share. Two synced
-devices satisfy the same linear relation; fit each and difference at a common server time.
+Robust fitting is essential — every starvation re-baselines the accounting, stepping
+`pushed − played`; plain least squares let a handful of steps tilt the line (residuals
+440–1220 µs), iterative 2.5σ rejection gives 181–385 µs. The rate offsets are a free validation:
+server-vs-TSF rate is physically common to all devices, and after rejection four independent fits
+agree at −16.7 to −18.5 ppm.
 
-Two details matter for trusting it:
+### The analyser is the referee
 
-- **Robust fitting is essential.** Every starvation re-baselines the accounting, stepping
-  `pushed − played`. Plain least squares let a handful of steps tilt the line (residuals
-  440–1220 µs); iterative 2.5σ rejection gives 181–385 µs and tightens confidence 4×.
-- **The rate offsets are a free validation.** Server-versus-TSF rate is physically common
-  to all devices. Before rejection the four fits scattered +0.2 to +14.5 ppm; after, they
-  agree at −16.7 to −18.5 ppm. Four independent fits converging on a shared physical
-  quantity is evidence the method measures what it claims.
+`scripts/i2s-skew.py` on MLS44 stimulus, `--samples 200000`. On music the analyser cannot resolve
+the problem at all (adjacent frames correlate at ~0.997); on MLS the runner-up correlation is
+~0.03. **Check `rival` before trusting any skew number** — a run at 0.94 means whole-frame errors
+are masquerading as findings. Per-capture precision is ~26 ns, so every µs it shows is board
+behaviour. Grade from `test.csv` with `scripts/bench/dod-grade.py` (the definition-of-done statistics) and
+`scripts/bench/structure-function.py`, never from plots.
 
 ---
 
-## 5. Error budget
+## 9. Error budget and current state
 
-Measured at 44.1 kHz:
+Measured at 44.1 kHz on the two-speaker bench:
 
 | Term | Contribution | Notes |
 |---|---|---|
-| TSF read noise | ~±3.5 µs | variation in a ~42 µs deterministic bracket; per-device |
+| TSF read noise | ~±3.5 µs per device | variation within a ~42 µs deterministic bracket |
 | Published mapping error | ~0 | common-mode by construction — what TSF buys |
-| Servo residual | ~200 µs, **white noise** | see below |
+| **Differential rate noise** | **~0.33 ppm** | ~150× the 0.017 ppm crystal budget; at 0.33 ppm a 1 µs error accrues in ~3 ms |
 | Frame quantisation | ~0 with rate lock | 22.7 µs per frame on the splice fallback |
 | DAC/amp/driver | fixed | identical hardware, cancels between devices |
 | **Speaker placement** | **29 µs per cm** | dominates everything below ~100 µs; trim with `static_delay` |
 
-Achieved inter-device alignment, robust-fit with ±2σ:
+Current wire behaviour (build 88, quiet window): median −1.5 µs, MAD 5.1 µs; structure function
+1.3–1.5 µs at τ = 1 s, 5.6–5.8 at τ = 10 s, plateau 11–14 µs with a 60–120 s correlation time.
 
-```
-a-b  −14.2 ±40.0 µs   not significant
-a-c  −19.6 ±60.8 µs   not significant
-b-c   −5.4 ±59.1 µs   not significant
-a-d  −99.0 ±42.9 µs   significant
-b-d  −84.7 ±40.4 µs   significant
-```
+**The residual is variance, not lag.** Consecutive-difference σ divided by σ came out 1.32–1.43
+against √2 ≈ 1.41 for white noise. So raising gain makes it worse and averaging harder makes it
+better at no tracking cost. `MEDIAN_WINDOW` went 15 → 31 for exactly this reason, reversing an
+earlier shortening made on the assumption the residual was lag.
 
-Three devices aligned within measurement error; one genuinely ~90 µs out, and that one is
-the weakest station on a saturated channel. The floor is ~40 µs, set by per-sample
-residual over ~47 samples — certifying 10 µs needs ~750 samples (≈45 min of quiet
-playback) or a lower residual.
-
-### The residual is noise, not lag
-
-Easy to get backwards, and it determines which fixes help. Consecutive-difference σ
-divided by σ came out **1.32–1.43** against √2 ≈ 1.41 for pure white noise. So the
-residual is *variance*, not tracking lag.
-
-Therefore **raising gain makes it worse** (a faster loop chases noise into the output) and
-**averaging harder makes it better** at no tracking cost, there being no ramp to trail.
-`MEDIAN_WINDOW` went 15 → 31 for exactly this reason — reversing an earlier change that
-shortened it to buy bandwidth, on the assumption the residual was lag.
+**The 0.33 ppm plateau is the open question.** At τ = 120 s the loop cannot correct every 3 ms;
+no gain increase closes a 40000× bandwidth gap. Whether the loop *generates* it (in which case
+tuning helps) or it is downstream (in which case only feed-forward or a better reference helps)
+is decided by the structure function of `d = fs_diff − trim_diff`, which has not been run.
 
 ---
 
-## 6. Failure modes worth knowing
+## 10. Robustness: what happens when the group changes
 
-**Correcting a measurement artefact displaces real audio.** The accounted-vs-observed
-residual was applied as a timing correction. While stages went unreported that residual
-was real unmeasured audio; once all were reported it became measurement offset
-(non-atomic sampling, quantisation, publish staleness). Applying it then manufactured
-relative offsets of 10 ms and 52 ms — the session's largest audible defect, introduced
-while trying to fix that defect. Now measured and reported but **not applied**.
+| Event | Handling | Cost |
+|---|---|---|
+| **Peer joins** | its raw line enters the mean; every device steps deterministically to the same new mean | measured: `|median error|` 154 µs within 15 s of a membership change vs 93 µs elsewhere (p90 674 vs 286) |
+| **Peer leaves** | expires after `MAPPING_EXPIRY_US = 5 s`; the mean moves | same |
+| **All peers gone** | `consensus_n < 2` → Kalman fallback; the deadline source switches | a step of the two mappings' disagreement — measured at **29 ms** once. Raises `deadline_source_switched_`, which the player loop converts into a kp-event re-arm plus a tag blank |
+| **Wi-Fi disruption, tags keep flowing** | mapping expires → fallback → PI **holds** (it will not steer on a per-device estimate while peers exist) | trim frozen at the learned crystal offset; error accrues at the residual rate only |
+| **Wi-Fi disruption, delivery stops** | ring drains → starvation re-baseline → hard resync on refill → resync window opens | audible gap; 10–14 s to reconverge |
+| **Reconnect / session epoch change** | `mark_kp_event_`, tag blank, `reanchor_armed` | off by default (`reanchor_after_reconnect: false`) |
+| **Local reboot** | NVS integral + align bias restored; TSF crystal seed if cold | boards with different NVS histories converge differently |
 
-**Assuming a fill instead of measuring it.** A starvation re-baseline zeroed the
-accounting assuming an empty pipeline. It usually is — DAC feedback gaps of 660–760 ms
-confirm a genuine drain — but the assumption went unchecked and cost three diagnoses.
-
-**Per-beacon allowances masquerading as rates.** The mapping slew limit was applied per
-beacon, silently coupling tracking speed to the beacon interval and starving tracking when
-a broadcast was late. Now a rate, scaled by the measured interval.
-
-**Constants that encode a relationship.** `Ki` is `Kp²/4`; the trim clamp is
-`Kp × converge_fine`; the muted steer size is a *slew rate*, not a frame count (8 frames
-is ~6800 ppm at 44.1 kHz, proportionally less as rate rises). Written as literals, these
-drift apart silently.
-
-**The ear outperformed every instrument.** Across five episodes a listener identified
-which device was offset, and its persistence, before any metric agreed — because the
-metrics were measured against a corrupted reference. The instruments that eventually
-worked were built from raw observations.
+**Every reflash costs five consensus membership changes.** Thirteen reflashes in one session made
+the operator the dominant disturbance on the bench. Batch changes; flash once; then leave it alone.
 
 ---
 
-## 7. Configuration reference
+## 11. Failure modes worth knowing
+
+**Correcting a measurement artefact displaces real audio.** The accounted-vs-observed residual was
+applied as a timing correction. While stages went unreported that residual was real unmeasured
+audio; once all were reported it became measurement offset. Applying it then manufactured relative
+offsets of 10 ms and 52 ms — the largest audible defect ever measured here, introduced while
+trying to fix that defect. Now measured and reported but **not applied** (`fill_corr`).
+
+**Assuming a fill instead of measuring it.** A starvation re-baseline zeroed the accounting
+assuming an empty pipeline. It usually is — DAC feedback gaps of 660–760 ms confirm a genuine
+drain — but the assumption went unchecked and cost three diagnoses.
+
+**Per-beacon allowances masquerading as rates.** The mapping slew limit was applied per beacon,
+silently coupling tracking speed to the beacon interval and starving tracking when a broadcast was
+late. Now a rate, scaled by the measured interval.
+
+**Constants that encode a relationship.** The trim clamp is `Kp × converge_fine`; the muted steer
+size is a *slew rate*, not a frame count (8 frames is ~6800 ppm at 44.1 kHz, proportionally less
+as rate rises); the splice horizon is a pipeline depth in chunks. Written as literals, these drift
+apart silently.
+
+**A unicast phase loop physically displaced the audio.** Build 85 sent ~100–200 `sendto/s` from
+the tag-observation thread and moved the bucketed wire from +2 µs to a stable **−1460 µs** at
+exactly its boot; it survived a reboot and cleared the moment build 86 disabled the loop.
+Mechanism still owed. Anything transmitting from the audio-observation path is suspect.
+
+**The ear outperformed every instrument.** Across five episodes a listener identified which device
+was offset, and its persistence, before any metric agreed — because the metrics were measured
+against a corrupted reference.
+
+---
+
+## 12. Configuration reference
+
+### YAML
 
 | Setting | Default | Effect on timing |
 |---|---|---|
-| `sync_deadband` | 128 µs | splice servo engage threshold (disengage at half); the rate-lock PI has no deadband |
-| `converge_fine` | 2 ms | coarse→fine handoff, and the derived trim clamp scales from it |
-| `hard_resync_threshold` | 50 ms | beyond this, whole chunks dropped or silence inserted |
+| `sync_deadband` | 128 µs | steer engage threshold; also the unmute band (×2) and `render_align`'s own-steady gate. The rate PI has no deadband |
+| `converge_fine` | 2 ms | coarse→fine handoff; the derived trim clamp scales from it |
+| `hard_resync_threshold` | 50 ms | beyond this, whole chunks dropped or silence inserted; also the TSF mapping plausibility bound |
+| `fast_splice_threshold` | **0 (off)** | standing offset at which position correction engages while converged. Bench: `1ms` |
+| `render_align_max` | 0 ms | deadline-bias cap. **See §4c — a YAML 0 does not currently disable it** |
+| `reanchor_after_reconnect` | false | forced repair cycle after a relock |
 | `rate_lock` | opt-in, S3 only | hardware clock steering; splices remain the fallback |
 | `tsf_sync` | opt-in | shared timebase; falls back to per-device Kalman |
+| `tsf_observer` | false | enables the `PHASEIN` group-input log |
 | `static_delay` | 0 | per-device trim — the right tool for placement asymmetry |
 | speaker `buffer_duration` | 100 ms | i2s ring depth; bounds recovery cushion |
 | speaker/mixer `timeout` | **`never`** | at the 500 ms default a delivery hiccup tears the pipeline down and rebuilds it at a different fill |
 
 Cross-field validation enforces `2 × sync_deadband < converge_fine < hard_resync_threshold`.
-Below the lower bound the coarse splices limit-cycle outside the band the unmute gate
-requires, and a client can stay muted indefinitely — this has happened.
+Below the lower bound the coarse splices limit-cycle outside the band the unmute gate requires,
+and a client can stay muted indefinitely — this has happened.
+
+### Runtime (`servo_param`, no reflash)
+
+`tau_s` 120 · `ti_s` 600 · `block_n` 64 · `knee_us` 25 · `tau_min_s` 5 · `splice_us` −1 (use
+config) · `tag_stale_ms` 1000 · `blank_ms` 500 · `gap_blank_ms` 50 · `align_max_us` 500 ·
+`align_gain` 0.3 · `align_deadband_us` 1 · `align_reject_us` 500 · `align_step_us` 20 ·
+`align_recentre_us` 2 · `align_apply` true · `resync_win_s` 60 · `resync_gain` 1.0 ·
+`resync_reopen_us` 400 · `resync_splice_us` 100 · `resync_close_s` 5 · `resync_local_us` 2000 ·
+`resync_blank_ms` 1200 · `phase_tx_hz` · `autotune` false · `persist` true.
+
+Bench hooks: `inject_split`, `inject_starvation`, `align_bias_us` / `align_bias_kick_us`.
 
 ---
 
-## 8. What this does not solve
+## 13. What this does not solve
 
-Sync is not delivery. Every dropout observed had the same signature: lateness growing ~1 s
-per second of wall clock with healthy RSSI, meaning data stopped arriving. This
-architecture shortens *recovery*; it cannot prevent the event.
+Sync is not delivery. Every dropout observed had the same signature: lateness growing ~1 s per
+second of wall clock with healthy RSSI, meaning data stopped arriving. This architecture shortens
+*recovery*; it cannot prevent the event.
 
-On the reference fleet the cause was airtime, not the clients: fourteen stations on one
-2.4 GHz channel at 81% utilisation (against 13–14 on every other radio), including two BLE
-proxies transmitting at 1–6 Mbps, where under DCF a slow station consumes airtime far out
-of proportion to the data it carries.
+On the reference fleet the cause was airtime, not the clients: fourteen stations on one 2.4 GHz
+channel at 81 % utilisation, including two BLE proxies transmitting at 1–6 Mbps, where under DCF a
+slow station consumes airtime far out of proportion to the data it carries.
+
+From 2026-08-30 ~18:53 the server's holes changed class — bursts of 964 ms to 6.3 s of lateness
+every few minutes. Under those, every refill plants a tag/ledger split and the window's tag steps
+fight an unattributed per-chunk drop actor in a ~10 s limit cycle. That is server-side
+(snapserver buffer 2000 → 4000, or the Pi), not a client timing defect.
