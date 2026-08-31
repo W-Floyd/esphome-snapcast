@@ -25,7 +25,7 @@ see WS0 in PLAN-sub-microsecond.md -- the row rate silently sets every n-depende
 
 USAGE
     python3 scripts/bench/structure-function.py [--csv PATH] [--last SECONDS] [--base prekp|now]
-                                                  [--max-rival 0.5] [--tol 0.1]
+                                                  [--max-rival 0.5] [--min-coef 0.99] [--tol 0.1]
 
 EXCLUDE EVENTS FIRST. A window containing a resync or a disconnect inflates every lag: a 300 s
 slice that happened to span two disconnects read 2.09x baseline where the clean 230 s inside it read
@@ -38,12 +38,22 @@ import csv
 import statistics as st
 import sys
 
+# WHY pcm_coef IS GATED ALONGSIDE rival (measured 2026-08-31, PLAN-sub-microsecond).
+# rival alone is NOT sufficient. During the ms-class reference steps the analyser's correlator
+# locks 35-36 WHOLE FRAMES away and offset_ns reports it; rival stays at 0.03-0.07 on many such
+# rows -- it does not catch this -- while pcm_coef falls to 0.46-0.95 against 0.999-1.000 when the
+# lock is good. Ungated, a real 49-197 us differential reads as 813-3295 us, and a 9-33x
+# "amplification mechanism" was briefly built on those rows before being retracted. Only 3.36 % of
+# rows fall below 0.99, so the gate is nearly free. The tell was arithmetic: the excursions were
+# exactly 794 and 816 us, i.e. 35 and 36 x 22.68 us.
+MIN_COEF = 0.99
+
 # tau seconds -> sd(diff) in us
 BASE_PREKP = {0.1: 0.300, 0.5: 1.008, 1: 1.873, 2: 3.245, 5: 6.175, 10: 8.346, 30: 9.004, 60: 8.904}
 BASE_NOW = {0.1: 0.193, 0.5: 0.766, 1: 1.364, 2: 2.249, 5: 4.105, 10: 6.908, 30: 12.437}
 
 
-def load(path, last, max_rival):
+def load(path, last, max_rival, min_coef=MIN_COEF):
     """Rival-gated load, keyed on unix_s (real timestamps, not row index)."""
     with open(path) as fh:
         rows = [r for r in fh if not r.startswith("#")]
@@ -56,7 +66,7 @@ def load(path, last, max_rival):
     unit = "ns" if skew_col.endswith("_ns") else ("us" if skew_col.endswith("_us") else "")
     scale = 1e-3 if unit == "ns" else 1.0
 
-    t, s, dropped, n_all = [], [], 0, 0
+    t, s, dropped, n_all, dropped_coef = [], [], 0, 0, 0
     for r in reader:
         try:
             ts = float(r["unix_s"])
@@ -70,6 +80,12 @@ def load(path, last, max_rival):
                     continue
             except ValueError:
                 pass
+        try:
+            if r.get("pcm_coef") and float(r["pcm_coef"]) < min_coef:
+                dropped_coef += 1
+                continue
+        except ValueError:
+            pass
         try:
             x = float(r[skew_col]) * scale
         except (ValueError, KeyError):
@@ -85,7 +101,7 @@ def load(path, last, max_rival):
         hi = t[-1]
         keep = [i for i, x in enumerate(t) if x >= hi - last]
         t, s = [t[i] for i in keep], [s[i] for i in keep]
-    return t, s, dropped, n_all
+    return t, s, dropped, n_all, dropped_coef
 
 
 def diffs_at_lag(t, s, tau, tol):
@@ -117,16 +133,19 @@ def main():
     p.add_argument("--last", type=float, default=0, help="use only the last N seconds")
     p.add_argument("--base", choices=("prekp", "now"), default="now")
     p.add_argument("--max-rival", type=float, default=0.5, help="drop rows above this (matches wire-window.py)")
+    p.add_argument("--min-coef", type=float, default=MIN_COEF,
+                   help="drop rows whose pcm_coef is below this -- catches whole-frame mislocks rival misses")
     p.add_argument("--tol", type=float, default=0.1, help="lag-match tolerance as a fraction of tau")
     a = p.parse_args()
 
-    t, s, dropped, n_all = load(a.csv, a.last, a.max_rival)
+    t, s, dropped, n_all, dcoef = load(a.csv, a.last, a.max_rival, a.min_coef)
     if len(s) < 500:
         sys.exit(f"only {len(s)} rival-clean samples -- need ~500+ for the 30 s lag to mean anything")
     span = t[-1] - t[0]
     rate = len(s) / span if span > 0 else 0
     med = st.median(s)
-    print(f"n={len(s)} (rival-gated {dropped}/{n_all}, max-rival {a.max_rival})  "
+    print(f"n={len(s)} (rival-gated {dropped}/{n_all} max-rival {a.max_rival}; "
+          f"coef-gated {dcoef} below {a.min_coef})  "
           f"span {span:.0f} s  rate {rate:.2f} rows/s")
     print(f"  skew median {med:+.2f} us   sd {st.stdev(s):.3f}   "
           f"MAD {st.median([abs(x-med) for x in s]):.3f}")

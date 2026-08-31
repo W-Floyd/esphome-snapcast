@@ -42,8 +42,18 @@ import csv
 import statistics as st
 import sys
 
+# WHY pcm_coef IS GATED ALONGSIDE rival (measured 2026-08-31, PLAN-sub-microsecond).
+# rival alone is NOT sufficient. During the ms-class reference steps the analyser's correlator
+# locks 35-36 WHOLE FRAMES away and offset_ns reports it; rival stays at 0.03-0.07 on many such
+# rows -- it does not catch this -- while pcm_coef falls to 0.46-0.95 against 0.999-1.000 when the
+# lock is good. Ungated, a real 49-197 us differential reads as 813-3295 us, and a 9-33x
+# "amplification mechanism" was briefly built on those rows before being retracted. Only 3.36 % of
+# rows fall below 0.99, so the gate is nearly free. The tell was arithmetic: the excursions were
+# exactly 794 and 816 us, i.e. 35 and 36 x 22.68 us.
+MIN_COEF = 0.99
 
-def load(path, max_rival, from_min, to_min):
+
+def load(path, max_rival, from_min, to_min, min_coef=MIN_COEF):
     with open(path) as fh:
         rows = [r for r in fh if not r.startswith("#")]
     out, t0 = [], None
@@ -64,6 +74,11 @@ def load(path, max_rival, from_min, to_min):
             continue
         try:
             if r.get("rival") and float(r["rival"]) > max_rival:
+                continue
+        except ValueError:
+            pass
+        try:
+            if r.get("pcm_coef") and float(r["pcm_coef"]) < min_coef:
                 continue
         except ValueError:
             pass
@@ -150,13 +165,15 @@ def main():
     p.add_argument("--csv", default="test.csv")
     p.add_argument("--bin", type=float, default=2.5, help="rate-estimate bin width in seconds")
     p.add_argument("--max-rival", type=float, default=0.5)
+    p.add_argument("--min-coef", type=float, default=MIN_COEF,
+                   help="drop rows below this pcm_coef -- whole-frame mislocks rival misses")
     p.add_argument("--max-p2p", type=float, default=60.0,
                    help="drop bins whose in-bin offset p2p exceeds this (us); quote it with any result")
     p.add_argument("--from-min", type=float, default=None)
     p.add_argument("--to-min", type=float, default=None)
     a = p.parse_args()
 
-    rows = load(a.csv, a.max_rival, a.from_min, a.to_min)
+    rows = load(a.csv, a.max_rival, a.from_min, a.to_min, a.min_coef)
     span = rows[-1][0] - rows[0][0]
     rate = len(rows) / span if span > 0 else 0
     series = binned(rows, a.bin, a.max_p2p)
@@ -169,7 +186,7 @@ def main():
         s["d_wire"] = s["achieved"] - s["trim_diff"]
 
     print(f"{a.csv}: n={len(rows)} rows, {rate:.1f} rows/s, span {span:.0f} s")
-    print(f"  bins {len(series)} x {a.bin}s (gate: rival<={a.max_rival}, in-bin p2p<={a.max_p2p} us), "
+    print(f"  bins {len(series)} x {a.bin}s (gate: rival<={a.max_rival}, coef>={a.min_coef}, in-bin p2p<={a.max_p2p} us), "
           f"{len(have)} with both fs and trim")
 
     sl = [s["achieved"] for s in have]

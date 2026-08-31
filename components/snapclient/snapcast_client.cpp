@@ -3354,6 +3354,9 @@ void SnapcastClient::player_task_() {
       if (adjust != 0 && st.converged) {  // WS3.1 invariant
         st.conv_ops++;
         st.conv_frames += static_cast<uint32_t>(std::abs(adjust));
+        // A coarse step only ever happens inside the resync window, so it is BY CONSTRUCTION a
+        // reference-step response and never counts against the quiet invariant. Kept explicit
+        // rather than omitted, so the asymmetry with the two sites below is deliberate and visible.
       }
       if (adjust > 0) {
         drop_frames = adjust;
@@ -3486,6 +3489,10 @@ void SnapcastClient::player_task_() {
         if (st.steer_dir != 0 && st.converged) {  // WS3.1 invariant
           st.conv_ops++;
           st.conv_frames += steer_frames;
+          if (!(st.dl_oor || now_us() < st.post_event_until_us)) {
+            st.conv_ops_q++;
+            st.conv_frames_q += steer_frames;
+          }
         }
         if (st.steer_dir > 0) {
           drop_frames = steer_frames;
@@ -3535,6 +3542,10 @@ void SnapcastClient::player_task_() {
         if (fast != 0 && st.converged) {  // WS3.1 invariant
           st.conv_ops++;
           st.conv_frames += static_cast<uint32_t>(std::abs(fast));
+          if (!(st.dl_oor || now_us() < st.post_event_until_us)) {
+            st.conv_ops_q++;
+            st.conv_frames_q += static_cast<uint32_t>(std::abs(fast));
+          }
         }
         if (fast > 0) {
           drop_frames = static_cast<uint32_t>(fast);
@@ -4361,6 +4372,14 @@ void SnapcastClient::publish_render_phase_sample_() {
 }
 
 void SnapcastClient::delay_loop_update_(ServoState &st) {
+  // WS3.1 GATE, SET AT A SINGLE POINT THAT ALWAYS EXECUTES. dl_oor means "the loop is NOT in clean
+  // in-range steady state", and it is asserted here on entry and cleared only on the one path that
+  // reaches a good in-range block. Setting it in the out-of-range branch alone left it latched
+  // through every OTHER early return in this function -- tags stale, deadline on the local
+  // fallback, not ready -- so a stale-tag period would have frozen it true and conv_ops_q would
+  // never increment again. That is CLAUDE.md's rule verbatim: a reset must not be conditional on
+  // an unrelated success; reset at a single point that always executes.
+  st.dl_oor = true;
   // Pull the accumulator state. A completed block is drained; a partial one is left to fill --
   // unless the stream has gone stale, in which case the partial block spans a gap and is discarded
   // (samples from before an outage folded into a mean with samples after it describe nothing).
@@ -4748,6 +4767,10 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     st.at_n = 0;
   }
 
+  // THE one clean exit: an in-range block on a shared mapping with fresh tags. Only here does the
+  // WS3.1 invariant apply, so only here is the gate released.
+  st.dl_oor = false;
+
   // Own short line, throttled by time -- never a tail on a report line (the 256-byte ceiling).
   if (now - st.dl_log_us >= DL_LOG_INTERVAL_US) {
     st.dl_log_us = now;
@@ -4765,8 +4788,13 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   if (now - st.conv_inv_log_us >= DL_LOG_INTERVAL_US) {
     st.conv_inv_log_us = now;
     const int32_t thr_now = this->tune_splice_us_.load(std::memory_order_relaxed);
-    ESP_LOGD(TAG, "FRAMEINV ops=%" PRIu32 " d=%" PRIu32 " frames=%" PRIu32 " conv=%d thr=%" PRId32 " us",
-             st.conv_ops, st.conv_ops - st.conv_ops_last_log, st.conv_frames, st.converged ? 1 : 0,
+    // qops/qframes ARE THE INVARIANT (converged AND no reference step outstanding); ops/frames are
+    // the ungated totals, which include correct step-tracking and must not be read as breaches.
+    ESP_LOGD(TAG,
+             "FRAMEINV qops=%" PRIu32 " qframes=%" PRIu32 " ops=%" PRIu32 " d=%" PRIu32
+             " frames=%" PRIu32 " conv=%d oor=%d thr=%" PRId32 " us",
+             st.conv_ops_q, st.conv_frames_q, st.conv_ops, st.conv_ops - st.conv_ops_last_log,
+             st.conv_frames, st.converged ? 1 : 0, st.dl_oor ? 1 : 0,
              thr_now >= 0 ? thr_now : static_cast<int32_t>(this->config_.fast_splice_threshold_us));
     st.conv_ops_last_log = st.conv_ops;
   }

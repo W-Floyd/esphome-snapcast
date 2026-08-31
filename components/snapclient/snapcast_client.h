@@ -515,10 +515,26 @@ class SnapcastClient {
     // structure is already close to true (the fast splice is threshold-gated, the window step
     // clamps to zero), so this is INSTRUMENTATION to prove it, not control work. Counted at all
     // three sites that can move a frame: the coarse window step, the soft steer, the fast splice.
-    uint32_t conv_ops{0};            // frame operations taken while st.converged
+    // CORRECTED 2026-08-31 after the first events this counter saw. "Zero frame operations while
+    // converged" is violated on EVERY ms-class reference step, and the violation is the servo doing
+    // the RIGHT thing: measured 418 frames moved against a 9478 us step, 524 against 11882, with
+    // the two boards moving IDENTICAL counts (418/418, 524/524) at 0.96-1.22x the step. The audio
+    // never jumps -- d(played)/dt stays at exactly 44100 f/s through every event -- so the DEADLINE
+    // moved and tracking it by whole frames is correct. The raw counter therefore reports correct
+    // behaviour as a breach, and would have been quoted that way.
+    //
+    // So the invariant is: zero frame operations while converged AND NO REFERENCE STEP OUTSTANDING.
+    // `_q` ("quiet") counts only that case and is the gate; the ungated pair is kept because it is
+    // what made the frame-for-frame tracking measurable in the first place.
+    uint32_t conv_ops{0};            // frame operations while st.converged (ANY state)
     uint32_t conv_frames{0};         // frames moved by them (magnitude)
+    uint32_t conv_ops_q{0};          // ... and with no reference step outstanding: THE INVARIANT
+    uint32_t conv_frames_q{0};
     uint32_t conv_ops_last_log{0};   // for the delta in the FRAMEINV line
     int64_t conv_inv_log_us{0};
+    /// Latched by delay_loop_update_: true while |dl_err| is past the out-of-range threshold, i.e.
+    /// while a reference step is being absorbed. Cleared on the first in-range block.
+    bool dl_oor{false};
     // Median of recent sync errors (rejects residual feedback spikes better than a
     // mean); the steering servo acts on this, not the raw per-chunk error. Same design
     // as the esp32 snapclient reference (99/19-sample medians on a sample-accurate age).

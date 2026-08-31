@@ -25,6 +25,16 @@ USAGE
 """
 import argparse, csv, re, statistics as st, subprocess, sys, bisect, datetime as dt
 
+# WHY pcm_coef IS GATED ALONGSIDE rival (measured 2026-08-31, PLAN-sub-microsecond).
+# rival alone is NOT sufficient. During the ms-class reference steps the analyser's correlator
+# locks 35-36 WHOLE FRAMES away and offset_ns reports it; rival stays at 0.03-0.07 on many such
+# rows -- it does not catch this -- while pcm_coef falls to 0.46-0.95 against 0.999-1.000 when the
+# lock is good. Ungated, a real 49-197 us differential reads as 813-3295 us, and a 9-33x
+# "amplification mechanism" was briefly built on those rows before being retracted. Only 3.36 % of
+# rows fall below 0.99, so the gate is nearly free. The tell was arithmetic: the excursions were
+# exactly 794 and 816 us, i.e. 35 and 36 x 22.68 us.
+MIN_COEF = 0.99
+
 RALIGN = re.compile(r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RALIGN group ([+-]?\d+) -> bias ([+-]?\d+) us")
 
 
@@ -63,6 +73,8 @@ def main():
             try:
                 t = float(r["unix_s"])
                 if float(r["rival"]) > 0.5:
+                    continue
+                if r.get("pcm_coef") and float(r["pcm_coef"]) < MIN_COEF:
                     continue
                 x = float(r["offset_ns"]) / 1000.0
             except (ValueError, KeyError, TypeError):

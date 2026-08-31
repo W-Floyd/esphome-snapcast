@@ -3882,6 +3882,10 @@ def main():
     p.add_argument("--sigrok-cli", default="sigrok-cli")
     p.add_argument("--timeout", type=float, default=120.0)
     p.add_argument("--out", default="i2s-skew.csv")
+    p.add_argument("--min-coef", type=float, default=0.0, metavar="COEF",
+                   help="reject captures whose PCM correlation peak is below COEF (0 = off, the "
+                        "default; 0.99 is the measured mislock threshold -- see the gate's comment). "
+                        "Rejected rows stay in the CSV with pcm_coef and a reason, value NaN.")
     p.add_argument("--annotate", nargs="+", metavar="LOG", default=None,
                    help="device logs (e.g. a.log b.log) to mark on the plot as vertical "
                         "bars: frame corrections, hard resyncs, and large trim steps. The "
@@ -4562,6 +4566,21 @@ def main():
                 off, ppm = float("nan"), float("nan")
             elif prefer is None and info.get("rival", 0) > RIVAL_MARGIN:
                 reason = reason or f"ambiguous frame match (rival {info['rival']:.2f})"
+
+            # ABSOLUTE CONFIDENCE GATE (--min-coef, default off). This is NOT the margin test above
+            # and cannot be folded into it: on the mislocks it was added for, `coef` fell to
+            # 0.46-0.95 while `rival` stayed at 0.03-0.07, so the MARGIN was 0.43-0.92 -- far above
+            # MIN_RIVAL_MARGIN, which passed every one of them. Measured 2026-08-31: during the
+            # ms-class reference steps the correlator locks 35-36 WHOLE FRAMES away; ungated, a real
+            # 49-197 us differential plots as 813-3295 us, and the excursions were exactly 794 and
+            # 816 us == 35 and 36 x 22.68 us. Only ~3.4 % of rows sit below 0.99, so the gate is
+            # nearly free. Rejected rows keep their place in the CSV with pcm_coef and this reason
+            # recorded -- the value is NaN'd, not dropped, so "absent" stays distinguishable from
+            # "zero" and the row count is unchanged.
+            if args.min_coef > 0 and math.isfinite(off) and coef < args.min_coef:
+                reason = (f"low confidence: peak {coef:.3f} < --min-coef {args.min_coef:.3f} "
+                          f"-- whole-frame mislock likely (frame_lag {info.get('frame_lag', 0):+d})")
+                off, ppm = float("nan"), float("nan")
 
             # ONLY A VALUE THAT SURVIVED EVERY GATE EARNS THE RIGHT TO ANCHOR THE NEXT BLOCK.
             # This sat above the gates, which is what made a bad lock self-perpetuating; it has

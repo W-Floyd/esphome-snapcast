@@ -159,11 +159,20 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
 
 ## WS3 — Pure-rate steady state (parallel with WS2)
 
-1. **Invariant, instrumented (R1.10b)**: zero frame operations while converged — one frame =
-   22.7 µs = 20× the budget. Structurally near-true already (fast splice threshold-gated, window
-   steps clamp to zero); the deliverable is the COUNTER and its log line, which must also log the
-   splice threshold in force (`splice_us` is a runtime override that can defeat the invariant).
-   Instrumentation, not control work; can start today.
+1. **Invariant, instrumented (R1.10b, CORRECTED 2026-08-31 by its own first data)**: zero frame
+   operations while converged **AND no reference step outstanding** — one frame = 22.7 µs = 20× the
+   budget. The original wording ("zero frame operations while converged") is WRONG and its counter
+   reported correct behaviour as a breach: on every ms-class reference step both boards move whole
+   frames to track it, measured at 418/418 frames against a 9478 µs step and 524/524 against 11882,
+   ratios 0.96–1.22×, while `d(played)/dt` stays at exactly 44100 f/s — the deadline moved, the
+   audio did not, and following it by whole frames is right. `FRAMEINV` therefore reports
+   **`qops`/`qframes`** (converged AND `!dl_oor` AND outside the resync window — THE gate) beside
+   the ungated `ops`/`frames` (kept: they are what made the frame-for-frame tracking measurable).
+   `dl_oor` is asserted at `delay_loop_update_` entry and cleared only at the single clean in-range
+   exit, so no other early return can latch it — the accumulator-reset rule. The line also logs the
+   splice threshold IN FORCE (`splice_us` is a runtime override that can defeat the invariant).
+   Instrumentation, not control work. NOTE the coarse window step is by construction a
+   reference-step response and is deliberately excluded from the quiet counters.
 2. **Crystal feed-forward — CLOSED (R9.4)**: the loop-derived differential crystal (with the wire
    flat, c_A + trim_A = c_B + trim_B ⇒ −med(trim_diff) = +4.78 ppm; the learned integrals agree at
    +4.88, sd 0.265) disagrees with the TSF-derived crystal_diff (+7.37 ppm, sd 0.623) by
