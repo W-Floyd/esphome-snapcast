@@ -3220,7 +3220,16 @@ void SnapcastClient::player_task_() {
       // (splice_hist / horizon_chunks); the coarse target now does too: pending = steps applied within
       // ring depth + one block, and the target is what the tags will read once they have landed.
       int64_t pending_us = 0;
-      if (resync_window && coarse_on_tags) {
+      const int64_t pre_sub_target_us = coarse_target_us;
+      // EVERY window decision subtracts the steps in flight, the LEDGER source included. 18:54:01:
+      // a 964 ms-late refill burst had the scheduler hard-resyncing on 96 of 128 chunks, every one
+      // re-arming the one-ledger-step latch, and each re-armed step decided on median_err_us -- a
+      // median that had not seen the previous steps. Seven +576-frame drops in 2.5 s against a flat
+      // +28 ms reading overshot to -47 ms; the mid-storm rebaseline reseeded the accounting, the
+      // tags then carried the truth alone, and TAGFAULT sided with the ledger: a 60 s max-amplitude
+      // tug of war ended only by the reconnect. With the subtraction, step 2's target is
+      // 28016 - 28224 = -208 -> the sign guard says wait.
+      if (resync_window) {
         // A step has LANDED when the DAC has played past the frame index it was applied at: the drop
         // is consumed where pushed_frames_total_ advances and the tags are observed where
         // played_frames_total_ advances, so the two counters straddle exactly the travel that
@@ -3248,7 +3257,7 @@ void SnapcastClient::player_task_() {
         coarse_target_us -= pending_us;
         // The subtraction must never manufacture a step the measurement did not ask for: if the
         // in-flight accounting flips the sign of the target, the honest statement is "wait".
-        if (pending_us != 0 && (coarse_target_us > 0) != (coarse_err_us > 0))
+        if (pending_us != 0 && (coarse_target_us > 0) != (pre_sub_target_us > 0))
           coarse_target_us = 0;
       }
       // A ONE-BOARD POSITION STEP ON A COMMON ERROR IS A DIFFERENTIAL ERROR. After a boot into a

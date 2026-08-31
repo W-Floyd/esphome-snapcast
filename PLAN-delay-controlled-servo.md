@@ -2716,3 +2716,20 @@ the two-block margin). Baked as compiled defaults for build 81.
 Open: kp 0.2 × ~950 µs gave a brief +241 ppm trim transient (inaudible, settled in 2 blocks) — watch
 the quiet-hour wire sd in the next soak for any cost of the boost at wander amplitudes (e≈80 µs →
 τ_eff 37 s, common-mode).
+
+### 2026-08-30 18:53–19:02 — build 81 confirmation interrupted by the ledger-step storm; fix for 82
+
+Confirmation ran into real server holes overlapping the injections and exposed a systematic failure,
+on A then reproduced on B: during a late refill burst the per-chunk scheduler hard-resyncs on ~96 of
+128 chunks, EVERY hard resync re-arms the window's one-ledger-step latch, each re-armed ledger step
+decides on median_err_us (a median that has not seen the previous steps), and the ledger path has no
+in-flight subtraction (pend was gated coarse_on_tags). A: seven +576-frame steps in 2.5 s against a
+flat +28 ms reading → −47 ms overshoot; the mid-storm rebaseline reseeded the accounting to ~0; the
+tags then carried the truth alone (SHADOW diff +40651) and TAGFAULT sided with the ledger → 60 s
+max-amplitude tug of war (tag inserts −576, scheduler hard-drops them back) ended only by the
+reconnect. Grades: 19 / 54 / 10 / DNF / DNF / DNF, TAGFAULT A 1.
+**Build 82:** every window decision subtracts the steps in flight — ledger source included — and the
+sign guard compares against the pre-subtraction target. Step 2 of the storm becomes 28016 − 28224 =
+−208 → wait. Prediction: a hole-overlapped injection shows at most ONE ledger step per landing, no
+tag/ledger split >5 ms, no TAGFAULT, and the watchdog's B-SPLIT/ERR5MS events stop appearing on
+natural holes.
