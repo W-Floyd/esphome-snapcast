@@ -163,6 +163,20 @@ class TsfSync {
   int32_t render_group_delta_us() const {
     return this->render_group_delta_us_.load(std::memory_order_relaxed);
   }
+  /// @brief The last computed group delta REGARDLESS of freshness, with its age in us; age is
+  /// INT64_MAX when none was ever computed. For consumers that need a MAGNITUDE BOUND rather than a
+  /// value to act on -- the delay loop's boost clamp is the case: it only needs to know roughly
+  /// whether the error is differential or common, which a delta tens of seconds old still answers,
+  /// whereas align steers on the value and must have the fresh one or nothing. Anything acting on
+  /// the VALUE must keep using render_group_delta_us() and its GROUP_DELTA_STALE_US gate.
+  int32_t render_group_delta_held_us(int64_t local_now_us, int64_t *age_us_out) const {
+    const int32_t v = this->group_delta_held_us_.load(std::memory_order_relaxed);
+    const int64_t at = this->group_delta_held_at_us_.load(std::memory_order_relaxed);
+    if (age_us_out != nullptr) {
+      *age_us_out = (at == 0) ? INT64_MAX : (local_now_us - at);
+    }
+    return (at == 0) ? INT32_MIN : v;
+  }
   /// Age of the published render phase at this instant, in ms, for the beacon: 0xFFFF when there is
   /// no phase or no sample instant. Network task.
   uint16_t render_phase_age_ms_() const {
@@ -404,6 +418,11 @@ class TsfSync {
   std::atomic<uint16_t> gdavg_pairs_pub_{0};
   int64_t phase_tx_last_us_{0};
   std::atomic<int32_t> render_phase_delta_plot_us_{INT32_MIN};
+  /// Last group delta and when it was computed, NEVER invalidated by age -- the freshness decision
+  /// belongs to the consumer (see render_group_delta_held_us). render_group_delta_us_ keeps its own
+  /// GROUP_DELTA_STALE_US invalidation for everything that steers on the value.
+  std::atomic<int32_t> group_delta_held_us_{INT32_MIN};
+  std::atomic<int64_t> group_delta_held_at_us_{0};
   /// WS2.0 sweep knob (R3.5/R12.2): the phase-TX period in us, default PHASE_TX_INTERVAL_US.
   /// A ratio at ONE rate cannot separate the two loss models -- p=0.02 per-packet and a ~1 pkt/s
   /// cap both explain the measured ~2 % delivery at 50 Hz -- and they differ only in how delivery

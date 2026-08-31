@@ -513,6 +513,12 @@ static constexpr float DL_TI_BOOT_S = 20.0f;
 // was caught mid-swing by a hold: measured +114 against a +57 crystal, board then ran 50 ppm fast
 // and the hold kept it there). Snap it to the average; the fast path owns the position anyway.
 static constexpr float DL_INTEGRAL_SNAP_PPM = 20.0f;
+// How long the delay loop's BOOST may keep using a group delta past its GROUP_DELTA_STALE_US (10 s)
+// freshness gate, as a magnitude bound only. 30 s covers the bursty dropouts measured at ~2.7 % of
+// decisions while staying well inside the 60-120 s correlation time of the wander it is bounding --
+// a delta older than that is not evidence about the present error. Nothing that STEERS on the
+// delta's value may use the held copy; see render_group_delta_held_us().
+static constexpr int64_t BOOST_GD_HOLD_US = 30000000;
 // Align bias is persisted only once it has moved this far from the stored value: the bias steps by
 // at most align_step_us per 10 s cycle, so a 5 us deadband keeps a settled board from writing NVS
 // on ordinary dither while still catching the minutes-long walks that are worth restoring.
@@ -4619,8 +4625,28 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // group delta (|gd| is the same number on both boards, so the schedule stays symmetric): boost on
   // min(|e|, |gd|*n/(n-1)) -- the gap to the others -- so common wander runs at tracking gain on
   // both boards while a genuinely differential residual (the post-window tails, where gd agreed
-  // with e) keeps the fast decay. gd unknown (boot, peers in transient) falls back to |e|:
-  // recovery needs the boost and a lone board has no pair to disturb.
+  // with e) keeps the fast decay.
+  //
+  // GD UNKNOWN IS NOT THE SAME AS BEING ALONE (fixed 2026-08-31, measured). The fallback used to be
+  // "gd unknown -> boost on |e|", justified as "recovery needs the boost and a lone board has no
+  // pair to disturb". But it was taken whenever gd == INT32_MIN REGARDLESS OF n_cons, so a board
+  // with a perfectly healthy pair that merely lost gd for one decision got full boost on a COMMON
+  // error -- which is precisely the differential motion the whole paragraph above exists to
+  // prevent, arriving through the one branch that skips it.
+  //
+  // MEASURED, 09:58:57. A common-mode step took both boards (A e +224 -> +322, B +84 -> +170). A's
+  // gd was unknown for that decision (6 gd=unknown in the window against B's 0), so A boosted on
+  // |e|: boost 12.5, kp 0.104, trim +57.10 -> +88.31 ppm in ONE block. B's gd was valid and clamped
+  // it to tracking gain, kp 0.008. The ~6 ppm differential over ~20 s put ~120 us on the wire and
+  // the pair then spent 40 s ramping back with an overshoot. gd goes unknown on ~2.7 % of decisions
+  // on BOTH boards and it is BURSTY, so this fires whenever a burst lands on one board of the pair
+  // during common wander -- which is most of the time, since the dropouts are independent.
+  //
+  // So: unknown gd with peers present means NO differential evidence, and the correct response to
+  // no evidence is tracking gain, not maximum gain. Full boost survives only where its rationale
+  // actually holds -- n_cons <= 1, genuinely alone, nothing to disturb. Cost, stated: a real
+  // differential residual recovers at tracking gain while gd is briefly unknown. That is the trade
+  // the old fallback was buying, and it is the wrong side of it at a 2.7 % dropout rate.
   float boost_err = std::abs(e);
   if (this->tsf_sync_ != nullptr) {
     const int32_t gd_boost = this->tsf_sync_->render_group_delta_us();
@@ -4629,6 +4655,37 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
       boost_err = std::min(boost_err,
                            std::abs(static_cast<float>(gd_boost)) * static_cast<float>(n_cons) /
                                static_cast<float>(n_cons - 1));
+    } else if (n_cons > 1) {
+      // PEERS EXIST BUT gd IS PAST ITS 10 s FRESHNESS GATE. Two stages, because the boost needs a
+      // MAGNITUDE BOUND and not a value to steer on -- a delta tens of seconds old still answers
+      // "is this error differential or common", which is the only question asked of it here.
+      //   age <= BOOST_GD_HOLD_US : keep using the held delta as the bound. Cheap and it covers the
+      //                             bursty dropouts (~2.7 % of decisions) that caused the damage.
+      //   older, or never computed: tracking gain. No differential evidence at all, and the correct
+      //                             response to no evidence is not maximum gain.
+      int64_t gd_age = INT64_MAX;
+      const int32_t gd_held = this->tsf_sync_->render_group_delta_held_us(now, &gd_age);
+      if (gd_held != INT32_MIN && gd_age <= BOOST_GD_HOLD_US) {
+        boost_err = std::min(boost_err,
+                             std::abs(static_cast<float>(gd_held)) * static_cast<float>(n_cons) /
+                                 static_cast<float>(n_cons - 1));
+        if (!st.boost_blind) {
+          st.boost_blind = true;
+          ESP_LOGD(TAG, "BOOSTHOLD gd stale %.1f s, bound from held %+" PRId32 " us (err %+.0f) t=%" PRId64,
+                   static_cast<double>(gd_age) / 1e6, gd_held, e, now);
+        }
+      } else {
+        boost_err = 0.0f;  // tracking gain: boost clamps to 1
+        if (!st.boost_blind) {
+          st.boost_blind = true;
+          ESP_LOGD(TAG, "BOOSTBLIND no gd within %.0f s with n=%" PRId32 " peers: tracking gain "
+                        "(err %+.0f us) t=%" PRId64,
+                   static_cast<double>(BOOST_GD_HOLD_US) / 1e6, n_cons, e, now);
+        }
+      }
+    }
+    if (gd_boost != INT32_MIN || n_cons <= 1) {
+      st.boost_blind = false;
     }
   }
   const float boost = std::clamp(boost_err / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));

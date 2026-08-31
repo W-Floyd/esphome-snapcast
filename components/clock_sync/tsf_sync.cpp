@@ -1059,10 +1059,13 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   // MEAN, NOT MEDIAN -- see render_group_delta_us(). vals are already relative to our own phase,
   // so the group average is at robust_mean() and our delta from it is the negation.
   const int64_t d = -static_cast<int64_t>(llround(robust_mean(vals, n, CONSENSUS_PHASE_SCALE_FLOOR_US)));
-  this->render_group_delta_us_.store(
-      static_cast<int32_t>(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, d))),
-      std::memory_order_relaxed);
+  const int32_t d_clamped =
+      static_cast<int32_t>(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, d)));
+  this->render_group_delta_us_.store(d_clamped, std::memory_order_relaxed);
   this->group_delta_at_us_ = local_now_us;
+  // Held copy: same value, never aged out here. See render_group_delta_held_us().
+  this->group_delta_held_us_.store(d_clamped, std::memory_order_relaxed);
+  this->group_delta_held_at_us_.store(local_now_us, std::memory_order_relaxed);
 }
 
 // GROUP-RELATIVE DIAGNOSTICS. Depth, crystal rate and render phase against the MEAN of the peers

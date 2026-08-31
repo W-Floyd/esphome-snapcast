@@ -535,6 +535,10 @@ class SnapcastClient {
     /// Latched by delay_loop_update_: true while |dl_err| is past the out-of-range threshold, i.e.
     /// while a reference step is being absorbed. Cleared on the first in-range block.
     bool dl_oor{false};
+    /// Edge latch for the BOOSTBLIND line: gd unknown while peers exist, so the boost is held at
+    /// tracking gain. Logged once per entry, not per block -- this fires on ~2.7 % of decisions and
+    /// a per-block line would be its own disturbance.
+    bool boost_blind{false};
     // Median of recent sync errors (rejects residual feedback spikes better than a
     // mean); the steering servo acts on this, not the raw per-chunk error. Same design
     // as the esp32 snapclient reference (99/19-sample medians on a sample-accurate age).
