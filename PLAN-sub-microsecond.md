@@ -2500,3 +2500,62 @@ A board power-cycle was proposed to the operator on this basis and withdrawn bef
 out. Cost: an aborted A/B run whose baseline arm was already contaminated by two ms-class events.
 The rule that would have prevented all three is the first one in CLAUDE.md, and each field's
 definition was inside the same function as the line that was quoted.
+
+## WS0 — `pcm_coef` must be gated alongside `rival` (2026-08-31 09:1x)
+
+Raised by a "flutter storm" the operator saw: wire excursions railing to ~850 us, every couple of
+minutes. Chased to an answer that retracts an intermediate finding of my own.
+
+**THE GATE.** `rival <= 0.5` is NOT sufficient. During the events below the analyser's correlator
+locks 35-36 whole frames away and `offset_ns` reports it; `rival` stays at **0.03-0.07** on many of
+those rows (it does not catch this) while **`pcm_coef` falls to 0.46-0.95** against 0.999-1.000 on
+every clean row. The tell was arithmetic: the excursion magnitudes were exactly 794 and 816 us,
+i.e. 35 x 22.68 and 36 x 22.68 us, and the SMOOTH part of the trace (offset with the frame jump
+removed) walked +11 -> +19 -> 0 us continuously THROUGH the event.
+
+```
+  event      rival<=0.5 only   + pcm_coef>=0.99    initial board mismatch
+  09:04:00        -854.7 us          -72.9 us              91 us
+  09:05:39        -812.7             -48.8                 73
+  09:06:43       +3295.0            -196.9  (sign flips)  100
+  09:10:27       -1006.7            -176.2                956
+```
+
+Only **3.36 %** of rows fall below `pcm_coef 0.99`, so the gate is nearly free. Every bench tool
+that gates on rival alone should add it (`structure-function.py`, `dod-grade.py`, `sf-d.py`,
+`wire-window.py`, `align-kick-fold.py`).
+
+CHECKED, and clean: the overnight DoD window is **unaffected** -- median block-p2p 12.51 us and
+worst 41.12 us with and without the coef gate, zero rows dropped. The mislocks are confined to
+event periods, so the session's baselines stand.
+
+**RETRACTED: the "recovery amplifies the differential 9-33x" finding.** With the coef gate the wire
+differential is 49-197 us against initial board mismatches of 73-956 us -- a ratio of 0.2-2.0x.
+There is NO amplification; the servo handles these events well. The 9-33x was the mislock magnitude
+divided by a real number, which is how a plausible mechanism gets built on a contaminated field.
+
+**Also retracted, same investigation**: a precursor hunt over log lines (`TSF sample failed`,
+`Offset ramp`, `Consensus over`, `RPUSH`) reported 20-60 % co-occurrence before OOR onsets. Against
+the BASE RATE of those lines the lifts are 0.0-1.6x on n=5 runs per board, and A and B contradict
+each other on both leaders. No precursor is established; the percentages should never have been
+quoted without the base rate.
+
+### What the events actually are
+
+Real, board-side, and long-standing -- the evidence is independent of the analyser:
+
+* both boards' firmware report `err` stepping ~9.4 ms, **simultaneous to 0.13 s**, magnitudes
+  matching to **~1 %** (9349/9440, 11127/11200, 5248/5148 us);
+* `SHADOW` shows `err_tag` AND `err_live` agreeing through it -- two independent on-device signals;
+* `FRAMEINV` (new this build) counted **d=103 converged frame ops on EACH board**, ~2.3 ms of audio
+  moved by frame operations while `conv=1`. WS3.1's invariant does not merely bend, it breaks on
+  every one of these -- and there was no way to count that before the line existed.
+
+Rate, from 24 h of `a.log`: **8-25 runs/hour** through the day, falling to **2-5/hour between
+04:00 and 07:00**. A ~9.4 ms common-mode displacement arriving 10x more often when the house is
+awake is network/server delivery, not the boards -- R8.1's "server hole", out of the servo's scope
+except that the servo's recovery is what gets measured.
+
+**ACTIONABLE**: the DoD hunt has a target window. The clean 45-min span that produced the first
+real DoD grading came out of exactly that 04:00-07:00 trough. Overnight is not a hopeful guess; it
+is where the event rate is 10x lower.

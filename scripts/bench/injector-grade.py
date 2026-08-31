@@ -13,8 +13,45 @@ Reads /tmp/injector-ab.json (arm windows) and test.csv, and prints per arm:
 
 Every number carries n and the arm's row rate (R10.1). Blocks failing the rival gate are dropped
 before anything is computed, matching wire-window.py's population.
+
+POST-FLASH (2026-08-31 09:00, build with FRAMEINV/RPHASE/RSTEP-split): two additions.
+
+  frame ops   FRAMEINV's converged-op counter, read from the logs per arm. WS3.1's invariant is
+              "zero frame operations while converged", and one frame is 22.7 us -- 2.4x the whole
+              differential sd on a quiet window. If ops accrue inside an arm, that arm's wire
+              numbers are not measuring the injectors under test and must be read with it stated.
+  rgate       the GATED phase delta the servo acts on, now its own column. Reported beside the
+              wire so "does the on-device differential track the wire" is answerable per arm.
 """
-import csv, json, statistics as st, sys, collections, bisect
+import csv, json, re, statistics as st, subprocess, sys, collections, bisect
+
+FRAMEINV_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?FRAMEINV ops=(\d+) d=(\d+) frames=(\d+) conv=(\d) thr=(-?\d+)")
+
+
+def frame_ops(log, t0, t1):
+    """(ops_delta, frames_delta, n_lines) over the window: FRAMEINV counters are cumulative."""
+    import datetime as dt
+    day = dt.datetime.fromtimestamp(t0).replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    raw = subprocess.run(["tail", "-c", "40000000", log], capture_output=True).stdout
+    first = last = None
+    n = 0
+    for line in raw.split(b"\n"):
+        m = FRAMEINV_RE.match(line.decode("utf-8", "replace"))
+        if not m:
+            continue
+        h, mi, sec, frac, ops, _d, frames, _conv, _thr = m.groups()
+        ts = day + int(h) * 3600 + int(mi) * 60 + int(sec) + int(frac) / 10 ** len(frac)
+        if not (t0 <= ts <= t1):
+            continue
+        v = (int(ops), int(frames))
+        if first is None:
+            first = v
+        last = v
+        n += 1
+    if first is None:
+        return None
+    return (last[0] - first[0], last[1] - first[1], n)
 
 RIVAL = 0.5
 
@@ -47,7 +84,8 @@ def rows_in(path, t0, t1):
                     return float(v) if v not in (None, "") else None
                 except ValueError:
                     return None
-            out.append((t, o, n("trim_a_ppm"), n("trim_b_ppm"), n("int_a_ppm"), n("int_b_ppm")))
+            out.append((t, o, n("trim_a_ppm"), n("trim_b_ppm"), n("int_a_ppm"), n("int_b_ppm"),
+                        n("rgate_a_us"), n("rgate_b_us")))
     return out
 
 
@@ -73,7 +111,7 @@ def sf(ts, xs, tau, tol=0.1):
 def main():
     arms = json.load(open(sys.argv[1] if len(sys.argv) > 1 else "/tmp/injector-ab.json"))
     print(f"{'arm':<10} {'n':>6} {'r/s':>5} | {'sdP_A':>6} {'sdP_B':>6} {'sd(trimdiff)':>12} "
-          f"{'sd(slope)':>9} | {'SF1':>5} {'SF2':>5} {'SF5':>5} {'SF10':>5} | {'ac10s':>6}")
+          f"{'sd(slope)':>9} | {'SF1':>5} {'SF2':>5} {'SF5':>5} {'SF10':>5} | {'ops':>9} {'rgate_sd':>8}")
     for a in arms:
         d = rows_in("test.csv", a["t0"], a["t1"])
         if len(d) < 200:
@@ -98,6 +136,18 @@ def main():
             m = st.mean(ser); v = [x - m for x in ser]; den = sum(x * x for x in v)
             if den > 0:
                 ac10 = sum(v[i] * v[i + 10] for i in range(len(v) - 10)) / den
+        # WS3.1: frame ops taken while converged, summed over both boards for this arm.
+        oa = frame_ops("a.log", a["t0"], a["t1"])
+        ob = frame_ops("b.log", a["t0"], a["t1"])
+        if oa is None and ob is None:
+            opstr = "no-line"
+        else:
+            ops = (oa[0] if oa else 0) + (ob[0] if ob else 0)
+            frm = (oa[1] if oa else 0) + (ob[1] if ob else 0)
+            opstr = f"{ops}/{frm}f"
+        # rgate: the gated on-device differential the servo acts on (blank pre-flash)
+        rg = [x[6] - x[7] for x in d if len(x) > 7 and x[6] is not None and x[7] is not None]
+        rgstr = f"{st.stdev(rg):.2f}" if len(rg) > 8 else "  --  "
         f = lambda x: f"{x:.3f}" if x is not None else "  -- "
         print(f"{a['arm']:<10} {len(d):>6} {len(d)/span:>5.1f} | "
               f"{st.stdev(pa) if len(pa)>8 else float('nan'):>6.3f} "
@@ -105,9 +155,14 @@ def main():
               f"{st.stdev(td) if len(td)>8 else float('nan'):>12.3f} "
               f"{st.stdev(sl) if len(sl)>8 else float('nan'):>9.3f} | "
               f"{f(sf(ts,xs,1)):>5} {f(sf(ts,xs,2)):>5} {f(sf(ts,xs,5)):>5} {f(sf(ts,xs,10)):>5} | "
-              f"{ac10:>+6.3f}")
+              f"{opstr:>9} {rgstr:>8}")
     print("\n  sdP_* = sd(trim - int) = commanded rate noise per board (P-term + align kick), ppm")
-    print("  ac10s = autocorrelation of the 1 s wire series at 10 s lag -- the stairstep test")
+    print("  ops   = FRAMEINV converged frame ops / frames moved, both boards, DELTA over the arm.")
+    print("          Non-zero means WS3.1's invariant broke in that arm and its wire numbers are")
+    print("          not purely the injectors under test -- one frame is 22.7 us.")
+    print("  rgate_sd = sd of the GATED on-device differential (rgate_b - rgate_a), ppm-free us.")
+    print("  Stairstep: use align-kick-fold.py, NOT an autocorrelation at 10 s -- ordinary wander")
+    print("          already sits at +0.87 there and smears the step (measured 2026-08-31).")
     print("  READ: arm1 (align off) cuts sdP hard => kick dominant; arm2 (tau 480) cuts it => P-term")
 
 

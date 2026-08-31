@@ -915,6 +915,21 @@ TRIM_NONE_RE = re.compile(
 PHASE_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Render phase .*?delta ([+-]?\d+) us")
 # "vs group" is the current wording, "vs leader" the retired one; both are accepted, see CRYSTAL_RE.
+# RPHASE (firmware 2026-08-31, from the PLAYER task at DEBUG): carries BOTH phase deltas because
+# they are different quantities -- dgate is pairing-window gated and is what the servo acts on;
+# dplot is the ungated quantity the VERBOSE snap_net "Render phase" line prints, which can
+# difference phases sampled seconds apart and report drift as skew. PHASE_RE keeps its historical
+# meaning (the ungated one) so `phase_a/b_us` stays comparable across the change; dgate gets NEW
+# columns rather than being folded into an existing name (R7.3: un-holding phase_* already changed
+# that column's population once, and reusing a name for a different quantity is the same defect).
+# Sentinels arrive as the literal `unknown` and must stay unparsed, never coerced to a number.
+# dplot is OPTIONAL in the pattern: never require a trailing field (CLAUDE.md). SYNC_RE once
+# required `trim ... ppm` and a truncated line failed to match and was dropped WHOLE, taking that
+# report's other fields with it. The line is ~119 bytes so truncation is unlikely here -- but
+# "unlikely" is what the 256-byte ceiling was assumed to be too, and a cheap optional group means
+# a clipped line still yields dgate instead of nothing.
+RPHASE_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?RPHASE mine=(\S+) dgate=(\S+)(?:\s+dplot=(\S+))?")
 DEPTH_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Playout depth ([+-]?\d+) us vs (?:group|leader)")
 # Comparable to the ppm this script measures per capture from the LRC edges.
@@ -1168,6 +1183,22 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         # to the host prefix so an older log still plots.
         # The value's capture group is carried per pattern rather than assumed to be 5: the
         # Crystal line reports mine, the group AND the delta, and the delta is the useful one.
+        rp = RPHASE_RE.match(line)
+        if rp:
+            tod_r = (int(rp.group(1)) * 3600 + int(rp.group(2)) * 60
+                     + int(rp.group(3)) + int(rp.group(4)) / (10 ** len(rp.group(4))))
+            dev_r = DEV_T_RE.search(line)
+            for name, gi in (("rphase_gate_us", 6), ("rphase_plot_us", 7)):
+                tok = rp.group(gi)
+                if tok is None or tok == "unknown":
+                    continue          # sentinel: absent, NOT zero (the INT64_MIN rule)
+                try:
+                    val = float(tok)
+                except ValueError:
+                    continue
+                extras.setdefault(name, []).append(
+                    (tod_r, val, int(dev_r.group(1)) if dev_r else None))
+            continue
         for key, rx, grp in (("phase_us", PHASE_RE, 5),
                              ("depth_us", DEPTH_RE, 5),
                              ("ramp_ppm", RAMP_RE, 5),
@@ -2600,7 +2631,8 @@ DISAMBIG_MARGIN = 0.50
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
           "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
           "crystal_a_ppm,crystal_b_ppm,dl_err_a_us,dl_err_b_us,dl_diff_us,"
-          "trim_a_ppm,trim_b_ppm,int_a_ppm,int_b_ppm,reason")
+          "trim_a_ppm,trim_b_ppm,int_a_ppm,int_b_ppm,"
+          "rgate_a_us,rgate_b_us,reason")
 # trim_*/int_* (2026-08-30): the DAC trim the delay loop commands and its integral, nearest-in-time
 # like dl_err. Appended BEFORE reason only; every pre-existing column keeps its index. These are
 # the columns that let corr(fs_diff, trim_diff) decide whether the differential rate wander is
@@ -4575,11 +4607,17 @@ def main():
                           nearest_value(FIRMWARE.get(("b", "dl_trim_ppm"), []), elapsed),
                           nearest_value(FIRMWARE.get(("a", "dl_int_ppm"), []), elapsed),
                           nearest_value(FIRMWARE.get(("b", "dl_int_ppm"), []), elapsed)))
+            # RPHASE dgate: the GATED delta, what align/the servo act on. Nearest-in-time at
+            # PHASE_MATCH_S like phase_*, and blank rather than held when absent.
+            rgcols = ",".join(
+                "" if v is None else f"{v:.1f}"
+                for v in (nearest_value(FIRMWARE.get(("a", "rphase_gate_us"), []), elapsed, tol=PHASE_MATCH_S),
+                          nearest_value(FIRMWARE.get(("b", "rphase_gate_us"), []), elapsed, tol=PHASE_MATCH_S)))
             log.write(f"{elapsed:.3f},{wall:.3f},{off:.1f},{ppm:.4f},{coef:.4f},"
                       f"{info.get('frame_lag',0)},{info.get('rival',float('nan')):.3f},"
                       f"{info.get('scatter_ns',float('nan')):.1f},"
                       f"{fs_a:.4f},{fs_b:.4f},{phase_cols},{','.join(held)},{dlcols},"
-                      f"{trimcols},{reason}\n")
+                      f"{trimcols},{rgcols},{reason}\n")
 
             note = reason
             if info.get("lag_steps"):
