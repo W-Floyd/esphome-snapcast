@@ -6,9 +6,10 @@ a frame operation (22.7 µs), and differential rate drift between corrections. "
 QUIET WINDOWS (rival-clean, no server hole inside) until the holes are gone — one hole is
 milliseconds and belongs to the server, not the servo.
 
-Current verified baseline (build 88, 21:39–21:45): wire median −1.5 µs, MAD 5.1, p2p 54.5 µs;
-kp median 0.008 in steady state (boost now scales on the differential portion); split escape
-verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
+PROVISIONAL baseline (R1.8/R2.3: window opens 2–3 min post-flash — disturbed regime; to be re-taken
+on one build, ≥30 min, ≥15 min post-flash): build 88, 21:39–21:45, wire median −1.5 µs, MAD 5.1,
+p2p 54.5 µs; kp median 0.008 in steady state (boost scales on the differential portion); split
+escape verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
 
 ## WS0 — The instrument first (no firmware)
 
@@ -16,9 +17,10 @@ verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
   test.csv). Decomposes today's ±3–8 µs into rate ripple vs measurement noise, and is the gate
   metric every later stage is judged by.
 
-* Definition of done for the whole plan (n-normalized, R1.9): |mean| <= 0.2 us over a 30-min quiet
-  window AND p2p <= 1 us over EVERY 1000 consecutive rival-clean samples within it (p0.5/p99.5
-  reported alongside), twice, on different days.
+* Definition of done for the whole plan (R1.9 + R2.4, disjoint-block form so the gate statistic is
+  the same statistic WS0 measured): over a 30-min quiet window, |mean| ≤ 0.2 µs, and across its six
+  disjoint 1000-sample rival-clean blocks: median block-p2p ≤ 1 µs AND worst block-p2p ≤ 2 µs
+  (p0.5/p99.5 reported alongside). Twice, on different days.
 
 ## WS1 — Render-tag truth (BLOCKER for everything downstream)
 
@@ -27,60 +29,100 @@ pairwise beacon phases ≤ 0.2 ms); standing blind offsets (specimen scratchpad 
 on-device signal shares the deadline+tag stamping, so none can see what the wire sees.
 
 1. **Decisive experiment before any fix** (bench, one evening): inject a known one-board deadline
-   step (`servo_param align_bias_us`, the build-71 hook) at several sizes (100/300/500 µs) in a
-   quiet hour. The wire must move 1:1 (measured 0.8–1.0 already); record what FRACTION the pairwise
-   phases and gd report. Today's data says ~12–20 %. This quantifies the lie and gives the
-   regression test for the fix.
+   step (`servo_param align_bias_us`, added in `3dd83ca` 2026-08-30) at several sizes
+   (100/300/500 µs) in a quiet hour. PRECONDITIONS (R1.6): freeze align first (`align_apply 0`);
+   never disable align via `align_max_us` after setting the bias (it zeroes the bias); add a range
+   check to `align_bias_us` (the only unvalidated servo_param) before relying on it. Record per
+   step whether the boost's `gd == INT32_MIN` fallback fired (R1.5), or a boost transient reads as
+   plant gain. The wire must move 1:1 (measured 0.8–1.0); record what FRACTION the pairwise phases
+   and gd report — today's data says ~12–20 %. This quantifies the lie and is the fix's regression
+   test.
 2. **Provenance trace**: `adjusted_ts` originates in the speaker fork (media_source →
    `notify_audio_played_tagged` → hub → client). Read where the fork computes it — the suspect
    class is a MODELED term (feedback pivot EWMA, scheduled-time fallback, gap blanking) standing in
-   for the measured DMA-completion instant. I2SDBG already carries `dma_real` — the hardware truth
-   exists on-device.
-3. **Fix**: stamp tags from the DMA-completion counter path, not the model; the model may smooth
-   but must not bias (same rule as the freshness gate: prefer a signal that reports its own
-   validity).
+   for a measured completion instant. Cite fork file:line for whatever it uses.
+3. **Fix — re-costed per R2.2**: `dma_real` is DMA buffer occupancy quantized to whole 10 ms
+   buffers (2205 on 300 938 of 309 440 lines; every value a multiple of 441) — there is NO existing
+   completion-instant signal. Stamping tags honestly most likely means adding a timestamp capture
+   in the fork's I2S TX-done callback/ISR: fork instrumentation on the blocker's critical path,
+   costed as such. The model may smooth but must not bias.
 4. **Gate**: the step test reads ≥ 90 % in pairwise phases; a standing offset can no longer form
-   invisibly (the 21:13-class episode must show gd ≈ wire).
+   invisibly (a 21:13-class episode must show gd ≈ wire); AND the build-88 sawtooth check re-runs
+   clean under honest gd (R1.5 — boost_err grows where the clamp binds today).
 
 ## WS2 — µs-class differential reference (needs WS1)
 
-1. Batched phase TX: ~10 samples per packet, sent from the NETWORK task at service cadence (5 Hz ×
-   10 = the same ~50 pairs/s; pairing is by sample instant, so batching loses nothing). This
-   replaces the reverted 50 Hz unicast loop, which physically displaced audio 1.5 ms (mechanism
-   still owed — separate small investigation, it may inform WS1).
-2. GDAVG windows lengthened 1 s → 10–30 s for the fine regime (≈ 0.3–1 µs noise if pair noise is
-   ~9 µs and honest after WS1).
-3. **Gate**: GDAVG(30 s) tracks the wire within ±0.5 µs over a quiet hour.
+0. **Delivery measurement first (R2.1)**: multicast currently delivers ~2 % of what is sent (GDAVG
+   n = 1.1/s against 50 pkt/s; 16/s existed only in the build-85 unicast era). Add sent-vs-received
+   counters (one log line each side, one minute of data) to decide the loss model: a PACKET-RATE
+   limit (AP multicast throttling, socket queue) makes batching win ~10×; a per-packet probability
+   makes batching worth exactly nothing (50p either way). No WS2 build work before this number.
+1. **WS2's actual blocker (R2.1.3)**: the only regime that ever produced a usable reference
+   (n≈16/s) is the one that displaced audio 1.5 ms. The task is "recover build 85's delivery
+   without its damage" — the unicast displacement mechanism (per-destination blocking / ARP path /
+   3× volume from the speaker-callback thread) is WS2's blocker, not a side note. The batched
+   design sends from the NETWORK task at service cadence (append-only wire-format change: count +
+   array, no version bump, short-packet defaults exercised; tolerate `stream_active_` gating or
+   flush a last batch on gap entry) — this replaces the still-live 20 ms multicast per-sample TX.
+2. GDAVG becomes a sliding EWMA at the current 1 s publish cadence (R1.4 — a 10–30 s box-car adds
+   ~15 s of group delay; the EWMA gets the noise without the lag; phase margin vs the τ=120 s fine
+   loop stated when the constant is chosen). Noise floor is delivery-bound: at 1.1 pairs/s a 30 s
+   equivalent holds n≈33 → ≥1.6 µs even by the independence bound (a floor, not an estimate);
+   WS2.3's gate is unreachable until WS2.0/2.1 restore ≥ ~15 pairs/s.
+3. **Gate**: GDAVG (EWMA, ~30 s equivalent) tracks the wire within ±0.5 µs over a quiet hour.
 4. Then: align consumes GDAVG instead of the single-pair delta; recentre cap stays 2 µs/cycle.
+   PRECONDITION (R1.4): staleness invalidation for the averaged delta (mirror of
+   GROUP_DELTA_STALE_US) — today the last average stands forever when comparable packets stop.
 
 ## WS3 — Pure-rate steady state (parallel with WS2)
 
-1. **Invariant, enforced**: zero frame operations while converged — a counter/log line that makes
-   any steer trim or splice in a quiet window a reportable defect (one frame = 22.7 µs = 20× the
-   budget). Quiet hours already read corrected −0/+0; make it a guarantee, not a habit.
-2. **Crystal feed-forward tightening**: the beaconed crystal-difference correction leaves 0.17 ppm
-   over 100 s (measured); budget needs ≤ ~0.05 ppm between fine corrections. Longer crystal
-   averaging + fine-loop cadence trade; measure, don't assume.
-3. **Divider dither ripple**: measure the rate-lock's phase ripple on the WS0 histogram at 0.1 ppm
-   scale. If the actuator itself ripples > ~0.5 µs p2p, this is the hardware floor and the goal
-   needs `set_rate_adjustment` upstream work (TODO already tracks it).
-4. **Gate**: quiet-window p2p ≤ 2 µs with rate-only control, before chasing the last factor of 2.
+1. **Invariant, instrumented (R1.10b)**: zero frame operations while converged — one frame =
+   22.7 µs = 20× the budget. Structurally near-true already (fast splice threshold-gated, window
+   steps clamp to zero); the deliverable is the COUNTER and its log line, which must also log the
+   splice threshold in force (`splice_us` is a runtime override that can defeat the invariant).
+   Instrumentation, not control work; can start today.
+2. **Crystal feed-forward — BUILD, then tune (R1.1)**: no shipped feed-forward exists
+   (`crystal_delta_ppm`'s only consumer is a log line; the 505→17 µs/100 s figure was the
+   analyser's offline subtraction). Target: crystal WANDER between fine corrections (the integral
+   already owns the constant part; re-measure the 0.17 ppm residual as a wander rate before any
+   code). Step 1 (R2.5): confirm the ~14 ppm TSF-crystal-vs-integral offset ("int +56 vs crystal
+   +42, measured all day") is common-mode across boards — it is 280× the 0.05 ppm target, and
+   `crystal_delta_ppm` is a difference of per-board quantities, so a per-board component survives
+   into the differential. If it is not common-mode, this workstream inherits a bias larger than the
+   error it corrects. Note (R2.5): the "seed as reference" structure RESPONSE 1 cited does not
+   exist in the tree — the cold-start seed is one-shot; a residual-only integrator would be NEW
+   structure and must be designed as such. Firmware workstream; can start before WS1.
+3. **Actuator sanity (R1.2)**: the sigma-delta bound is analytic (~10 ns = one step × one tick);
+   the only way it breaks is the tick cadence not being ~100 Hz — confirm cadence and burstiness
+   from the fork's tick call site. The analyser (26 ns floor) cannot see 10 ns; do not measure what
+   the arithmetic already answers. `set_rate_adjustment` is off the critical path.
+4. **Gate**: quiet-window p2p ≤ 2 µs (disjoint-block form) with rate-only control, before chasing
+   the last factor of 2.
 
 ## WS4 — Event hygiene (protects the metric; mostly done or user-side)
 
 * Server `buffer 2000 → 4000` ms (user): tonight's 1–6 s late bursts are the dominant disturbance.
-* Boot ring: A/B `resync_gain 0.6` (queued; |1 − 0.6·1.75| ≈ 0.05 → one round instead of 45 s).
+* Boot ring: A/B `resync_gain 0.6 vs running 1.0` (header default 1.0f; the "60 %" comment is
+  historical). The 21:37 episode's steps were `src=tag` (RSTEP 21:37:14.852: err=+7075 src=tag),
+  so `resync_gain` IS in the path (rebuts R2.6.2). r is NOT fixed at 1.79 (R2.6.1: two points
+  across a boot drain are not a step response, and build 51 measured 1:1 on clean landings) — log
+  r per episode; 0.6 is chosen for robustness (monotone convergence for any r < 2/0.6 ≈ 3.3, near-
+  deadbeat at the observed boot r), not as deadbeat tuning to n=1 evidence.
 * Split escape (build 87, verified) bounds every tug variant; the padding-dispenser interaction and
   the accounting-split formation stay on the root-cause list but no longer gate the goal.
 
 ## Order and honesty
 
-WS0 → WS1 (blocker) → WS2 + WS3 in parallel → gates in sequence 2 µs → 1 µs. Mean 0 falls out of
-WS1+WS2 (bias is already ±2 µs). The residual risk after all gates: crystal wander between
-corrections and dither ripple — physics of this hardware; WS3.3 measures whether the last factor
-of 2 is reachable without upstream `set_rate_adjustment`.
+Start today, before the WS1 blocker resolves: WS0 baseline re-take, WS2.0 delivery counters,
+WS3.1 invariant counter, WS3.2 wander measurement + common-mode check (all instrumentation or
+measurement). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
+WS3.2 build → gates in sequence 2 µs → 1 µs (disjoint-block statistic throughout). Mean 0 falls
+out of WS1+WS2 (bias is already ±2 µs). Residual risk after all gates: crystal wander between
+corrections and the unresolved 1.5 ms TX-displacement mechanism constraining WS2's delivery —
+physics and one owed mechanism, both measured before they are believed.
 
-## WS0 result (2026-08-30 21:17–21:45, build 87/88, hole-free 5-min windows)
+## WS0 result (2026-08-30 21:17–21:45, build 87/88, hole-free 5-min windows) — MISCAPTIONED, see R1.8
+(spans two firmware eras and opens 2–3 min post-flash; kept as observation; re-take pending)
 
 Best window (21:41): n=988, mean −4.1, med −4.6, MAD **1.68 µs**, p2p 24.4 µs [−15.2..+9.2].
 Typical: MAD 3–9 µs, p2p 27–71 µs, p1/p99 at ±15–36 µs; window means wander ±4 µs.
@@ -327,3 +369,207 @@ states "0.6 vs running 1.0"; r≈1.75 provenance: measured 21:37:14–21:37:21 b
 line, logging the splice threshold in force since `splice_us` can defeat the invariant at runtime).
 (c) Sequencing corrected: WS3.1 (instrumentation) and WS3.2 (feed-forward firmware) can start
 before WS1 resolves; WS2 remains gated on WS1.
+
+---
+
+## REVIEW 2 (2026-08-30, code- and log-checked)
+
+Dispositions in RESPONSE 1 read fairly. One concession from me (R2.7). Two new findings that are
+larger than anything in REVIEW 1 — R2.1 in particular changes what WS2 is.
+
+### R2.1 — GDAVG is getting ~1 pair per second, not ~50. WS2.2 and WS2.3 are unreachable as written
+
+Measured from the live `a.log` tail (200 MB, byte-anchored, 20:26–22:18, 1749 GDAVG lines):
+
+| span | mean `n` per 1 s roll |
+|---|---|
+| 20:26–20:37 (multicast only) | **1.1** |
+| 20:38–20:55 (build 85, unicast loop live) | **14–18** |
+| 20:56–22:18 (build 86/87/88, multicast only) | **1.0–1.2** |
+
+`n=1` in 1361 of 1749 reports; `n ≤ 2` in 84 %. The transmitter sends every 20 ms
+(`PHASE_TX_INTERVAL_US`), so **multicast is delivering ~2 % of what it sends**. This is not a
+pairing-window artefact: `OWN_PHASE_RING = 32` at ~94 Hz covers ~340 ms against a 60 ms match
+window, and the same receive path reached 16 pairs/s under unicast. It is delivery.
+
+Three consequences, in order of severity:
+
+1. **WS2.2's noise figure is off by ~5×.** "≈ 0.3–1 µs noise if pair noise is ~9 µs" needs
+   n = 81–900 per window, i.e. 3–30 pairs/s. At 1.1 pairs/s a 30 s window holds n ≈ 33 → 9/√33 ≈
+   **1.6 µs**, and that is the independence bound, which CLAUDE.md says to treat as a floor, not an
+   estimate. **WS2.3's gate (±0.5 µs) cannot be met at the current delivery rate**, whatever the
+   window length. Lengthening to 60 s buys √2 and costs 30 s of lag.
+2. **Batching, as specified, delivers exactly nothing.** 50 pkt/s × 1 sample at delivery p gives
+   50p samples/s; 5 pkt/s × 10 samples at the same p gives 50p samples/s. Identical. Batching only
+   wins if the loss is a **packet-rate limit** (AP multicast throttling, receiver socket queue) and
+   not a per-packet probability — and then it wins ~10×. **Measure which before building it**: a
+   sent-vs-received counter for one minute settles it, costs one log line, and decides whether WS2.1
+   is worth doing at all.
+3. **The only regime that has ever produced a usable differential reference is the one that broke
+   playout.** n = 16/s existed solely during 20:38–20:55, the build-85 unicast era that displaced
+   audio 1.5 ms. WS2 is therefore not "average the reference harder" — it is "recover build 85's
+   sample rate without build 85's damage", and the 1.5 ms mechanism moves from "separate small
+   investigation" to **WS2's actual blocker**. The plan should say that.
+
+### R2.2 — `dma_real` is a constant buffer depth, not a completion instant
+
+RESPONSE 1 is right that `I2SDBG` exists in the running firmware; that was never the question.
+The question was whether it carries the hardware truth WS1.3 plans to stamp tags from. From the same
+log:
+
+```
+I2SDBG queued=88730 dma_real=2205 (50000 us) written=107840424 completed=107838219 inflight=2205
+```
+
+`dma_real = 2205` on **300 938 of 309 440** lines on board A, and every other observed value is a
+multiple of 441 (441 frames = 10 ms at 44.1 kHz): 0, 441, 882, 1323, 1764, 2205. That is a **DMA
+buffer occupancy in whole 10 ms buffers**, pinned at the steady-state five-buffer depth. `completed`
+is then just `written − 2205`, a constant offset.
+
+So I2SDBG provides no DMA-completion *instant*, and anything derived from it is quantized to 10 ms —
+four orders of magnitude coarser than the budget. `adjusted_ts` is plainly finer than that, so it is
+computed some other way in the fork, which is consistent with WS1.2's "modeled term" suspicion but
+removes the escape route WS1.3 was built on.
+
+**WS1.3 should be re-costed now, not after the provenance trace**: stamping from a real completion
+instant most likely means adding a timestamp capture in the fork's I2S TX-done callback/ISR — new
+instrumentation in the fork, not a switch from one existing signal to another. That is a materially
+bigger job and it sits on the critical path of the plan's declared blocker.
+
+### R2.3 — The plan of record still says the things RESPONSE 1 retracted
+
+`79247ce` changed **6 lines, all in WS0**. Everything else in RESPONSE 1 — "wording fixed",
+"restated", "preconditions added", "rebudgeted", "sequencing corrected" — is a disposition, not an
+edit. As the file stands:
+
+* WS1.1 still says "the build-71 hook" (it is `3dd83ca`, today) and still omits `align_apply 0`.
+* WS2.1 still says batching "replaces the reverted 50 Hz unicast loop".
+* WS3.2 still says "tightening" a correction that does not exist.
+* WS3.3 still says a > 0.5 µs dither ripple would make the goal need `set_rate_adjustment`.
+* "Order and honesty" still names dither ripple as residual risk and still reads as fully blocked
+  on WS1.
+
+A reader arriving at this file in a week reads WS1–WS4 and the summary; they do not read the review
+correspondence. Right now those two halves contradict each other, and the wrong half is the one
+formatted as the plan. Fold the accepted dispositions into the body.
+
+### R2.4 — The n-normalization does not normalize
+
+The new definition of done is p2p ≤ 1 µs over **every** 1000 consecutive rival-clean samples inside
+a 30-min window. The maximum over all sliding 1000-sample blocks equals the whole-window p2p
+whenever the window's extreme high and extreme low fall within 1000 samples of each other — which,
+at ~3.3 samples/s, means within ~5 minutes. Given the WS0 result already shows ±10–40 µs excursions
+arriving in bursts, that condition will usually hold. So the "n-normalized" gate is, in practice,
+still the 30-minute p2p test.
+
+If the intent is a like-for-like comparison against the 5-minute WS0 evidence, gate on **disjoint**
+blocks with a named statistic — e.g. "median block p2p ≤ 1 µs and worst block ≤ 2 µs over six
+disjoint 1000-sample blocks" — so the number being compared is the same number that was measured
+before. As written, "gap to goal ~25× on p2p" is still comparing a 5-min statistic to a 30-min one.
+
+### R2.5 — The R1.1 dispute cites a precedent that is not in the tree
+
+RESPONSE 1 argues feed-forward and integral need not fight, "the correct structure is the one the
+cold-start seed already uses (feed-forward as the integral's *reference*, integral learns the
+residual)". Read at `snapcast_client.cpp:4578-4589`: it is a **one-shot seed**, guarded by
+`st.dl_cold_start && st.trim_integral_ppm == 0.0f`, that writes `own_crystal_ppm()` into the
+integral once and is never revisited. The integral then owns the whole term. There is no reference
+being maintained and no residual-only integrator anywhere in the tree — the structure being cited as
+precedent would be new.
+
+Worse for WS3.2, the comment two lines above records the hazard directly: the TSF crystal estimate
+"sits ~14 ppm from the trim the DAC actually needs (int +56 vs crystal +42, measured all day)".
+A 14 ppm bias is 280× the 0.05 ppm WS3.2 is aiming at. It only cancels if it is **common-mode across
+boards** — plausible (both read the same AP TSF, both have the same MCLK path) but unverified, and
+`crystal_delta_ppm` is a *difference of two per-board quantities*, so a per-board component survives.
+Add "confirm the ~14 ppm offset is common-mode" as WS3.2's first step; if it is not, the differential
+feed-forward inherits a bias larger than the error it is correcting.
+
+### R2.6 — r ≈ 1.79 contradicts a measurement already in the tree, and may not be the parameter `resync_gain` scales
+
+Two problems with the provenance now cited for WS4's boot-ring A/B:
+
+1. **It contradicts build 51.** `snapcast_client.cpp:3225-3227` records "every step arrives on the
+   wire 1:1 — but ~2 s after it is applied". A plant gain of 1.79 says a step moves the error by
+   1.79×. Both cannot be true. The likely reconciliation is that the 21:37 boot-ring pair
+   (+7075 → −5569 over ~7 s) is not a clean step response at all: at boot the ring is draining, the
+   block average straddles the landing, and the second reading contains the drain as well as the
+   step. Fitting a plant gain to two points across that is exactly the "conclusion that holds because
+   two numbers happen to be close" pattern.
+2. **`resync_gain` may not have been in the path.** At `:3316-3322` the damping applies only when
+   `resync_window && coarse_on_tags`; a **ledger** step in the window takes the full target by
+   design, and the comment says so explicitly. If the +7075 was a ledger step — plausible at boot,
+   where the ledger arithmetic is available — then setting `resync_gain 0.6` changes nothing about
+   that episode and the A/B will read null for a reason unrelated to the hypothesis.
+
+Before the A/B: state whether the episode's steps were `RSTEP` tag or ledger, and log r per episode
+rather than fixing it from n = 1. Deadbeat-by-construction (g = 1/r) is also the least robust choice
+available — stability holds for 0 < g < 2/r ≈ 1.12, so anything in 0.4–0.7 converges monotonically
+and none of it depends on r being 1.79 rather than 1.4 or 2.2.
+
+### R2.7 — CONCEDED: R1.3(2), the speaker-callback thread is exonerated at 50 multicast sends/s
+
+The response's A/B is right and the log supports it: 20:26–20:37 and 20:56–22:18 both run 50
+multicast `sendto`/s from the speaker callback thread and both are wire-clean; only 20:38–20:55,
+which added the unicast roster loop, displaced. My R1.3(2) claimed the thread hypothesis was
+untested — it was tested, by the eras either side. Withdrawn. What remains untested is
+unicast-specific cost (per-destination blocking, ARP/neighbour path, 3× volume), which is what
+WS2.1's revised falsification target now names, and that is correct.
+
+Note this concession sharpens R2.1(3) rather than softening it: the exonerating eras are precisely
+the eras with n ≈ 1.
+
+### R2.8 — Bench note
+
+Reading `a.log` by timestamp misled me again during this review: `tail -c 40MB | grep 21:37` returned
+a window ending 15:08 while the file's true tail was 22:18. CLAUDE.md's rule held — I only got
+straight answers after copying a byte-anchored tail to the scratchpad and working from that. The
+GDAVG numbers above come from that copy; the earlier attempt to locate the 21:37 boot-ring episode
+by timestamp is the reason R2.6 asks the question rather than answering it.
+
+---
+
+## RESPONSE 2 (2026-08-30; all accepted items folded into the plan BODY this cycle, per R2.3)
+
+**R2.1 — ACCEPTED; WS2 restructured.** The n≈1/s multicast delivery matches my own post-86
+observation; the 50p-vs-50p batching-null argument is correct under per-packet loss. WS2 now leads
+with WS2.0 (sent-vs-received counters decide the loss model before any build work), names the
+unicast displacement mechanism as WS2's blocker (not a side note), and corrects the noise floor
+(≥1.6 µs at current delivery — gate unreachable until ≥ ~15 pairs/s is restored). WS2.3's gate kept
+but explicitly delivery-gated.
+
+**R2.2 — ACCEPTED; WS1.3 re-costed in the body.** `dma_real` is buffer occupancy quantized to whole
+10 ms buffers; there is no existing completion-instant signal. WS1.3 is now "add a timestamp
+capture in the fork's I2S TX-done callback/ISR" — fork instrumentation on the blocker's critical
+path. (RESPONSE 1's half-dispute is withdrawn where it mattered: existence in the log said nothing
+about fitness.)
+
+**R2.3 — ACCEPTED and executed.** This cycle edits WS1 (provenance `3dd83ca`, `align_apply 0`
+precondition, `align_max_us` ordering, range check, gd-fallback logging, sawtooth re-check in the
+gate), WS2 (full restructure), WS3 (feed-forward = build; wander target; common-mode check; tick-
+cadence restatement; dither claim gone), WS4 (resync_gain bullet rewritten), Order-and-honesty
+(start-today list; dither ripple removed from residual risk), the baseline caption (PROVISIONAL),
+and the WS0-result caption (MISCAPTIONED flag). The correspondence is now commentary; the body is
+the plan.
+
+**R2.4 — ACCEPTED.** Sliding-1000 max ≡ window p2p whenever the extremes fall within ~5 min of each
+other, which the burst structure makes usual. Gate redefined on six DISJOINT 1000-sample blocks:
+median block-p2p ≤ 1 µs AND worst ≤ 2 µs — the same statistic WS0 measured, made comparable.
+
+**R2.5 — ACCEPTED, including the correction of my own precedent claim.** The cold-start seed is
+one-shot; a residual-only integrator would be new structure, and the body now says so. The ~14 ppm
+int-vs-crystal offset common-mode check is WS3.2 step 1; if per-board, the differential
+feed-forward inherits a bias 280× its target and the design changes.
+
+**R2.6 — PARTIALLY REBUTTED, remainder accepted.** (2) is rebutted by the episode log: the 21:37
+ring steps were `src=tag` (RSTEP 21:37:14.852 err=+7075 src=tag gd=+1069), so `resync_gain` is in
+the path for exactly this episode class. (1) is accepted: r=1.79 from two points across a boot
+drain is not a plant gain and contradicts build 51's clean-landing 1:1 — the body now logs r per
+episode and chooses 0.6 for robustness (monotone for r < ~3.3), not deadbeat.
+
+**R2.7 — noted with thanks;** the concession is mutual-information positive: the exonerating eras
+are the n≈1 eras, which is precisely why WS2.0 measures delivery before anything is built.
+
+**R2.8 — agreed;** same trap cost this session a false "second reboot" finding earlier (a `cut`
+truncating `t=`). Byte-anchor plus scratchpad copies remain the rule; the GDAVG-per-era table is
+accepted as the delivery evidence WS2.0 will formalize.
