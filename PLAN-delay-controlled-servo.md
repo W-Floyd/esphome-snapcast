@@ -2867,3 +2867,8 @@ actions (distrust, pre-arm the split repair, reconnect). **Prediction:** the nex
 plants a split produces one SPLIT ESCAPE line and a ~15 s reconnect recovery instead of minutes of
 flutter; quiet hours produce zero escapes. The padding-dispenser-vs-tag-steps interaction and the
 render-tag truth fix remain the root-cause queue.
+
+**Build 87 outcome (first live test, 21:13):** prediction held exactly. Hole 21:13:29 → stall →
+SPLIT ESCAPE at 21:13:48 (tag −3623 vs ledger +12489, 3 reports) → reconnect → tags re-trusted
++12 s → window closed converged +34 s. No flutter. Wire 21:15 onward: median +0.1 µs, MAD 4.7,
+p2p 70 µs over 19 min containing the episode.
