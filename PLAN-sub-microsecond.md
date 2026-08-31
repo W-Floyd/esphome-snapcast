@@ -130,8 +130,8 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
 
 ## WS4 — Event hygiene (protects the metric; mostly done or user-side)
 
-* Server `buffer 2000 → 4000` ms — PROMOTED to WS0's precondition (R4.3); listed here only for
-  completeness. Half the record is millisecond-class; no gradeable window exists until this is done.
+* Server `buffer 2000 → 4000` ms — deferred by user decision (2000 ms stands; see WS0 for the
+  grading consequences and the revisit condition).
 * Boot ring — A MECHANISM ITEM, not a gain A/B (R3.1). The full 21:37 episode is 28 tag-step
   decisions over 46 s whose magnitude ratio converges to 1.00 (r → 2.00): a SUSTAINED limit cycle
   at full-magnitude correction, the textbook signature of one-decision-stale measurement — and
