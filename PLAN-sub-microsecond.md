@@ -57,16 +57,23 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
   instrument). BASELINE CARRY-FORWARD (R7.5/R8.6): R5.2's SF and R6.2's rate decomposition live in
   the old-schema `test.csv` (readable — prefix headers accepted on read since the R7.1 fix); the
   new-schema file starts fresh, and both baselines are re-taken on it as part of the WS0 re-take.
-* Instrument floor, stated once (R6.4): `scatter_ns` median 25.8 ns tonight — 400× below the 10 µs
-  the SF reads at 30 s. The analyser is not the limit at any scale this plan works at.
+* Instrument floor, scoped (R6.4 as corrected by R11.4): the wire POSITION measurement is never
+  the limit — `scatter_ns` ~26–28 ns per capture (median 27.7 on the 23:41 file at 38.1 rows/s,
+  --samples 200000), 400× below the 10 µs the SF reads at 30 s. The `fs_*` RATE estimate IS a
+  limit below ~10 rows/s (marginal against 0.33 ppm at 3.3 rows/s, SEM 0.043 ppm/30 s at 38.1) —
+  which is why SF_d's achieved-rate estimator is the wire slope, and why capture config rides
+  along with every quoted number.
 
 * Definition of done for the whole plan (R1.9 + R2.4 + R3.4 + R4.1 + R10.1, DUAL UNITS —
   the capture rate changed 11× tonight, 3.3 → 38.1 rows/s, and a sample-count-only window
   shrank to 157 s, inside the 60–120 s correlation time: six blocks of one wander draw would
-  report a small SE and FALSE-PASS the mean gate): over a span of AT LEAST 30 minutes AND
-  6000 rival-clean samples, blocks being the LARGER of 1000 samples or 5 minutes — |mean| ≤ 0.2 µs WITH SE ≤ 0.1 µs (n and SE reported; SE
-  from block-means variance, not sd/√n, per the independence rule), and across the six disjoint
-  1000-sample blocks: median block-p2p ≤ 1 µs AND worst block-p2p ≤ 2 µs (p0.5/p99.5 alongside).
+  report a small SE and FALSE-PASS the mean gate): over ONE span of AT LEAST 30 minutes AND
+  6000 rival-clean samples, two statistics in their OWN units (R11.2 — they want opposite
+  normalisations): p2p N-FIXED — at least six disjoint 1000-sample rival-clean blocks, median
+  block-p2p ≤ 1 µs AND worst ≤ 2 µs (p0.5/p99.5 alongside; comparable to every prior measurement);
+  mean/SE TIME-FIXED — at least six disjoint blocks of ≥ 5 minutes spanning the ≥ 30 minutes,
+  |mean| ≤ 0.2 µs WITH SE ≤ 0.1 µs from those block means (longer than the 60–120 s correlation
+  time; SE from block-means variance, not sd/√n, per the independence rule).
   Twice, on different days. Stated plainly (R4.1): tonight's block-mean sd is 2.4–4.2 µs, so the
   mean gate is UNREACHABLE by averaging (12–50 h/attempt) until the SF plateau comes down — the
   mean gate is downstream of the plateau work, by construction, and a pass before that work would
@@ -220,10 +227,12 @@ FIRST: archive the current CSVs (R10.1) — then the start-today list, all instr
 measurement, no flash: SF-tool fixes + re-baseline (R4.5), WS0 baseline re-take (SF plateau +
 histogram, capture config recorded), WS2.0 delivery rate sweep, WS3.1 invariant counter, and the
 RSTEP raw=/tgt= field split (R3.2).
-THE ONE FLASH (R8.5/R9.5) carries five firmware changes together — WS2.0's PHASE_TX_INTERVAL_US
-servo_param, WS3.1's counter, the RSTEP raw=/tgt= split, the align_bias_us range check, and
-'Render phase' restored to DEBUG on both boards — because separate flashes destroy the clean
-windows WS0 hunts (CLAUDE.md's measured reflash cost).
+THE ONE FLASH (R8.5/R9.5 as corrected by R11.1) carries five firmware changes together — WS2.0's
+PHASE_TX_INTERVAL_US servo_param, WS3.1's counter, the RSTEP raw=/tgt= split, the align_bias_us
+range check, and item five REVISED: the render-phase delta emitted from the PLAYER task at DEBUG,
+same format as the snap_net original (which STAYS VERBOSE — it sat on the stack of the 07:51
+logger-ring crash; this is the Crystal-line precedent, not a re-levelling) — because separate
+flashes destroy the clean windows WS0 hunts (CLAUDE.md's measured reflash cost).
 CRITICAL PATH: WS1 (honest measurement; gates WS2) and WS3.4 (the SF plateau, owner unknown —
 SF_d decides loop-generated vs downstream, then the tau_s sweep only if loop-generated).
 THE PLAN'S CENTRAL SIZING FACT (R6.2): holding ±0.5 µs against 0.33 ppm of differential rate noise
@@ -1829,3 +1838,109 @@ SF_d's achieved-rate estimator (~400× better than fs_b − fs_a; fs_* stays as 
 cross-check), and the capture-rate dependence is recorded — the same test is decisive at 38 rows/s
 and marginal at 3.3, which is R10.1's point made kinetic. The already-queued fs-based SF_d job is
 kept as the cross-check leg; the slope-based leg follows on its window.
+
+---
+
+## REVIEW 11 (2026-08-31, RESPONSE 10)
+
+Order and honesty is clean, the DoD is dual-unit, the historical block is gone, WS3.4 names SF_d.
+One item of the single flash re-introduces a known crash, and three smaller things.
+
+### R11.1 — Flash item five restores a line that was demoted because it crashed a board
+
+R9.5 asked for `Render phase` back at DEBUG on both boards, and I proposed it. I did not read why it
+is VERBOSE. The reason is in the three lines above the call (`tsf_sync.cpp:1146-1149`):
+
+> VERBOSE, not DEBUG: this line is emitted from the snap_net task once a second, and B crashed at
+> 07:51:26 (2026-08-30) inside the logger's TaskLogBuffer ring (ringbuf.c:367 assert) with exactly
+> this call on the stack — the non-main-thread log path is the fragile one. **RALIGN carries the
+> delta.**
+
+So the plan's single flash currently carries an item whose known consequence is a logger-ring crash,
+accepted on my recommendation without either of us reading the mechanism — the failure CLAUDE.md
+names first. **Withdraw R9.5 as specified.**
+
+The tree already contains the correct fix, applied to the same defect twelve hours ago. The `Crystal`
+line hit the identical crash and was not re-levelled; it was **re-emitted from the player task**
+(`snapcast_client.cpp:5979-5987`): *"The Crystal line, from the PLAYER task: its network-task
+original sat on the stack of both logger-ring crashes (07:51, 16:08) and is VERBOSE there now. Same
+format — the analyzer's crystal_a/b_ppm columns parse it."*
+
+Options, in order:
+
+1. **Parse `RALIGN` instead — no flash at all.** `RALIGN group %+d -> bias …` is already `ESP_LOGD`
+   on the player task (`:6060`), carries the group delta, and `i2s-skew.py` does not parse it.
+   Caveat, and it is disqualifying for WS1.1 specifically: RALIGN prints only under
+   `align_cap > 0 && st.converged && own_steady && align_due` — so it is a **conditioned** sample
+   (converged only), it follows the align cadence rather than 1 Hz, and it prints **nothing when
+   `align_max_us` is 0 or when WS1.1 freezes align with `align_apply 0`** (the shadow variant still
+   prints `group`, but only if the channel is enabled at all). Good as a cheap general-purpose
+   series; not the signal WS1.1 needs.
+2. **Emit the delta from the PLAYER task at DEBUG, same format, leaving the snap_net original
+   VERBOSE** — exactly the Crystal precedent. One firmware line, unconditional, safe task, and
+   `PHASE_RE` matches unchanged because the format is preserved. This is what flash item five should
+   be.
+
+Do not raise the snap_net line's level.
+
+### R11.2 — The dual-unit DoD contradicts itself, and re-breaks the p2p normalisation
+
+The gate now reads: *"blocks being the LARGER of 1000 samples or 5 minutes"* and then, two lines
+later, *"across the six disjoint 1000-sample blocks: median block-p2p ≤ 1 µs…"*. Those are different
+blocks. At 38.1 rows/s a 5-minute block is **11 430 samples**, so under the first clause the p2p test
+becomes ~11× harsher than the one every baseline in this document was measured with — which is
+exactly the extreme-value non-comparability R2.4 was raised to fix, reintroduced by R10.1's fix.
+
+The two statistics want opposite normalisations and should be specified separately:
+
+* **p2p — n-fixed**: at least six disjoint **1000-sample** rival-clean blocks; median ≤ 1 µs, worst
+  ≤ 2 µs. (Comparable to every prior measurement.)
+* **mean / SE — time-fixed**: at least six disjoint blocks of **≥ 5 minutes** spanning ≥ 30 minutes;
+  |mean| ≤ 0.2 µs with SE ≤ 0.1 µs from those block means. (Longer than the 60–120 s correlation
+  time, which is R10.1's point.)
+
+Both drawn from the same span; neither expressed in the other's unit.
+
+### R11.3 — The archive rule fires after the loss it exists to prevent
+
+`archive-test-20260830-2350.csv` holds **23:41–23:50, 9.1 minutes, 21 331 rows**. The 23:19–23:39
+file (32 935 rows) and everything before it are gone — the analyser truncates on restart, so a manual
+archive can only ever catch the fragment that happens to be current.
+
+`watch-bench` already detects a recreated/truncated `test.csv` (`334d006`). Make that hook **copy the
+file aside before the new run overwrites it**, or run the analyser with a timestamped `--out` so
+nothing is ever truncated. As written the rule will lose the next window the same way, and the plan
+has now lost the raw data behind R5.2 and R6.2 — which RESPONSE 10 records honestly, but the
+mechanism that lost them is still live.
+
+### R11.4 — Two overstated sentences in WS0
+
+* *"The analyser is not the limit at any scale this plan works at."* True of the offset column
+  (~26–28 ns per capture; median `scatter_ns` reads 27.7 on the current file, not 25.8). **Not true
+  of the frequency columns**, which WS3.4's own paragraph says were marginal against the 0.33 ppm
+  signal at 3.3 rows/s. Scope it: the wire *position* measurement is never the limit; the `fs_*`
+  *rate* estimate is, below ~10 rows/s.
+* The instrument-floor bullet quotes 25.8 ns "tonight" from a file that no longer exists. Quote a
+  range (~26–28 ns) with the capture config, per R10.1's own rule.
+
+---
+
+## RESPONSE 11 (2026-08-31; amendments in the body and the analyser)
+
+**R11.1 — ACCEPTED, with the failure owned on both sides**: I accepted R9.5 without re-reading a
+demotion I had made myself twelve hours earlier for a crash I had decoded myself — the
+blind-acceptance failure in its purest form. Flash item five is REVISED to option 2: emit the
+render-phase delta from the PLAYER task at DEBUG, same format (PHASE_RE parses unchanged), snap_net
+original stays VERBOSE — the Crystal-line precedent. The snap_net line's level is never raised.
+
+**R11.2 — ACCEPTED; the DoD's two statistics are now specified in their own units** (p2p n-fixed at
+1000-sample blocks, comparable to every prior number; mean/SE time-fixed at ≥5-min blocks spanning
+≥30 min) — R10.1's fix had reintroduced R2.4's defect for the p2p side.
+
+**R11.3 — ACCEPTED, shipped at the only point that can act in time**: the analyser itself now
+os.replace()'s the old file to a dated name BEFORE open("w") — a watch-bench hook polls too late by
+construction, and the manual rule already demonstrated its failure mode tonight. Syntax-checked.
+
+**R11.4 — ACCEPTED, both**: the instrument-floor sentence is scoped (position never the limit;
+fs_* is, below ~10 rows/s — hence the wire-slope estimator) and the quoted floor is a range with
+its capture config, per R10.1's own rule.

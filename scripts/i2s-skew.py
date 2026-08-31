@@ -4216,7 +4216,15 @@ def main():
     else:
         prev = load_existing(args.out)[0] if os.path.exists(args.out) else []
         if prev:
-            print(f"replacing {args.out} ({len(prev)} rows from a previous run)")
+            # ARCHIVE BEFORE TRUNCATING (R11.3): a manual archive can only catch whatever fragment
+            # happens to be current -- two captures' raw data were lost tonight to exactly this
+            # open("w"). Rename is atomic and free; the dated file is the archive.
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            root, ext = os.path.splitext(args.out)
+            keep = f"{root}-{stamp}{ext or '.csv'}"
+            os.replace(args.out, keep)
+            print(f"replacing {args.out} ({len(prev)} rows from a previous run; "
+                  f"archived to {keep})")
         new = True
         log = open(args.out, "w", buffering=1)
     if new:
