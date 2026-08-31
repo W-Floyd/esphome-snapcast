@@ -2733,3 +2733,15 @@ sign guard compares against the pre-subtraction target. Step 2 of the storm beco
 −208 → wait. Prediction: a hole-overlapped injection shows at most ONE ledger step per landing, no
 tag/ledger split >5 ms, no TAGFAULT, and the watchdog's B-SPLIT/ERR5MS events stop appearing on
 natural holes.
+
+### 2026-08-30 19:05 — build 82 unstable at boot: wait, do not compensate (build 83)
+
+82's err−pend arithmetic diverged in the boot window: with fast landings smeared across the block
+average, the binary landed/in-flight label mislabels a just-visible step and the subtraction
+manufactures a correction from a step that already landed — tag steps −2715 → +5307 → −8178 →
++10449, ×1.5 per round, into a 16 ms split (A, 19:05–19:06). Build 52's lesson relearned: a block
+straddling a landing cannot be fixed by arithmetic. **Build 83:** serial step-and-verify — while any
+window step is in flight (frame-exact, 2-block margin, 6 s expiry), every coarse decision waits
+(target zeroed, pend printed). One correction travels at a time; the next decision reads audio that
+wholly post-dates it. This also serializes the ledger storm case by construction. Prediction:
+injections ~10–13 s (one landing wait per round), no growing oscillations, no splits, TAGFAULTs 0.

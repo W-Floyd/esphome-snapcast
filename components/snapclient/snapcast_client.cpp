@@ -3254,11 +3254,18 @@ void SnapcastClient::player_task_() {
           if (this->played_frames_total_ < st.win_step_land_frame[i] + 2 * block_frames)
             pending_us += st.win_step_us[i];
         }
-        coarse_target_us -= pending_us;
-        // The subtraction must never manufacture a step the measurement did not ask for: if the
-        // in-flight accounting flips the sign of the target, the honest statement is "wait".
-        if (pending_us != 0 && (coarse_target_us > 0) != (pre_sub_target_us > 0))
-          coarse_target_us = 0;
+        // NEVER STEP WHILE A CORRECTION IS IN FLIGHT -- wait, do not compensate. Build 82 subtracted
+        // the in-flight sum from the target and stepped the difference; at boot (ring drained, fast
+        // landings smeared across the block average) the binary landed/in-flight label mislabels a
+        // just-visible step, and err - pend then MANUFACTURES a correction from a step that already
+        // landed: 19:05:08-11, tag steps -2715 -> +5307 -> -8178 -> +10449, x1.5 growth per round,
+        // ending in a 16 ms split. A block average straddling a landing cannot be corrected by
+        // arithmetic (build 52's lesson, relearned); the only unconditionally stable rule is serial
+        // step-and-verify: one correction travels at a time, and the next decision reads audio that
+        // wholly post-dates it. pre_sub_target_us stays in the RSTEP log as the raw target.
+        (void) pre_sub_target_us;
+        if (pending_us != 0)
+          coarse_target_us = 0;  // a step is still travelling; this block proves nothing yet
       }
       // A ONE-BOARD POSITION STEP ON A COMMON ERROR IS A DIFFERENTIAL ERROR. After a boot into a
       // running group err_tag is mostly the +-150 us common deadline wander, and A's window steps on
