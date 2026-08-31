@@ -1010,6 +1010,14 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         # Same arity as the normal return: it was short by one, so an unreadable log
         # would have crashed the caller's unpacking rather than being skipped.
         return [], start_offset, state, [], [], {}, [], [], [], []
+    # ROTATION / TRUNCATION GUARD: a logger restart that recreates the file leaves the carried
+    # offset beyond EOF, and seek() past EOF reads nothing forever -- the poll silently goes
+    # deaf for the rest of the run. Detect shrinkage and re-prime as if from scratch.
+    try:
+        if start_offset > os.fstat(f.fileno()).st_size:
+            start_offset = 0
+    except OSError:
+        pass
     if start_offset == 0 and tail_bytes:
         try:
             size = os.fstat(f.fileno()).st_size
@@ -2586,7 +2594,12 @@ DISAMBIG_MARGIN = 0.50
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
           "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
-          "crystal_a_ppm,crystal_b_ppm,dl_err_a_us,dl_err_b_us,dl_diff_us,reason")
+          "crystal_a_ppm,crystal_b_ppm,dl_err_a_us,dl_err_b_us,dl_diff_us,"
+          "trim_a_ppm,trim_b_ppm,int_a_ppm,int_b_ppm,reason")
+# trim_*/int_* (2026-08-30): the DAC trim the delay loop commands and its integral, nearest-in-time
+# like dl_err. Appended BEFORE reason only; every pre-existing column keeps its index. These are
+# the columns that let corr(fs_diff, trim_diff) decide whether the differential rate wander is
+# commanded by the loop or arises downstream of it (PLAN-sub-microsecond R6.3).
 # The firmware columns are HELD from that board's most recent log line, not resampled: the
 # firmware emits these far slower than rows arrive, so the same value repeats across many rows
 # and is empty until the first line arrives.
@@ -2598,8 +2611,13 @@ SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
 # Held rather than interpolated for the same reason as the rest: it steps every 4 s on the
 # device (RATE_WINDOW_US) and inventing values between those steps would fabricate resolution
 # the measurement does not have.
-HELD_COLS = (("a", "phase_us"), ("b", "phase_us"), ("a", "ramp_ppm"), ("b", "ramp_ppm"),
+HELD_COLS = (("a", "ramp_ppm"), ("b", "ramp_ppm"),
              ("a", "crystal_ppm"), ("b", "crystal_ppm"))
+# phase_us is NO LONGER HELD (2026-08-30): held, it printed a run-start constant on every row for
+# two hours as if it were a per-row measurement -- the sentinel-as-a-number failure inside the
+# instrument of record, and it nearly discredited a real finding (PLAN-sub-microsecond R6.1).
+# It is now nearest-in-time like dl_err, blanking honestly when no line is close.
+PHASE_MATCH_S = 5.0  # the Render phase line ticks ~1 Hz; 5 s tolerates a stall without holding forever
 
 # The delay-loop error is NEAREST-in-time, not held, and that is the point. It ticks about
 # once a second (measured: median 1.048 s, p90 1.341 s, longest gap 27 s), which is close
@@ -3970,7 +3988,17 @@ def main():
             # Device time is placed on the host axis PER BOOT EPOCH -- see place_device_times for
             # why a single offset across a log spanning reboots lands nowhere. Each series is
             # anchored from its own rows, in log order, so the epoch split is well defined.
-            host = lambda tod: tod_to_unix(tod, t_start) - t_start
+            #
+            # DAY REFERENCE IS NOW, NOT THE RUN START. tod_to_unix picks the day (of -1/0/+1
+            # around the reference's midnight) that puts the dateless log time nearest the
+            # reference. Referenced to t_start, a run older than ~12 h maps every FRESH line a
+            # day into the past: measured 2026-08-30 on a 31 h run, phase_a/b froze at the
+            # previous evening's values for two hours of rows and dl_err_* went blank on 100 %
+            # of rows -- the points were still appended, just placed 24 h early, outside every
+            # nearest-in-time window. Lines read by a live poll were just written, so "now" is
+            # the honest reference; the +-1-day search still covers a whole-file priming pass.
+            host_ref = time.time()
+            host = lambda tod: tod_to_unix(tod, host_ref) - t_start
             jit_all, n_all = [], 0
             for key, pts in xt.items():
                 placed, jit, nst = place_device_times(pts, lambda r: host(r[0]), lambda r: r[1])
@@ -4475,6 +4503,10 @@ def main():
             for key in HELD_COLS:
                 pts = FIRMWARE.get(key)
                 held.append(f"{pts[-1][1]:.4g}" if pts else "")
+            # phase_us: nearest-in-time (see the HELD_COLS note) -- blank past PHASE_MATCH_S.
+            pha = nearest_value(FIRMWARE.get(("a", "phase_us"), []), elapsed, tol=PHASE_MATCH_S)
+            phb = nearest_value(FIRMWARE.get(("b", "phase_us"), []), elapsed, tol=PHASE_MATCH_S)
+            phase_cols = ",".join("" if v is None else f"{v:.4g}" for v in (pha, phb))
             # Nearest-in-time, not held: see DL_MATCH_S. errA - errB is the firmware's own
             # view of the quantity measured on the wire, so it goes on the same row as the
             # measurement and the two can be differenced offline rather than only by eye.
@@ -4484,10 +4516,18 @@ def main():
             if dld is not None:
                 DL_DIFF.append((elapsed, dld))
             dlcols = ",".join("" if v is None else f"{v:.1f}" for v in (dla, dlb, dld))
+            # Commanded trim and integral, same treatment (PLAN-sub-microsecond R6.3).
+            trimcols = ",".join(
+                "" if v is None else f"{v:.2f}"
+                for v in (nearest_value(FIRMWARE.get(("a", "dl_trim_ppm"), []), elapsed),
+                          nearest_value(FIRMWARE.get(("b", "dl_trim_ppm"), []), elapsed),
+                          nearest_value(FIRMWARE.get(("a", "dl_int_ppm"), []), elapsed),
+                          nearest_value(FIRMWARE.get(("b", "dl_int_ppm"), []), elapsed)))
             log.write(f"{elapsed:.3f},{wall:.3f},{off:.1f},{ppm:.4f},{coef:.4f},"
                       f"{info.get('frame_lag',0)},{info.get('rival',float('nan')):.3f},"
                       f"{info.get('scatter_ns',float('nan')):.1f},"
-                      f"{fs_a:.4f},{fs_b:.4f},{','.join(held)},{dlcols},{reason}\n")
+                      f"{fs_a:.4f},{fs_b:.4f},{phase_cols},{','.join(held)},{dlcols},"
+                      f"{trimcols},{reason}\n")
 
             note = reason
             if info.get("lag_steps"):
