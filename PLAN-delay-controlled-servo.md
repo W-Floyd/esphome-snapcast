@@ -2745,3 +2745,23 @@ window step is in flight (frame-exact, 2-block margin, 6 s expiry), every coarse
 (target zeroed, pend printed). One correction travels at a time; the next decision reads audio that
 wholly post-dates it. This also serializes the ledger storm case by construction. Prediction:
 injections ~10–13 s (one landing wait per round), no growing oscillations, no splits, TAGFAULTs 0.
+
+### 2026-08-30 19:10–19:25 — build 83 under the jumbo-hole regime: the split is the invariant
+
+83's six injections all DNF'd — not because of the serial rule (pend held correctly, e.g. RSTEP
+err=+0 pend=−3560 waits) but because the bench regime changed at ~18:53: server bursts of 964 ms /
+2.5 s / 6.3 s / 5.4 s lateness (observer bailouts 17:50, 18:57, 19:02, 19:19; starves ramping 4/30min
+→ 7/30min at 19:0x). Every jumbo refill now plants a tag/ledger split (−5…−47 ms: tags+wire see
+early audio, ledger reads ~0) and the system enters a stable ~10.4 s limit cycle: window tag steps
+insert on err_tag (−3.6k/−10.7k alternating), an unattributed per-chunk actor drops −256…−544
+frames/report on the ledger signal (0 hard resyncs — steer is gated off while tags live and bounded
+1/chunk; suspicion is the fast-splice fallback in TAGFAULT gaps), and the two orbit around the
+constant split. TAGFAULT→reconnect used to heal it; tonight the reconnect's own refill burst plants
+the next split — A looped through 3 TAGFAULTs and was still split at −10 ms (B settled clean at
++35 µs). A rebooted to break the loop.
+**Standing decisions:** stop injecting (the operator is now the dominant disturbance); leave 83
+soaking. **Next builds (fresh eyes):** (1) actor-tagged corrected counters (split the Sync −X/+Y by
+source) — the drop actor must be named, not guessed; (2) revisit re-arming the accounting-split
+repair when the tag/ledger disagreement is large and persistent while tags are live (b291c42
+disarmed it wholesale; the split, not the tug, is the invariant to remove); (3) the server-side
+jumbo holes are the user's lever (snapserver buffer 2000→4000, or the Pi host).
