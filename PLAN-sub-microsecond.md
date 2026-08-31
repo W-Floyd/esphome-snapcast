@@ -1944,3 +1944,11 @@ construction, and the manual rule already demonstrated its failure mode tonight.
 **R11.4 — ACCEPTED, both**: the instrument-floor sentence is scoped (position never the limit;
 fs_* is, below ~10 rows/s — hence the wire-slope estimator) and the quoted floor is a range with
 its capture config, per R10.1's own rule.
+
+## WS3.4 interim (00:0x — clean-window repeat, read under RESPONSE 9's caveats)
+
+29 clean 30 s segments: sd(fs_diff)=1.29 ppm, sd(trim_diff)=1.25 ppm, corr=−0.852 — the corr is the
+feedback identity (no inference drawn). The number worth carrying: **the loop commands ±1.25 ppm of
+differential trim per 30 s segment in QUIET steady state** (~4× the 0.33 ppm wire-slope figure;
+estimator SEM ~0.04–0.26 ppm depending on row-rate mix across the 23:41 restart). Attribution still
+waits on SF_d.
