@@ -2822,3 +2822,18 @@ Root-cause queue for next session, sharpened: the displacement lives BELOW the t
 stamping (SYNCX feedback pinned at its 9999 µs/10 ms cap on both boards); truing the render tags
 against the physical DMA is prerequisite to both the standing-offset class and the <1 µs goal —
 GDAVG stays shadow until then.
+
+### 2026-08-30 20:53 — build 86 confirms: the 50 Hz unicast loop displaced the audio 1.5 ms
+
+Disabling the unicast roster loop (everything else kept) cleared the offset at 86's boot; user
+confirmed on the plot. So: a stable, systematic −1.5 ms physical displacement, invisible to every
+on-device signal, caused by ~100–200 extra sendto()/s issued from the tag-observation thread.
+**Mechanism still owed** (the user's standard): candidates, to be separated next session — (1) the
+tag-observation thread delayed per cycle, shifting stamping and audio together; (2) concurrent
+sendto on one socket from two tasks corrupting the network task's timing; (3) 50 Hz unicast at
+non-TSF snapclients on the roster (f04fc4 / ESP32-Caster / a56b60) perturbing something shared.
+The safe TX redesign when the exchange is next needed: batch ~10 samples per packet, sent from the
+NETWORK task at service cadence (5 Hz × 10 samples = the same 50 pairs/s; pairing is by sample
+instant so batching loses nothing) — no cross-task socket use, 1/10th the packets. Until then GDAVG
+degrades to multicast-only (n≈1–2/s), which is harmless shadow. The <1 µs path stays blocked on the
+render-tag truth fix regardless (the 8× phase under-read), so nothing is waiting on the exchange.
