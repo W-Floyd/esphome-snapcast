@@ -2837,3 +2837,19 @@ NETWORK task at service cadence (5 Hz × 10 samples = the same 50 pairs/s; pairi
 instant so batching loses nothing) — no cross-task socket use, 1/10th the packets. Until then GDAVG
 degrades to multicast-only (n≈1–2/s), which is harmless shadow. The <1 µs path stays blocked on the
 render-tag truth fix regardless (the 8× phase under-read), so nothing is waiting on the exchange.
+
+### 2026-08-30 21:01–21:03 — flutter episode: the hard branch is the silent per-block actor
+
+Group hole 21:01:34 (B bailed and reconnected clean; A entered the split: tag +31.6 ms LATE, ledger
+−12.2 ms EARLY, diff 43.8 ms). A then sat flat at +35.7 ms for 30+ s, audibly fluttering, with RSKIP
+refusing every block at since_act=−39 ms and NO RSTEP lines: the hard-resync branch (the
+|err|>hard_us per-chunk path) fires every chunk on the tag error, refreshes coarse_act_us each time
+(starving the measured step machinery), and its drops are negated by the ledger-side scheduler —
+the same two-actuator tug, now with the hard branch as the tag-side actor. TAGFAULT never fired:
+its trigger counts "tag-driven corrections" and the hard branch's are not counted, so the one
+healer (reconnect, which rebuilds the ledger) never ran. A rebooted to restore the bench (4th
+episode tonight; all specimens in logs).
+**Escape hatch for build 87:** detect the INVARIANT itself — |err_tag − ledger| > 5 ms sustained
+10 s while playing (SHADOW already computes it every report) → the existing TAGFAULT/reconnect
+path. Both signals cannot be right; a reconnect rebuilds the ledger in ~15 s. This bounds every tug
+variant regardless of which actuator pair is fighting.
