@@ -50,7 +50,9 @@ while True:
         elif now-lastline[k]>60: emit(f"{k}-LOGGAP", f"{f} silent {int(now-lastline[k])} s (sleep? wedge?)")
     try: csz=os.path.getsize(CSV)
     except OSError: csz=cpos
-    if csz>cpos:
+    if csz < cpos:
+        cpos, clast = csz, now  # recreated/truncated file: reset the baseline, not a stall
+    elif csz > cpos:
         with open(CSV,"rb") as fh:
             fh.seek(cpos); rows=fh.read(csz-cpos).decode("utf-8","ignore").split("\n")
         cpos=csz; clast=now
