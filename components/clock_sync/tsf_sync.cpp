@@ -1148,6 +1148,11 @@ void TsfSync::update_group_diagnostics_(int64_t local_now_us) {
   // this call on the stack -- the non-main-thread log path is the fragile one. RALIGN carries the delta.
     ESP_LOGV(TAG, "Render phase mine %+" PRId64 " group(%zu) delta %+" PRId64 " us t=%" PRId64, mine_phase,
              phase_n, mine_phase - static_cast<int64_t>(llround(group)), local_now_us);
+    // Published so the PLAYER task can emit it at DEBUG without this fragile call site being
+    // re-levelled (R11.1: this line crashed B inside the logger ring at 07:51). Stored, not
+    // logged, here.
+    this->render_phase_delta_plot_us_.store(
+        static_cast<int32_t>(mine_phase - static_cast<int64_t>(llround(group))), std::memory_order_relaxed);
   }
 
   // Playout depth against the peer mean, with a sustained-divergence alarm.
@@ -1354,9 +1359,10 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
 // (~94 Hz) so every peer sample pairs regardless -- and per-window noise falls as ~1/sqrt(n) at
 // best (chunk samples are correlated; the GDAVG-vs-live shadow measures the real gain). Beyond
 // ~50 Hz the window length is the knob, not the packet rate. ~90 B x 50/s of airtime: negligible.
-static constexpr int64_t PHASE_TX_INTERVAL_US = 20000;
+static constexpr int64_t PHASE_TX_INTERVAL_US = 20000;  // default; runtime knob below (WS2.0)
 void TsfSync::send_phase_report(int64_t local_now_us) {
-  if (local_now_us - this->phase_tx_last_us_ < PHASE_TX_INTERVAL_US) {
+  if (local_now_us - this->phase_tx_last_us_ <
+      this->phase_tx_interval_us_.load(std::memory_order_relaxed)) {
     return;
   }
   if (!this->have_mac_ || !this->have_bssid_ || this->sock_ < 0) {

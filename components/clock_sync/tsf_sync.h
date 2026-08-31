@@ -220,6 +220,13 @@ class TsfSync {
   /// the newest render-phase sample; multicast only (the 1 Hz beacon still unicasts the roster).
   /// Call from the player task at chunk cadence; throttled internally to PHASE_TX_INTERVAL_US.
   void send_phase_report(int64_t local_now_us);
+  /// @brief WS2.0: set the phase-TX period (us). Bounds 20000/rate: 5 Hz = 200000 .. 50 Hz = 20000.
+  void set_phase_tx_interval_us(int64_t us) {
+    this->phase_tx_interval_us_.store(us, std::memory_order_relaxed);
+  }
+  int64_t phase_tx_interval_us() const {
+    return this->phase_tx_interval_us_.load(std::memory_order_relaxed);
+  }
   /// @brief Windowed mean of per-peer paired phase deltas, same convention as
   /// render_group_delta_us(); INT32_MIN until a window has closed with pairs in it. SHADOW ONLY.
   int32_t render_group_delta_avg_us() const {
@@ -232,6 +239,13 @@ class TsfSync {
                : RENDER_PHASE_UNKNOWN;
   }
   int64_t render_phase_us() const { return this->render_phase_us_.load(std::memory_order_relaxed); }
+  /// UNGATED phase delta, the quantity the VERBOSE snap_net "Render phase" line prints. NOT
+  /// pairing-window gated, so it can difference phases sampled seconds apart and report drift as
+  /// skew -- for plotting only. Paired with render_group_delta_us() (gated, what acts) on the
+  /// RPHASE line so the two can be compared rather than confused. INT32_MIN until first computed.
+  int32_t render_phase_delta_plot_us() const {
+    return this->render_phase_delta_plot_us_.load(std::memory_order_relaxed);
+  }
 
   static constexpr int64_t RENDER_PHASE_UNKNOWN = INT64_MIN;
 
@@ -389,6 +403,14 @@ class TsfSync {
   std::atomic<int32_t> render_group_delta_avg_us_{INT32_MIN};
   std::atomic<uint16_t> gdavg_pairs_pub_{0};
   int64_t phase_tx_last_us_{0};
+  std::atomic<int32_t> render_phase_delta_plot_us_{INT32_MIN};
+  /// WS2.0 sweep knob (R3.5/R12.2): the phase-TX period in us, default PHASE_TX_INTERVAL_US.
+  /// A ratio at ONE rate cannot separate the two loss models -- p=0.02 per-packet and a ~1 pkt/s
+  /// cap both explain the measured ~2 % delivery at 50 Hz -- and they differ only in how delivery
+  /// responds to RATE. Delivered rate is read from the existing `GDAVG n=` line, so no counters
+  /// are added. Flat n vs send rate => cap => batching wins ~10x; linear => probabilistic =>
+  /// batching wins nothing. Atomic: written from the API (main loop), read on the player task.
+  std::atomic<int64_t> phase_tx_interval_us_{20000};
   std::atomic<uint32_t> pub_server_id_hash_{0};
   std::atomic<uint32_t> pub_stream_id_hash_{0};
   Peer *find_peer_(const uint8_t mac[6], int64_t local_now_us);

@@ -3272,8 +3272,7 @@ void SnapcastClient::player_task_() {
         // ending in a 16 ms split. A block average straddling a landing cannot be corrected by
         // arithmetic (build 52's lesson, relearned); the only unconditionally stable rule is serial
         // step-and-verify: one correction travels at a time, and the next decision reads audio that
-        // wholly post-dates it. pre_sub_target_us stays in the RSTEP log as the raw target.
-        (void) pre_sub_target_us;
+        // wholly post-dates it. pre_sub_target_us is logged as RSTEP's raw= (R3.2).
         if (pending_us != 0)
           coarse_target_us = 0;  // a step is still travelling; this block proves nothing yet
       }
@@ -3332,17 +3331,29 @@ void SnapcastClient::player_task_() {
       const int32_t adjust = std::clamp(adjust_frames, -max_adjust, max_adjust);
       // One short dedicated line per in-window decision (<= one per block). Build 44's B episode
       // (23:51:29-23:52:15) sat at +600 us for 45 s with no step and nothing in the log said why.
+      // FIELD SPLIT (R3.2): `err=` carried THREE different quantities under one name -- the raw
+      // target; the gd-clamp bound |gd|*n/(n-1) when |target| < resync_local_us; and a literal 0
+      // meaning "a step is in flight", a sentinel printed as a measurement. Two review rounds read
+      // it as "the error", and an r-per-episode computed across a clamped round measures the clamp,
+      // not the plant. Now: raw= is pre-mutation, tgt= is what the step is actually taken from.
+      // raw == tgt on an unmutated round; tgt=0 with raw!=0 is the in-flight case; tgt<raw with
+      // |raw| < resync_local_us is the gd clamp. Nothing parses this line, so `err=` is retired
+      // rather than kept as an alias for one of its three meanings.
       if (resync_window) {
         const int32_t gd_log = this->tsf_sync_ != nullptr ? this->tsf_sync_->render_group_delta_us() : INT32_MIN;
         if (gd_log == INT32_MIN) {
-          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=unknown ok=%d step=%+" PRId64 " adj=%+" PRId32 " pend=%+" PRId64,
-                   coarse_target_us, coarse_on_tags ? "tag" : "ledger", coarse_step_ok ? 1 : 0, coarse_step_us, adjust,
-                   pending_us);
+          ESP_LOGD(TAG, "RSTEP raw=%+" PRId64 " tgt=%+" PRId64 " src=%s gd=unknown ok=%d step=%+" PRId64 " adj=%+" PRId32 " pend=%+" PRId64,
+                   pre_sub_target_us, coarse_target_us, coarse_on_tags ? "tag" : "ledger", coarse_step_ok ? 1 : 0,
+                   coarse_step_us, adjust, pending_us);
         } else {
-          ESP_LOGD(TAG, "RSTEP err=%+" PRId64 " src=%s gd=%+" PRId32 " ok=%d step=%+" PRId64 " adj=%+" PRId32 " pend=%+" PRId64,
-                   coarse_target_us, coarse_on_tags ? "tag" : "ledger", gd_log, coarse_step_ok ? 1 : 0, coarse_step_us,
-                   adjust, pending_us);
+          ESP_LOGD(TAG, "RSTEP raw=%+" PRId64 " tgt=%+" PRId64 " src=%s gd=%+" PRId32 " ok=%d step=%+" PRId64 " adj=%+" PRId32 " pend=%+" PRId64,
+                   pre_sub_target_us, coarse_target_us, coarse_on_tags ? "tag" : "ledger", gd_log, coarse_step_ok ? 1 : 0,
+                   coarse_step_us, adjust, pending_us);
         }
+      }
+      if (adjust != 0 && st.converged) {  // WS3.1 invariant
+        st.conv_ops++;
+        st.conv_frames += static_cast<uint32_t>(std::abs(adjust));
       }
       if (adjust > 0) {
         drop_frames = adjust;
@@ -3472,6 +3483,10 @@ void SnapcastClient::player_task_() {
         const uint32_t steer_frames = (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)
                                           ? 1
                                           : startup_steer_frames(frames);
+        if (st.steer_dir != 0 && st.converged) {  // WS3.1 invariant
+          st.conv_ops++;
+          st.conv_frames += steer_frames;
+        }
         if (st.steer_dir > 0) {
           drop_frames = steer_frames;
           st.soft_dropped_frames += steer_frames;
@@ -3517,6 +3532,10 @@ void SnapcastClient::player_task_() {
         const int32_t fast =
             this->fast_splice_(st, tag_err_live ? st.dl_err_us : median_err_us, rec.params.sample_rate,
                                !tag_err_live && st.drift_excess_since_us != 0, horizon_chunks, tag_err_live);
+        if (fast != 0 && st.converged) {  // WS3.1 invariant
+          st.conv_ops++;
+          st.conv_frames += static_cast<uint32_t>(std::abs(fast));
+        }
         if (fast > 0) {
           drop_frames = static_cast<uint32_t>(fast);
           st.soft_dropped_frames += static_cast<uint32_t>(fast);
@@ -4735,6 +4754,22 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     ESP_LOGD(TAG, "DLLOOP err=%+" PRId64 " us trim=%+.2f int=%+.2f ppm kp=%.3f n=%" PRIu32 " dt=%.2f t=%" PRId64,
              st.dl_err_us, st.trim_applied_ppm, st.trim_integral_ppm, kp, n, dt_s, now);
   }
+
+  // WS3.1 INVARIANT LINE. Own short line, fixed field count, no variable-length tail -- the
+  // 256-byte ceiling rule, and this one is meant to be COUNTED from, which is exactly the use
+  // that the truncated `Sync:` line silently corrupted (three retracted findings). `thr` is the
+  // splice threshold IN FORCE, not the compiled default: `splice_us` is a runtime override
+  // (set_servo_param) that can defeat the invariant, so a zero-ops report is only meaningful
+  // beside the threshold that produced it. `d` is the delta since the last line, so a reader
+  // never has to difference two absolute counters across a reboot.
+  if (now - st.conv_inv_log_us >= DL_LOG_INTERVAL_US) {
+    st.conv_inv_log_us = now;
+    const int32_t thr_now = this->tune_splice_us_.load(std::memory_order_relaxed);
+    ESP_LOGD(TAG, "FRAMEINV ops=%" PRIu32 " d=%" PRIu32 " frames=%" PRIu32 " conv=%d thr=%" PRId32 " us",
+             st.conv_ops, st.conv_ops - st.conv_ops_last_log, st.conv_frames, st.converged ? 1 : 0,
+             thr_now >= 0 ? thr_now : static_cast<int32_t>(this->config_.fast_splice_threshold_us));
+    st.conv_ops_last_log = st.conv_ops;
+  }
 }
 #endif  // USE_I2S_RATE_LOCK
 
@@ -4994,6 +5029,12 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     // gain); align_bias_kick_us also queues the change as a kick (measures the kick path). Freeze
     // align first (align_apply 0) or it will undo the step. 2026-08-30: the 28 % delivery figure
     // could not be separated from a timebase event without this.
+    //
+    // RANGE-CHECKED (R1.6): this was the only set_servo_param name with no bound while every
+    // sibling validates, and WS1.1's step experiment is about to make it load-bearing -- a typo'd
+    // magnitude was applied silently. Bounded by align_max_us's own ceiling, which is the largest
+    // bias the channel itself can ever command.
+    if (!(value >= -20000.0f && value <= 20000.0f)) return false;
     const int32_t before = this->render_bias_us_.load(std::memory_order_relaxed);
     const int32_t after = static_cast<int32_t>(value);
     this->render_bias_us_.store(after, std::memory_order_relaxed);
@@ -5043,6 +5084,18 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_splice_us") {
     if (!(value >= 20.0f && value <= 5000.0f)) return false;
     this->tune_resync_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "phase_tx_hz") {
+    // WS2.0 (R3.5/R12.2): sweep the phase-TX rate and read delivery from the EXISTING `GDAVG n=`
+    // line -- own samples arrive at ~94 Hz so essentially every arriving peer sample pairs, which
+    // makes n a delivered-packet counter, and it is the same series R2.1's 1.1/s-vs-16/s table was
+    // built from. Sent rate is this parameter. Flat n vs rate => a packet-rate cap => batching
+    // wins ~10x and WS2.1 is worth building; linear => per-packet loss => batching wins nothing
+    // and the unicast question is the only path. One tunable, five minutes, one workstream decided.
+    if (!(value >= 1.0f && value <= 50.0f)) return false;
+    if (this->tsf_sync_ == nullptr) return false;
+    this->tsf_sync_->set_phase_tx_interval_us(static_cast<int64_t>(1000000.0f / value));
+    ESP_LOGW(TAG, "SERVOPARAM phase_tx_hz=%.1f (interval %lld us)", value,
+             static_cast<long long>(this->tsf_sync_->phase_tx_interval_us()));
   } else if (name == "autotune") {
     this->tune_autotune_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "persist") {
@@ -5985,6 +6038,29 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             ESP_LOGD(TAG, "Crystal: mine %+.3f group %+.3f delta %+.3f ppm t=%" PRId64, cmine, cmine - cdelta, cdelta,
                      now_us());
           }
+          // RPHASE, from the PLAYER task at DEBUG -- the phase column WS1.1 needs to grade its
+          // step experiment (R9.5), delivered by the Crystal-line route rather than by re-levelling
+          // the snap_net original, which crashed B inside the logger ring at 07:51 and STAYS
+          // VERBOSE (R11.1).
+          //
+          // BOTH deltas, because they are DIFFERENT QUANTITIES and the plan's instruction to
+          // preserve "the same format" predates noticing it (tsf_sync.cpp:1133-1137 says so):
+          //   dgate = render_group_delta_us(), pairing-window gated -- what actually acts
+          //   dplot = the ungated snap_net quantity -- may difference phases sampled seconds
+          //           apart and report DRIFT as skew; for plotting only
+          // Emitting one and calling it "the phase delta" would bake in a choice between them;
+          // emitting both lets the step experiment measure which tracks the wire. Own short line,
+          // fixed fields, no variable-length tail (the 256-byte ceiling). Sentinels print as
+          // `unknown`, never as INT32_MIN (the -9223372036854775808 rule).
+          const int32_t dgate = this->tsf_sync_->render_group_delta_us();
+          const int32_t dplot = this->tsf_sync_->render_phase_delta_plot_us();
+          const int64_t ph = this->tsf_sync_->render_phase_us();
+          char gbuf[16] = "unknown", pbuf[16] = "unknown", hbuf[24] = "unknown";
+          if (dgate != INT32_MIN) snprintf(gbuf, sizeof(gbuf), "%+" PRId32, dgate);
+          if (dplot != INT32_MIN) snprintf(pbuf, sizeof(pbuf), "%+" PRId32, dplot);
+          if (ph != TsfSync::RENDER_PHASE_UNKNOWN) snprintf(hbuf, sizeof(hbuf), "%+" PRId64, ph);
+          ESP_LOGD(TAG, "RPHASE mine=%s dgate=%s dplot=%s n=%u t=%" PRId64, hbuf, gbuf, pbuf,
+                   this->tsf_sync_->consensus_n(), now_us());
         }
         // Cap, gain and deadband are runtime tunables (servo_param align_max_us / align_gain /
         // align_deadband_us); align_max_us defaults to the YAML render_align_max (0 = off).

@@ -509,6 +509,16 @@ class SnapcastClient {
     uint32_t soft_dropped_frames{0};
     uint32_t soft_inserted_frames{0};
     uint32_t hard_resyncs{0};
+    // WS3.1 INVARIANT: zero frame operations while converged. One frame is 22.7 us at 44.1 kHz --
+    // 20x a 1 us p2p budget, and 2.4x the whole differential sd measured on a quiet 45-min window
+    // (9.4 us, 2026-08-31) -- so a single op while converged spends the budget outright. The
+    // structure is already close to true (the fast splice is threshold-gated, the window step
+    // clamps to zero), so this is INSTRUMENTATION to prove it, not control work. Counted at all
+    // three sites that can move a frame: the coarse window step, the soft steer, the fast splice.
+    uint32_t conv_ops{0};            // frame operations taken while st.converged
+    uint32_t conv_frames{0};         // frames moved by them (magnitude)
+    uint32_t conv_ops_last_log{0};   // for the delta in the FRAMEINV line
+    int64_t conv_inv_log_us{0};
     // Median of recent sync errors (rejects residual feedback spikes better than a
     // mean); the steering servo acts on this, not the raw per-chunk error. Same design
     // as the esp32 snapclient reference (99/19-sample medians on a sample-accurate age).
