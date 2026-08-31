@@ -1,4 +1,4 @@
-# HANDOFF — snapclient sync work, as of 2026-08-30 19:00
+# HANDOFF — snapclient sync work, as of 2026-08-30 21:00
 
 ## Bench layout
 
@@ -665,3 +665,19 @@ while a step is in flight; frame-exact landing test). B rode the same regime set
 State at 19:26: both boards settled on 83, injections stopped, PLAN carries the standing decisions:
 actor-tagged corrected counters first, then revisit re-arming the split repair on large persistent
 disagreement; the jumbo holes themselves are server-side (buffer 2000→4000 / the Pi).
+
+## Builds 84–86: the 50 Hz phase exchange and what it found (2026-08-30, 20:25–20:56)
+
+Toward <1 µs: phases are now SAMPLED per tagged chunk (94 Hz) and exchanged in phase-only packets;
+paired deltas roll into a 1 s averaged group delta (`GDAVG`, shadow only, validated against the
+live delta in quiet and through an event). Findings, in order of importance:
+* **The render-phase values under-measure a real differential ~8×** (matched window: rival-clean
+  wire −1.5 ms, pairwise beacon phases ≤0.2 ms). Pairing/consensus exonerated; suspect is the
+  tag/feedback stamping (SYNCX feedback pinned at its 10 ms cap on both boards). This blocks the
+  <1 µs goal and explains the "blind standing offset" class. First job next session.
+* **Build 85's unicast phase loop physically displaced the audio a stable −1.5 ms** (bucketed wire:
+  +2 µs → −1460 µs at exactly 85's boot; survived a board reboot; cleared the moment 86 disabled the
+  loop). ~100–200 sendto/s from the tag-observation thread. Mechanism owed; candidates in PLAN. Safe
+  redesign when needed: batch ~10 samples/packet from the NETWORK task at 5 Hz.
+* GDAVG currently degrades to n≈1–2/s (multicast-only; this AP drops client-to-client multicast) —
+  harmless while shadow. Live build: 86 on both speakers; observer untouched all session (control).

@@ -31,7 +31,7 @@ section; most of the obvious approaches have already failed on hardware.
 
 ## Sync
 
-**BUILD 81 IS LIVE (2026-08-30 ~18:50) — see `PLAN-delay-controlled-servo.md` for the 77→81 arc.**
+**BUILD 86 IS LIVE (2026-08-30 20:53) — see `PLAN-delay-controlled-servo.md` for the 77→81 arc.**
 Post-hole convergence goal (<100 µs within 10 s of a 300 ms injection) **met**: knee A/B graded
 14/10/13/14 s including the 5 s hold, i.e. converged at +5…+9 s. The three levers that got there:
 ledger first step waits for two consistent readings (78); frame-exact in-flight step accounting —
