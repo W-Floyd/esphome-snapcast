@@ -4526,7 +4526,28 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // that only one board has turns common-mode error into differential motion; the rate loop's
   // gain must be the same function of the error on every board. Position corrections (the coarse
   // step-and-verify) do the resync: a bounded one-off, not a sustained rate.
-  const float boost = std::clamp(std::abs(e) / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
+  // BOOST ON THE DIFFERENTIAL PORTION OF THE ERROR, NOT ITS MAGNITUDE. 21:01 (build 86, knee 25):
+  // common timeline wander ramped BOTH boards' e to ~-220 us together; kp scaled to ~0.07-0.08 on
+  // each, and the boost multiplied their slightly-different local readings into kp*(e_A - e_B) ~
+  // 2-5 ppm of differential trim -- the +-30-50 us steady-state sawtooth, reset at each wander
+  // zero-crossing. Same lesson as the 08-29 window boost, arriving through a symmetric function:
+  // gain responding to a COMMON error still moves the pair apart. The differential evidence is the
+  // group delta (|gd| is the same number on both boards, so the schedule stays symmetric): boost on
+  // min(|e|, |gd|*n/(n-1)) -- the gap to the others -- so common wander runs at tracking gain on
+  // both boards while a genuinely differential residual (the post-window tails, where gd agreed
+  // with e) keeps the fast decay. gd unknown (boot, peers in transient) falls back to |e|:
+  // recovery needs the boost and a lone board has no pair to disturb.
+  float boost_err = std::abs(e);
+  if (this->tsf_sync_ != nullptr) {
+    const int32_t gd_boost = this->tsf_sync_->render_group_delta_us();
+    const int32_t n_cons = this->tsf_sync_->consensus_n();
+    if (gd_boost != INT32_MIN && n_cons > 1) {
+      boost_err = std::min(boost_err,
+                           std::abs(static_cast<float>(gd_boost)) * static_cast<float>(n_cons) /
+                               static_cast<float>(n_cons - 1));
+    }
+  }
+  const float boost = std::clamp(boost_err / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
   const float tau_eff = tau_tuned / boost;
   // Ti is NOT boosted: Ki = kp/Ti already rises with kp. Dividing Ti too made Ki scale with boost^2
   // and wound the (already correct, NVS-restored) integral during the position catch-up -- the

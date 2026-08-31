@@ -2872,3 +2872,11 @@ render-tag truth fix remain the root-cause queue.
 SPLIT ESCAPE at 21:13:48 (tag −3623 vs ledger +12489, 3 reports) → reconnect → tags re-trusted
 +12 s → window closed converged +34 s. No flutter. Wire 21:15 onward: median +0.1 µs, MAD 4.7,
 p2p 70 µs over 19 min containing the episode.
+
+### 2026-08-30 21:2x — build 88: boost on the differential portion (user-approved sawtooth fix)
+
+boost_err = min(|e|, |gd|·n/(n−1)), |e| when gd unknown. Mechanism and evidence in the code comment
+(21:01 traces: kp 0.008→0.080 on both boards under common wander, kp·(e_A−e_B) ≈ 2–5 ppm
+differential = the ±30–50 µs teeth). **Prediction:** during common wander (e ~200 µs, gd tens) kp
+stays ≤ ~0.02 and the teeth vanish from the 15-s medians; post-event tails (gd ≈ e) keep the fast
+decay, so injection recoveries stay ≤ ~14 s; boot (gd unknown) unchanged.
