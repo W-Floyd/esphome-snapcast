@@ -1387,16 +1387,15 @@ void TsfSync::send_phase_report(int64_t local_now_us) {
   dest.sin_port = htons(TSF_PORT);
   dest.sin_addr.s_addr = inet_addr(TSF_GROUP);
   sendto(this->sock_, &pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
-  // ... AND UNICAST THE ROSTER MIRROR. Build 84 sent these multicast-only and GDAVG read n=1-2
-  // pairs/s -- exactly the 1 Hz unicast beacon rate: this AP does not deliver client-to-client
-  // multicast, precisely as the beacon path's comment warned. Same remedy as the beacon, from a
-  // per-slot atomic mirror because this task must not touch the network task's vectors.
-  for (size_t i = 0; i < PUB_PEER_SLOTS; i++) {
-    const uint32_t addr = this->pub_peer_addr_[i].load(std::memory_order_relaxed);
-    if (addr == 0) continue;
-    dest.sin_addr.s_addr = addr;
-    sendto(this->sock_, &pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
-  }
+  // BUILD 86: THE UNICAST ROSTER LOOP IS DISABLED, EXPERIMENTALLY. Build 85 added it (multicast
+  // alone delivered n=1-2 pairs/s) and the wire stepped to a REAL, rival-clean -1.5 ms at exactly
+  // 85's boot (bucketed medians: +2.2 us at 20:30-20:34, -1460 at 20:34-20:38), standing through
+  // converge cycles and through a reboot of the displaced board, invisible to every on-device
+  // signal. Mechanism unknown -- candidates: ~100-200 sendto/s on the tag-observation thread, two
+  // tasks sending on one socket, 50 Hz unicast at non-TSF snapclients on the roster. This revert is
+  // the experiment that decides whether the loop is the cause; the safe re-introduction (send from
+  // the network task off a queue) comes after the wire answers.
+  (void) 0;
 }
 
 void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
