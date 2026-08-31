@@ -2481,6 +2481,12 @@ void SnapcastClient::player_task_() {
     } else if (saved_bias != 0) {
       ESP_LOGW(TAG, "Render align: stored bias %+" PRId32 " us REFUSED (cap %" PRId32 ") -- starting from 0",
                saved_bias, cap);
+    } else {
+      // SAY SO. Without this, "nothing was stored" and "restored a stored 0" print identically,
+      // and the first boot after this feature shipped looked exactly like a silent failure of it.
+      // Absent is not zero (CLAUDE.md), and the distinction matters here because a genuine stored
+      // 0 is what `align_max_us 0` leaves behind on purpose.
+      ESP_LOGI(TAG, "Render align: no stored bias (cap %" PRId32 ") -- starting from 0", cap);
     }
   }
 #endif
