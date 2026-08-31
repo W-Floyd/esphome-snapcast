@@ -13,14 +13,28 @@ escape verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
 
 ## WS0 — The instrument first (no firmware)
 
-* Quiet-hour wire HISTOGRAM of the current rate-lock-only regime (rival-gated, hole-free spans from
-  test.csv). Decomposes today's ±3–8 µs into rate ripple vs measurement noise, and is the gate
-  metric every later stage is judged by.
+* PRECONDITION (R4.3): server `buffer 2000 → 4000` ms — promoted from WS4. Half of tonight's
+  record (12 of 24 five-min blocks) carries millisecond-class p2p, and the longest contiguous
+  rival-clean run is ~25 min < the 32 min the DoD needs. Nothing downstream can be GRADED until a
+  32-min clean span exists; this is WS0's first action, not hygiene.
+* Primary gate metric is the STRUCTURE FUNCTION (R4.2), not the histogram: SF(τ) with plateau and
+  corner reported before and after every change (`scripts/bench/structure-function.py`, committed
+  `8ca60e6`; the skew is bounded wander — 0.30 µs at τ=0.1 s rising to a plateau of 9.0 µs at
+  τ≥30 s, 6.5 µs after the 08-28 fixes, corner at 10–30 s coinciding with the trim loop's ~24 s
+  limit cycle at loop gain 0.79). The plateau is what sets both the p2p tails and the mean's SE;
+  histogram/MAD/p2p stay for the excursion population but are window-length-dependent and cannot
+  be the gate. Tool work first (R4.5): add rival gating (match wire-window's), compute lags from
+  timestamps (uniform-dt assumption breaks the moment gating drops rows), and re-baseline BASE_NOW
+  on build 88 — the shipped baselines are three eras old.
 
-* Definition of done for the whole plan (R1.9 + R2.4 + R3.4, window defined by SAMPLE COUNT since
-  3.29 samples/s × 30 min < 6000): over 6000 consecutive rival-clean samples in a quiet span,
-  |mean| ≤ 0.2 µs, and across the six disjoint 1000-sample blocks: median block-p2p ≤ 1 µs AND
-  worst block-p2p ≤ 2 µs (p0.5/p99.5 reported alongside). Twice, on different days.
+* Definition of done for the whole plan (R1.9 + R2.4 + R3.4 + R4.1): over 6000 consecutive
+  rival-clean samples in a quiet span — |mean| ≤ 0.2 µs WITH SE ≤ 0.1 µs (n and SE reported; SE
+  from block-means variance, not sd/√n, per the independence rule), and across the six disjoint
+  1000-sample blocks: median block-p2p ≤ 1 µs AND worst block-p2p ≤ 2 µs (p0.5/p99.5 alongside).
+  Twice, on different days. Stated plainly (R4.1): tonight's block-mean sd is 2.4–4.2 µs, so the
+  mean gate is UNREACHABLE by averaging (12–50 h/attempt) until the SF plateau comes down — the
+  mean gate is downstream of the plateau work, by construction, and a pass before that work would
+  be a coin flip, not a result.
 
 ## WS1 — Render-tag truth (BLOCKER for everything downstream)
 
@@ -101,12 +115,20 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
    the only way it breaks is the tick cadence not being ~100 Hz — confirm cadence and burstiness
    from the fork's tick call site. The analyser (26 ns floor) cannot see 10 ns; do not measure what
    the arithmetic already answers. `set_rate_adjustment` is off the critical path.
+5. **Trim-loop limit cycle (R4.2 — the plateau's named owner)**: the SF corner at 10–30 s coincides
+   with the trim loop's ~24 s limit cycle at loop gain 0.79 (documented on this bench 2026-08-28)
+   — the plateau (9.0 → 6.5 µs) IS the quantity the goal is made of, it sets both the p2p tails and
+   the mean's SE (R4.1), and no other workstream touches it (crystal FF is a 100 s+ term; actuator
+   ripple is 10 ns). Mechanism work on the trim loop's cycle — gain/cadence/lag structure — judged
+   on SF(τ) plateau + corner, before/after every change. This and WS1 are jointly the plan's
+   critical path.
 4. **Gate**: quiet-window p2p ≤ 2 µs (disjoint-block form) with rate-only control, before chasing
    the last factor of 2.
 
 ## WS4 — Event hygiene (protects the metric; mostly done or user-side)
 
-* Server `buffer 2000 → 4000` ms (user): tonight's 1–6 s late bursts are the dominant disturbance.
+* Server `buffer 2000 → 4000` ms — PROMOTED to WS0's precondition (R4.3); listed here only for
+  completeness. Half the record is millisecond-class; no gradeable window exists until this is done.
 * Boot ring — A MECHANISM ITEM, not a gain A/B (R3.1). The full 21:37 episode is 28 tag-step
   decisions over 46 s whose magnitude ratio converges to 1.00 (r → 2.00): a SUSTAINED limit cycle
   at full-magnitude correction, the textbook signature of one-decision-stale measurement — and
@@ -130,10 +152,13 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
 
 ## Order and honesty
 
-Start today, before the WS1 blocker resolves: WS0 baseline re-take, WS2.0 delivery rate sweep,
-WS3.1 invariant counter, WS3.2 wander measurement + common-mode check, and the RSTEP raw=/tgt=
-field split (R3.2 — precondition for both WS4's mechanism work and WS1's step experiment; all
-instrumentation or measurement). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
+FIRST ACTION (R4.3, user-side): server `buffer 2000 → 4000` — no gradeable window exists without
+it. Start today, before the WS1 blocker resolves: SF-tool fixes + re-baseline (R4.5), WS0 baseline
+re-take (SF plateau + histogram), WS2.0 delivery rate sweep, WS3.1 invariant counter, WS3.2 wander
+measurement + common-mode check, and the RSTEP raw=/tgt= field split (R3.2 — precondition for both
+WS4's mechanism work and WS1's step experiment; all instrumentation or measurement). Critical path
+to the GOAL is now explicitly twofold: WS1 (honest measurement) and WS3.5 (the trim-loop limit
+cycle that owns the SF plateau). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
 WS3.2 build → gates in sequence 2 µs → 1 µs (disjoint-block statistic throughout). Mean 0 falls
 out of WS1+WS2 (bias is already ±2 µs). Residual risk after all gates: crystal wander between
 corrections and the unresolved 1.5 ms TX-displacement mechanism constraining WS2's delivery —
@@ -142,8 +167,11 @@ physics and one owed mechanism, both measured before they are believed.
 ## WS0 result (2026-08-30 21:17–21:45, build 87/88, hole-free 5-min windows) — MISCAPTIONED, see R1.8
 (spans two firmware eras and opens 2–3 min post-flash; kept as observation; re-take pending)
 
-Best window (21:41): n=988, mean −4.1, med −4.6, MAD **1.68 µs**, p2p 24.4 µs [−15.2..+9.2].
-Typical: MAD 3–9 µs, p2p 27–71 µs, p1/p99 at ±15–36 µs; window means wander ±4 µs.
+DISTRIBUTION over hole-free 5-min blocks (R4.4 — the earlier caption quoted the best window of a
+bounded-wander signal, i.e. the trough of the wander, not the floor): MAD min 1.68 / median ~4.5 /
+max 7.5 µs across the evening (R4.4's eleven-block census: 3.04–7.50, median 4.52, none below 3.0);
+p2p 20–71 µs; block means −10.7…+2.9 µs, sd 2.4–4.2 µs within contiguous runs. The core is ~9× from
+a 0.5 µs-class budget, not ~3×.
 Decomposition the numbers force: (a) an excursion population at ±10–40 µs sets p2p (P-term responses
 to block-noise/wander leakage — the WS2/WS3 target); (b) ±4 µs mean wander between windows (the
 tag/align bias floor — WS1's target); (c) the core is already MAD ≈ 1.7 µs in the best window, i.e.
@@ -753,3 +781,151 @@ disjoint blocks; wall clock was short by ~1.3 %). EWMA rationale corrected: equa
 p = 0.02 from a ~1 pkt/s cap; `PHASE_TX_INTERVAL_US` becomes a servo_param and the sweep's shape
 (flat vs linear) decides whether batching is worth building at all. One tunable, five minutes,
 one workstream decided — accepted verbatim into the body.
+
+---
+
+## REVIEW 4 (2026-08-30, measured from test.csv and the bench scripts)
+
+R3.1–R3.5 are all discharged in the body. This round is about the goal itself. I re-measured the
+wire rather than re-reading the plan, rival-gated at 0.5, over the last two hours (20:45–22:44,
+n = 22 599 at 3.14 samples/s), in disjoint 5-min blocks:
+
+```
+  21:15 n= 908 med  -0.21 MAD  3.37 p2p    48.2 mean  +2.92     20:45 med -1562  MAD  68  p2p  8973
+  21:20 n= 899 med  +1.33 MAD  7.50 p2p    57.6 mean  -2.08     20:50 med -1454  MAD 342  p2p  8422
+  21:30 n= 916 med  -5.06 MAD  6.91 p2p    44.2 mean  -2.26     20:55 med    +8.8 MAD  19  p2p  7201
+  21:40 n=1034 med  -3.79 MAD  3.04 p2p    27.2 mean  -1.86     21:00 med   -20.4 MAD  46  p2p 10054
+  21:45 n= 862 med  +3.35 MAD  5.22 p2p    29.8 mean  +2.25     21:05 med    -7.4 MAD  13  p2p  7684
+  21:50 n= 868 med  -2.55 MAD  3.85 p2p    45.9 mean  -2.51     21:10 med    +1.4 MAD   8  p2p  9273
+  22:20 n=1044 med  -4.72 MAD  4.52 p2p    42.4 mean -10.67     21:25 med    +4.5 MAD   6  p2p  4363
+  22:25 n=1024 med  -6.00 MAD  5.75 p2p    49.0 mean  -7.52     21:35 med    -3.5 MAD  27  p2p  9457
+  22:30 n=1034 med  -4.57 MAD  3.13 p2p    20.0 mean  -4.96     21:55 med    -0.6 MAD  12  p2p  8948
+  22:35 n=1033 med  +0.50 MAD  7.14 p2p    39.3 mean  +0.30     22:00 med    -0.2 MAD   9  p2p  7619
+  22:40 n=1027 med  -3.42 MAD  4.25 p2p    67.0 mean  -3.04     22:05 med    -2.8 MAD   9  p2p 10698
+             (11 hole-free blocks)                              22:10 / 22:15  p2p 9763 / 6111
+```
+
+### R4.1 — The mean gate is 5–25× below the reproducibility of the measurement
+
+The DoD asks for |mean| ≤ 0.2 µs over 6000 rival-clean samples, twice. Measured tonight, on the
+clean blocks only:
+
+* 5-min block means span **−10.67 … +2.92 µs**; within a contiguous clean run their sd is
+  **2.4 µs** (21:15–21:50, six blocks) and **4.2 µs** (22:20–22:40, five blocks).
+* The two longest clean ~30-min stretches give window means of **−0.59 µs** and **−5.18 µs**. They
+  differ from each other by 4.6 µs.
+* Even treating the 5-min means as independent — which the structure function says they are not —
+  a 30-min mean carries SE ≈ 2.4/√6 … 4.2/√5 = **1.0–1.9 µs**. That is a floor, per CLAUDE.md's rule
+  on sem and independence.
+
+So a gate at 0.2 µs would be passed and failed by chance at roughly 1 in 5 attempts on *unchanged
+firmware*, and "twice, on different days" does not fix that — it makes a coin-flip gate need two
+heads. Reaching SE ≤ 0.2 µs by averaging alone needs ~25–100× the time: **12–50 hours per
+attempt**.
+
+Two honest options, and the plan should pick one explicitly: state the mean gate **with its own
+uncertainty** (e.g. "|mean| ≤ 0.2 µs with SE ≤ 0.1 µs, n and SE reported"), or accept that the mean
+gate is unreachable until the wander that produces the SE comes down — which is R4.2.
+
+### R4.2 — WS0 measures with the statistic this bench already retired, and nothing in the plan targets the plateau
+
+`scripts/bench/structure-function.py` (written 2026-08-28, still untracked) opens with:
+
+> JUDGE CHANGES ON THIS, NOT ON sd. Plain sd over a window conflates two different things and its
+> value depends on the window length … the same build measured sd 3.15 over 17 s and 8.06 over
+> 4 minutes.
+
+and records what the skew actually is: **bounded wander**, 0.30 µs at τ = 0.1 s rising to a
+**plateau of 9.0 µs for τ ≥ 30 s (6.5 µs after the 08-28 fixes)**, with a corner at 10–30 s that
+"coincides with the trim loop's ~24 s limit cycle and its 0.79 loop gain".
+
+WS0's histogram, MAD and p2p are that same window-length-dependent family. The plateau is what sets
+both the p2p tails and the mean SE in R4.1 — it is the quantity the goal is actually made of — and
+**no workstream targets it**. WS3 is crystal feed-forward (a DC/wander term at 100 s+) and actuator
+sanity (10 ns); neither touches a 24 s limit cycle in the trim loop. Together with R3.1's coarse-step
+limit cycle, that is **two limit cycles in one control stack, one of them documented on this bench
+for two days and absent from the plan**.
+
+Concretely: add "trim-loop limit cycle (τ ≈ 24 s, loop gain 0.79)" as a WS3 item with the structure
+function as its metric, and make WS0 report **SF(τ) with the plateau and corner** beside the
+histogram, before and after every change. The histogram stays useful for the excursion population;
+it cannot be the gate metric.
+
+### R4.3 — Half the record is not quiet, and tonight contains no window long enough for the DoD
+
+Of 24 rival-gated 5-min blocks in the last two hours, **12 carry a millisecond-class p2p** (4.4 to
+10.7 ms). "Quiet window (rival-clean, hole-free)" selection is discarding ~50 % of the record, not
+trimming a rare tail.
+
+That has two consequences the plan does not carry:
+
+1. **The DoD is currently unachievable.** 6000 consecutive rival-clean samples at 3.14/s needs
+   ~32 minutes of *contiguous* clean time. The longest clean run tonight is 22:18–22:44, about
+   **25 minutes ≈ 4700 samples**; the 21:15–21:53 run is broken by 21:25's 4.4 ms event. The gate
+   asks for a window that does not exist in the current regime.
+2. **WS4's server-buffer item is not hygiene, it is WS0's precondition.** `buffer 2000 → 4000` is
+   listed as "(user)" alongside items marked "mostly done". It is the difference between a record
+   that can be gated and one that cannot. Promote it and do it first — nothing downstream can be
+   graded until a 32-minute clean span exists.
+
+### R4.4 — "MAD ≈ 1.7 µs, within ~3× of the goal" is a minimum reported as a typical
+
+The WS0 result quotes the **best** window of that evening. Across tonight's eleven hole-free blocks,
+MAD runs **3.04 – 7.50 µs, median 4.52, and none below 3.0**. The core is therefore ~**9×** from a
+0.5 µs-class budget, not ~3×, and the encouraging sentence — "the p2p budget is spent almost entirely
+by the tails, not the core" — is partly a selection effect: pick the best of nine windows on a
+bounded-wander signal and you have picked the trough of the wander, not the noise floor.
+
+Re-caption with the distribution (min / median / max over blocks), not the extremum. This is the same
+"compare like with like" failure as R2.4, one level up: the *selection rule* differs between the
+baseline and the goal.
+
+### R4.5 — The structure-function tool cannot be pointed at this record as it stands
+
+Two defects, both cheap, both blocking if WS0 adopts it (R4.2):
+
+* **It does not gate on `rival`.** `wire-window.py` does (`--max-rival`, default 0.5); this one
+  keeps every row whose `offset_ns` parses. Run unmodified on the last 30 minutes it reports
+  `sd 126 µs` and ratios of **25–723×** baseline — all events, no signal. The two tools are not
+  measuring the same population, so their numbers cannot be compared, which is exactly what a
+  before/after gate would do.
+* **`dt = (t[-1]-t[0])/len(t)` assumes uniform spacing**, so every lag is mis-sized once rows are
+  dropped — and gating for rival drops rows by construction. Compute lags from timestamps, or index
+  into a resampled series.
+* It is **untracked** (`git status`: `?? scripts/bench/structure-function.py`). A tool that is about
+  to define the plan's gate metric should be in the tree with its baselines, and its `BASE_NOW`
+  constants are from 2026-08-28 at KP 0.25 / 1 Hz beacons — a config three eras old. Re-baseline on
+  build 88 as part of the WS0 re-take, or every ratio it prints is against a bench that no longer
+  exists.
+
+---
+
+## RESPONSE 4 (2026-08-30; amendments in the body)
+
+**R4.1 — ACCEPTED; both options taken, in order.** The DoD mean gate now carries its own
+uncertainty (|mean| ≤ 0.2 µs WITH SE ≤ 0.1 µs, SE from block-means variance per the independence
+rule) AND states plainly that it is unreachable by averaging (12–50 h/attempt at tonight's
+block-mean sd) until the plateau comes down — the mean gate is downstream of R4.2's work by
+construction. A pass before that would be a coin flip; the plan now says so where the gate is
+defined.
+
+**R4.2 — ACCEPTED in full; this is the round's real finding.** The bench retired sd two days ago
+and the plan rebuilt its gate out of sd's family. SF(τ) plateau + corner is now the primary gate
+metric; the histogram is demoted to excursion bookkeeping. The trim-loop ~24 s limit cycle at loop
+gain 0.79 — documented 08-28, absent from every workstream — is now WS3.5, named owner of the
+plateau, and the critical path is stated as WS1 + WS3.5 jointly. Two limit cycles in one stack
+(R3.1's coarse-step, this one) is also now on the record.
+
+**R4.3 — ACCEPTED; the buffer change is promoted to WS0's precondition and the plan's FIRST
+ACTION.** Half the record millisecond-class and no 32-min clean span means nothing can be graded;
+"hygiene" was the wrong word and the (user) tag was hiding a hard dependency.
+
+**R4.4 — ACCEPTED.** The WS0 result is re-captioned with the block distribution (MAD 3.04–7.50,
+median 4.52, none below 3.0; the 1.68 was the trough of the wander). Core distance restated as ~9×.
+Same selection-rule failure as R2.4, acknowledged as such.
+
+**R4.5 — ACCEPTED, one update.** The tool was committed this hour (`8ca60e6`), so "untracked" is
+resolved; the two code defects stand and are now WS0 work items (rival gating to match
+wire-window's population; lags from timestamps since gating drops rows), plus BASE_NOW re-baselined
+on build 88 — the shipped baselines predate three eras of control-law change and every ratio
+against them is a comparison with a bench that no longer exists.
