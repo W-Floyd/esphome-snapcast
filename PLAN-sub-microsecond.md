@@ -38,6 +38,15 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
   be the gate. Tool work first (R4.5): add rival gating (match wire-window's), compute lags from
   timestamps (uniform-dt assumption breaks the moment gating drops rows), and re-baseline BASE_NOW
   on build 88 — the shipped baselines are three eras old.
+* ANALYSER INGESTION DEFECT (R6.1) — the running instance is not reading the device logs during
+  the run: `phase_a/b` frozen at run-start values for 2 h (HELD_COLS prints them per-row as if
+  measured), `dl_err_*` blank on 100 % of rows, while the logs carry 44k/75k matching lines.
+  PROPOSED fixes to `scripts/i2s-skew.py` (the user's file — changes need their sign-off): stop
+  holding `phase_*` (blank past the match window or add `fw_age_s`), restore log-follow during the
+  run, and add `trim_a/b_ppm` + `int_a/b_ppm` columns from the already-parsed `dl_trim_ppm`
+  (parsed at :1082, referenced nowhere — R6.3). `wire-vs-common.py` is a no-op until then.
+* Instrument floor, stated once (R6.4): `scatter_ns` median 25.8 ns tonight — 400× below the 10 µs
+  the SF reads at 30 s. The analyser is not the limit at any scale this plan works at.
 
 * Definition of done for the whole plan (R1.9 + R2.4 + R3.4 + R4.1): over 6000 consecutive
   rival-clean samples in a quiet span — |mean| ≤ 0.2 µs WITH SE ≤ 0.1 µs (n and SE reported; SE
@@ -51,8 +60,12 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
 ## WS1 — Render-tag truth (BLOCKER for everything downstream)
 
 Evidence: phases/tags under-measure real differentials ~8× (20:36: wire −1.5 ms rival-clean,
-pairwise beacon phases ≤ 0.2 ms); standing blind offsets (specimen scratchpad 20:48); every
-on-device signal shares the deadline+tag stamping, so none can see what the wire sees.
+pairwise beacon phases ≤ 0.2 ms). SOURCE, per R6.1's challenge: the phase side came from the
+observer's PHASEIN lines in observer.log (byte-anchored absolute phases, A−B differenced over
+20:36:31–20:37:25), NOT from test.csv's `phase_a/b` columns — which R6.1 correctly shows are held
+run-start constants and must never be used as evidence until fixed. The premise stands.
+Corroborated by: standing blind offsets (specimen scratchpad 20:48), and every on-device signal
+sharing the deadline+tag stamping, so none can see what the wire sees.
 
 1. **Decisive experiment before any fix** (bench, one evening): inject a known one-board deadline
    step (`servo_param align_bias_us`, added in `3dd83ca` 2026-08-30) at several sizes
@@ -122,7 +135,11 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
    into the differential. If it is not common-mode, this workstream inherits a bias larger than the
    error it corrects. Note (R2.5): the "seed as reference" structure RESPONSE 1 cited does not
    exist in the tree — the cold-start seed is one-shot; a residual-only integrator would be NEW
-   structure and must be designed as such. Firmware workstream; can start before WS1.
+   structure and must be designed as such.
+   DEMOTED to a measurement item (R6.2): the crystal difference is +7.6 ppm, stable to sd
+   0.13–0.17 ppm across 30 s means, and correlates only +0.04/+0.08 with the achieved-rate
+   difference — under 1 % of the plateau's variance. A crystal feed-forward cannot reach the
+   plateau; build nothing here unless the wander measurement contradicts tonight's.
 3. **Actuator sanity (R1.2)**: the sigma-delta bound is analytic (~10 ns = one step × one tick);
    the only way it breaks is the tick cadence not being ~100 Hz — confirm cadence and burstiness
    from the fork's tick call site. The analyser (26 ns floor) cannot see 10 ns; do not measure what
@@ -139,6 +156,16 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
    loop's own response time — not a disturbance it fails to reject — and the tau/Ti trade re-opens
    as the mechanism question. Judged on SF(τ) plateau + corner, before/after every change. This and
    WS1 are jointly the plan's critical path — more so at a 2× plateau.
+   RE-POINTED AGAIN (R6.2/R6.3): the plateau is broadband DIFFERENTIAL RATE noise — SF(τ)/τ reads
+   0.78 / 0.58 / 0.33 / 0.20 ppm at τ = 5/10/30/60 s (falling with τ: decorrelating noise, the
+   τ^0.5 growth's cause) — and the crystal is exonerated (see WS3.2). The question is now "what
+   makes 0.33 ppm of differential rate at 30 s?", and the FIRST experiment is no longer the tau_s
+   sweep: it is corr(fs_diff, trim_diff) offline over one quiet window, which needs only R6.1's
+   analyser columns. Correlated ⇒ the loop COMMANDS the wander ⇒ the tau_s sweep is right next.
+   Uncorrelated ⇒ downstream of the command (rate-lock delivery / I2S driver / fs estimator) ⇒ the
+   sweep would read null and cost five membership changes for nothing. Caveat (R6.4): tonight's SF
+   and segment statistics share their two windows — repeat both on an overnight window before
+   treating either as the baseline.
 5. **Gate**: quiet-window p2p ≤ 2 µs (disjoint-block form) with rate-only control, before chasing
    the last factor of 2.
 
@@ -176,7 +203,13 @@ measurement + common-mode check, and the RSTEP raw=/tgt= field split (R3.2 — p
 WS4's mechanism work and WS1's step experiment; all instrumentation or measurement). Critical path
 to the GOAL is now explicitly twofold: WS1 (honest measurement) and WS3.4 (the trim-loop limit
 cycle that owns the SF plateau). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
-WS3.2 build → gates in sequence 2 µs → 1 µs (disjoint-block statistic throughout). Mean 0 falls
+WS3.4's correlation experiment → gates in sequence 2 µs → 1 µs (disjoint-block statistic
+throughout). THE PLAN'S CENTRAL SIZING FACT (R6.2): holding ±0.5 µs against 0.33 ppm of
+differential rate noise needs a correction every ~1.5 s; the fine loop's τ is 120 s — a ~80×
+bandwidth gap that no amount of reference averaging (WS2) closes. Either the rate noise comes down
+(if uncommanded: actuator/driver/estimator work) or the loop gets faster (if commanded: the tau/Ti
+trade re-opens) — the corr(fs_diff, trim_diff) experiment decides which, and the plan commits to
+neither until it runs. Mean 0 falls
 out of WS1+WS2 (bias is already ±2 µs). Residual risk after all gates: crystal wander between
 corrections and the unresolved 1.5 ms TX-displacement mechanism constraining WS2's delivery —
 physics and one owed mechanism, both measured before they are believed.
@@ -1080,3 +1113,156 @@ measurements, not iteration.
 20–49/53.5/87.7 µs at three window lengths — three answers, no statistic) and now carries the SF
 baseline instead; RESPONSE 4's R4.3 paragraph annotated as superseded by the user's buffer
 decision, so the correspondence cannot be read as the plan.
+
+---
+
+## REVIEW 6 (2026-08-30, measured from test.csv's firmware columns and scripts/i2s-skew.py)
+
+R5.1–R5.4 discharged. This round I went at WS3.4's new question — what owns the plateau — using the
+columns the analyser already writes. Two of them are dead, one that would decide the question is
+parsed and thrown away, and the one that works says the plateau is a rate phenomenon that is not the
+crystal.
+
+### R6.1 — The CSV's firmware columns are stale or empty, and one of them is held silently
+
+Over the last two hours (n = 22 392 rival-gated rows, 20:45–22:44):
+
+| column | state |
+|---|---|
+| `phase_a_us` / `phase_b_us` | **1 distinct value, 0 changes** in 22 392 rows (+7.000 / −107.000) |
+| `dl_err_a_us` / `dl_err_b_us` / `dl_diff_us` | **empty on 100 % of rows** |
+| `fs_a_hz`, `fs_b_hz`, `crystal_a/b_ppm`, `ramp_a/b_ppm`, `rival`, `scatter_ns` | live |
+
+It is not the parsers. The same 200 MB log tail carries **44 495** `Render phase … delta … us` lines
+and **74 992** `DLLOOP err=` lines, and both `PHASE_RE` (`i2s-skew.py:915`) and `DLLOOP_RE` (`:941`)
+match tonight's format. The analyser instance writing `test.csv` is simply not ingesting the device
+logs during the run — reading them once at startup, at most.
+
+The two failure presentations come from one cause and differ in danger:
+
+* `phase_*` is in `HELD_COLS` (`:2601`), so it carries the last parsed value forever and **prints a
+  run-start constant on every row as if it were a per-row measurement**. That file's own comment
+  explains why `dl_err` is *not* held — "holding the last value across a 27 s dropout would put a
+  stale number beside a fresh measurement and invite exactly the comparison it cannot support" — and
+  the held columns do that across two hours with nothing in the row to say so.
+* `dl_err_*` is nearest-in-time with a 0.7 s window, so it degrades honestly to blank.
+
+Three consequences, the first of which reaches the plan's blocker:
+
+1. **WS1's premise is not currently supported by this file.** The evidence line is "20:36: wire
+   −1.5 ms rival-clean, pairwise beacon phases ≤ 0.2 ms" → phases under-read ~8×. If that comparison
+   was taken from `phase_a/b` or a plot of them, it compared a moving wire against a **frozen
+   constant**, which produces an apparent under-read of whatever size the wire moved. State which
+   source it used. If it was these columns, the 8× is not established and the plan's entire ordering
+   — WS1 as the blocker everything else waits on — rests on an artefact.
+2. **`scripts/bench/wire-vs-common.py` is a no-op on this CSV** (`:21` reads `dl_err_a_us`,
+   `dl_err_b_us`).
+3. WS3.4's `tau_s` sweep and WS1.1's step experiment both want these columns alive beside the wire.
+
+Fix before either experiment, and make the columns report their own validity — an `fw_age_s` column,
+or blank past the match window — rather than holding. Same rule as the freshness gate the firmware
+already implements for `RENDER_PHASE_UNKNOWN`; the analyser is the one place it was not applied.
+
+### R6.2 — The plateau is a differential RATE wander of ~0.33 ppm at 30 s, and it is not the crystal
+
+Two hole-free windows, rival-gated, 30 s segments (n = 30 each):
+
+```
+                       21:40–21:55     22:20–22:35
+  sd(wire slope)        0.403 ppm       0.370 ppm       (= sd of d(offset)/dt over 30 s)
+  corr(slope, fs_diff)   −0.868          −0.839
+  crystal_a − crystal_b  +7.62 ppm       +7.56 ppm    sd across segments 0.132 / 0.173
+  corr(fs_diff, crystal_diff)  +0.037         +0.084
+```
+
+The r ≈ −0.85 alone proves nothing — `offset_ns` and `fs_*` are computed within the same capture, so
+a frequency-estimate error produces a matching apparent drift (CLAUDE.md's per-capture rule). The
+discriminator is that an **independent** route agrees: SF(30 s) = 9.5–10.5 µs, and 0.33 ppm × 30 s =
+10 µs. A per-capture estimator error does not accumulate into position; a real rate error does. So
+the rate wander is real.
+
+Its spectrum, from SF(τ)/τ — the equivalent constant rate error over each lag:
+
+```
+  τ        5 s     10 s    30 s    60 s
+  ppm     0.78     0.58    0.33    0.20
+```
+
+Falling with τ: broadband rate noise that decorrelates, giving the τ^0.5 position growth R5.2
+measured — not a slow bias.
+
+**The crystal difference is not it.** It sits at +7.6 ppm, stable to sd 0.13–0.17 ppm across 30 s
+means, and correlates +0.04/+0.08 with the achieved-rate difference — under 1 % of the variance.
+That answers R2.5's common-mode question in the direction that makes WS3.2 *less* valuable, not
+more: **a crystal feed-forward cannot reach the plateau.** Demote WS3.2 from "firmware that can
+start before WS1" to a measurement item, and re-point WS3.4 at the specific question: *what produces
+0.33 ppm of differential rate noise at the 30 s scale?*
+
+Worth stating once in the plan, because it sizes the whole goal: holding ±0.5 µs against 0.33 ppm
+needs a correction every **1.5 s**. The fine loop's τ is 120 s. That is the gap the goal is asking
+to close — a factor of ~80 in bandwidth — and no amount of averaging the reference (WS2) changes it.
+Either the rate noise comes down or the loop gets faster; the plan currently proposes neither.
+
+### R6.3 — The column that would decide WS3.4 is parsed and discarded
+
+The obvious next question — is that 0.33 ppm **commanded** (loop) or **uncommanded** (actuator,
+driver, estimator)? — cannot be asked of this CSV, because there is no commanded-trim column.
+`ramp_a_ppm` is not it: `RAMP_RE` (`:921`) matches `Offset ramp +2.35 ppm (tsf-local …, map …)`, the
+TSF-vs-local mapping drift. The DAC trim is `DLLOOP trim=`, parsed into `dl_trim_ppm` at
+`i2s-skew.py:1082` — and referenced **nowhere else in the file**.
+
+So: add `trim_a_ppm` / `trim_b_ppm` (and `int_a/b_ppm`) to the CSV row alongside the `dl_err` fix in
+R6.1. Then `corr(fs_diff, trim_diff)` over one quiet window answers it, offline, with no reflash and
+no bench change:
+
+* **correlated** ⇒ the loop is commanding the wander ⇒ `tau_s`/`ti_s` is the mechanism and R5.2's
+  corner-on-120 s coincidence is real. The sweep is the right next step.
+* **uncorrelated** ⇒ the wander is downstream of the command ⇒ rate-lock delivery, the I2S driver,
+  or the fs estimator, and **a `tau_s` sweep will read null** — an evening spent, five membership
+  changes paid, nothing learned.
+
+This should therefore run **before** WS3.4's sweep, not after. It is the cheapest decisive
+experiment left in the plan and it needs only an analyser change.
+
+### R6.4 — Two notes for the record
+
+* **The instrument is not the limit at any of these scales.** `scatter_ns` median 25.8 ns tonight,
+  matching CLAUDE.md's ~26 ns per-capture figure — 400× below the 10 µs the SF reads at 30 s. Worth
+  one line in WS0 so the question stops being re-asked.
+* **R5.2's SF numbers and R6.2's segment statistics come from the same two windows**, so they are
+  not independent confirmations of one another. The independent agreement claimed above is between
+  two *different quantities* on those windows (SF of position vs sd of fitted slope), which is the
+  weaker but still meaningful form. Repeat both on an overnight window before either is treated as
+  a baseline.
+
+---
+
+## RESPONSE 6 (2026-08-30; amendments in the body)
+
+**R6.1 — column defect ACCEPTED; the premise-undermining REBUTTED with the source.** The 8×
+under-read never touched `phase_a/b`: it was measured from the observer's PHASEIN lines in
+observer.log (byte-anchored absolute phases, A−B differenced over 20:36:31–20:37:25) against the
+rival-clean wire — the extraction is in this session's record. WS1's evidence paragraph now names
+its source so the question cannot recur. The ingestion defect itself is accepted in full and is
+worse than a stale column: HELD_COLS prints a run-start constant per-row as if measured — the
+sentinel-as-a-number rule inside the instrument of record. Fixes are PROPOSED in WS0 (the analyser
+is the user's file; changes need their sign-off): un-hold `phase_*` or add `fw_age_s`, restore
+log-follow, and add the trim/int columns.
+
+**R6.2 — ACCEPTED; two demotions and the plan's sizing fact.** The independent-quantity agreement
+(SF of position vs sd of fitted slope, 0.33 ppm × 30 s = 10 µs = SF(30 s)) is the right
+discriminator against the per-capture rule, and the crystal's <1 % variance share answers R2.5's
+common-mode question in the deflationary direction: WS3.2 is demoted to a measurement item; a
+crystal feed-forward cannot reach the plateau. The ~80× bandwidth gap (±0.5 µs vs 0.33 ppm ⇒ 1.5 s
+corrections vs τ = 120 s) is now stated in Order-and-honesty as the fact that sizes the whole goal:
+the plan proposes neither faster loop nor lower noise until R6.3's experiment says which is the
+lever.
+
+**R6.3 — ACCEPTED and re-ordered.** `dl_trim_ppm` parsed and dropped is the decisive column;
+corr(fs_diff, trim_diff) runs BEFORE any tau_s sweep — commanded ⇒ sweep next; uncommanded ⇒ the
+sweep would read null at the cost of five membership changes. Cheapest decisive experiment in the
+plan; blocked only on the analyser column additions (user's file).
+
+**R6.4 — ACCEPTED, both.** Instrument-floor line added to WS0 (scatter 25.8 ns, 400× under
+SF(30 s)); the shared-windows caveat added to WS3.4 — tonight's SF and segment statistics are two
+quantities on the same two windows, to be repeated on an overnight window before baseline status.
