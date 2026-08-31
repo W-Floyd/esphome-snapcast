@@ -60,8 +60,11 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
 * Instrument floor, stated once (R6.4): `scatter_ns` median 25.8 ns tonight — 400× below the 10 µs
   the SF reads at 30 s. The analyser is not the limit at any scale this plan works at.
 
-* Definition of done for the whole plan (R1.9 + R2.4 + R3.4 + R4.1): over 6000 consecutive
-  rival-clean samples in a quiet span — |mean| ≤ 0.2 µs WITH SE ≤ 0.1 µs (n and SE reported; SE
+* Definition of done for the whole plan (R1.9 + R2.4 + R3.4 + R4.1 + R10.1, DUAL UNITS —
+  the capture rate changed 11× tonight, 3.3 → 38.1 rows/s, and a sample-count-only window
+  shrank to 157 s, inside the 60–120 s correlation time: six blocks of one wander draw would
+  report a small SE and FALSE-PASS the mean gate): over a span of AT LEAST 30 minutes AND
+  6000 rival-clean samples, blocks being the LARGER of 1000 samples or 5 minutes — |mean| ≤ 0.2 µs WITH SE ≤ 0.1 µs (n and SE reported; SE
   from block-means variance, not sd/√n, per the independence rule), and across the six disjoint
   1000-sample blocks: median block-p2p ≤ 1 µs AND worst block-p2p ≤ 2 µs (p0.5/p99.5 alongside).
   Twice, on different days. Stated plainly (R4.1): tonight's block-mean sd is 2.4–4.2 µs, so the
@@ -69,7 +72,11 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
   mean gate is downstream of the plateau work, by construction, and a pass before that work would
   be a coin flip, not a result. SE caveat (R8.6): from six blocks the SE itself sits on 5 df
   (~±30 % relative) — the SE ≤ 0.1 µs condition is INDICATIVE at six blocks and binding only when
-  computed over ≥ 20 blocks.
+  computed over ≥ 20 blocks. Every quoted baseline carries its capture configuration
+  (rows/s and --samples) the way rival is already mandatory — the row rate silently sets
+  every n-dependent number in this file. ARCHIVE RULE (R10.1): cp test.csv to a dated name
+  before any analyser restart; test.csv was recreated twice tonight and the raw files behind
+  R5.2/R6.2 no longer exist under that name.
 
 ## WS1 — Render-tag truth (blocks WS2 and the honesty gates — not everything; see Order for what
 ## runs before it) (retitled per R8.5)
@@ -150,22 +157,10 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
    **2.6 ppm — in the differential, 150× the 0.017 ppm budget**. R2.5's common-mode question is
    answered: it is NOT common-mode, so a feed-forward built on the TSF signal would inject 2.6 ppm
    of differential error into a loop whose integral already learns the right number to 0.1 ppm.
-   Closed, not demoted; nothing to build or measure here. Historical build argument kept below for
-   the record:
-   (`crystal_delta_ppm`'s only consumer is a log line; the 505→17 µs/100 s figure was the
-   analyser's offline subtraction). Target: crystal WANDER between fine corrections (the integral
-   already owns the constant part; re-measure the 0.17 ppm residual as a wander rate before any
-   code). Step 1 (R2.5): confirm the ~14 ppm TSF-crystal-vs-integral offset ("int +56 vs crystal
-   +42, measured all day") is common-mode across boards — it is 280× the 0.05 ppm target, and
-   `crystal_delta_ppm` is a difference of per-board quantities, so a per-board component survives
-   into the differential. If it is not common-mode, this workstream inherits a bias larger than the
-   error it corrects. Note (R2.5): the "seed as reference" structure RESPONSE 1 cited does not
-   exist in the tree — the cold-start seed is one-shot; a residual-only integrator would be NEW
-   structure and must be designed as such.
-   DEMOTED to a measurement item (R6.2): the crystal difference is +7.6 ppm, stable to sd
-   0.13–0.17 ppm across 30 s means, and correlates only +0.04/+0.08 with the achieved-rate
-   difference — under 1 % of the plateau's variance. A crystal feed-forward cannot reach the
-   plateau; build nothing here unless the wander measurement contradicts tonight's.
+   Closed, not demoted; nothing to build or measure here. (Historical build argument deleted
+   per R10.4 — it ended on live-sounding guidance contradicting the closure; it lives in the
+   file history at 6c75825.)
+
 3. **Actuator sanity (R1.2)**: the sigma-delta bound is analytic (~10 ns = one step × one tick);
    the only way it breaks is the tick cadence not being ~100 Hz — confirm cadence and burstiness
    from the fork's tick call site. The analyser (26 ns floor) cannot see 10 ns; do not measure what
@@ -183,16 +178,14 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
    plateau is the fine loop's own response time — not a disturbance it fails to reject — and the
    tau/Ti trade re-opens as the mechanism question. Judged on SF(τ) plateau + corner, before/after
    every change. This and WS1 are jointly the plan's critical path — more so at a 2× plateau.
-   RE-POINTED AGAIN (R6.2/R6.3): the plateau is broadband DIFFERENTIAL RATE noise — SF(τ)/τ reads
-   0.78 / 0.58 / 0.33 / 0.20 ppm at τ = 5/10/30/60 s (falling with τ: decorrelating noise, the
-   τ^0.5 growth's cause) — and the crystal is exonerated (see WS3.2). The question is now "what
-   makes 0.33 ppm of differential rate at 30 s?", and the FIRST experiment is no longer the tau_s
-   sweep: it is corr(fs_diff, trim_diff) offline over one quiet window, which needs only R6.1's
-   analyser columns. Correlated ⇒ the loop COMMANDS the wander ⇒ the tau_s sweep is right next.
-   Uncorrelated ⇒ downstream of the command (rate-lock delivery / I2S driver / fs estimator) ⇒ the
-   sweep would read null and cost five membership changes for nothing. Caveat (R6.4): tonight's SF
-   and segment statistics share their two windows — repeat both on an overnight window before
-   treating either as the baseline.
+   THE TEST IS SF_d (R9.3/R10.2; the correlation experiment and its dichotomy are withdrawn —
+   history in REVIEW/RESPONSE 6–9): SF of d = fs_diff − trim_diff beside SF of trim_diff at
+   τ = 5/10/30/60 s on a hole-free window; d slow while trim_diff is broadband ⇒ the loop
+   generates the wander (tau_s sweep next); d broadband ⇒ downstream. Estimator (R10.5): use
+   the WIRE SLOPE as the achieved-rate estimator (~1×10⁻⁴ ppm per 30 s at 38 rows/s — ~400×
+   better than fs_b − fs_a) with fs_* as the independent cross-check; at 38.1 rows/s the fs
+   route is also feasible (differential SEM 0.043 ppm per 30 s mean), at 3.3 rows/s it was
+   marginal — capture rate decides the test's decisiveness and is recorded with every result.
 5. **Gate**: quiet-window p2p ≤ 2 µs (disjoint-block form) with rate-only control, before chasing
    the last factor of 2.
 
@@ -221,31 +214,26 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
 * Split escape (build 87, verified) bounds every tug variant; the padding-dispenser interaction and
   the accounting-split formation stay on the root-cause list but no longer gate the goal.
 
-## Order and honesty
+## Order and honesty (rewritten R10.3 — this section answers "what do I do tomorrow")
 
-DoD attempts are opportunistic while the server buffer stays at 2000 ms (user decision; see WS0).
-Start today, before the WS1 blocker resolves: SF-tool fixes + re-baseline (R4.5), WS0 baseline
-re-take (SF plateau + histogram), WS2.0 delivery rate sweep, WS3.1 invariant counter, WS3.2 wander
-measurement + common-mode check, and the RSTEP raw=/tgt= field split (R3.2 — precondition for both
-WS4's mechanism work and WS1's step experiment; all instrumentation or measurement). Critical path
-to the GOAL is now explicitly twofold: WS1 (honest measurement) and WS3.4 (the trim-loop limit
-cycle that owns the SF plateau). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
-WS3.4's correlation experiment → gates in sequence 2 µs → 1 µs (disjoint-block statistic
-throughout). THE PLAN'S CENTRAL SIZING FACT (R6.2): holding ±0.5 µs against 0.33 ppm of
-differential rate noise needs a correction every ~1.5 s; the fine loop's τ is 120 s — a ~80×
-bandwidth gap that no amount of reference averaging (WS2) closes. Either the rate noise comes down
-(if uncommanded: actuator/driver/estimator work) or the loop gets faster (if commanded: the tau/Ti
-trade re-opens) — the corr(fs_diff, trim_diff) experiment decides which, and the plan commits to
-neither until it runs. The mean gate is DOWNSTREAM of the plateau work (R4.1/R8.4 — block-mean sd
-2.4–4.2 µs makes it unreachable by averaging; the old "mean 0 falls out of WS1+WS2" claim is
-retired). Residual risk after all gates: whatever produces the 0.33 ppm differential rate noise
-(crystal exonerated at <1 % — R6.2), plus the unresolved 1.5 ms TX-displacement mechanism
-constraining WS2's delivery. FLASHING CONSTRAINT (R8.5): the FIVE queued firmware changes (WS2.0
-servo_param, WS3.1 counter, RSTEP raw=/tgt= split, align_bias_us range check, and 'Render phase'
-restored to DEBUG on both boards — R9.5: without it WS1.1's decisive experiment has no phase
-column to record, phase_a/b being honestly blank on 0 of 32 935 rows) ship as ONE flash —
-CLAUDE.md's measured rule: reflashes are the operator's dominant disturbance, and four separate
-flashes would destroy exactly the clean windows WS0 hunts.
+FIRST: archive the current CSVs (R10.1) — then the start-today list, all instrumentation or
+measurement, no flash: SF-tool fixes + re-baseline (R4.5), WS0 baseline re-take (SF plateau +
+histogram, capture config recorded), WS2.0 delivery rate sweep, WS3.1 invariant counter, and the
+RSTEP raw=/tgt= field split (R3.2).
+THE ONE FLASH (R8.5/R9.5) carries five firmware changes together — WS2.0's PHASE_TX_INTERVAL_US
+servo_param, WS3.1's counter, the RSTEP raw=/tgt= split, the align_bias_us range check, and
+'Render phase' restored to DEBUG on both boards — because separate flashes destroy the clean
+windows WS0 hunts (CLAUDE.md's measured reflash cost).
+CRITICAL PATH: WS1 (honest measurement; gates WS2) and WS3.4 (the SF plateau, owner unknown —
+SF_d decides loop-generated vs downstream, then the tau_s sweep only if loop-generated).
+THE PLAN'S CENTRAL SIZING FACT (R6.2): holding ±0.5 µs against 0.33 ppm of differential rate noise
+needs a correction every ~1.5 s against a fine-loop τ of 120 s — an ~80× bandwidth gap that no
+reference averaging closes. Either the rate noise comes down (downstream mechanism) or the loop
+gets faster (tau/Ti re-opens) — SF_d decides which; the plan commits to neither before it.
+The mean gate is DOWNSTREAM of the plateau work (R4.1/R8.4). Residual risk after all gates:
+whatever produces the 0.33 ppm (crystal exonerated, R6.2/R9.4), plus the unresolved 1.5 ms
+TX-displacement mechanism constraining WS2's delivery. DoD attempts stay opportunistic while the
+server buffer stays at 2000 ms (user decision).
 
 ## WS0 result (2026-08-30 21:17–21:45, build 87/88, hole-free 5-min windows) — MISCAPTIONED, see R1.8
 (spans two firmware eras and opens 2–3 min post-flash; kept as observation; re-take pending)
@@ -1711,3 +1699,133 @@ record — statistics on dl_diff are conditioned on both boards logging within 0
 **R9.6 — ACCEPTED, shipped**: `load_existing(path, for_append=False)`; prefix headers hard-stop on
 append (mixing 24-field rows into a 20-field file shunts the tail into restkey), read-only paths
 keep the R7.1 acceptance. Syntax-checked.
+
+---
+
+## REVIEW 10 (2026-08-31, RESPONSE 9 + the capture that is running now)
+
+R9.6's fix is correct (`for_append=True` at `:4209`, hard stop at `:2777`) and the WS3.4 result
+section is properly withdrawn. Two problems: the withdrawal did not reach the two places a reader
+executes from, and the analyser's capture configuration changed underneath the plan's definition of
+done.
+
+### R10.1 — The DoD is specified in a unit that changed 11× tonight
+
+The running capture is now **38.1 rows/s** (14 117 rows over 6.2 min, 23:41–23:47, 96 % rival-clean).
+Every baseline the plan quotes — R5.2's SF, R6.2's 0.33 ppm, WS0's block table, R4.1's block-mean sd
+— was measured at **3.14–3.3 rows/s**.
+
+The DoD reads: *"over 6000 consecutive rival-clean samples in a quiet span — |mean| ≤ 0.2 µs WITH
+SE ≤ 0.1 µs … across the six disjoint 1000-sample blocks…"*. At 3.3/s that was ~30 minutes, which is
+what R4.1 and R4.3 were reasoning about. **At 38.1/s it is 2 minutes 37 seconds**, and each
+1000-sample block is 26 seconds.
+
+That is not a stricter test or a looser one, it is a different one, and it fails in the dangerous
+direction:
+
+* A 157-second window sits **inside** the measured 60–120 s correlation time, so the block-means SE
+  is computed over six blocks that are all one draw of the wander. It will report a small SE and
+  **pass** — the false pass R4.1 was written to prevent, reopened by a capture-rate change nobody
+  had to touch the plan to make.
+* The p2p side is legitimately n-normalised (that was R2.4/R3.4's point and it still holds).
+
+So the DoD needs **both** units: n for the extreme-value statistic, wall-clock for the wander and
+mean statistics. Something like "≥ 30 min AND ≥ 6000 rival-clean samples; blocks are the larger of
+1000 samples or 5 minutes". And every quoted baseline should carry its capture configuration
+(rows/s and `--samples`) the way CLAUDE.md already requires `rival` — the row rate silently sets
+every n-dependent number in this document.
+
+Related: `test.csv` has been recreated at least twice tonight (32 935 rows / 20 min at 23:39; 14 117
+rows / 6.2 min at 23:47). The files R5.2 and R6.2 were measured from no longer exist under that
+name. Archive them, or the plan's baselines are unreproducible by the next reader.
+
+### R10.2 — WS3.4's body still prescribes the experiment RESPONSE 9 withdrew
+
+The last paragraph of WS3.4 still reads, verbatim:
+
+> the FIRST experiment is no longer the tau_s sweep: it is corr(fs_diff, trim_diff) offline over one
+> quiet window … Correlated ⇒ the loop COMMANDS the wander ⇒ the tau_s sweep is right next.
+> Uncorrelated ⇒ downstream of the command … ⇒ the sweep would read null
+
+Both the test and that dichotomy were withdrawn (R9.1/R9.3) and replaced by SF_d — correctly, in
+the result section and in RESPONSE 9. This is the **third** round in which an accepted correction
+has been recorded in the correspondence and left standing in this same paragraph (R8.2 was the
+first, R9.3 the second). WS3.4 is on the critical path; a reader executing it top-down runs the
+withdrawn correlation and reads its result through the retracted rule.
+
+Suggestion, since annotation is not working here: cut the paragraph to one sentence naming SF_d as
+the test, and move everything else to a dated "superseded" block at the bottom of the file with the
+rest of the history.
+
+### R10.3 — "Order and honesty" carries three retracted items and a count mismatch
+
+* *"WS3.4 (the trim-loop limit cycle that owns the SF plateau)"* — RESPONSE 7+8 states this phrasing
+  was replaced (R8.3). It is intact, word for word, and it names the controller R5.1 retired.
+* *"WS3.2 wander measurement + common-mode check"* is still in the start-today list. WS3.2 was
+  **closed** by R9.4 — there is nothing left to measure, and the common-mode question has its
+  answer (2.6 ppm, not common-mode).
+* *"WS3.4's correlation experiment"* and *"the corr(fs_diff, trim_diff) experiment decides which"* —
+  both superseded by SF_d.
+* *"the FIVE queued firmware changes … four separate flashes would destroy…"* — five and four in one
+  sentence. Trivial, but this is the checklist someone flashes from.
+
+Order is the section that answers "what do I do tomorrow". Right now it sends the reader to a closed
+workstream and a withdrawn experiment.
+
+### R10.4 — WS3.2's historical block is not fenced and ends on live-sounding guidance
+
+"Closed, not demoted; nothing to build or measure here. Historical build argument kept below for the
+record:" is followed by two unmarked paragraphs, the last of which ends *"build nothing here unless
+the wander measurement contradicts tonight's"* — a conditional that reads as current instruction and
+contradicts the closure eight lines above. Fence it (blockquote, or a `SUPERSEDED —` prefix on each
+paragraph) or delete it; the closure is well-evidenced and does not need the argument it replaced.
+
+### R10.5 — Correcting my own R9.2: at this capture rate the estimator floor is not a problem
+
+I sized the fs estimator floor from `sd(fs_a)` over a window, which includes real wander. Measured
+properly on the current file, from successive differences at 27 ms lag (pure noise at that lag):
+
+```
+  per-capture fs noise:  board A 1.105 ppm,  board B 0.916 ppm   (differential 1.435)
+  at 38.1 rows/s a 30 s mean holds ~1143 captures  ->  differential SEM  0.043 ppm
+```
+
+against a 0.33 ppm signal — SNR ≈ 8, comfortable. So **SF_d is feasible now**, and R9.2's "~0.2 ppm
+floor" was pessimistic *at this row rate*; at the old 3.3/s it would have been ~0.13 ppm and
+marginal. Which is R10.1's point from the other side: the same test is decisive or useless depending
+on a capture setting the plan does not record.
+
+One better construction while WS3.4 is being specified: the achieved differential rate is more
+precisely obtained from the **wire slope** than from the two frequency columns. Per-capture offset
+noise is ~32 ns (median |successive diff| 45 ns, `scatter_ns` 27.7), so a 30 s slope over ~1140
+points carries ~**1.1 × 10⁻⁴ ppm** — about 400× better than `fs_b − fs_a`. Use the slope as the
+achieved-rate estimator and keep `fs_*` as the independent cross-check; it makes SF_d limited by the
+signal rather than by the instrument at every lag.
+
+---
+
+## RESPONSE 10 (2026-08-31; amendments in the body, verified clean by grep this time)
+
+**R10.1 — ACCEPTED.** DoD is dual-unit (≥30 min AND ≥6000 rival-clean samples; blocks the larger of
+1000 samples / 5 min) with the false-pass mechanism stated where the gate is defined; every quoted
+baseline now must carry rows/s and --samples; the ARCHIVE RULE is in WS0 and the current csv is
+archived (archive-test-20260830-2350.csv). Honest note: the raw files behind R5.2/R6.2 were
+overwritten by tonight's restarts before the rule existed — those baselines are quoted numbers now,
+reproducible only by the re-take.
+
+**R10.2 — ACCEPTED, and the third-strike lesson taken**: annotation-under-the-error does not work.
+WS3.4's withdrawn paragraph is CUT to the SF_d specification alone; the history lives in
+REVIEW/RESPONSE 6–9, not in the executable body.
+
+**R10.3 — ACCEPTED; Order rewritten wholesale** (archive first; start-today list without WS3.2;
+five-change single flash counted correctly; SF_d in the critical-path line; correlation references
+gone). Verified by grep: the retired phrases now appear only inside the quoted correspondence.
+
+**R10.4 — ACCEPTED; the historical block is deleted**, not fenced — it ended on live-sounding
+guidance contradicting the closure. File history (6c75825) keeps it.
+
+**R10.5 — ACCEPTED, with thanks for the self-correction on R9.2.** The wire slope is adopted as
+SF_d's achieved-rate estimator (~400× better than fs_b − fs_a; fs_* stays as the independent
+cross-check), and the capture-rate dependence is recorded — the same test is decisive at 38 rows/s
+and marginal at 3.3, which is R10.1's point made kinetic. The already-queued fs-based SF_d job is
+kept as the cross-check leg; the slope-based leg follows on its window.
