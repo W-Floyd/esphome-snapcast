@@ -2366,3 +2366,18 @@ Consequences:
    throughout), so the overnight DoD/SF results above are not contaminated — but that is a fact
    that had to be checked, not assumed, and it is checked: every `Consensus over` line on A and B
    in the window reads `2 estimate(s)` with spread ~155 us.
+
+## WS3.4 tau sweep (2026-08-31 07:24–08:15) — INCONCLUSIVE, two instrument findings
+
+SF30 (ppm), n=14–28 pairs (±20–25 % each): tau60 trim 0.52 / slope 0.66 / d 0.62; tau240 0.46 /
+0.48 / 0.31; tau120 0.98 / 0.75 / 0.86. The 1/tau prediction is neither confirmed nor refuted —
+differences sit within ~2σ, the three windows were non-stationary (morning conditions drifting),
+and n is too small. The overnight loop-generated verdict stands unchallenged but unstrengthened.
+Repeat needs the paired/interleaved design R5.3 prescribed (alternate tau every ~10 min across an
+hour) and a healthy analyzer.
+Instrument findings: (1) the analyzer's row rate DECAYED 38 → 1.2 rows/s across its 8 h run
+(23:41→08:15) — progressive slowdown, likely plot/state cost growing with points; every long-window
+statistic silently loses n. Restart clears it; root cause is analyser-side (user's tool). (2) The
+sweep's first analysis run returned zero segments because the fixed sample-count threshold assumed
+38 rows/s — thresholds derived from row rate must scale with the measured rate (R10.1's lesson, in
+the analysis scripts this time).
