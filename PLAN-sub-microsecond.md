@@ -2559,3 +2559,71 @@ except that the servo's recovery is what gets measured.
 **ACTIONABLE**: the DoD hunt has a target window. The clean 45-min span that produced the first
 real DoD grading came out of exactly that 04:00-07:00 trough. Overnight is not a hopeful guess; it
 is where the event rate is 10x lower.
+
+## THE FLUTTER, SOLVED (2026-08-31 09:2x) — and WS3.1's invariant is wrong as written
+
+Operator: "isn't a solution, we actually need to figure out the flutter." Correct -- hunting a quiet
+window was avoidance. Here is the mechanism, end to end.
+
+### The chain
+
+1. **A shared REFERENCE step arrives.** `err` jumps 2-27 ms on both boards, **simultaneous to
+   0.13 s**, magnitudes matching to **~1 %** (9349/9440, 11127/11200, 5248/5148 us). `err_tag` and
+   `err_live` agree through it, so it is not one measurement path misbehaving.
+2. **The AUDIO NEVER JUMPS.** `d(played_frames_total_)/dt` is **exactly 44100.0 f/s** median, inside
+   event windows and outside, on both boards. (The only large deviations are counter resets at
+   08:08:48 and 08:54:02, not events.) The DAC consumes continuously at nominal rate THROUGH every
+   event -- so `err` steps because the DEADLINE moved, not the playout. This is the load-bearing
+   measurement and it uses only a monotonic counter, immune to every modeled term.
+3. **Both boards track it correctly, frame for frame:**
+
+```
+   onset      err step (A/B)     frames moved (A/B)   as us    ratio (A/B)
+   09:04:00   -9349 / -9440         418 / 418          9478    1.01 / 1.00
+   09:05:39  -11127 / -11200        524 / 524         11882    1.07 / 1.06
+   09:06:43   -5248 / -5148         374 / 378          ~8500   1.62 / 1.67
+   09:10:27  -20861 / -21817       1125 / 1128        ~25550   1.22 / 1.17
+```
+
+   IDENTICAL frame counts on the two boards (418/418, 524/524), at 0.96-1.22x the step.
+4. **Residual differential on the wire: 50-200 us** (coef-gated).
+5. **The 800-3300 us on the plot is CORRELATOR MISLOCK** -- 35-36 whole frames, `pcm_coef`
+   0.46-0.95, inflating the real residual 4-16x. See the `pcm_coef` gate section above.
+
+Rate: 8-25 events/hour awake, **2-5/hour between 04:00-07:00** -- diurnal, hence server/network
+delivery, not the boards.
+
+**CONCLUSION: the servo is behaving correctly.** A real external reschedule, tracked frame-for-frame
+by both boards in agreement, displayed 4-16x too large by an ungated instrument. What looked like
+the largest defect on the bench is mostly the measurement.
+
+### WS3.1's invariant is WRONG AS WRITTEN — correction required
+
+"Zero frame operations while converged" is violated on every one of these events, and the violation
+is the servo doing **the right thing**: 418 frames moved against a 9478 us reference step is correct
+tracking, not a defect. As specified, `FRAMEINV` reports correct behaviour as an invariant breach --
+and would have been quoted that way (I quoted "103 ops = 2.3 ms moved while converged" before
+noticing `ops` is the operation count and `frames` is the magnitude; the frames delta is 418 =
+9.48 ms, which is the whole story).
+
+Restate the invariant as: **zero frame operations while converged AND no reference step outstanding**
+-- i.e. gate the counter on the OOR/resync state, or report ops inside and outside event windows
+separately. Until then the raw counter is not a gate. The line stays valuable: it is what made the
+frame-for-frame tracking measurable at all.
+
+### Open thread
+
+09:06:43 over-corrects at **1.62x / 1.67x on BOTH boards** while every other event sits at
+0.96-1.22x. Consistent across boards, so mechanism rather than noise, but n=1. Worth pulling if it
+recurs -- an over-correction that agrees across boards points at the step-sizing arithmetic, not the
+plant.
+
+### Method notes (two dead ends, recorded so they are not re-run)
+
+* **No log line predicts the onset.** Two attempts with proper base rates: `TSF sample failed`
+  reads lift 1.4-2.0x on A and 0.0-1.3x on B (n=30 runs, boards contradicting); `Offset ramp`,
+  `Consensus over`, `RPUSH`, `GDAVG` all sit at 0.7-1.5x. An earlier version of this hunt quoted
+  20-60 % co-occurrence with NO base rate and is retracted -- those lines fire every few seconds
+  anyway. A line-type diff (numbers stripped, event windows vs null windows) also returned all-`inf`
+  lifts from broken null sampling; fixed, it returns nothing.
+* The answer came from a monotonic counter (`played`), not from log-line archaeology.
