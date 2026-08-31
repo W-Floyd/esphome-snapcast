@@ -462,6 +462,8 @@ static constexpr int64_t DL_ERR_STALE_US = 1000000;
 // and how long the ledger takes over before tags are trusted again.
 static constexpr uint8_t TAG_FAULT_MISSES = 3;
 static constexpr int64_t TAG_SPLIT_US = 3000;  // tag vs ledger disagreement that makes a miss a fault
+static constexpr int64_t SPLIT_ESCAPE_US = 5000;      // tug episodes ran 10-44 ms; quiet is <100 us
+static constexpr uint8_t SPLIT_ESCAPE_REPORTS = 3;    // ~10 s at report cadence
 static constexpr int64_t TAG_AGREE_US = 1000;   // tag vs ledger agreement that counts toward re-trusting the tags
 static constexpr unsigned TAG_AGREE_BLOCKS = 3;  // consecutive agreeing blocks that end a tag distrust early
 static constexpr int64_t TAG_JUDGE_US = 2000000;   // pipeline 0.28 s + a 0.65 s block average + margin; 1 s judged blocks that still held pre-correction samples (22:42 false fault)
@@ -5819,6 +5821,31 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             const int64_t shadow_err = tag_local_us - tag_deadline;
             ESP_LOGD(TAG, "SHADOW err_tag=%" PRId64 " err_live=%" PRId64 " diff=%" PRId64 " age=%" PRId64,
                      shadow_err, median_err_us, shadow_err - median_err_us, tag_age_us);
+            // SPLIT ESCAPE (build 87). Four tug episodes tonight (18:54, 19:13, 20:36-class, 21:02)
+            // shared one invariant: |tag - ledger| of 10-44 ms sustained for minutes while two
+            // actuators fought over it (tag steps vs the scheduler at 18:54; tag steps vs the
+            // padding dispenser at 21:02, RECON drift growing under them). Both signals cannot be
+            // right, and the one proven healer is the TAGFAULT teardown -- but TAGFAULT's judge
+            // never ran in these episodes because per-block actions kept refreshing coarse_act_us.
+            // So detect the INVARIANT itself: the disagreement this line already measures,
+            // sustained for three reports (~10 s). Quiet-hour |diff| is < 100 us; the 14:37 lesson
+            // (tags and ledger AGREEING at +47 ms during honest catch-up) is respected because
+            // agreement never trips this. Fires the exact TAGFAULT actions: distrust, pre-arm the
+            // split repair, reconnect.
+            if (std::abs(shadow_err - median_err_us) > SPLIT_ESCAPE_US) {
+              if (now_us() >= st.tag_fault_until_us && ++st.split_escape_streak >= SPLIT_ESCAPE_REPORTS) {
+                st.split_escape_streak = 0;
+                st.tag_fault_until_us = now_us() + TAG_FAULT_US;
+                st.drift_excess_since_us = now_us() - DRIFT_REPAIR_HOLD_US;
+                ESP_LOGW(TAG,
+                         "SPLIT ESCAPE: tag %+" PRId64 " vs ledger %+" PRId64 " us for %u reports -- "
+                         "distrusting tags and reconnecting",
+                         shadow_err, median_err_us, static_cast<unsigned>(SPLIT_ESCAPE_REPORTS));
+                this->reconnect_requested_.store(true, std::memory_order_relaxed);
+              }
+            } else {
+              st.split_escape_streak = 0;
+            }
           }
 
 #ifdef USE_SNAPCLIENT_TIMING_DIAG

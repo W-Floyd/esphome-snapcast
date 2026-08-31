@@ -913,6 +913,7 @@ class SnapcastClient {
     /// constant +97 ms err_tag and A's splice gave up on -19.5 ms over and over, for 40 minutes,
     /// while SHADOW showed the tag and ledger errors apart by exactly the RECON drift.
     uint8_t tag_miss{0};
+    uint8_t split_escape_streak{0};  // consecutive reports with |tag - ledger| > SPLIT_ESCAPE_US
     /// While now < this, err_tag is not trusted: coarse decisions, the measured-error splice and
     /// the split-repair disarm all fall back to the ledger, as if tags were stale.
     int64_t tag_fault_until_us{0};

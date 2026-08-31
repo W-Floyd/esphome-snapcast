@@ -2853,3 +2853,17 @@ episode tonight; all specimens in logs).
 10 s while playing (SHADOW already computes it every report) → the existing TAGFAULT/reconnect
 path. Both signals cannot be right; a reconnect rebuilds the ledger in ~15 s. This bounds every tug
 variant regardless of which actuator pair is fighting.
+
+### 2026-08-30 21:05 — build 87: the split escape
+
+The 21:02 episode, read raw, corrected the actor list: RSTEPs were firing (+576/block, the RSKIP
+beside them is the same block's skip-log), the counter-actor is the PADDING DISPENSER (PADDISP
+pad=235 ms), the accounting split GROWS under the fight (RECON −43.7k → −96.3k in seconds), the
+depth-divergence detector said "−40 ms vs group" for 67 s into an unconsumed log, and TAGFAULT's
+judge was starved by the per-block act refresh. Build 87 detects the invariant instead: at the
+SHADOW line, |tag − ledger| > 5 ms for 3 consecutive reports (~10 s; episodes ran 10–44 ms, quiet
+is <100 µs, and honest catch-up has tag/ledger AGREEING so it never trips) → the exact TAGFAULT
+actions (distrust, pre-arm the split repair, reconnect). **Prediction:** the next jumbo hole that
+plants a split produces one SPLIT ESCAPE line and a ~15 s reconnect recovery instead of minutes of
+flutter; quiet hours produce zero escapes. The padding-dispenser-vs-tag-steps interaction and the
+render-tag truth fix remain the root-cause queue.
