@@ -14,7 +14,11 @@ verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
 
 * Quiet-hour wire HISTOGRAM of the current rate-lock-only regime (rival-gated, hole-free spans from
   test.csv). Decomposes today's ±3–8 µs into rate ripple vs measurement noise, and is the gate
-  metric every later stage is judged by. Also establishes the divider dither's own ripple floor.
+  metric every later stage is judged by.
+
+* Definition of done for the whole plan (n-normalized, R1.9): |mean| <= 0.2 us over a 30-min quiet
+  window AND p2p <= 1 us over EVERY 1000 consecutive rival-clean samples within it (p0.5/p99.5
+  reported alongside), twice, on different days.
 
 ## WS1 — Render-tag truth (BLOCKER for everything downstream)
 
