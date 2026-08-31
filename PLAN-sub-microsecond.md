@@ -13,10 +13,13 @@ escape verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
 
 ## WS0 — The instrument first (no firmware)
 
-* PRECONDITION (R4.3): server `buffer 2000 → 4000` ms — promoted from WS4. Half of tonight's
-  record (12 of 24 five-min blocks) carries millisecond-class p2p, and the longest contiguous
-  rival-clean run is ~25 min < the 32 min the DoD needs. Nothing downstream can be GRADED until a
-  32-min clean span exists; this is WS0's first action, not hygiene.
+* SERVER BUFFER: user decision 2026-08-30 ~22:5x — stays at 2000 ms for now. Consequence (R4.3)
+  stands: 32-min contiguous clean spans are rare in this regime (longest tonight ~25 min), so DoD
+  attempts are OPPORTUNISTIC — hunt them in naturally quiet hours (overnight), do not schedule
+  them. For progress-grading between changes (not the DoD), an interim window of 4000 consecutive
+  rival-clean samples / four disjoint blocks is defined, achievable in the current regime; every
+  interim grade says which window size it used. If clean spans stay too rare even overnight, the
+  buffer decision gets revisited with that evidence.
 * Primary gate metric is the STRUCTURE FUNCTION (R4.2), not the histogram: SF(τ) with plateau and
   corner reported before and after every change (`scripts/bench/structure-function.py`, committed
   `8ca60e6`; the skew is bounded wander — 0.30 µs at τ=0.1 s rising to a plateau of 9.0 µs at
@@ -152,8 +155,8 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
 
 ## Order and honesty
 
-FIRST ACTION (R4.3, user-side): server `buffer 2000 → 4000` — no gradeable window exists without
-it. Start today, before the WS1 blocker resolves: SF-tool fixes + re-baseline (R4.5), WS0 baseline
+DoD attempts are opportunistic while the server buffer stays at 2000 ms (user decision; see WS0).
+Start today, before the WS1 blocker resolves: SF-tool fixes + re-baseline (R4.5), WS0 baseline
 re-take (SF plateau + histogram), WS2.0 delivery rate sweep, WS3.1 invariant counter, WS3.2 wander
 measurement + common-mode check, and the RSTEP raw=/tgt= field split (R3.2 — precondition for both
 WS4's mechanism work and WS1's step experiment; all instrumentation or measurement). Critical path
