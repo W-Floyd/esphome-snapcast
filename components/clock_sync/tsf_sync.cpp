@@ -636,6 +636,68 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       const int64_t phase_sampled_us =
           pkt.render_phase_age_ms == 0xFFFF ? local_now_us : local_now_us - static_cast<int64_t>(pkt.render_phase_age_ms) * 1000;
       this->record_peer_phase_(*peer, pkt.render_phase_us, phase_sampled_us);
+      // AVERAGED DELTA PAIRING (build 84, shadow). Pair this peer sample against the nearest own
+      // sample within 60 ms -- both sides now sample at chunk cadence, so nearly every 30 Hz
+      // arrival pairs -- and accumulate ((peer - mine) - drift*gap) per peer for the 1 s roll
+      // below. Window and sign conventions match recompute_group_delta_.
+      if (pkt.render_phase_us != RENDER_PHASE_UNKNOWN) {
+        const size_t pi = static_cast<size_t>(peer - this->peer_);
+        this->mapping_mutex_.lock();
+        const float drift = this->map_drift_ppm_;
+        int64_t best_gap = INT64_MAX;
+        int64_t best_phase = 0, best_at = 0;
+        for (size_t k = 0; k < OWN_PHASE_RING; k++) {
+          if (this->own_ph_[k].at_us == 0) continue;
+          const int64_t gap = phase_sampled_us - this->own_ph_[k].at_us;
+          if (std::abs(gap) < std::abs(best_gap)) {
+            best_gap = gap;
+            best_phase = this->own_ph_[k].phase_us;
+            best_at = this->own_ph_[k].at_us;
+          }
+        }
+        this->mapping_mutex_.unlock();
+        if (best_at != 0 && std::abs(best_gap) <= 60000 && pi < MAX_PEERS &&
+            this->gdavg_n_[pi] < 0xFFFF) {
+          this->gdavg_sum_[pi] += static_cast<double>(pkt.render_phase_us - best_phase) -
+                                  static_cast<double>(drift) * 1e-6 * static_cast<double>(best_gap);
+          this->gdavg_n_[pi]++;
+        }
+      }
+      // Roll the window once per second: gd_avg = -mean(0, per-peer means), the live delta's
+      // convention (mine is in the group; > 0 = I render LATE). Published even when empty
+      // (INT32_MIN) so a consumer can tell "no pairs" from "zero".
+      if (this->gdavg_roll_us_ == 0) this->gdavg_roll_us_ = local_now_us;
+      if (local_now_us - this->gdavg_roll_us_ >= 1000000) {
+        this->gdavg_roll_us_ = local_now_us;
+        double sum = 0.0;
+        uint32_t peers_n = 0, pairs = 0;
+        for (size_t i = 0; i < MAX_PEERS; i++) {
+          if (this->gdavg_n_[i] > 0) {
+            sum += this->gdavg_sum_[i] / this->gdavg_n_[i];
+            pairs += this->gdavg_n_[i];
+            peers_n++;
+          }
+          this->gdavg_sum_[i] = 0.0;
+          this->gdavg_n_[i] = 0;
+        }
+        if (peers_n > 0) {
+          const double d = -sum / static_cast<double>(peers_n + 1);
+          this->render_group_delta_avg_us_.store(
+              static_cast<int32_t>(std::clamp(d, -2.0e9, 2.0e9)), std::memory_order_relaxed);
+          this->gdavg_pairs_pub_.store(static_cast<uint16_t>(std::min<uint32_t>(pairs, 0xFFFF)),
+                                       std::memory_order_relaxed);
+          if (++this->gdavg_log_ctr_ >= 3) {
+            this->gdavg_log_ctr_ = 0;
+            ESP_LOGD(TAG, "GDAVG avg=%+ld n=%u live=%ld",
+                     static_cast<long>(this->render_group_delta_avg_us_.load(std::memory_order_relaxed)),
+                     static_cast<unsigned>(pairs),
+                     static_cast<long>(this->render_group_delta_us_.load(std::memory_order_relaxed)));
+          }
+        } else {
+          this->render_group_delta_avg_us_.store(INT32_MIN, std::memory_order_relaxed);
+          this->gdavg_pairs_pub_.store(0, std::memory_order_relaxed);
+        }
+      }
     }
 
     // PHASE-ONLY BEACON: the sender has no settled estimate to pool. Its phase and diagnostics
@@ -1281,6 +1343,52 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   // for everyone else (see the note above this function).
 }
 
+// 30 Hz PHASE-ONLY EXCHANGE (build 84, SHADOW). The live group delta pairs one phase sample per
+// block (~1.5 Hz each side, 300 ms window) -- ~1 pairing/s with ~10 us-class noise per side, which
+// is the floor under align and the sub-arm gate. Raising the beacon rate alone adds nothing (a
+// re-sent sample creates no new sample instants); this path raises the SAMPLE rate (the client now
+// samples per chunk) and ships each fresh sample in a no_mapping=1 packet the existing receive
+// path already understands. Multicast only: the 1 Hz beacon keeps the unicast roster, and touching
+// the roster from the player task would race set_peers/learn_peer_ on the network task.
+// 50 Hz (every 2nd chunk). The rate only sets pairs/second -- own samples arrive at chunk cadence
+// (~94 Hz) so every peer sample pairs regardless -- and per-window noise falls as ~1/sqrt(n) at
+// best (chunk samples are correlated; the GDAVG-vs-live shadow measures the real gain). Beyond
+// ~50 Hz the window length is the knob, not the packet rate. ~90 B x 50/s of airtime: negligible.
+static constexpr int64_t PHASE_TX_INTERVAL_US = 20000;
+void TsfSync::send_phase_report(int64_t local_now_us) {
+  if (local_now_us - this->phase_tx_last_us_ < PHASE_TX_INTERVAL_US) {
+    return;
+  }
+  if (!this->have_mac_ || !this->have_bssid_ || this->sock_ < 0) {
+    return;
+  }
+  const int64_t phase = this->render_phase_for_beacon_();
+  const int64_t at = this->render_phase_at_us_.load(std::memory_order_relaxed);
+  if (phase == RENDER_PHASE_UNKNOWN || at == 0) {
+    return;  // transient, or nothing rendered: the beacon side already says so at 1 Hz
+  }
+  this->phase_tx_last_us_ = local_now_us;
+  TsfPacket pkt = {};
+  pkt.magic = TSF_MAGIC;
+  pkt.version = TSF_VERSION;
+  memcpy(pkt.bssid, this->bssid_, 6);
+  memcpy(pkt.sender_mac, this->my_mac_, 6);
+  pkt.server_id_hash = this->pub_server_id_hash_.load(std::memory_order_relaxed);
+  pkt.stream_id_hash = this->pub_stream_id_hash_.load(std::memory_order_relaxed);
+  pkt.no_mapping = 1;  // phase report only; mapping fields are zero and must not be read
+  pkt.pipeline_us = this->pipeline_us_.load(std::memory_order_relaxed);
+  pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
+  pkt.render_phase_us = phase;
+  pkt.render_phase_age_ms =
+      static_cast<uint16_t>(std::clamp<int64_t>((local_now_us - at) / 1000, 0, 0xFFFE));
+  pkt.render_bias_us = this->pub_render_bias_us_.load(std::memory_order_relaxed);
+  struct sockaddr_in dest = {};
+  dest.sin_family = AF_INET;
+  dest.sin_port = htons(TSF_PORT);
+  dest.sin_addr.s_addr = inet_addr(TSF_GROUP);
+  sendto(this->sock_, &pkt, sizeof(pkt), 0, reinterpret_cast<struct sockaddr *>(&dest), sizeof(dest));
+}
+
 void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server_id_hash,
                       uint32_t stream_id_hash) {
   const int64_t since_last_service = local_now_us - this->last_service_us_;
@@ -1288,6 +1396,10 @@ void TsfSync::service(int64_t local_now_us, const Estimate &est, uint32_t server
     return;
   }
   this->last_service_us_ = local_now_us;
+  // Mirrors for the player-task phase reports (build 84): the hashes otherwise exist only as
+  // arguments on this task.
+  this->pub_server_id_hash_.store(server_id_hash, std::memory_order_relaxed);
+  this->pub_stream_id_hash_.store(stream_id_hash, std::memory_order_relaxed);
 
   if (!this->have_mac_) {
     this->have_mac_ = esp_wifi_get_mac(WIFI_IF_STA, this->my_mac_) == ESP_OK;

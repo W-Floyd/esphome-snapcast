@@ -133,6 +133,14 @@ class TsfSync {
   void set_render_phase_us(int64_t phase_us, int64_t at_us = 0) {
     this->render_phase_us_.store(phase_us, std::memory_order_relaxed);
     this->render_phase_at_us_.store(at_us, std::memory_order_relaxed);
+    // Feed the own-phase sample ring for the 30 Hz averaged delta (build 84). Called at chunk
+    // cadence from the player task; the pairing reader runs on the network task.
+    if (phase_us != RENDER_PHASE_UNKNOWN && at_us != 0) {
+      this->mapping_mutex_.lock();
+      this->own_ph_[this->own_ph_idx_] = OwnPhase{phase_us, at_us};
+      this->own_ph_idx_ = (this->own_ph_idx_ + 1) % OWN_PHASE_RING;
+      this->mapping_mutex_.unlock();
+    }
     if (at_us != 0) {
       this->recompute_group_delta_(at_us);
     }
@@ -208,6 +216,16 @@ class TsfSync {
     return n >= 2 ? static_cast<int32_t>(sum / n) : INT32_MIN;
   }
   void set_render_phase_broadcast(bool on) { this->render_phase_broadcast_.store(on, std::memory_order_relaxed); }
+  /// @brief 30 Hz phase-only exchange (build 84, SHADOW). Sends a no_mapping=1 TsfPacket carrying
+  /// the newest render-phase sample; multicast only (the 1 Hz beacon still unicasts the roster).
+  /// Call from the player task at chunk cadence; throttled internally to PHASE_TX_INTERVAL_US.
+  void send_phase_report(int64_t local_now_us);
+  /// @brief Windowed mean of per-peer paired phase deltas, same convention as
+  /// render_group_delta_us(); INT32_MIN until a window has closed with pairs in it. SHADOW ONLY.
+  int32_t render_group_delta_avg_us() const {
+    return this->render_group_delta_avg_us_.load(std::memory_order_relaxed);
+  }
+  uint16_t render_group_delta_avg_n() const { return this->gdavg_pairs_pub_.load(std::memory_order_relaxed); }
   int64_t render_phase_for_beacon_() const {
     return this->render_phase_broadcast_.load(std::memory_order_relaxed)
                ? this->render_phase_us_.load(std::memory_order_relaxed)
@@ -350,6 +368,29 @@ class TsfSync {
     float crystal_ppm;
   };
   Peer peer_[MAX_PEERS]{};
+  // 30 Hz phase exchange (build 84, shadow). Own render-phase samples now arrive at chunk cadence
+  // (~94 Hz) from the player task; peers' arrive at ~30 Hz on the network task. Pairing for the
+  // AVERAGED delta reads both, so the ring is guarded by mapping_mutex_ (short critical sections,
+  // same cross-task discipline as the mapping fields).
+  struct OwnPhase {
+    int64_t phase_us;
+    int64_t at_us;
+  };
+  static constexpr size_t OWN_PHASE_RING = 32;
+  OwnPhase own_ph_[OWN_PHASE_RING]{};
+  size_t own_ph_idx_{0};
+  // Per-peer window accumulation of paired deltas ((peer - mine) - drift*gap); rolled once per
+  // second on the network task into render_group_delta_avg_us_ (same sign convention as the live
+  // group delta: > 0 = I render LATE).
+  double gdavg_sum_[MAX_PEERS]{};
+  uint16_t gdavg_n_[MAX_PEERS]{};
+  int64_t gdavg_roll_us_{0};
+  uint8_t gdavg_log_ctr_{0};
+  std::atomic<int32_t> render_group_delta_avg_us_{INT32_MIN};
+  std::atomic<uint16_t> gdavg_pairs_pub_{0};
+  int64_t phase_tx_last_us_{0};
+  std::atomic<uint32_t> pub_server_id_hash_{0};
+  std::atomic<uint32_t> pub_stream_id_hash_{0};
   Peer *find_peer_(const uint8_t mac[6], int64_t local_now_us);
 
   std::atomic<int32_t> render_group_delta_us_{INT32_MIN};

@@ -1232,6 +1232,14 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
     }
   }
   this->playout_mutex_.unlock();
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+  // Build 84: a fresh phase sample per tagged chunk (the ring in tsf feeds the averaged group
+  // delta), and the 50 Hz phase report (throttled inside; multicast only).
+  this->publish_render_phase_sample_();
+  if (this->tsf_sync_ != nullptr && !this->config_.tsf_observer) {
+    this->tsf_sync_->send_phase_report(now_us());
+  }
+#endif
 }
 
 // THREAD CONTEXT: Speaker playback callback thread
@@ -4295,6 +4303,18 @@ void SnapcastClient::publish_render_phase_(bool steady) {
   // The phase is still measured and kept LOCALLY (the resync gate reads my own delta against the
   // peers' phases while my window is open -- that is when it needs it); only the BEACON goes quiet.
   this->tsf_sync_->set_render_phase_broadcast(steady);
+  this->publish_render_phase_sample_();
+#endif
+}
+
+// Measure one render-phase sample and store it (chunk cadence since build 84 -- the 50 Hz phase
+// exchange needs fresh sample instants, not re-sent ones). Does NOT touch the broadcast flag:
+// transient gating stays with the per-block publish_render_phase_ call.
+void SnapcastClient::publish_render_phase_sample_() {
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+  if (this->tsf_sync_ == nullptr || this->config_.tsf_observer) {
+    return;
+  }
   int64_t phase_tsf = 0, phase_local = 0, phase_width = 0;
   if (!TsfSync::raw_tsf_sample(phase_tsf, phase_local, phase_width)) {
     return;

@@ -1091,6 +1091,7 @@ class SnapcastClient {
   /// THREAD CONTEXT: player task.
   void delay_loop_update_(ServoState &st);
   void publish_render_phase_(bool steady);  // per-block render phase to the group; UNKNOWN while in transient
+  void publish_render_phase_sample_();      // measure + store one phase sample (no broadcast-flag change)
   int64_t travel_horizon_us_() const;  // ring + pipeline + two blocks: how long a position change takes to reach the tags
 #endif
 
