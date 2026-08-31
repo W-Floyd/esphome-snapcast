@@ -2781,3 +2781,17 @@ the live gd's (if pairs were independent, ~2 µs vs ~10; correlation will keep i
 line — the shadow measures how far). If GDAVG tracks the wire's slow differential with µs-class
 noise, it becomes align's input next; if it inherits the live gd's bias pathologies (the tail-era
 3–5× under-read), that under-read is upstream of pairing and the investigation moves there.
+
+### 2026-08-30 20:34–20:38 — build 85: unicast phase reports; the 5× under-read isolated
+
+Unicast roster mirror fixed delivery: GDAVG n=1–2 → 15–28 pairs/s, and avg tracks live within
+noise (avg −114/−195 vs live −133/−196) — the averaged channel works. It immediately sharpened the
+open question: during the post-boot settle the rival-gated wire read a REAL −1620 µs while BOTH
+delta estimators read ~±150 µs and each board's err_tag sat at +330/+290 (only 40 µs apart) — the
+5× differential under-read is upstream of pairing, in what the phase/tag measurement can see.
+OFFDBG rules out the shared-offset filters (rawgaps ±200 µs, symmetric, no standing split); SYNCX
+feedback model identical on both boards (9999 µs/10 ms cap each). The wire decays at ~2.7 µs/s
+(align/EWMA pace), so it is a boot-transient differential that on-device signals are largely blind
+to. Next: offline cross-board comparison of per-chunk RAW render phases against the analyzer's
+wire for the same span — decides whether phase-in-TSF disagrees with the wire (pairing/consensus
+exonerated, tag stamping suspect) or agrees (then the loss is in consensus/extrapolation).
