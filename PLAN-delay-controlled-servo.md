@@ -2896,3 +2896,20 @@ Queue addition: quiet-hour wire histogram of the current rate-lock-only regime �
 Boot ring (build-88 era): full-gain tag steps vs a straddling average at boot, r≈1.75 → factor
 0.75/round → 45 s. A/B queued: resync_gain 0.6 (|1−0.6·1.75|≈0.05, one round; costs ~one round on
 clean tails).
+
+### 2026-08-31 06:35 — overnight double failure: zombie session on A, epoch-mixed deadline on B
+
+Found at 06:35 (user: "b is down?"). Server UP throughout (B received chunks continuously).
+1. **A: 3.74 h idle-stall with no reconnect** (PLAYER STALLED "13458 s", phase=idle(record queue),
+   since ~02:51). The bailout path needs records arriving ("stream late and not catching up"); a
+   session that stops delivering records entirely never trips it, and the STALLED log line drives
+   no action. The dead-session backstop has a records-silent blind spot — fix queue.
+2. **B: reconnect onto a degenerate consensus** at 05:41 (stream 15.6 s late → bailout →
+   "Consensus over 1 estimate(s)", then "over 2, spread 575214 µs" pooled) came back with an
+   epoch-mixed deadline: err ≈ −11,144,476,240 ms ≈ the full TSF↔server offset — hard resync
+   inserting silence on every chunk for ~54 min. Neither TAGFAULT nor SPLIT ESCAPE fires at this
+   error scale (out-of-range forever, tag path never judged). Fix queue: a deadline sanity bound
+   (|err| beyond any playable horizon ⇒ rebuild the mapping / reconnect, never per-chunk-correct),
+   and consensus adoption gates on n≥2 with bounded spread after a bailout.
+Both boards rebooted (established remedy) with R12.1 verify protocol; SF_d job died with the
+overnight session restart and is requeued after the bench settles.
