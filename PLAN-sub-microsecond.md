@@ -115,14 +115,14 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
    the only way it breaks is the tick cadence not being ~100 Hz — confirm cadence and burstiness
    from the fork's tick call site. The analyser (26 ns floor) cannot see 10 ns; do not measure what
    the arithmetic already answers. `set_rate_adjustment` is off the critical path.
-5. **Trim-loop limit cycle (R4.2 — the plateau's named owner)**: the SF corner at 10–30 s coincides
+4. **Trim-loop limit cycle (R4.2 — the plateau's named owner)**: the SF corner at 10–30 s coincides
    with the trim loop's ~24 s limit cycle at loop gain 0.79 (documented on this bench 2026-08-28)
    — the plateau (9.0 → 6.5 µs) IS the quantity the goal is made of, it sets both the p2p tails and
    the mean's SE (R4.1), and no other workstream touches it (crystal FF is a 100 s+ term; actuator
    ripple is 10 ns). Mechanism work on the trim loop's cycle — gain/cadence/lag structure — judged
    on SF(τ) plateau + corner, before/after every change. This and WS1 are jointly the plan's
    critical path.
-4. **Gate**: quiet-window p2p ≤ 2 µs (disjoint-block form) with rate-only control, before chasing
+5. **Gate**: quiet-window p2p ≤ 2 µs (disjoint-block form) with rate-only control, before chasing
    the last factor of 2.
 
 ## WS4 — Event hygiene (protects the metric; mostly done or user-side)
