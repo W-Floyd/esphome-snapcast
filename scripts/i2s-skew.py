@@ -61,6 +61,7 @@ import argparse
 import collections
 import bisect
 import concurrent.futures
+import itertools
 import json
 import math
 import queue
@@ -69,7 +70,11 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 import time
+import traceback
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
 
 try:
     import numpy as np
@@ -685,6 +690,15 @@ def match_temperature(line):
 
 # Above this many samples the plot is decimated for drawing (the data is untouched).
 MAX_PLOT_POINTS = 2500
+# The width the .svg on disk is always laid out at. The live view overrides it per client;
+# the file does not follow the browser, or every capture would rewrite it a different shape.
+PLOT_WIDTH = 900
+
+# Panel series colours, by position in the panel's SORTED key order. Module-level because
+# the legend has to name the same colour the drawing will use, and the two are computed in
+# different places -- a second literal list would drift and the swatch would then be a
+# confident lie about which trace a checkbox controls.
+PANEL_PALETTE = ["#c2410c", "#0f766e", "#7c3aed", "#a16207", "#be123c"]
 
 # TSF group state, e.g. "tsf=consensus(n2, 1.0s, depth +2267 render +12 us)" / "tsf=solo(...)".
 # Matched on the first letter only: the Sync line is long and the logger truncates it mid-token,
@@ -703,6 +717,12 @@ TEMPS = {}
 # None marks a window with no trim programmed at all, which is a hole in the integral and
 # not a zero; see integral_fit.
 TRIMS = {}
+# [(elapsed_s, dl_err_a - dl_err_b in us)], built once where the CSV row is written so the
+# overlay and the column are literally the same numbers. A second derivation would be a
+# second thing to keep in step, and this plot exists to compare belief with measurement --
+# the comparison must not itself be two different computations.
+DL_DIFF = []
+
 # (board, key) -> [(elapsed_s, value)] for what the firmware BELIEVES, so it can be shown
 # against what the wire measures. Sampled at the firmware's own cadence (render phase every
 # ~24 s over these logs), not at the capture rate.
@@ -901,10 +921,55 @@ DEPTH_RE = re.compile(
 RAMP_RE = re.compile(
     r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Offset ramp ([+-][\d.]+) ppm")
 
+# "DLLOOP err=-41 us trim=+49.68 int=+53.82 ppm kp=0.100 n=36 dt=0.35 t=438623050"
+#
+# This is the delay loop's OWN error against its target, and the difference between the two
+# boards' errors is the closest thing the firmware has to the quantity this script measures
+# on the wire. Correlated at r = 0.88 against the wire with ~2.5 us of bias and 13 us/s of
+# noise, where phase_b - phase_a is biased by tens of microseconds, 3-4x noisier, and
+# carries stall-stamp spikes. So this, not Render phase, is the device-vs-truth comparison.
+#
+# Requiring trim= is deliberate and is NOT the trailing-field mistake this project has made
+# before: the OUT OF RANGE form below is a DIFFERENT line that genuinely has no trim, and
+# the two forms partition the DLLOOP lines exactly (measured: 8716 + 1382 = 10098, no
+# remainder). Length checked too -- 139-140 bytes on 842 of 846 sampled lines, far short of
+# the 256-byte formatting ceiling, so nothing here is at risk of being cut mid-token.
+# int= is OPTIONAL even though every real line has it. The project's own rule: a regex that
+# requires a trailing field turns a formatting limit into silent whole-line data loss, and
+# SYNC_RE has already made exactly that mistake once. err is the load-bearing field and it
+# comes first, so a line cut anywhere after it still yields the measurement.
+DLLOOP_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?DLLOOP err=([-+]\d+) us"
+    r"(?: trim=([-+\d.]+))?(?: int=([-+\d.]+))?")
+
+# "DLLOOP err=-1532 us OUT OF RANGE (>=1000), holding integral +55.28 ppm t=348479916"
+# The error is real but was not acted on, so it is an ANNOTATION rather than a sample: mixing
+# it into the series would plot a value the loop explicitly refused to use.
+DL_OOR_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?DLLOOP err=([-+]\d+) us OUT OF RANGE "
+    r"\(>=(\d+)\)")
+
+# "Delay loop: engaged, integral +55.36 ppm (err -186 us) t=..." and
+# "Delay loop: deadline on local fallback, holding integral +55.36 ppm + P -18.19 ... tau t=..."
+DL_STATE_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?Delay loop: (.+?)(?:\s+t=\d+)?\s*$")
+
+# "SERVOPARAM tau_s=10.000 t=358621434" -- note this one is logged WITHOUT the [snap_player]
+# tag the other lines carry, so nothing here may require it.
+SERVOPARAM_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SERVOPARAM (\S+?)=([-+\d.]+)")
+
+# "SERVOTUNE hold tau=10.0 s (r1=+0.99 mean=-146 sd=107) t=..." -- and a "sluggish-looking
+# window ... not acted on" form with no tau at all, which must not be mistaken for a change.
+SERVOTUNE_RE = re.compile(
+    r"^\[(\d\d):(\d\d):(\d\d)\.(\d+)\].*?SERVOTUNE .*?\btau=([\d.]+)")
+
+DL_INTEGRAL_RE = re.compile(r"integral ([+-][\d.]+)")
+
 
 def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=None,
                       sync_us=200, peak_us=600, pipe_ms=25, tail_bytes=0,
-                      rendertag_us=500, phasein_us=1000):
+                      rendertag_us=500, phasein_us=1000, dl_event_s=5.0):
     """Clock-affecting events from a device log: (time_of_day_s, kind, text).
 
     Three kinds, all read off the one Sync line the firmware emits every ~3.3 s:
@@ -984,6 +1049,107 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
             trims.append((tod_w, None, float(tn.group(5)),
                           int(dv.group(1)) if dv else None))
             continue
+        # --- delay loop ------------------------------------------------------------
+        # OUT OF RANGE is tested FIRST because it is a DLLOOP line too: err is present but
+        # the loop explicitly refused to act on it, so it becomes an annotation and never a
+        # sample. Mixing it into the series would plot a value the firmware discarded.
+        oor = DL_OOR_RE.match(line)
+        if oor:
+            tod_o = (int(oor.group(1)) * 3600 + int(oor.group(2)) * 60 + int(oor.group(3))
+                     + int(oor.group(4)) / (10 ** len(oor.group(4))))
+            # First line of a run only. These repeat every loop tick for as long as the
+            # condition lasts -- 1382 of them in one log against 8716 normal lines -- and
+            # marking each would paint the panel solid and hide everything else on it.
+            # Same rewind hazard as the delay-loop gate: a re-read must be able to mark
+            # the first line of a run it has already seen once.
+            if tod_o < state.get("oor_t", tod_o):
+                state["oor"] = False
+            state["oor_t"] = tod_o
+            if not state.get("oor"):
+                ev.append((tod_o, "oor",
+                           f"{board}: dl out of range {oor.group(5)} us"))
+            state["oor"] = True
+            continue
+        dl = DLLOOP_RE.match(line)
+        if dl:
+            state["oor"] = False          # a normal tick ends the run
+            tod_d = (int(dl.group(1)) * 3600 + int(dl.group(2)) * 60 + int(dl.group(3))
+                     + int(dl.group(4)) / (10 ** len(dl.group(4))))
+            dv = DEV_T_RE.search(line)
+            dev = int(dv.group(1)) if dv else None
+            extras.setdefault("dl_err_us", []).append((tod_d, dev, float(dl.group(5))))
+            if dl.group(6) is not None:
+                extras.setdefault("dl_trim_ppm", []).append(
+                    (tod_d, dev, float(dl.group(6))))
+            if dl.group(7) is not None:
+                extras.setdefault("dl_int_ppm", []).append(
+                    (tod_d, dev, float(dl.group(7))))
+            continue
+        ds = DL_STATE_RE.match(line)
+        if ds:
+            tod_s = (int(ds.group(1)) * 3600 + int(ds.group(2)) * 60 + int(ds.group(3))
+                     + int(ds.group(4)) / (10 ** len(ds.group(4))))
+            # The spacing gate below compares against a time carried in `state`, and that
+            # state survives a REWIND: priming walks the whole log and leaves dlmode_t at
+            # the end of it, then the replot pass re-reads the same file from byte zero.
+            # Every event then failed "now - last >= dl_event_s" on a NEGATIVE difference,
+            # and --replot silently drew no delay-loop marks at all -- measured 39 events
+            # on the first pass, 0 on the second. Time-of-day also wraps at midnight, which
+            # goes backwards for the same reason and must reset the gate just as much.
+            if tod_s < state.get("dlmode_t", tod_s):
+                state.pop("dlmode_t", None)
+                state["dlmode"] = None
+            txt = ds.group(5)
+            # Six forms in one log, not the two the loop's name suggests: engaged (149),
+            # deadline on local fallback (135), setpoint changed (14), integral (10), tags
+            # stale (9), integral restored (5). Splitting on the comma left labels like
+            # "setpoint changed (" -- a truncation that reads as a parse failure. Take
+            # whole words up to the first clause break instead.
+            mode = ("engaged" if "engaged" in txt
+                    else "holding" if "holding" in txt
+                    else " ".join(re.split(r"[,(]", txt, maxsplit=1)[0].split())[:22].strip())
+            gi = DL_INTEGRAL_RE.search(txt)
+            # On CHANGE, and no more often than dl_event_s. The loop alternates
+            # holding->engaged roughly every ten seconds, so every line is a change and
+            # marking them all would bury the plot -- the same reason trim is thresholded.
+            if (mode != state.get("dlmode")
+                    and tod_s - state.get("dlmode_t", -1e9) >= dl_event_s):
+                ev.append((tod_s, "dlloop", f"{board}: dl {mode}"
+                           + (f" {gi.group(1)} ppm" if gi else "")))
+                state["dlmode_t"] = tod_s
+            state["dlmode"] = mode
+            continue
+        spm = SERVOPARAM_RE.match(line)
+        if spm:
+            tod_p = (int(spm.group(1)) * 3600 + int(spm.group(2)) * 60 + int(spm.group(3))
+                     + int(spm.group(4)) / (10 ** len(spm.group(4))))
+            # Ungated: a whole log holds 8-11 of these, and each one is a deliberate change
+            # to the loop's constants, which is exactly what a reader wants marked.
+            ev.append((tod_p, "servoparam", f"{board}: {spm.group(5)}={spm.group(6)}"))
+            continue
+        stn = SERVOTUNE_RE.match(line)
+        if stn:
+            tod_t = (int(stn.group(1)) * 3600 + int(stn.group(2)) * 60 + int(stn.group(3))
+                     + int(stn.group(4)) / (10 ** len(stn.group(4))))
+            if tod_t < state.get("tau_t", tod_t):
+                state["tau"] = None
+            state["tau_t"] = tod_t
+            tau = stn.group(5)
+            # Only when tau MOVES. Most SERVOTUNE lines report a hold at the current value,
+            # and the "sluggish-looking window ... not acted on" form carries no tau at all
+            # and must not be read as a change -- which is why the pattern requires tau=.
+            # The first observation is marked too, not just changes: it states what tau the
+            # run is actually using. Measured on these logs, tau never moves -- 64 lines,
+            # all tau=10.0 -- so a change-only rule would annotate nothing at all and leave
+            # the reader unable to tell "unchanged" from "not parsed".
+            if state.get("tau") is None:
+                ev.append((tod_t, "servotune", f"{board}: tau {tau} s"))
+            elif tau != state["tau"]:
+                ev.append((tod_t, "servotune",
+                           f"{board}: tau {state['tau']} -> {tau} s"))
+            state["tau"] = tau
+            continue
+
         # The firmware's own view, on its own log lines: matched before SYNC_RE's continue.
         # Each carries the device timestamp when the firmware is new enough; None falls back
         # to the host prefix so an older log still plots.
@@ -1252,21 +1418,283 @@ def tod_to_unix(tod, ref_unix):
     return best
 
 
-def write_svg(path, ts, ys, title, ylabel, include_zero=True,
-              xlabel="elapsed (s)", log_axes=False, events=(), panels=(), stats=None,
-              overlays=None, expand_for_overlays=False):
-    """Plot without a plotting dependency -- the rest of scripts/ is stdlib too.
+def _as_xy(pts):
+    """(n, 2) float array from a series, sorted by x with non-finite rows dropped.
+
+    fromiter over a flattened chain, not np.asarray(list_of_tuples): measured 13.1 ms
+    against 38.5 ms for 400k points, because asarray has to probe each tuple for shape and
+    type. An array that arrives already an array costs nothing, so a caller that keeps its
+    series in numpy pays no conversion at all.
+    """
+    if isinstance(pts, np.ndarray):
+        arr = pts.astype(float, copy=False).reshape(-1, 2)
+    else:
+        n = len(pts)
+        if not n:
+            return np.empty((0, 2))
+        arr = np.fromiter(itertools.chain.from_iterable(pts), dtype=float,
+                          count=2 * n).reshape(-1, 2)
+    arr = arr[np.isfinite(arr[:, 0]) & np.isfinite(arr[:, 1])]
+    if arr.shape[0] > 1 and not np.all(np.diff(arr[:, 0]) >= 0):
+        arr = arr[np.argsort(arr[:, 0], kind="stable")]
+    return arr
+
+
+def _envelope(xs, vs, x_lo, x_hi, buckets):
+    """Aggregate a dense series into at most ``buckets`` columns of (x, lo, hi, mean).
+
+    This is what a wide time window actually wants. Stride sampling keeps 1 point in n and
+    throws the other n-1 away, so an excursion narrower than the stride is simply not on
+    the plot -- and on this bench the excursions ARE the signal. Bucketing by PIXEL COLUMN
+    keeps the extremes of every column, which is the same picture the eye would get from
+    the undecimated trace, at a vertex count bounded by the width of the panel rather than
+    by the length of the run.
+
+    It is also the cheaper path at size: the work is four numpy reductions over the raw
+    arrays instead of a Python loop, and the drawn vertex count stops growing with n.
+
+    ``xs`` must be non-decreasing, which makes the bucket index non-decreasing too, so the
+    reductions are reduceat over runs rather than the much slower ufunc.at scatter.
+    """
+    span = (x_hi - x_lo) or 1.0
+    idx = ((xs - x_lo) / span * buckets).astype(np.int64)
+    np.clip(idx, 0, buckets - 1, out=idx)
+    starts = np.flatnonzero(np.diff(idx, prepend=idx[0] - 1))
+    counts = np.diff(np.append(starts, xs.size)).astype(np.float64)
+    return (np.add.reduceat(xs, starts) / counts,
+            np.minimum.reduceat(vs, starts),
+            np.maximum.reduceat(vs, starts),
+            np.add.reduceat(vs, starts) / counts)
+
+
+def _split_runs(xs):
+    """Index bounds of contiguous runs, split on gaps -- split_gaps over numpy arrays.
+
+    Same rule (ten times the median spacing, floored at half a second) but computed on the
+    RAW series. split_gaps ran on the already-decimated points, so its median spacing was
+    the stride times the true spacing and it could not see a gap shorter than ten strides:
+    at 20k captures that is a blind spot of ~80 samples. Segmenting the raw series first
+    also lets each segment be enveloped on its own, so a band never spans a dropout.
+    """
+    if xs.size < 3:
+        return [(0, xs.size)] if xs.size else []
+    d = np.diff(xs)
+    med = float(np.median(d))
+    limit = max(10 * med, 0.5) if med > 0 else 0.5
+    cuts = np.flatnonzero(d > limit) + 1
+    bounds = np.concatenate(([0], cuts, [xs.size]))
+    return [(int(a), int(b)) for a, b in zip(bounds, bounds[1:]) if b > a]
+
+
+def _write_atomic(path, text):
+    """Write via a temp file and rename.
+
+    The live view no longer reads this file -- it is served the display list directly --
+    but anything else watching the path still can, and a plain truncate-and-write is
+    visible half-finished to whatever reads it next. The rename is atomic, so a reader
+    sees either the old plot or the new one and never a partial document.
+    """
+    # A unique temp per WRITE, not per process. `{path}.tmp{pid}` collided whenever two
+    # writes overlapped -- the final plot in main() is not under plot_busy, so it races a
+    # live draw thread -- and the loser's os.replace raised FileNotFoundError after the
+    # winner had already renamed the shared name away. Same directory, so the replace
+    # stays on one filesystem and stays atomic.
+    d, base = os.path.dirname(path) or ".", os.path.basename(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=base + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+# Drawing ops. The layout below emits these, and two back ends consume them: an SVG
+# writer for the file on disk, and a JSON feed for the live canvas in --serve.
+#
+# One layout, two renderers. The alternative -- porting the axis ranging, the robust
+# overlay scaling, the gap splitting and the tick-decimal rule into JavaScript -- would
+# have put the plot's actual judgement calls in two places, and the browser copy would
+# have drifted from the file copy silently, which is the exact failure this project
+# keeps re-learning. The canvas gets device coordinates and paints them; it decides
+# nothing.
+#
+#   ["rect",   x, y, w, h, fill, opacity]
+#   ["line",   x1, y1, x2, y2, stroke, width, dash, opacity]
+#   ["poly",   [x0,y0,x1,y1,...], stroke, width, dash, opacity, clip]
+#   ["area",   [x0,y0,x1,y1,...], fill, opacity, clip]        (closed, filled)
+#   ["circle", cx, cy, r, fill]
+#   ["text",   x, y, s, anchor, fill, size, weight, rot]
+#
+# dash is None or [on, off]; clip is None or "top"; rot is None or [deg, cx, cy].
+
+
+# Chrome colours are named, not literal, so the two back ends can disagree about what
+# "axis" looks like without disagreeing about the plot. The SVG resolves every token to
+# the value it has always used -- the file is unchanged -- and the canvas resolves the
+# same token against the viewer's colour scheme.
+#
+# Only the CHROME is tokenised. The data colours stay literal hex, because a categorical
+# palette is the one thing that must not be re-chosen per theme: the reader identifies a
+# series by hue, and a dark-mode palette that reassigned hues would make two screenshots
+# of the same run disagree about which trace is which. The canvas lifts their lightness
+# for contrast and leaves the hue alone.
+THEME_LIGHT = {
+    "bg": "white", "fg": "#000", "grid": "#e5e5e5", "axis": "#333",
+    "tick": "#555", "tickmark": "#888", "stats": "#666", "zero": "#888",
+    "zero2": "#bbb", "shade": "#000",
+}
+
+
+def _svg_colour(c):
+    return THEME_LIGHT.get(c, c)
+
+
+def _xml_escape(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def _ops_to_svg(ops, W, H, clip=None):
+    """Render a display list as an SVG document."""
+    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
+         f'font-family="-apple-system,sans-serif" font-size="12">']
+    if clip:
+        cx, cy, cw, ch = clip
+        o.append(f'<defs><clipPath id="toppanel"><rect x="{cx}" y="{cy}" '
+                 f'width="{cw}" height="{ch}"/></clipPath></defs>')
+    open_clip = False
+    for op in ops:
+        kind = op[0]
+        want_clip = ((kind == "poly" and op[5] is not None)
+                     or (kind == "area" and op[4] is not None))
+        if want_clip and not open_clip:
+            o.append('<g clip-path="url(#toppanel)">')
+            open_clip = True
+        elif open_clip and not want_clip:
+            o.append('</g>')
+            open_clip = False
+        if kind == "rect":
+            _, x, y, w, h, fill, opac = op
+            a = f' opacity="{opac}"' if opac is not None else ""
+            o.append(f'<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{_svg_colour(fill)}"{a}/>')
+        elif kind == "line":
+            _, x1, y1, x2, y2, st, wd, dash, opac = op
+            a = f' stroke-width="{wd}"' if wd is not None else ""
+            if dash:
+                a += f' stroke-dasharray="{dash[0]} {dash[1]}"'
+            if opac is not None:
+                a += f' opacity="{opac}"'
+            o.append(f'<line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="{_svg_colour(st)}"{a}/>')
+        elif kind == "poly":
+            _, flat, st, wd, dash, opac, _clip = op
+            pl = " ".join(f"{flat[i]},{flat[i+1]}" for i in range(0, len(flat), 2))
+            a = f' stroke-width="{wd}"' if wd is not None else ""
+            if dash:
+                a += f' stroke-dasharray="{dash[0]} {dash[1]}"'
+            if opac is not None:
+                a += f' opacity="{opac}"'
+            o.append(f'<polyline points="{pl}" fill="none" stroke="{_svg_colour(st)}"{a}/>')
+        elif kind == "area":
+            _, flat, fill, opac, _clip = op
+            pl = " ".join(f"{flat[i]},{flat[i+1]}" for i in range(0, len(flat), 2))
+            a = f' opacity="{opac}"' if opac is not None else ""
+            o.append(f'<polygon points="{pl}" fill="{_svg_colour(fill)}" '
+                     f'stroke="none"{a}/>')
+        elif kind == "circle":
+            _, cx, cy, r, fill = op
+            o.append(f'<circle cx="{cx}" cy="{cy}" r="{r}" fill="{_svg_colour(fill)}"/>')
+        elif kind == "text":
+            _, x, y, s, anchor, fill, size, weight, rot = op
+            a = ""
+            if anchor:
+                a += f' text-anchor="{anchor}"'
+            if fill:
+                a += f' fill="{_svg_colour(fill)}"'
+            if size is not None:
+                a += f' font-size="{size}"'
+            if weight:
+                a += f' font-weight="{weight}"'
+            if rot:
+                a += f' transform="rotate({rot[0]} {rot[1]} {rot[2]})"'
+            o.append(f'<text x="{x}" y="{y}"{a}>{_xml_escape(s)}</text>')
+    if open_clip:
+        o.append('</g>')
+    o.append("</svg>")
+    return "\n".join(o)
+
+
+def build_plot(ts, ys, title, ylabel, include_zero=True,
+               xlabel="elapsed (s)", log_axes=False, events=(), panels=(), stats=None,
+               overlays=None, expand_for_overlays=False, width=PLOT_WIDTH, hidden=()):
+    """Lay the plot out and return (ops, W, H, clip) -- no plotting dependency.
+
+    ``hidden`` is a set of group ids not to draw. Hiding happens HERE, in the layout, not
+    in the renderer: a hidden panel has to give its band back, and a hidden series has to
+    stop stretching its panel's axis. A renderer that merely skipped the ops would leave a
+    blank band and an axis scaled to something invisible -- the plot would be lying about
+    its own range. The returned ``legend`` lists every toggleable group so the page can
+    build its controls from the frame instead of hard-coding a list that goes stale.
+
+    ``width`` exists so the live view can be laid out at the browser's width instead of
+    being a 900 px picture stretched to fit. Stretching would scale the type with the
+    plot; relaying out spends the extra pixels on TIME, which is the axis a wider window
+    is being given to. The margins are fixed, so only the plotting area grows.
 
     Extra panels are drawn only where they have data, so a run without temperature
     logging looks exactly as before. Both panels share the x axis and the event bars
     span both, which is the point: it should be obvious at a glance whether a skew
     excursion lines up with a temperature move.
     """
-    W, ML, M, MB = 900, 108, 70, 70
+    W, ML, M, MB = max(420, int(width)), 108, 70, 70
+    hid = set(hidden or ())
+    legend = []          # {id, label, kind, colour} for every group that COULD be drawn
+    def grp(gid, label, kind, colour=None):
+        legend.append({"id": gid, "label": label, "kind": kind, "colour": colour})
+        return gid not in hid
     # Only panels with something in them take space, so a run without temperature (or
     # without rate columns, replotting an older CSV) looks exactly as it did before.
-    extra = [(lab, series) for lab, series in panels
-             if series and any(v for v in series.values())]
+    # Non-finite values are dropped here, not drawn: a NaN in a panel series poisoned the
+    # panel's whole axis range (min/max of anything containing NaN is NaN) and then every
+    # coordinate computed from it. The trace and the overlays have always filtered; the
+    # panels did not. Empty series are KEPT so a colour and legend slot are not silently
+    # reassigned, which is what dropping them would do.
+    extra = []
+    for item in panels:
+        # (label, series[, pid[, sid_map]]). The ID is separate from the LABEL because the
+        # label is not stable: "d(rate)/dt (Hz/s), 1s fit" carries a fit window that
+        # rate_derivative widens to at least five sample spacings, so it reads 5s early in
+        # a run and 1.2s once rows arrive faster. Keyed on the label, a toggle stopped
+        # matching the moment the window moved and the panel silently came back.
+        lab, series = item[0], item[1]
+        pid = (item[2] if len(item) > 2 and item[2] else lab)
+        sid_map = (item[3] if len(item) > 3 and item[3] else {})
+        if not series:
+            continue
+        # (n, 2) float arrays, filtered and sorted ONCE here. The scalar version filtered
+        # with a comprehension, then sorted a list of tuples, then rebuilt arrays for
+        # drawing -- three Python passes over every panel point on every frame.
+        clean = {k: _as_xy(pts_) for k, pts_ in series.items()}
+        if not any(a.size for a in clean.values()):
+            continue
+        panel_on = grp(f"panel:{pid}", lab, "panel")
+        # A hidden SERIES keeps its key with an empty list, so the palette index and legend
+        # row of the series after it do not shift -- the same reason empty series are kept
+        # above. A panel with nothing left to draw gives its band back entirely.
+        kept = {}
+        order = sorted(clean)
+        for k, arr in clean.items():
+            # Same index the drawing loop will use -- it enumerates sorted(series.items())
+            # over these same keys -- so the swatch matches the line.
+            col_k = PANEL_PALETTE[order.index(k) % len(PANEL_PALETTE)]
+            on = grp(f"series:{pid}|{sid_map.get(k, k)}", k, "series", col_k) and panel_on
+            kept[k] = arr if on else np.empty((0, 2))
+        if panel_on and any(a.size for a in kept.values()):
+            extra.append((lab, kept))
     top0, top1 = M, M + 280
     bands, y = [], top1
     for _ in extra:
@@ -1275,24 +1703,31 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
         y += 150
     H = y + MB
 
-    pts = [(t, y) for t, y in zip(ts, ys) if math.isfinite(y)]
-    if not pts:
-        open(path, "w").write(
-            f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}">'
-            f'<text x="{W/2}" y="{H/2}" text-anchor="middle" font-family="sans-serif">'
-            f'no valid measurements yet</text></svg>')
-        return
-    xs = [p[0] for p in pts]
-    x0, x1 = min(xs), max(xs)
+    # Vectorised deliberately. The scalar version -- a comprehension over zip(ts, ys) with
+    # math.isfinite, then min/max over Python lists -- was 2.4M isfinite calls and 1.6M
+    # min/max calls at 400k captures, and it, not the drawing, was the whole cost of a
+    # wide window: 550 ms of which the aggregation itself was 8.
+    xs_a = np.asarray(ts, dtype=float)
+    vs_a = np.asarray(ys, dtype=float)
+    if xs_a.size != vs_a.size:
+        n_ = min(xs_a.size, vs_a.size)
+        xs_a, vs_a = xs_a[:n_], vs_a[:n_]
+    keep = np.isfinite(xs_a) & np.isfinite(vs_a)
+    xs_a, vs_a = xs_a[keep], vs_a[keep]
+    pts = xs_a          # truthiness/len only; the tuple list is never built
+    if not xs_a.size:
+        return ([["text", W / 2, H / 2, "no valid measurements yet", "middle",
+                  "fg", None, None, None]], W, H, None, legend)
+    x0, x1 = float(xs_a.min()), float(xs_a.max())
     for _, series in extra:
-        for pts_ in series.values():
-            for x, _v in pts_:
-                x0, x1 = min(x0, x), max(x1, x)
+        for arr in series.values():
+            if arr.size:
+                x0 = min(x0, float(arr[0, 0]))
+                x1 = max(x1, float(arr[-1, 0]))
     if x1 - x0 < 1e-9:
         x1 = x0 + 1
 
-    vs = [p[1] for p in pts]
-    y0, y1 = min(vs), max(vs)
+    y0, y1 = float(vs_a.min()), float(vs_a.max())
     # Overlays set the scale too -- confining them to the measured range showed only the
     # part that happened to fall inside it, which reads as agreement where there may be
     # none. But follow their ROBUST range, not their extremes: 2 of 1572 render-phase
@@ -1333,15 +1768,15 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
     def mk_py(p0, p1, v0, v1):
         return lambda v: p1 - (v - v0) / (v1 - v0 or 1) * (p1 - p0)
 
+    def r1(v):
+        return round(v, 1)
+
     py = mk_py(top0, top1, y0, y1)
-    o = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
-         f'font-family="-apple-system,sans-serif" font-size="12">',
-         f'<rect width="{W}" height="{H}" fill="white"/>',
-         f'<defs><clipPath id="toppanel"><rect x="{ML}" y="{top0}" '
-         f'width="{W-40-ML}" height="{top1-top0}"/></clipPath></defs>',
-         f'<text x="{ML}" y="26" font-size="15" font-weight="600">{title}</text>']
+    clip = (ML, top0, W - 40 - ML, top1 - top0)
+    o = [["rect", 0, 0, W, H, "bg", None],
+         ["text", ML, 26, title, None, "fg", 15, "600", None]]
     if stats:
-        o.append(f'<text x="{ML}" y="44" font-size="11" fill="#666">{stats}</text>')
+        o.append(["text", ML, 44, stats, None, "stats", 11, None, None])
 
     def tick(vv, span):
         """Decimals from the axis SPAN, not the value. A rate axis spanning 0.3 Hz around
@@ -1358,113 +1793,157 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
         for k in range(6):
             v = v0 + (v1 - v0) * k / 5
             yy = pyf(v)
-            o.append(f'<line x1="{ML}" y1="{yy:.1f}" x2="{W-40}" y2="{yy:.1f}" '
-                     f'stroke="#e5e5e5"/>')
+            o.append(["line", ML, r1(yy), W - 40, r1(yy), "grid", None, None, None])
             vv = 10 ** v if log_axes else v
             t_lbl = f"{vv:,.0f}" if log_axes else tick(vv, v1 - v0)
-            o.append(f'<text x="{ML-8}" y="{yy+4:.1f}" text-anchor="end" '
-                     f'fill="#555">{t_lbl}</text>')
-        o.append(f'<line x1="{ML}" y1="{p1}" x2="{W-40}" y2="{p1}" stroke="#333"/>')
-        o.append(f'<line x1="{ML}" y1="{p0}" x2="{ML}" y2="{p1}" stroke="#333"/>')
-        o.append(f'<text x="16" y="{(p0+p1)/2}" text-anchor="middle" fill="#333" '
-                 f'transform="rotate(-90 16 {(p0+p1)/2})">{lab}</text>')
+            o.append(["text", ML - 8, r1(yy + 4), t_lbl, "end", "tick", None, None, None])
+        o.append(["line", ML, p1, W - 40, p1, "axis", None, None, None])
+        o.append(["line", ML, p0, ML, p1, "axis", None, None, None])
+        o.append(["text", 16, (p0 + p1) / 2, lab, "middle", "axis", None, None,
+                  [-90, 16, (p0 + p1) / 2]])
         if xticks:
             for k in range(6):
                 t = x0 + (x1 - x0) * k / 5
                 xx = px(t)
-                o.append(f'<line x1="{xx:.1f}" y1="{p1}" x2="{xx:.1f}" y2="{p1+5}" '
-                         f'stroke="#888"/>')
+                o.append(["line", r1(xx), p1, r1(xx), p1 + 5, "tickmark", None, None, None])
                 tt = 10 ** t if log_axes else t
                 if not log_axes and abs(tt) < (x1 - x0) * 1e-3:
                     tt = 0.0
-                o.append(f'<text x="{xx:.1f}" y="{p1+20}" text-anchor="middle" '
-                         f'fill="#555">{tt:.4g}</text>')
-            o.append(f'<text x="{W/2}" y="{p1+42}" text-anchor="middle" '
-                     f'fill="#333">{xlabel}</text>')
+                o.append(["text", r1(xx), p1 + 20, f"{tt:.4g}", "middle", "tick",
+                          None, None, None])
+            o.append(["text", W / 2, p1 + 42, xlabel, "middle", "axis", None, None, None])
 
     axis(top0, top1, y0, y1, ylabel, py, not extra)
     if y0 <= 0 <= y1:
         z = py(0.0)
-        o.append(f'<line x1="{ML}" y1="{z:.1f}" x2="{W-40}" y2="{z:.1f}" stroke="#888" '
-                 f'stroke-width="1.2" stroke-dasharray="2 3"/>')
-        o.append(f'<text x="{W-36}" y="{z+4:.1f}" fill="#888">0</text>')
+        o.append(["line", ML, r1(z), W - 40, r1(z), "zero", 1.2, [2, 3], None])
+        o.append(["text", W - 36, r1(z + 4), "0", None, "zero", None, None, None])
 
     bar_bottom = bands[-1][1] if bands else top1
     colours = {"corrected": "#d9534f", "resync": "#8e44ad", "trim": "#e0a800",
                "sync": "#1a7f37", "pipeline": "#0969da", "role": "#000000",
                "rendertag": "#c2410c", "phasein": "#0e7490",
-               "trimstop": "#b91c1c", "trimrail": "#a16207", "consensus": "#7c3aed"}
+               "trimstop": "#b91c1c", "trimrail": "#a16207", "consensus": "#7c3aed",
+               "dlloop": "#0d9488", "servoparam": "#65a30d", "servotune": "#7e22ce",
+               "oor": "#e11d48"}
+    # Registered per KIND, not per event: there can be hundreds of marks and the useful
+    # control is "stop showing trims", never "stop showing this one trim".
+    ev_on = {}
+    for kind in sorted({k for _x, k, _l in events}):
+        ev_on[kind] = grp(f"event:{kind}", kind, "event", colours.get(kind, "#888"))
     for i, (ex, kind, label) in enumerate(sorted(events)):
-        if not (x0 <= ex <= x1):
+        if not (x0 <= ex <= x1) or not ev_on.get(kind, True):
             continue
         xx = px(ex)
         col = colours.get(kind, "#888")
-        o.append(f'<line x1="{xx:.1f}" y1="{top0}" x2="{xx:.1f}" y2="{bar_bottom}" '
-                 f'stroke="{col}" stroke-width="1.1" stroke-dasharray="4 3" '
-                 f'opacity="0.75"/>')
+        o.append(["line", r1(xx), top0, r1(xx), bar_bottom, col, 1.1, [4, 3], 0.75])
         ly = top1 - 6 - (i % 3) * 12
-        txt = label if len(label) <= 30 else label[:29] + "\u2026"
-        o.append(f'<text x="{xx-3:.1f}" y="{ly:.1f}" font-size="9" fill="{col}" '
-                 f'transform="rotate(-90 {xx-3:.1f} {ly:.1f})">{txt}</text>')
+        txt = label if len(label) <= 30 else label[:29] + "…"
+        o.append(["text", r1(xx - 3), r1(ly), txt, None, col, 9, None,
+                  [-90, r1(xx - 3), r1(ly)]])
 
     # Decimate for drawing: beyond a few thousand points the extra vertices are below
     # one pixel, and a run of 100k captures would otherwise emit a multi-megabyte SVG
     # that is rewritten after every capture.
-    draw = pts
-    if len(pts) > MAX_PLOT_POINTS:
-        step = len(pts) / MAX_PLOT_POINTS
-        draw = [pts[min(int(i * step), len(pts) - 1)] for i in range(MAX_PLOT_POINTS)]
-        draw.append(pts[-1])
-    # Decimate first, then segment: decimation can only widen a gap, never invent one, and
-    # segmenting the drawn points keeps the breaks where the eye sees them.
-    segments = split_gaps(draw)
-    for seg in segments:
-        if len(seg) == 1:
-            t, v = seg[0]
-            o.append(f'<circle cx="{px(t):.1f}" cy="{py(v):.1f}" r="2" fill="#2b6cb0"/>')
+    trace_on = grp("trace", "measured skew", "trace", "#2b6cb0")
+    band_on = grp("band", "min/max band", "trace", "#2b6cb0")
+    # One bucket per pixel column: past that the extra vertices are sub-pixel, and this
+    # bounds the drawn size by the PANEL rather than by the length of the run, which is
+    # the whole point at a wide window.
+    ncol = max(1, min(int(W - ML - 40), MAX_PLOT_POINTS))
+    # Segment the RAW series, then aggregate each segment, so a band never spans a dropout.
+    runs = _split_runs(xs_a)
+    ndrawn = 0
+    for (a, b) in (runs if trace_on else []):
+        n = b - a
+        if n == 1:
+            o.append(["circle", r1(px(xs_a[a])), r1(py(vs_a[a])), 2, "#2b6cb0"])
             continue
-        o.append(f'<polyline points="{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in seg)}" '
-                 f'fill="none" stroke="#2b6cb0" stroke-width="1.5"/>')
+        if n <= ncol:
+            # Sparse enough to draw every point: no aggregation, no band, nothing hidden.
+            flat = []
+            for i in range(a, b):
+                flat.append(r1(px(xs_a[i])))
+                flat.append(r1(py(vs_a[i])))
+            o.append(["poly", flat, "#2b6cb0", 1.5, None, None, None])
+            ndrawn += n
+            continue
+        cx, lo_, hi_, mean_ = _envelope(xs_a[a:b], vs_a[a:b], x0, x1, ncol)
+        pxs = np.round(ML + (cx - x0) / ((x1 - x0) or 1) * (W - ML - 40), 1)
+        yl = np.round(top1 - (lo_ - y0) / ((y1 - y0) or 1) * (top1 - top0), 1)
+        yh = np.round(top1 - (hi_ - y0) / ((y1 - y0) or 1) * (top1 - top0), 1)
+        ym = np.round(top1 - (mean_ - y0) / ((y1 - y0) or 1) * (top1 - top0), 1)
+        if band_on:
+            # Forward along the max edge, back along the min edge: one closed polygon per
+            # segment. The band is min/max, NOT a confidence interval -- it is the actual
+            # extremes of the samples in that column, so a spike one sample wide is still
+            # on the plot at full height.
+            band = np.empty(4 * pxs.size)
+            band[0::2] = np.concatenate((pxs, pxs[::-1]))
+            band[1::2] = np.concatenate((yh, yl[::-1]))
+            o.append(["area", band.tolist(), "#2b6cb0", 0.25, None])
+        flat = np.empty(2 * pxs.size)
+        flat[0::2] = pxs
+        flat[1::2] = ym
+        o.append(["poly", flat.tolist(), "#2b6cb0", 1.2, None, None, None])
+        ndrawn += int(pxs.size)
     # The firmware's own estimates, on the same axis as the measurement. Thin and dashed so
     # the measured trace stays dominant: these are claims, not observations.
     if overlays:
         opal = ["#7c3aed", "#be123c", "#0f766e", "#a16207"]
         for i, (name, pts_) in enumerate(sorted(overlays.items())):
-            good = [(x, v) for x, v in pts_ if math.isfinite(v)]
-            if len(good) < 2:
+            gd = _as_xy(pts_)
+            if gd.shape[0] < 2:
                 continue
             col = opal[i % len(opal)]
+            # Registered with its colour BEFORE the hide test, so a hidden overlay still
+            # appears in the controls -- a toggle you cannot find again is a one-way door.
+            if not grp(f"overlay:{name}", name, "overlay", col):
+                continue
             # Counted against the FINAL axis, so the legend states how much of the overlay
             # the reader cannot see.
-            nof = sum(1 for _x, v in good if v < y0 or v > y1)
+            nof = int(np.count_nonzero((gd[:, 1] < y0) | (gd[:, 1] > y1)))
             # Clipped to the panel: an off-scale excursion would otherwise draw straight
             # across the panels below it.
-            o.append(f'<g clip-path="url(#toppanel)">')
-            for seg in split_gaps(sorted(good)):
-                if len(seg) < 2:
+            gx, gv = gd[:, 0], gd[:, 1]
+            for oa, ob in _split_runs(gx):
+                if ob - oa < 2:
                     continue
-                o.append(f'<polyline points="'
-                         f'{" ".join(f"{px(t):.1f},{py(v):.1f}" for t, v in seg)}" '
-                         f'fill="none" stroke="{col}" stroke-width="1" '
-                         f'stroke-dasharray="5 3" opacity="0.85"/>')
-            o.append('</g>')
-            tag = f"{name} ({nof}/{len(good)} off-scale)" if nof else name
-            o.append(f'<text x="{W-44}" y="{top0+14+i*13}" text-anchor="end" '
-                     f'font-size="10" fill="{col}">{tag}</text>')
+                if ob - oa <= ncol:
+                    sxp = np.round(ML + (gx[oa:ob] - x0) / ((x1 - x0) or 1)
+                                   * (W - ML - 40), 1)
+                    syp = np.round(top1 - (gv[oa:ob] - y0) / ((y1 - y0) or 1)
+                                   * (top1 - top0), 1)
+                else:
+                    # Overlays get the MEAN line only, no band. They are the firmware's
+                    # claims rather than measurements, and they stay thin and dashed so the
+                    # measured trace and its band remain what the eye reads first.
+                    cx_, _lo, _hi, mn_ = _envelope(gx[oa:ob], gv[oa:ob], x0, x1, ncol)
+                    sxp = np.round(ML + (cx_ - x0) / ((x1 - x0) or 1) * (W - ML - 40), 1)
+                    syp = np.round(top1 - (mn_ - y0) / ((y1 - y0) or 1)
+                                   * (top1 - top0), 1)
+                flat = np.empty(2 * sxp.size)
+                flat[0::2] = sxp
+                flat[1::2] = syp
+                o.append(["poly", flat.tolist(), col, 1, [5, 3], 0.85, "top"])
+            tag = f"{name} ({nof}/{gd.shape[0]} off-scale)" if nof else name
+            o.append(["text", W - 44, top0 + 14 + i * 13, tag, "end", col, 10, None, None])
     # Shade what is missing, so a gap reads as absence rather than as an axis break.
-    for prev, nxt in zip(segments, segments[1:]):
-        gx0, gx1 = px(prev[-1][0]), px(nxt[0][0])
+    gaps_on = len(runs) > 1 and grp("gaps", "dropout shading", "chrome", None)
+    for (_a0, b0), (a1, _b1) in (zip(runs, runs[1:]) if gaps_on else ()):
+        gx0, gx1 = px(xs_a[b0 - 1]), px(xs_a[a1])
         if gx1 - gx0 >= 1.0:
-            o.append(f'<rect x="{gx0:.1f}" y="{top0}" width="{gx1-gx0:.1f}" '
-                     f'height="{top1-top0}" fill="#000" opacity="0.05"/>')
-    if len(draw) <= 800:
-        for t, v in draw:
-            o.append(f'<circle cx="{px(t):.1f}" cy="{py(v):.1f}" r="2.5" fill="#2b6cb0"/>')
+            o.append(["rect", r1(gx0), top0, r1(gx1 - gx0), top1 - top0, "shade", 0.05])
+    # Dots only where every sample is genuinely drawn -- marking aggregated columns would
+    # imply a measurement at the column centre that was never taken.
+    if trace_on and 0 < ndrawn <= 800 and ndrawn == xs_a.size:
+        for t, v in zip(xs_a.tolist(), vs_a.tolist()):
+            o.append(["circle", r1(px(t)), r1(py(v)), 2.5, "#2b6cb0"])
 
-    palette = ["#c2410c", "#0f766e", "#7c3aed", "#a16207", "#be123c"]
+    palette = PANEL_PALETTE
     for bi, ((lab, series), (p0, p1)) in enumerate(zip(extra, bands)):
-        allv = [v for pts_ in series.values() for _, v in pts_]
-        v0, v1 = min(allv), max(allv)
+        allv = np.concatenate([a[:, 1] for a in series.values() if a.size])
+        v0, v1 = float(allv.min()), float(allv.max())
         # Rates sit near 44100 with variation of a fraction of a Hz, so the pad has to be
         # relative to the value, not a fixed 1.0, or the trace flattens to a line.
         pad_ = (v1 - v0) * 0.15 or (abs(v0) * 1e-6 or 1.0)
@@ -1473,23 +1952,597 @@ def write_svg(path, ts, ys, title, ylabel, include_zero=True,
         axis(p0, p1, v0, v1, lab, pyb, bi == len(extra) - 1)
         if v0 <= 0 <= v1:
             zz = pyb(0.0)
-            o.append(f'<line x1="{ML}" y1="{zz:.1f}" x2="{W-40}" y2="{zz:.1f}" '
-                     f'stroke="#bbb" stroke-dasharray="2 3"/>')
-        for i, (name, pts_) in enumerate(sorted(series.items())):
-            if not pts_:
+            o.append(["line", ML, r1(zz), W - 40, r1(zz), "zero2", None, [2, 3], None])
+        # Bands from two series in one panel overlap over their whole width and composite
+        # to a muddy neutral that reads as a third colour. Thinner when there is more than
+        # one, so the overlap stays legible and the MEAN lines carry the comparison.
+        # (Hidden series are already empty arrays here, so they do not count.)
+        nvis = sum(1 for a in series.values() if a.size)
+        band_a = 0.22 if nvis < 2 else 0.10
+        for i, (name, arr) in enumerate(sorted(series.items())):
+            if not arr.size:
                 continue
             col = palette[i % len(palette)]
-            for seg in split_gaps(sorted(pts_)):
-                if len(seg) < 2:
+            sx, sv = arr[:, 0], arr[:, 1]
+            for pa, pb in _split_runs(sx):
+                if pb - pa < 2:
                     continue
-                pl = " ".join(f"{px(x):.1f},{pyb(v):.1f}" for x, v in seg)
-                o.append(f'<polyline points="{pl}" fill="none" stroke="{col}" '
-                         f'stroke-width="1.4"/>')
+                if pb - pa <= ncol:
+                    flat = []
+                    for j in range(pa, pb):
+                        flat.append(r1(px(sx[j])))
+                        flat.append(r1(pyb(sv[j])))
+                    o.append(["poly", flat, col, 1.4, None, None, None])
+                    continue
+                cx, lo_, hi_, mean_ = _envelope(sx[pa:pb], sv[pa:pb], x0, x1, ncol)
+                bxs = np.round(ML + (cx - x0) / ((x1 - x0) or 1) * (W - ML - 40), 1)
+                bl = np.round(p1 - (lo_ - v0) / ((v1 - v0) or 1) * (p1 - p0), 1)
+                bh = np.round(p1 - (hi_ - v0) / ((v1 - v0) or 1) * (p1 - p0), 1)
+                bm = np.round(p1 - (mean_ - v0) / ((v1 - v0) or 1) * (p1 - p0), 1)
+                if band_on:
+                    band = np.empty(4 * bxs.size)
+                    band[0::2] = np.concatenate((bxs, bxs[::-1]))
+                    band[1::2] = np.concatenate((bh, bl[::-1]))
+                    o.append(["area", band.tolist(), col, band_a, None])
+                flat = np.empty(2 * bxs.size)
+                flat[0::2] = bxs
+                flat[1::2] = bm
+                o.append(["poly", flat.tolist(), col, 1.2, None, None, None])
             # Left-aligned inside the panel: at the right edge it was easy to miss.
-            o.append(f'<text x="{ML+8}" y="{p0+14+i*13}" font-size="10" '
-                     f'fill="{col}">{name}</text>')
-    o.append("</svg>")
-    open(path, "w").write("\n".join(o))
+            o.append(["text", ML + 8, p0 + 14 + i * 13, name, None, col, 10, None, None])
+    return o, W, H, clip, legend
+
+
+# Set by --serve. Every write_svg goes through here, so the live view follows the same
+# four call sites the file always did -- there is no second "live" path to keep in step.
+PLOT_SERVER = None
+
+
+def write_svg(path, *a, write_file=True, **kw):
+    """Lay the plot out, optionally write the SVG, and push it to any live view.
+
+    The layout is computed once and both back ends consume it, so the two outputs can run
+    at different rates without laying the plot out twice. Serializing the SVG is the
+    expensive half (measured at 20k captures: 11.8 ms to lay out, 3.4 ms to serialize,
+    ~16 ms total with the write) -- which is why --svg-every skips the write and not the
+    frame. Pass a falsy path to write no file at all.
+    """
+    srv = PLOT_SERVER
+    out = None
+    if write_file and path:
+        # The FILE is never filtered. It is the artefact of the run, and a toggle someone
+        # flicked in a browser must not silently decide what a saved plot contains.
+        out = build_plot(*a, width=PLOT_WIDTH, **kw)
+        _write_atomic(path, _ops_to_svg(out[0], out[1], out[2], out[3]))
+    if srv is not None:
+        live_w, hid = srv.width, srv.hidden
+        # A second layout only when the browser differs from the file -- which is the
+        # common case, and it is still the cheaper half of a frame (11.8 ms against ~16 ms
+        # for serializing and writing the SVG at 20k captures).
+        if out is None or out[1] != live_w or hid:
+            out = build_plot(*a, width=live_w, hidden=hid, **kw)
+        srv.publish(*out)
+    elif out is None:
+        out = build_plot(*a, width=PLOT_WIDTH, **kw)
+    return out
+
+
+# The live view, folded in from the standalone svgwatch.py it replaces.
+#
+# svgwatch watched the .svg file and, on every change, reassigned img.src. That made the
+# browser refetch the document, rebuild an SVG DOM of ~17k nodes and rasterize it from
+# scratch -- measured at 70-100 ms per frame with rsvg, and it scaled with the point
+# count. It also raced the writer: a plain truncate-and-write was visible to the watcher
+# half-finished.
+#
+# Now the process serves its own display list over one long-lived SSE connection and the
+# page paints it to a canvas. No document is reparsed: what crosses the socket is JSON
+# arrays of numbers, and the canvas redraw is a few hundred microseconds. The SVG file is
+# still written for anything that wants a file.
+PAGE = """<!doctype html><meta charset="utf-8"><title>i2s-skew</title>
+<style>
+ :root{--page:#f6f6f6;--ink:#666;--edge:rgba(0,0,0,.20);--btn:#fff;--btnink:#444}
+ @media (prefers-color-scheme: dark){
+   :root{--page:#0e1013;--ink:#8b929c;--edge:rgba(0,0,0,.6);--btn:#1d2127;--btnink:#c3c9d2}
+ }
+ html[data-theme=light]{--page:#f6f6f6;--ink:#666;--edge:rgba(0,0,0,.20);--btn:#fff;--btnink:#444}
+ html[data-theme=dark]{--page:#0e1013;--ink:#8b929c;--edge:rgba(0,0,0,.6);--btn:#1d2127;--btnink:#c3c9d2}
+ html,body{height:100%}
+ html,body{margin:0;background:var(--page);color:var(--ink);font:12px -apple-system,sans-serif}
+ /* A column of [toolbar][legend | plot]. Everything is IN FLOW: the toolbar and the
+    legend used to be position:fixed and sat on top of the canvas, hiding the y axis and
+    the title. In flow they take their own space and the plot gets the rest -- and because
+    the relayout width is read from #wrap, opening the legend re-lays the plot narrower
+    rather than covering it. */
+ body{display:flex;flex-direction:column}
+ #bar{flex:none;display:flex;gap:6px;align-items:center;flex-wrap:wrap;
+      justify-content:flex-end;padding:5px 8px;border-bottom:1px solid var(--edge)}
+ #main{flex:1;display:flex;min-height:0}
+ #wrap{flex:1;min-width:0;overflow:auto;padding:8px}
+ canvas{box-shadow:0 1px 4px var(--edge);display:block}
+ #hud{font-variant-numeric:tabular-nums;margin-right:auto;padding-left:2px}
+ #hud.stale{color:#d9534f}
+ button{cursor:pointer;border:1px solid var(--edge);background:var(--btn);color:var(--btnink);
+     border-radius:5px;padding:2px 7px;font:11px -apple-system,sans-serif}
+ button.on{border-color:currentColor;font-weight:600}
+ #win{display:flex;gap:3px;flex-wrap:wrap;justify-content:flex-end}
+ #legend{flex:none;display:flex;flex-direction:column;gap:2px;overflow:auto;
+         padding:7px 10px 10px;border-right:1px solid var(--edge);font-size:11px}
+ #legend.hide{display:none}
+ #legend h4{margin:5px 0 1px;font-size:10px;font-weight:600;opacity:.65;
+            text-transform:uppercase;letter-spacing:.4px}
+ #legend label{display:flex;gap:5px;align-items:center;cursor:pointer;white-space:nowrap}
+ #legend label.off{opacity:.4;text-decoration:line-through}
+ #legend .sw{width:9px;height:9px;border-radius:2px;flex:none}
+</style>
+<div id=bar><span id=hud>connecting</span>
+ <span id=win title="seconds of history plotted (--plot-window)"></span>
+ <button id=el title="show/hide the element toggles">elements</button>
+ <button id=tt title="colour scheme">auto</button></div>
+<div id=main><div id=legend class=hide></div>
+<div id=wrap><canvas id=c></canvas></div></div>
+<script>
+const cv = document.getElementById("c"), ctx = cv.getContext("2d"),
+      hud = document.getElementById("hud"), tt = document.getElementById("tt"),
+      winbar = document.getElementById("win"), wrap = document.getElementById("wrap"),
+      legendEl = document.getElementById("legend");
+let W = 0, H = 0, lastFrame = null, last = 0, scale = 1;
+const PAD = 16;   // matches #wrap padding, both sides
+
+// How much room the plot actually has. The bar floats, so only the padding is subtracted.
+// Math.max(420, NaN) is NaN, and a canvas sized NaN renders nothing at all -- a blank
+// page that looks like a dead stream rather than a layout that has not happened yet. A
+// pane measured before layout, or in a context with no box, reads 0 or undefined, so the
+// floor is applied to a number that is known to be one.
+function span(v, min) { return Math.max(min, Math.floor(Number(v) - PAD) || min); }
+function availW() { return span(wrap.clientWidth, 420); }
+function availH() { return span(wrap.clientHeight, 300); }
+
+// Ask the capture to lay the NEXT frame out at this width. Relayout, not stretch: the
+// extra pixels go to the time axis and the type stays 12 px. Debounced, because a drag
+// fires resize continuously and each one would otherwise be a request.
+let sizeTimer = 0, sentW = 0;
+function reportSize() {
+  clearTimeout(sizeTimer);
+  sizeTimer = setTimeout(() => {
+    const w = availW();
+    if (w === sentW) return;
+    sentW = w;
+    fetch("/control?w=" + w).catch(() => {});
+  }, 150);
+}
+window.addEventListener("resize", () => { reportSize(); if (lastFrame) paint(lastFrame); });
+
+// Element toggles, built from the frame's own legend rather than a hard-coded list --
+// which series and event kinds exist depends on the run, the flags and the logs, so any
+// list written here would be wrong for most runs. Hiding is done by the CAPTURE, not
+// here: a hidden panel gives its band back and a hidden series stops stretching its
+// panel's axis, neither of which a renderer that just skipped ops could do.
+const KINDS = [["trace","trace"],["overlay","overlays"],["event","event marks"],
+               ["panel","panels"],["series","panel series"],["chrome","chrome"]];
+let hidden = new Set(), legendSig = "";
+function sendHidden() {
+  fetch("/control?hidden=" + encodeURIComponent([...hidden].join(","))).catch(() => {});
+}
+function buildLegend(items) {
+  // Rebuilt only when the SET of groups changes, not every frame: rebuilding on each
+  // frame would drop the scroll position and fight the pointer at 10 fps.
+  const sig = items.map(g => g.id).join("|");
+  if (sig === legendSig) { syncLegend(); return; }
+  legendSig = sig;
+  legendEl.innerHTML = "";
+  legendEl.classList.toggle("hide", items.length === 0);
+  for (const [kind, title] of KINDS) {
+    const mine = items.filter(g => g.kind === kind);
+    if (!mine.length) continue;
+    const h = document.createElement("h4"); h.textContent = title;
+    legendEl.appendChild(h);
+    for (const g of mine) {
+      const lab = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type = "checkbox"; cb.dataset.gid = g.id;
+      cb.onchange = () => {
+        if (cb.checked) hidden.delete(g.id); else hidden.add(g.id);
+        lab.className = cb.checked ? "" : "off";
+        sendHidden();
+      };
+      const sw = document.createElement("span");
+      sw.className = "sw";
+      sw.style.background = g.colour || "transparent";
+      if (!g.colour) sw.style.boxShadow = "inset 0 0 0 1px currentColor";
+      lab.append(cb, sw, document.createTextNode(g.label));
+      legendEl.appendChild(lab);
+    }
+  }
+  syncLegend();
+}
+function syncLegend() {
+  for (const cb of legendEl.querySelectorAll("input")) {
+    cb.checked = !hidden.has(cb.dataset.gid);
+    cb.parentNode.className = cb.checked ? "" : "off";
+  }
+}
+
+// Seconds of history. "all" is 0, which the capture reads as the whole run.
+const WINDOWS = [["1s",1],["5s",5],["10s",10],["15s",15],["30s",30],
+                 ["1m",60],["5m",300],["15m",900],["1h",3600],["6h",21600],["all",0]];
+let curWin = null;
+for (const [label, secs] of WINDOWS) {
+  const b = document.createElement("button");
+  b.textContent = label; b.dataset.secs = secs;
+  b.onclick = () => {
+    curWin = secs;
+    for (const el of winbar.children) el.className = (+el.dataset.secs === secs) ? "on" : "";
+    fetch("/control?window=" + secs).catch(() => {});
+  };
+  winbar.appendChild(b);
+}
+
+// The chrome tokens the display list names, resolved per scheme. The SVG on disk resolves
+// the same tokens to the light column, so the file and a light-mode tab are the same
+// picture; only this table knows about dark.
+const THEME = {
+  light: {bg:"#ffffff", fg:"#000000", grid:"#e5e5e5", axis:"#333333", tick:"#555555",
+          tickmark:"#888888", stats:"#666666", zero:"#888888", zero2:"#bbbbbb",
+          shade:"#000000", shadeAlpha:1, contrast:0},
+  dark:  {bg:"#16181d", fg:"#e8eaed", grid:"#272b33", axis:"#9aa1ab", tick:"#8b929c",
+          tickmark:"#6b727c", stats:"#7d848e", zero:"#6f7681", zero2:"#464c55",
+          shade:"#ffffff", shadeAlpha:1.3, contrast:4.5}
+};
+
+let mode = localStorage.getItem("i2s-theme") || "auto";
+const sysDark = window.matchMedia("(prefers-color-scheme: dark)");
+function themeName() { return mode === "auto" ? (sysDark.matches ? "dark" : "light") : mode; }
+function applyMode() {
+  document.documentElement.dataset.theme = mode === "auto" ? "" : mode;
+  tt.textContent = mode;
+  if (lastFrame) paint(lastFrame);
+}
+tt.onclick = () => {
+  mode = {auto:"light", light:"dark", dark:"auto"}[mode];
+  localStorage.setItem("i2s-theme", mode);
+  applyMode();
+};
+sysDark.addEventListener("change", () => { if (mode === "auto") applyMode(); });
+
+// Data colours are never re-chosen, only lightened: the reader identifies a series by
+// hue, and a dark palette that reassigned hues would make two screenshots of one run
+// disagree about which trace is which. Hue and saturation survive.
+//
+// The target is CONTRAST against the background, not a fixed HSL lightness. Lightness is
+// not perceptual and the palette is not equiluminant: raising every series to L=62% left
+// purple at 3.7:1 and teal at 11.9:1 against the same background -- a three-fold spread in
+// visual weight that the light theme does not have, applied by a rule that looked uniform.
+// Raising each colour only until it clears the ratio keeps the whole palette in one band.
+const liftCache = new Map();
+function srgbLum(r, g, b) {
+  const f = x => x <= 0.03928 ? x/12.92 : Math.pow((x + 0.055)/1.055, 2.4);
+  return 0.2126*f(r) + 0.7152*f(g) + 0.0722*f(b);
+}
+function hslToRgb(h, s, l) {
+  const c = (1 - Math.abs(2*l - 1)) * s, hp = h/60, x = c * (1 - Math.abs(hp % 2 - 1));
+  const [r, g, b] = hp < 1 ? [c,x,0] : hp < 2 ? [x,c,0] : hp < 3 ? [0,c,x]
+                  : hp < 4 ? [0,x,c] : hp < 5 ? [x,0,c] : [c,0,x];
+  const m = l - c/2;
+  return [r+m, g+m, b+m];
+}
+function lift(hex, T) {
+  if (!T.contrast) return hex;
+  let v = liftCache.get(hex);
+  if (v !== undefined) return v;
+  // Anything that is not a hex triple is handed back untouched rather than parsed into
+  // NaN. parseInt("wh", 16) is NaN, NaN*100|0 is 0, and the result was a confident
+  // hsl(0 0% 0%) -- a colour that looks like an answer. A colour this cannot read is one
+  // it has no business rewriting.
+  if (!/^#([0-9a-f]{3}|[0-9a-f]{6})$/i.test(hex)) { liftCache.set(hex, hex); return hex; }
+  let h = hex.replace("#", "");
+  if (h.length === 3) h = h[0]+h[0]+h[1]+h[1]+h[2]+h[2];
+  const r = parseInt(h.slice(0,2),16)/255, g = parseInt(h.slice(2,4),16)/255,
+        b = parseInt(h.slice(4,6),16)/255;
+  const mx = Math.max(r,g,b), mn = Math.min(r,g,b), l0 = (mx+mn)/2, d = mx-mn;
+  let hh = 0, ss = 0;
+  if (d) {
+    ss = d / (1 - Math.abs(2*l0 - 1));
+    hh = mx === r ? ((g-b)/d + (g<b?6:0)) : mx === g ? ((b-r)/d + 2) : ((r-g)/d + 4);
+    hh *= 60;
+  }
+  ss = Math.min(ss, 0.85);
+  const bgL = srgbLum(...[1,3,5].map(i => parseInt(T.bg.slice(i,i+2),16)/255));
+  const ratio = L => (Math.max(L,bgL) + 0.05) / (Math.min(L,bgL) + 0.05);
+  // Monotone in l over the range we search, so bisection is exact enough at 12 steps
+  // (~0.02% of the lightness range) and costs nothing behind the cache.
+  let lo = l0, hi = 0.92;
+  if (ratio(srgbLum(...hslToRgb(hh, ss, lo))) < T.contrast) {
+    for (let i = 0; i < 12; i++) {
+      const mid = (lo + hi)/2;
+      if (ratio(srgbLum(...hslToRgb(hh, ss, mid))) < T.contrast) lo = mid; else hi = mid;
+    }
+    lo = hi;
+  }
+  v = `hsl(${hh.toFixed(0)} ${(ss*100)|0}% ${(lo*100).toFixed(1)}%)`;
+  liftCache.set(hex, v);
+  return v;
+}
+
+// The frame arrives at whatever width the capture last laid it out at, which lags a
+// resize by one frame and can never match a viewport shorter than the plot is tall. So
+// the canvas also scales to fit -- down only. Upscaling would be the stretch this is
+// meant to avoid, and it is unnecessary: the next frame arrives at the right width.
+function fit(w, h) {
+  scale = Math.min(1, availW() / w, availH() / h);
+  const r = (window.devicePixelRatio || 1) * scale;
+  const cw = Math.round(w * r), ch = Math.round(h * r);
+  if (cv.width !== cw || cv.height !== ch) {
+    W = w; H = h;
+    cv.width = cw; cv.height = ch;
+    cv.style.width = Math.round(w * scale) + "px";
+    cv.style.height = Math.round(h * scale) + "px";
+  }
+  ctx.setTransform(r, 0, 0, r, 0, 0);
+}
+
+// SVG puts the text origin on the alphabetic baseline, which is canvas's default, so the
+// two back ends agree without a fudge factor. Everything else here is a direct
+// translation of one op; the page computes no layout of its own.
+function paint(f) {
+  const t0 = performance.now();
+  lastFrame = f;
+  if (f.hidden) hidden = new Set(f.hidden);
+  if (f.legend) buildLegend(f.legend);
+  const T = THEME[themeName()];
+  const col = c => (c === null || c === undefined) ? T.fg : (T[c] || lift(c, T));
+  fit(f.w, f.h);
+  ctx.clearRect(0, 0, f.w, f.h);
+  ctx.lineCap = "butt"; ctx.lineJoin = "round";
+  let clipped = false;
+  for (const op of f.ops) {
+    const want = (op[0] === "poly" && op[6] !== null) || (op[0] === "area" && op[4] !== null);
+    if (want && !clipped) { ctx.save(); ctx.beginPath();
+      ctx.rect(f.clip[0], f.clip[1], f.clip[2], f.clip[3]); ctx.clip(); clipped = true; }
+    else if (clipped && !want) { ctx.restore(); clipped = false; }
+    switch (op[0]) {
+      case "rect": {
+        const [, x, y, w, h, fill, opac] = op;
+        // The gap shade is the one mark whose job is a fixed fraction of contrast against
+        // the background, so its alpha follows the theme rather than the display list.
+        ctx.globalAlpha = opac === null ? 1 : opac * (fill === "shade" ? T.shadeAlpha : 1);
+        ctx.fillStyle = col(fill); ctx.fillRect(x, y, w, h); ctx.globalAlpha = 1;
+        break;
+      }
+      case "line": {
+        const [, x1, y1, x2, y2, st, wd, dash, opac] = op;
+        ctx.globalAlpha = opac === null ? 1 : opac;
+        ctx.strokeStyle = col(st); ctx.lineWidth = wd === null ? 1 : wd;
+        ctx.setLineDash(dash || []);
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+        ctx.setLineDash([]); ctx.globalAlpha = 1;
+        break;
+      }
+      case "poly": {
+        const [, p, st, wd, dash, opac] = op;
+        ctx.globalAlpha = opac === null ? 1 : opac;
+        ctx.strokeStyle = col(st); ctx.lineWidth = wd === null ? 1 : wd;
+        ctx.setLineDash(dash || []);
+        ctx.beginPath(); ctx.moveTo(p[0], p[1]);
+        for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i], p[i+1]);
+        ctx.stroke(); ctx.setLineDash([]); ctx.globalAlpha = 1;
+        break;
+      }
+      case "area": {
+        const [, p, fill, opac] = op;
+        ctx.globalAlpha = opac === null ? 1 : opac;
+        ctx.fillStyle = col(fill);
+        ctx.beginPath(); ctx.moveTo(p[0], p[1]);
+        for (let i = 2; i < p.length; i += 2) ctx.lineTo(p[i], p[i+1]);
+        ctx.closePath(); ctx.fill(); ctx.globalAlpha = 1;
+        break;
+      }
+      case "circle": {
+        const [, cx, cy, rad, fill] = op;
+        ctx.fillStyle = col(fill); ctx.beginPath();
+        ctx.arc(cx, cy, rad, 0, 6.283185307179586); ctx.fill();
+        break;
+      }
+      case "text": {
+        const [, x, y, str, anchor, fill, size, weight, rot] = op;
+        ctx.fillStyle = col(fill);
+        ctx.font = (weight ? weight + " " : "") + (size === null ? 12 : size) +
+                   "px -apple-system,sans-serif";
+        ctx.textAlign = anchor === "middle" ? "center" : (anchor === "end" ? "right" : "left");
+        if (rot) { ctx.save(); ctx.translate(rot[1], rot[2]);
+                   ctx.rotate(rot[0] * Math.PI / 180); ctx.translate(-rot[1], -rot[2]); }
+        ctx.fillText(str, x, y);
+        if (rot) ctx.restore();
+        break;
+      }
+    }
+  }
+  if (clipped) ctx.restore();
+  last = Date.now();
+  hud.className = "";
+  hud.textContent = `${f.w}\u00d7${f.h}` + (scale < 0.999 ? ` @${(scale*100)|0}%` : "") +
+                    ` · ${f.ops.length} ops · ${(performance.now() - t0).toFixed(1)} ms`;
+}
+
+// One connection for the life of the page. EventSource reconnects on its own if the
+// capture is restarted, so the tab does not have to be.
+const es = new EventSource("/events");
+es.onmessage = e => paint(JSON.parse(e.data));
+es.onerror = () => { hud.className = "stale"; hud.textContent = "disconnected"; };
+setInterval(() => {
+  if (last && Date.now() - last > 15000) {
+    hud.className = "stale";
+    hud.textContent = `no frame for ${((Date.now() - last)/1000)|0}s`;
+  }
+}, 2000);
+document.getElementById("el").onclick = () => {
+  legendEl.classList.toggle("hide");
+  // The legend is in flow, so showing it narrows #wrap. Ask for a relayout at the new
+  // width and repaint at once so the change is not a frame late.
+  reportSize();
+  if (lastFrame) paint(lastFrame);
+};
+applyMode();
+reportSize();
+</script>
+"""
+
+
+class PlotServer:
+    """Serves the live canvas view and the display list that feeds it.
+
+    Frames are published, not polled: a draw calls publish() and every connected client
+    thread wakes on the condition. A client that is mid-write when the next frame lands
+    skips it rather than queueing -- the plot is a current-state view, and a backlog of
+    stale frames is worse than a dropped one.
+    """
+
+    def __init__(self, port, svg_path):
+        self.port = port
+        self.svg_path = svg_path
+        self.cv = threading.Condition()
+        self.version = 0
+        self.frame = None
+        self.httpd = None
+        self.bad_frames = 0
+        # Set by the page. `width` is the browser's plotting width; `window` overrides
+        # --plot-window in seconds (0 = the whole run, None = leave the flag alone). Both
+        # are read by the capture loop on its next tick rather than applied here: the
+        # server holds no data, and a control that redrew from the server would need a
+        # second copy of it.
+        self.width = PLOT_WIDTH
+        self.window = None
+        self.hidden = frozenset()
+        # Set by the capture loop to a zero-argument callable that redraws from the latest
+        # snapshot. Without it a toggle would not take effect until the next capture --
+        # up to --plot-every seconds of a control that appears not to work. Replaced (not
+        # called) by the draw path, so it always closes over current data.
+        self.redraw = None
+
+    def publish(self, ops, W, H, clip, legend=()):
+        payload = {"w": W, "h": H, "clip": clip, "ops": ops, "legend": list(legend),
+                   "hidden": sorted(self.hidden)}
+        with self.cv:
+            payload["v"] = self.version + 1
+            try:
+                # allow_nan defaults to True and emits bare NaN/Infinity, which are not
+                # JSON: the browser rejects the whole frame with "unexpected character at
+                # column <somewhere in the middle>", naming an offset that says nothing
+                # about which series produced it. Failing here instead names the frame and
+                # keeps the number out of the payload.
+                blob = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+            except ValueError as e:
+                self.bad_frames += 1
+                if self.bad_frames == 1:
+                    print(f"\n  WARNING: plot frame {payload['v']} is not serializable "
+                          f"({e}); the live view will hold the previous frame. This is a "
+                          f"non-finite coordinate, not a display problem -- report it")
+                return
+            self.version = payload["v"]
+            self.frame = blob.encode()
+            self.cv.notify_all()
+
+    def start(self):
+        server = self
+
+        class Handler(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def _send(self, body, ctype):
+                self.send_response(200)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if self.path == "/":
+                    self._send(PAGE.encode(), "text/html; charset=utf-8")
+                elif self.path.startswith("/plot.svg"):
+                    try:
+                        with open(server.svg_path, "rb") as f:
+                            self._send(f.read(), "image/svg+xml")
+                    except OSError:
+                        self.send_error(404)
+                elif self.path.startswith("/control"):
+                    # keep_blank_values, or `?hidden=` -- the page's "everything back
+                    # on" state -- parses to an EMPTY DICT and silently does nothing.
+                    # The one value that has to clear the set is the one parse_qs drops.
+                    q = urllib.parse.parse_qs(
+                        urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+                    try:
+                        if "w" in q:
+                            # Clamped: a bogus width from a control channel should not be
+                            # able to make the process lay out a 200k-pixel plot.
+                            server.width = max(420, min(6000, int(float(q["w"][0]))))
+                        if "window" in q:
+                            wv = float(q["window"][0])
+                            server.window = max(0.0, wv)
+                        if "hide" in q or "show" in q:
+                            h = set(server.hidden)
+                            h |= {g for g in q.get("hide", [""])[0].split(",") if g}
+                            h -= {g for g in q.get("show", [""])[0].split(",") if g}
+                            server.hidden = frozenset(h)
+                        if "hidden" in q:      # absolute set, for the page's own state
+                            server.hidden = frozenset(
+                                g for g in q["hidden"][0].split(",") if g)
+                    except (ValueError, IndexError):
+                        self.send_error(400); return
+                    self._send(json.dumps({"width": server.width,
+                                           "window": server.window,
+                                           "hidden": sorted(server.hidden)}).encode(),
+                               "application/json")
+                    # Redraw now rather than at the next capture. Off the handler thread:
+                    # a layout can take tens of milliseconds and the control should return
+                    # immediately.
+                    cb = server.redraw
+                    if cb is not None:
+                        threading.Thread(target=cb, daemon=True).start()
+                elif self.path == "/events":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.send_header("Cache-Control", "no-store")
+                    # An HTTP/1.1 body with neither Content-Length nor chunked framing is
+                    # undelimited, and the only legal way to delimit one is by closing the
+                    # connection -- so it must say so. Both forms happen to deliver bytes
+                    # against CPython's own handler here (checked), but "keep-alive" on an
+                    # unframed body is a protocol lie, and the client that eventually reads
+                    # it is not guaranteed to be this one.
+                    self.send_header("Connection", "close")
+                    self.close_connection = True
+                    self.end_headers()
+                    seen = 0
+                    try:
+                        while True:
+                            with server.cv:
+                                # A reconnecting page must not stare at a blank canvas
+                                # until the next capture, so the current frame is sent
+                                # immediately when there is one.
+                                if server.version == seen:
+                                    server.cv.wait(timeout=10.0)
+                                frame, seen = server.frame, server.version
+                            if frame is None:
+                                self.wfile.write(b": ping\n\n")
+                            else:
+                                self.wfile.write(b"data: " + frame + b"\n\n")
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                else:
+                    self.send_error(404)
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+            allow_reuse_address = True
+
+        self.httpd = Server(("127.0.0.1", self.port), Handler)
+        self.port = self.httpd.server_address[1]
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        return self.port
 
 
 def _load_probe_bias_ns():
@@ -1533,7 +2586,7 @@ DISAMBIG_MARGIN = 0.50
 
 SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
           "fs_a_hz,fs_b_hz,phase_a_us,phase_b_us,ramp_a_ppm,ramp_b_ppm,"
-          "crystal_a_ppm,crystal_b_ppm,reason")
+          "crystal_a_ppm,crystal_b_ppm,dl_err_a_us,dl_err_b_us,dl_diff_us,reason")
 # The firmware columns are HELD from that board's most recent log line, not resampled: the
 # firmware emits these far slower than rows arrive, so the same value repeats across many rows
 # and is empty until the first line arrives.
@@ -1547,6 +2600,47 @@ SCHEMA = ("elapsed_s,unix_s,offset_ns,ppm,pcm_coef,frame_lag,rival,scatter_ns,"
 # the measurement does not have.
 HELD_COLS = (("a", "phase_us"), ("b", "phase_us"), ("a", "ramp_ppm"), ("b", "ramp_ppm"),
              ("a", "crystal_ppm"), ("b", "crystal_ppm"))
+
+# The delay-loop error is NEAREST-in-time, not held, and that is the point. It ticks about
+# once a second (measured: median 1.048 s, p90 1.341 s, longest gap 27 s), which is close
+# enough to the capture rate that a real pairing exists most of the time and dishonest to
+# fake when it does not. Holding the last value across a 27 s dropout would put a stale
+# number beside a fresh measurement and invite exactly the comparison it cannot support.
+#
+# 0.7 s is derived from that cadence, not picked. Measured on a.log/b.log at a 1 Hz row
+# cadence, with BOTH boards required to pair:
+#
+#     tol 0.35 s -> 26.7%    tol 0.70 s -> 73.3%
+#     tol 0.50 s -> 54.8%    tol 1.00 s -> 73.7%
+#
+# 0.7 s is the knee. Going to 1.0 s buys 0.4 points, because what is left unpaired is not
+# marginal timing but real dropouts -- the longest gap in the log is 27 s -- and widening
+# the tolerance further would start pairing ACROSS those rather than through them.
+#
+# Note 73%, not the ~99% an interval count suggests: 99.3% of INTERVALS are under 2*tol,
+# but a handful of long gaps hold a large share of the elapsed time, and both boards have
+# to land at once (~0.86 each, ~0.73 jointly). The interval figure is time-blind and was
+# the wrong statistic for a per-row fill rate.
+DL_MATCH_S = 0.7
+
+
+def nearest_value(series, t, tol=DL_MATCH_S):
+    """Value of `series` nearest in time to t, or None if nothing is within tol.
+
+    Returns None rather than the closest-whatever-the-distance so that "no sample" and
+    "a sample that happens to be far away" cannot be confused downstream -- an empty CSV
+    cell is a fact, a stale one is a fabrication.
+    """
+    if not series:
+        return None
+    i = bisect.bisect_left(series, (t,))
+    best = None
+    for j in (i - 1, i):
+        if 0 <= j < len(series):
+            d = abs(series[j][0] - t)
+            if d <= tol and (best is None or d < best[0]):
+                best = (d, series[j][1])
+    return None if best is None else best[1]
 
 
 DUMP_SCHEMA = "elapsed_s,skew_ns"
@@ -1685,6 +2779,13 @@ def rate_derivative(series, window):
     block is ~2 Hz/s of noise for a quantity that moves far slower. Fitting a slope over
     a window of points trades time resolution for a derivative that means something.
     """
+    # Drop non-finite points BEFORE the prefix sums. cumsum past a NaN is NaN for every
+    # window after it, so one failed capture -- a row printing "--", best coef 0.00 -- took
+    # out the rest of the panel: measured, a single NaN at sample 50 of 200 left 155 of 200
+    # output slopes non-finite. In the SVG those became `nan` coordinates, which render as
+    # nothing, so the panel simply stopped and looked like an axis that ran out of data.
+    # The `ok` mask below cannot catch it: it tests the fit's denominator, not its inputs.
+    series = [(x, v) for x, v in series if math.isfinite(x) and math.isfinite(v)]
     if len(series) < 3:
         return [], window
     xs = np.array([x for x, _ in series])
@@ -1705,7 +2806,7 @@ def rate_derivative(series, window):
     sx, sy = Sx[hi] - Sx[lo], Sy[hi] - Sy[lo]
     sxy, sxx = Sxy[hi] - Sxy[lo], Sxx[hi] - Sxx[lo]
     den = cnt * sxx - sx * sx
-    ok = (cnt >= 3) & (np.abs(den) > 0)
+    ok = (cnt >= 3) & (np.abs(den) > 0) & np.isfinite(den) & np.isfinite(sxy) & np.isfinite(sy)
     slope = np.where(ok, (cnt * sxy - sx * sy) / np.where(ok, den, 1.0), np.nan)
     return [(float(x), float(v)) for x, v in zip(xs[ok], slope[ok])], window
 
@@ -1720,11 +2821,14 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None,
     # How fast the A-B offset is changing -- the derivative of the panel above, in ppm.
     # Three independent routes to the same quantity, which is the point of putting them on
     # one axis: they should agree, and where they do not, one of them is wrong.
-    ab = {}
+    ab, ab_sids = {}, {}
     if skew:
         d, w = rate_derivative(win(skew), args.rate_window)
         # skew is ns against seconds, so the slope is ns/s -- ppm is that over 1000.
         if d:
+            # The window is in the LABEL, never in the id: it moves with the sample
+            # cadence, and an id that moves is a toggle that stops working.
+            ab_sids[f"d(skew)/dt, {w:.2g}s fit"] = "dskew_dt"
             ab[f"d(skew)/dt, {w:.2g}s fit"] = [(x, v / 1000.0) for x, v in d]
     if ppm_series:
         p = win(ppm_series)
@@ -1741,32 +2845,32 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None,
         if diff:
             ab["fs_b - fs_a"] = diff
     if ab:
-        panels.append(("A-B rate of change (ppm)", ab))
+        panels.append(("A-B rate of change (ppm)", ab, "ab_rate", ab_sids))
 
     t2 = trim_temps(temps, lo, hi)
     if t2:
-        panels.append(("temperature (\u00b0C)", t2))
+        panels.append(("temperature (\u00b0C)", t2, "temp", None))
     ra, rb = win(rate_a), win(rate_b)
     if ra or rb:
-        panels.append(("I2S frame rate (Hz)", {"a rate": ra, "b rate": rb}))
+        panels.append(("I2S frame rate (Hz)", {"a rate": ra, "b rate": rb}, "fs", None))
         da, wa = rate_derivative(ra, args.rate_window)
         db, wb = rate_derivative(rb, args.rate_window)
         if da or db:
             panels.append((f"d(rate)/dt (Hz/s), {max(wa, wb):.2g}s fit",
-                           {"a d/dt": da, "b d/dt": db}))
+                           {"a d/dt": da, "b d/dt": db}, "drate_dt", None))
     # The boards' own view of the differential rate, on the same time axis as the offset
     # above it: this is the quantity whose integral the offset is supposed to be, so the
     # two panels should be visibly derivative and integral of one another.
     if dtrim:
         dt = win(dtrim)
         if dt:
-            panels.append(("differential trim mean (ppm)", {"b - a": dt}))
+            panels.append(("differential trim mean (ppm)", {"b - a": dt}, "dtrim", None))
     # What each board BELIEVES its offset from the group is, next to the measured ppm.
     # Same units, so it goes on one panel and any disagreement is read directly.
     ramp = {f"{b} ramp": win(FIRMWARE.get((b, "ramp_ppm"), [])) for b in ("a", "b")}
     ramp = {k: v for k, v in ramp.items() if v}
     if ramp:
-        panels.append(("firmware offset ramp (ppm)", ramp))
+        panels.append(("firmware offset ramp (ppm)", ramp, "ramp", None))
     # tsf-local: each board's clock against the RADIO timebase, so it is measured outside the
     # audio servo loop -- the only reference here that is. Its own panel rather than sharing
     # with the ramp above: these sit around +42 and +37 ppm where the ramp sits near 0, so one
@@ -1775,7 +2879,7 @@ def build_panels(args, rate_a, rate_b, temps, lo, hi, dtrim=None,
     tsfl = {f"{b} crystal delta": win(FIRMWARE.get((b, "crystal_ppm"), [])) for b in ("a", "b")}
     tsfl = {k: v for k, v in tsfl.items() if v}
     if tsfl:
-        panels.append(("crystal delta vs group (ppm)", tsfl))
+        panels.append(("crystal delta vs group (ppm)", tsfl, "crystal", None))
     return panels
 
 
@@ -1802,6 +2906,16 @@ def firmware_overlays(lo, hi, which=("phase",)):
                    if lo <= x <= hi]
             if pts:
                 out[f"{board} {label}"] = pts
+    # The delay loop's own error difference, on the measured axis. This is the one the wire
+    # actually tracks -- r = 0.88, ~2.5 us bias, ~13 us/s noise -- where render phase is
+    # biased by tens of microseconds, 3-4x noisier and carries stall-stamp spikes. Same
+    # sign convention as the measurement, which is board B minus board A on the wire and
+    # errA - errB here: the loop's error is what it must still REMOVE, so a board running
+    # late has a positive error and appears late on the wire.
+    if "dl" in which:
+        pts = [(x, v * 1000.0) for x, v in DL_DIFF if lo <= x <= hi]
+        if pts:
+            out["delay-loop err a-b"] = pts
     return out
 
 
@@ -2764,9 +3878,25 @@ def main():
                    help="plot only the last N seconds (0 = the whole run). A live chart "
                         "wants a bounded window: the cost of a write grows with the "
                         "points in it, so an unbounded run slows the refresh over time")
+    p.add_argument("--serve", type=int, nargs="?", const=8000, default=None,
+                   metavar="PORT",
+                   help="serve a live canvas plot on http://127.0.0.1:PORT/ (default "
+                        "8000; 0 picks a free port). Replaces the old svgwatch.py: the "
+                        "display list is streamed over one SSE connection and painted to "
+                        "a canvas, so no SVG document is refetched or reparsed per frame. "
+                        "The .svg file is still written")
     p.add_argument("--plot-every", type=float, default=2.0,
-                   help="seconds between plot rewrites; the CSV is always written per "
-                        "capture. Redrawing every capture makes a long run quadratic")
+                   help="seconds between plot FRAMES -- a layout, pushed to --serve and, "
+                        "subject to --svg-every, written to the .svg. The CSV is always "
+                        "written per capture. Redrawing every capture makes a long run "
+                        "quadratic")
+    p.add_argument("--svg-every", type=float, default=None, metavar="SECONDS",
+                   help="seconds between .svg FILE writes, independent of --plot-every "
+                        "(default: every frame). Serializing and writing the file is the "
+                        "expensive half of a frame, so --serve --plot-every 0.1 "
+                        "--svg-every 10 gives a live view at the capture rate while the "
+                        "file stays a periodic artefact. Ignored without --serve, where "
+                        "the file IS the output. The final plot is always written")
     p.add_argument("--dump-skew", default=None,
                    help="write the PER-FRAME skew series (one row per audio frame, "
                         "~44100/s) to this CSV, not just one row per capture")
@@ -2774,10 +3904,18 @@ def main():
                    help="let the overlays widen the skew axis. Off by default: fitting the "
                         "firmware estimates costs an order of magnitude of range and the "
                         "convergence being read on that panel flattens to a line")
-    p.add_argument("--overlay", default="phase",
+    p.add_argument("--overlay", default="dl",
                    help="firmware offset estimates to draw over the measured skew, comma "
-                        "separated: phase, depth, none. The axis expands to fit whatever "
-                        "is overlaid, and depth-vs-group is ms-scale, so it is opt-in")
+                        "separated: dl, phase, depth, none. Default is dl -- the delay "
+                        "loop's own errA-errB, which tracks the wire at r=0.88 with ~2.5 us "
+                        "of bias, where phase_b-phase_a is biased by tens of microseconds, "
+                        "3-4x noisier and carries stall-stamp spikes. The axis expands to "
+                        "fit whatever is overlaid, and depth-vs-group is ms-scale, so that "
+                        "one stays opt-in")
+    p.add_argument("--dl-event-s", type=float, default=5.0,
+                   help="--annotate: minimum spacing between Delay loop engaged/holding "
+                        "marks. The loop alternates about every ten seconds, so marking "
+                        "every transition would bury the plot")
     p.add_argument("--y-free", action="store_true",
                    help="scale the vertical axis to the data instead of always including "
                         "zero; use when the shape of the variation matters more than its "
@@ -2798,6 +3936,21 @@ def main():
     overlay_sel = tuple(x.strip() for x in args.overlay.split(",")
                         if x.strip() and x.strip() != "none")
 
+    if args.serve is not None:
+        global PLOT_SERVER
+        PLOT_SERVER = PlotServer(args.serve, args.plot)
+        try:
+            port = PLOT_SERVER.start()
+        except OSError as e:
+            # Loud, not fatal: a busy port is no reason to lose a capture, but a run that
+            # silently served nothing while the operator watched a stale tab is worse.
+            PLOT_SERVER = None
+            print(f"  WARNING: --serve failed to bind port {args.serve}: {e}\n"
+                  f"           continuing without the live view")
+        else:
+            print(f"  live plot: http://127.0.0.1:{port}/   "
+                  f"(canvas, streamed; {args.plot} still written)")
+
     def collect_events(t_start, offsets=None):
         """Log events as (elapsed_seconds, kind, label), relative to the run start."""
         out = []
@@ -2812,7 +3965,8 @@ def main():
                                                                 LOG_STATE.get(path), args.sync_us,
                                                                 args.peak_us, args.pipeline_ms,
                                                                 args.log_tail_mb * (1 << 20),
-                                                                args.rendertag_us, args.phasein_us)
+                                                                args.rendertag_us, args.phasein_us,
+                                                                args.dl_event_s)
             # Device time is placed on the host axis PER BOOT EPOCH -- see place_device_times for
             # why a single offset across a log spanning reboots lands nowhere. Each series is
             # anchored from its own rows, in log order, so the epoch split is well defined.
@@ -2930,10 +4084,33 @@ def main():
         REPAIRS.clear()
         INJECTS.clear()
         DEV_ANCHOR.clear()
+        DL_DIFF.clear()
         ev, _ = collect_events(anchor0 or time.time())
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]
+        # The overlay comes from the CSV on a replot, not from a second pass over the logs:
+        # the column IS the pairing that was made when the row was written, and recomputing
+        # it here against a re-parsed log would silently answer a slightly different
+        # question -- with a different tolerance outcome at every gap.
+        DL_DIFF.extend(load_column(args.out, "dl_diff_us"))
+        if not DL_DIFF and args.annotate:
+            # The column is only written by a live capture, so a CSV from before this
+            # existed -- or from a run without --annotate -- has none. Recompute it from
+            # the logs at the CSV's own row times, using the same tolerance, and SAY SO:
+            # it is the same rule applied to the same data, but the pairing was made now
+            # rather than then, so a gap that has since been re-read could pair differently.
+            fa = FIRMWARE.get(("a", "dl_err_us"), [])
+            fb = FIRMWARE.get(("b", "dl_err_us"), [])
+            for t in ts0:
+                va, vb = nearest_value(fa, t), nearest_value(fb, t)
+                if va is not None and vb is not None:
+                    DL_DIFF.append((t, va - vb))
+            if DL_DIFF:
+                print(f"  dl_diff_us absent from {args.out}; recomputed "
+                      f"{len(DL_DIFF)}/{len(ts0)} pairing(s) from the logs "
+                      f"(tol {DL_MATCH_S:g}s)")
         print(f"replot: {len(ts0)} rows spanning {ts0[-1]-ts0[0]:.1f} s, "
-              f"{len(ev)} log event(s) in window")
+              f"{len(ev)} log event(s) in window"
+              + (f", {len(DL_DIFF)} delay-loop pairing(s)" if DL_DIFF else ""))
         for path, (lo, hi) in sorted(LOG_COVERAGE.items()):
             miss = ""
             if hi < ts0[-1] - 5 or lo > ts0[0] + 5:
@@ -3007,6 +4184,10 @@ def main():
     ppm_series = []          # (elapsed, ppm) so the per-capture slope can be plotted
     # Start from the primed offsets so the first in-loop poll reads only new bytes.
     events, log_off, last_plot = [], primed_offsets, 0.0
+    # Without a live view the file is the only output, so throttling it would just throw
+    # frames away for nothing.
+    svg_every = args.svg_every if (args.svg_every and PLOT_SERVER is not None) else 0.0
+    last_svg = 0.0
     # A write in flight means this one is skipped, not queued: the chart is cosmetic and
     # must never hold up the acquisition.
     plot_busy = threading.Lock()
@@ -3294,10 +4475,19 @@ def main():
             for key in HELD_COLS:
                 pts = FIRMWARE.get(key)
                 held.append(f"{pts[-1][1]:.4g}" if pts else "")
+            # Nearest-in-time, not held: see DL_MATCH_S. errA - errB is the firmware's own
+            # view of the quantity measured on the wire, so it goes on the same row as the
+            # measurement and the two can be differenced offline rather than only by eye.
+            dla = nearest_value(FIRMWARE.get(("a", "dl_err_us"), []), elapsed)
+            dlb = nearest_value(FIRMWARE.get(("b", "dl_err_us"), []), elapsed)
+            dld = (dla - dlb) if (dla is not None and dlb is not None) else None
+            if dld is not None:
+                DL_DIFF.append((elapsed, dld))
+            dlcols = ",".join("" if v is None else f"{v:.1f}" for v in (dla, dlb, dld))
             log.write(f"{elapsed:.3f},{wall:.3f},{off:.1f},{ppm:.4f},{coef:.4f},"
                       f"{info.get('frame_lag',0)},{info.get('rival',float('nan')):.3f},"
                       f"{info.get('scatter_ns',float('nan')):.1f},"
-                      f"{fs_a:.4f},{fs_b:.4f},{','.join(held)},{reason}\n")
+                      f"{fs_a:.4f},{fs_b:.4f},{','.join(held)},{dlcols},{reason}\n")
 
             note = reason
             if info.get("lag_steps"):
@@ -3332,7 +4522,12 @@ def main():
             # Only true when priming was skipped (no --annotate, or the simulator).
             first_poll = args.annotate and log_off is None
             now = time.time()
-            due = (now - last_plot >= args.plot_every) or (n + 1 >= args.count > 0)
+            last_frame = (n + 1 >= args.count > 0)
+            due = (now - last_plot >= args.plot_every) or last_frame
+            # Two clocks, one layout. svg_every only ever SUBTRACTS writes from the frames
+            # --plot-every already produced: a file cannot be written more often than the
+            # plot is laid out, and asking for that silently gets the frame rate instead.
+            due_svg = (svg_every <= 0 or now - last_svg >= svg_every or last_frame)
             new_ev, log_off = collect_events(t_start, log_off)
             if first_poll:
                 # The first poll reads the whole file to establish trim/resync
@@ -3346,19 +4541,30 @@ def main():
             events.extend(new_ev)
             if due and not plot_busy.locked():
                 last_plot = now
+                if due_svg:
+                    last_svg = now
                 pt, py_ = list(ts), list(ys)
-                if args.plot_window > 0 and ts:
-                    cut = ts[-1] - args.plot_window
+                # The live view can widen or narrow the window without restarting the
+                # capture. It overrides the flag rather than replacing it, so a run
+                # started with --plot-window keeps that value until someone touches the
+                # control, and the CSV is unaffected either way -- this only ever changes
+                # what is DRAWN.
+                pw = args.plot_window
+                if PLOT_SERVER is not None and PLOT_SERVER.window is not None:
+                    pw = PLOT_SERVER.window
+                if pw > 0 and ts:
+                    cut = ts[-1] - pw
                     i0 = bisect.bisect_left(ts, cut)
                     pt, py_ = ts[i0:], ys[i0:]
                 snap = (pt, py_, list(events), list(rate_a), list(rate_b),
                         list(ppm_series))
 
                 def draw(pt=snap[0], py_=snap[1], evs=snap[2], ra=snap[3], rb=snap[4],
-                         ps=snap[5]):
+                         ps=snap[5], wf=due_svg):
                     try:
                         write_svg(args.plot, pt, py_, "I2S playout skew",
                                   "board B - board A (ns)   [+ = B later]",
+                                  write_file=wf,
                                   stats=stats_caption(pt, py_),
                                   include_zero=not args.y_free, events=evs,
                                   overlays=firmware_overlays(pt[0] - 1, pt[-1] + 1, overlay_sel),
@@ -3367,11 +4573,23 @@ def main():
                                                       pt[0] - 1, pt[-1] + 1,
                                                       skew=list(zip(pt, py_)),
                                                       ppm_series=ps))
+                    except Exception:
+                        # A draw runs on its own thread, so an exception here vanishes
+                        # into the default thread hook and the live view simply stops
+                        # updating -- looking exactly like a stalled capture. Say so.
+                        traceback.print_exc()
                     finally:
                         plot_busy.release()
 
                 plot_busy.acquire()
                 threading.Thread(target=draw, daemon=True).start()
+                if PLOT_SERVER is not None:
+                    # A control toggle redraws this same snapshot, but never writes the
+                    # file: the .svg records the run, not what someone was looking at.
+                    def _redraw(d=draw):
+                        if plot_busy.acquire(blocking=False):
+                            d(wf=False)
+                    PLOT_SERVER.redraw = _redraw
             n += 1
             if (args.count == 0 or n < args.count) and args.interval > 0 \
                     and not args.simulate:
