@@ -2807,3 +2807,18 @@ physical DMA during transients (SYNCX feedback sits at its 9999 µs/10 ms cap on
 capped model hides exactly the differential). Deep fix is tag-stamping-side; next session. The
 analyzer also lost correlation (rival 0.89) while A drifted, so late-window wire numbers are gated
 garbage — graded spans must stay rival-clean (they were).
+
+### 2026-08-30 20:47–20:51 — standing blind offset specimen; column retraction
+
+**Retraction:** "the analyzer lost correlation (rival 0.89)" misread the CSV — that column is
+pcm_coef; rival sat at 0.030–0.035 (clean) throughout. The −1.5…−1.8 ms differential is REAL,
+rival-clean, stood ~13 minutes without decaying through multiple converge cycles, with every
+on-device signal reading fine (err_tag ~0 both, pairwise beacon phases ≤0.2 ms, pipeline depths
+equal) — a live specimen of the blind-offset class the pipeline-divergence comment predicted.
+pcm_coef degraded 0.98→0.905 (user confirmed) from the misalignment itself. Depth-state capture in
+scratchpad/blind-offset-specimen-2048.txt (mixer DEPTH totals differ ~10–70 ms sample-to-sample —
+noisy, needs matched-instant comparison). B (the late board) rebooted to restore the pair.
+Root-cause queue for next session, sharpened: the displacement lives BELOW the tag/feedback
+stamping (SYNCX feedback pinned at its 9999 µs/10 ms cap on both boards); truing the render tags
+against the physical DMA is prerequisite to both the standing-offset class and the <1 µs goal —
+GDAVG stays shadow until then.
