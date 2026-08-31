@@ -17,10 +17,10 @@ escape verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
   test.csv). Decomposes today's ±3–8 µs into rate ripple vs measurement noise, and is the gate
   metric every later stage is judged by.
 
-* Definition of done for the whole plan (R1.9 + R2.4, disjoint-block form so the gate statistic is
-  the same statistic WS0 measured): over a 30-min quiet window, |mean| ≤ 0.2 µs, and across its six
-  disjoint 1000-sample rival-clean blocks: median block-p2p ≤ 1 µs AND worst block-p2p ≤ 2 µs
-  (p0.5/p99.5 reported alongside). Twice, on different days.
+* Definition of done for the whole plan (R1.9 + R2.4 + R3.4, window defined by SAMPLE COUNT since
+  3.29 samples/s × 30 min < 6000): over 6000 consecutive rival-clean samples in a quiet span,
+  |mean| ≤ 0.2 µs, and across the six disjoint 1000-sample blocks: median block-p2p ≤ 1 µs AND
+  worst block-p2p ≤ 2 µs (p0.5/p99.5 reported alongside). Twice, on different days.
 
 ## WS1 — Render-tag truth (BLOCKER for everything downstream)
 
@@ -52,11 +52,14 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
 
 ## WS2 — µs-class differential reference (needs WS1)
 
-0. **Delivery measurement first (R2.1)**: multicast currently delivers ~2 % of what is sent (GDAVG
-   n = 1.1/s against 50 pkt/s; 16/s existed only in the build-85 unicast era). Add sent-vs-received
-   counters (one log line each side, one minute of data) to decide the loss model: a PACKET-RATE
-   limit (AP multicast throttling, socket queue) makes batching win ~10×; a per-packet probability
-   makes batching worth exactly nothing (50p either way). No WS2 build work before this number.
+0. **Delivery RATE SWEEP first (R2.1 + R3.5)**: multicast currently delivers ~2 % of what is sent
+   (GDAVG n = 1.1/s against 50 pkt/s; 16/s existed only in the build-85 unicast era). A ratio at one
+   rate cannot separate the loss models (p = 0.02 and a ~1 pkt/s cap both explain it); the models
+   differ in how delivery responds to RATE. Make `PHASE_TX_INTERVAL_US` a servo_param and sweep
+   5/10/25/50 Hz for a minute each, plotting delivered pkt/s (sent-vs-received counters, one log
+   line each side). Flat ⇒ rate cap ⇒ batching wins ~10× and WS2.1 is worth building. Linear in
+   send rate ⇒ probabilistic ⇒ batching wins nothing and the unicast question is the only path.
+   One tunable, five minutes, decides the workstream. No WS2 build work before this.
 1. **WS2's actual blocker (R2.1.3)**: the only regime that ever produced a usable reference
    (n≈16/s) is the one that displaced audio 1.5 ms. The task is "recover build 85's delivery
    without its damage" — the unicast displacement mechanism (per-destination blocking / ARP path /
@@ -64,11 +67,13 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
    design sends from the NETWORK task at service cadence (append-only wire-format change: count +
    array, no version bump, short-packet defaults exercised; tolerate `stream_active_` gating or
    flush a last batch on gap entry) — this replaces the still-live 20 ms multicast per-sample TX.
-2. GDAVG becomes a sliding EWMA at the current 1 s publish cadence (R1.4 — a 10–30 s box-car adds
-   ~15 s of group delay; the EWMA gets the noise without the lag; phase margin vs the τ=120 s fine
-   loop stated when the constant is chosen). Noise floor is delivery-bound: at 1.1 pairs/s a 30 s
-   equivalent holds n≈33 → ≥1.6 µs even by the independence bound (a floor, not an estimate);
-   WS2.3's gate is unreachable until WS2.0/2.1 restore ≥ ~15 pairs/s.
+2. GDAVG becomes a sliding EWMA at the current 1 s publish cadence (R1.4, rationale corrected per
+   R3.4: at equal effective n an EWMA has the SAME lag as a box-car — τ = T/2 — its real advantages
+   are continuous update, no 30 s staircase handed to align, and no boundary discard; "30 s
+   equivalent" means τ = 15 s. Phase margin vs the τ=120 s fine loop stated when the constant is
+   chosen). Noise floor is delivery-bound: at 1.1 pairs/s a 30 s-equivalent holds n≈33 → ≥1.6 µs
+   even by the independence bound (a floor, not an estimate); WS2.3's gate is unreachable until
+   WS2.0/2.1 restore ≥ ~15 pairs/s.
 3. **Gate**: GDAVG (EWMA, ~30 s equivalent) tracks the wire within ±0.5 µs over a quiet hour.
 4. Then: align consumes GDAVG instead of the single-pair delta; recentre cap stays 2 µs/cycle.
    PRECONDITION (R1.4): staleness invalidation for the averaged delta (mirror of
@@ -102,20 +107,33 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
 ## WS4 — Event hygiene (protects the metric; mostly done or user-side)
 
 * Server `buffer 2000 → 4000` ms (user): tonight's 1–6 s late bursts are the dominant disturbance.
-* Boot ring: A/B `resync_gain 0.6 vs running 1.0` (header default 1.0f; the "60 %" comment is
-  historical). The 21:37 episode's steps were `src=tag` (RSTEP 21:37:14.852: err=+7075 src=tag),
-  so `resync_gain` IS in the path (rebuts R2.6.2). r is NOT fixed at 1.79 (R2.6.1: two points
-  across a boot drain are not a step response, and build 51 measured 1:1 on clean landings) — log
-  r per episode; 0.6 is chosen for robustness (monotone convergence for any r < 2/0.6 ≈ 3.3, near-
-  deadbeat at the observed boot r), not as deadbeat tuning to n=1 evidence.
+* Boot ring — A MECHANISM ITEM, not a gain A/B (R3.1). The full 21:37 episode is 28 tag-step
+  decisions over 46 s whose magnitude ratio converges to 1.00 (r → 2.00): a SUSTAINED limit cycle
+  at full-magnitude correction, the textbook signature of one-decision-stale measurement — and
+  `pend=+0` on all 28, i.e. the serial step-and-verify guard never fired at the 1.6 s decision
+  cadence (it demonstrably works at 0.65 s: pend=−2448 at 21:38:01, +158/+181/+204 at 22:10). The
+  "landed" test (played ≥ land + 2·blocks) and "the measurement is post-landing" are different
+  questions that 2 blocks makes agree at only one cadence — a two-numbers-happen-to-agree defect in
+  a load-bearing position. Distinguish offline against this episode: (a) landed-detector declares
+  landed while the tag average is still pre-step, vs (b) the step physically appears TWICE in
+  err_tag (e.g. `tag_anchor_deadline_us_` advancing with the drop) — (b) belongs to WS1.
+  PRECONDITION: split the RSTEP field (R3.2) — `err=` currently carries three quantities (raw
+  target; gd-clamp bound |gd|·n/(n−1) below resync_local, verified 22:10: gd=+107→err=+160; and a
+  literal 0 meaning "step in flight") — log `raw=` and `tgt=` separately or r-per-episode computes
+  the clamp, not the plant. THEN the gain change, as confirmation not fix: g·r ≤ 1 is the monotone
+  bound (R3.3 — 0.6 is monotone only for r ≤ 1.67; at r = 2.00 it is oscillatory-decaying 0.2/round;
+  deadbeat is 0.5) — and if the mechanism is staleness, r is a property of the cadence and no fixed
+  g is right. Also on the record: gd sawed ±2.4 ms for 46 s during the episode — an AUDIBLE
+  disturbance larger than anything WS0 measured, which is why this outranks a tuning item.
 * Split escape (build 87, verified) bounds every tug variant; the padding-dispenser interaction and
   the accounting-split formation stay on the root-cause list but no longer gate the goal.
 
 ## Order and honesty
 
-Start today, before the WS1 blocker resolves: WS0 baseline re-take, WS2.0 delivery counters,
-WS3.1 invariant counter, WS3.2 wander measurement + common-mode check (all instrumentation or
-measurement). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
+Start today, before the WS1 blocker resolves: WS0 baseline re-take, WS2.0 delivery rate sweep,
+WS3.1 invariant counter, WS3.2 wander measurement + common-mode check, and the RSTEP raw=/tgt=
+field split (R3.2 — precondition for both WS4's mechanism work and WS1's step experiment; all
+instrumentation or measurement). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
 WS3.2 build → gates in sequence 2 µs → 1 µs (disjoint-block statistic throughout). Mean 0 falls
 out of WS1+WS2 (bias is already ±2 µs). Residual risk after all gates: crystal wander between
 corrections and the unresolved 1.5 ms TX-displacement mechanism constraining WS2's delivery —
@@ -573,3 +591,165 @@ are the n≈1 eras, which is precisely why WS2.0 measures delivery before anythi
 **R2.8 — agreed;** same trap cost this session a false "second reboot" finding earlier (a `cut`
 truncating `t=`). Byte-anchor plus scratchpad copies remain the rule; the GDAVG-per-era table is
 accepted as the delivery evidence WS2.0 will formalize.
+
+---
+
+## REVIEW 3 (2026-08-30, code- and log-checked)
+
+The body now matches the correspondence; R2.3 is discharged. Two new findings, both from pulling the
+21:37 episode RESPONSE 2 cited. The first says WS4's boot-ring item is chasing a symptom; the second
+says the field both of us have been quoting as "the error" is three different quantities.
+
+### R3.1 — The 21:37 "boot ring" is a sustained limit cycle at plant gain 2.00, and `pend` is blind to it
+
+RESPONSE 2 quotes the first two steps. Here is the whole episode (byte-anchored from `a.log`,
+21:37:14 → 21:38:00, every in-window decision, `src=tag`, `resync_gain` = 1.0 so `step = err`):
+
+```
++7075 −5569 +4251 −3772 +3265 −3032 +2762 −2651 +2518 −2548 +2440 −2447 +2432 −2538
++2526 −2478 +2469 −2476 +2461 −2549 +2476 −2404 +2523 −2403 +2382 −2521 +2393 −2459
+```
+
+**28 decisions, 46 seconds, and after the first six rounds it stops decaying.** Successive
+magnitude ratios: 0.79, 0.76, 0.89, 0.87, 0.93, 0.91, 0.96, 0.95, 1.01, 0.96, 1.00, 0.99, 1.04,
+1.00, 0.98, 1.00, 1.00, 0.99, 1.04, 0.97, 0.97, 1.00, 0.95, 1.06, 1.01, 0.95, 1.03. The last
+fifteen average **1.00**. `pend=+0` on every one of the 28.
+
+Three things follow, and they change WS4:
+
+1. **r is not 1.79 and it is not a constant.** |1 − g·r| = ratio with g = 1.0 gives r = 1.79 at the
+   first step and **r = 2.00 in the sustained tail**. A two-point estimate at the top of the decay
+   picked the least representative round. Twenty-eight rounds is a real estimate; use it.
+2. **A plant gain of exactly 2.00 on a position correction is not a plant gain.** Physically, drop
+   108 frames when 108 frames late and you land near zero. Landing at *minus the same amount*, round
+   after round, means the correction is being counted twice — or, equivalently, that the error the
+   next decision reads is exactly one decision stale. Sustained (not decaying, not growing)
+   oscillation at full-magnitude correction is the textbook signature of **one-sample measurement
+   delay in the loop**, and it is the failure this file has already documented twice: build 54
+   ("the block average is wholly post-landing only a full block after the landing") and build 78
+   (`snapcast_client.cpp:3245-3252` — "pend read +0 at every decision and the next tag round
+   re-stepped each ledger step in full"). The serial step-and-verify guard written to prevent
+   exactly this — `if (pending_us != 0) coarse_target_us = 0` — **never fired during the cycle**.
+3. **Therefore `resync_gain 0.6` is a damping bodge on a staleness defect.** At r = 2.00 it makes
+   |1 − 1.2| = 0.2, so the cycle decays ~5×/round and the symptom disappears. The broken
+   landed-detector stays, and it will resurface wherever the decision interval and the block horizon
+   sit differently. Note the detector is not universally broken — it read `pend=−2448` at 21:38:01
+   and `pend=+158/+181/+204` at 22:10:44–50, one decision after the step. During the cycle,
+   decisions were **1.6 s apart** and it read +0; when it worked, they were **0.65 s apart**. The
+   "landed" test (`played_frames_total_ ≥ land_frame + 2·block_frames`) and the "the measurement is
+   post-landing" question are two different questions, and 2 blocks is the number that happens to
+   make them agree at one cadence — CLAUDE.md's "conclusions that hold only because two numbers
+   happen to be close", in the load-bearing position.
+
+**WS4's boot-ring bullet should be rewritten as a mechanism item, not a gain A/B**: distinguish
+(a) landed-detector says landed while the tag average is still pre-step, from (b) the step
+physically moving audio ~2× (e.g. `tag_anchor_deadline_us_` advancing with the drop, so the
+correction appears in both terms of `err_tag`). Both are testable offline against this episode.
+Run the gain A/B *after*, as confirmation, not as the fix — and note (b) lands inside WS1's
+territory, so it may not be a separate workstream at all.
+
+Also worth stating plainly: this ran for 46 s with `gd` alternating +1706/−987, +1730/−872,
++1683/−1027 — the pair really was sawing ±2.4 ms across an unmute. That is not a p2p-budget item,
+it is an audible one, and it is a bigger disturbance than anything WS0 measured.
+
+### R3.2 — `RSTEP err=` is three different quantities sharing one name
+
+`snapcast_client.cpp:3335-3345` logs `coarse_target_us` under the label `err`. By then
+`coarse_target_us` has been through two mutations:
+
+* **gd clamp** (`:3305-3315`), when |target| < `resync_local_us` (default 2000): target becomes
+  `|gd|·n/(n−1)`. Verified in the 22:10 window with n = 3: `gd=+107 → err=+160` (107·1.5 = 160.5),
+  `gd=+125 → err=+187`, `gd=+146 → err=+219`. Those `err` values are **not errors at all** — they
+  are the gap-to-peers bound, printed in the error's field.
+* **in-flight zeroing** (`:3277`): `if (pending_us != 0) coarse_target_us = 0`. So
+  `err=+0 ... pend=+158` at 22:10:44 does not mean the error was zero; it means a step was
+  travelling. A literal 0 standing for "not measured this round" is the sentinel-as-a-number rule.
+
+And when a step is *refused* (`ok=0`) neither mutation has run, so the same field carries the raw
+target. Three quantities, distinguished only by reading `ok=` and `pend=` and knowing the 2000 µs
+threshold.
+
+Consequences:
+
+* RESPONSE 2's rebuttal survives — `+7075` is above the clamp threshold and `pend=0`, so it is the
+  raw target, and `src=tag` settles that `resync_gain` was in the path. R2.6.2 stays rebutted.
+* But **WS4's "log r per episode" will compute garbage** on any round where the clamp or the
+  zeroing fired: a ratio taken across a clamped round measures the clamp, not the plant. The r-per-
+  episode instrumentation needs the raw error logged as its own field before it can produce a
+  number worth acting on.
+* More generally: this is a load-bearing diagnostic line whose central field means different things
+  on different rows, and both of us read it as "the error" for two review rounds. Split it —
+  `raw=` (pre-mutation), `tgt=` (post-clamp), keep `pend=` — before WS4 or WS1 leans on it. Cheap,
+  and it is the same defect class as the 256-byte ceiling: the instrument was shaped to confirm
+  what was expected of it.
+
+### R3.3 — WS4's stability justification is the wrong bound
+
+"0.6 is chosen for robustness (monotone convergence for any r < 2/0.6 ≈ 3.3)". Two corrections:
+
+* g·r < 2 is the **stability** bound (converges at all). **Monotone** — no sign alternation — needs
+  g·r ≤ 1, i.e. r ≤ 1/0.6 = **1.67**.
+* At the measured r = 2.00 (R3.1), g = 0.6 gives g·r = 1.2, so convergence is *oscillatory*, decaying
+  0.2 per round. Perfectly fine, but it is not what the bullet claims.
+* If r really is 2.00, the deadbeat choice is **g = 0.5**, which nulls in one round. That is a
+  reason to prefer 0.5 over 0.6 — but only after R3.1's mechanism question is answered, because if
+  the "gain" is a staleness artefact then r is a property of the decision cadence and no fixed g is
+  right.
+
+### R3.4 — Two arithmetic checks on the amended body
+
+* **"six disjoint 1000-sample blocks"** (WS0 DoD): the WS0 evidence is n = 988 in 5 min → **3.29
+  samples/s** → a 30-min window holds ~5920 samples, i.e. **5.9 blocks before any rival gating**.
+  Six is not reachable; five is, and fewer if the gate discards anything. Either state the block
+  count as "at least five" or define the window by sample count (6000 rival-clean samples) rather
+  than by wall clock.
+* **"the EWMA gets the noise without the lag"** (WS2.2, inherited from my R1.4 — my wording, my
+  error): at equal noise reduction an EWMA and a box-car have the *same* lag. Box-car length T:
+  effective n = rate·T, mean lag T/2. EWMA time constant τ: effective n ≈ 2·rate·τ, lag τ. Equal n
+  ⇒ τ = T/2 ⇒ equal lag. The EWMA's real advantages are **continuous update** (no 30 s staircase in
+  a signal align consumes) and no discard at window boundaries. Fix the rationale; the choice is
+  still right. Also define "30 s equivalent" — τ = 30 s is ~66 effective samples at 1.1/s, an
+  equivalent box-car of 30 s is ~33.
+
+### R3.5 — WS2.0 measures the wrong thing at one rate
+
+"Sent-vs-received counters, one minute of data" gives the delivery *ratio* at 50 pkt/s. It does not
+distinguish the two loss models, because both explain 2 % at 50 pkt/s: probabilistic loss with
+p = 0.02, or a rate cap at ~1 pkt/s. The models differ only in how delivery responds to **rate**.
+
+Make `PHASE_TX_INTERVAL_US` a `servo_param` and sweep 5 / 10 / 25 / 50 Hz for a minute each,
+plotting delivered pkt/s. Flat ⇒ rate cap ⇒ batching wins ~10× and WS2.1 is worth building. Linear
+in the send rate ⇒ probabilistic ⇒ batching wins nothing and WS2 needs the unicast question answered
+instead. One tunable and five minutes decides a workstream.
+
+---
+
+## RESPONSE 3 (2026-08-30; amendments in the body, as before)
+
+**R3.1 — ACCEPTED in full; WS4 rewritten as a mechanism item.** The 28-round tail at ratio 1.00 is
+decisive: sustained full-magnitude alternation is one-decision-stale measurement, not a plant gain,
+and pend=+0 through all 28 at the 1.6 s cadence (while demonstrably working at 0.65 s) convicts the
+fixed 2-block landed margin of being right at exactly one cadence — the two-numbers-agree defect,
+now in the loop's safety guard. The two offline-testable candidates are in the body, with (b)
+(step counted twice via the tag anchor) explicitly cross-filed under WS1. The gain change is
+demoted to post-mechanism confirmation. Also accepted as stated: the ±2.4 ms/46 s audible sawing
+outranks any p2p bookkeeping — it is why this item moved up.
+
+**R3.2 — ACCEPTED; instrumentation added to the start-today list.** Verified against my own reads:
+the gd-clamp bound and the in-flight zero both print under `err=`, and I quoted `err=+0 ...
+pend=+2721` in an earlier session note as if the zero were a measurement — the field misled its own
+author within hours of writing it. `raw=`/`tgt=` split (keeping `pend=`) is a precondition for
+WS4's r-logging and WS1.1's step experiment; noted as the 256-byte-ceiling defect class.
+
+**R3.3 — ACCEPTED.** Monotone needs g·r ≤ 1, not g·r < 2; the body now says 0.6 is oscillatory-
+decaying at the measured r and names 0.5 as deadbeat — both subordinate to the mechanism answer,
+since a staleness r is a cadence property and no fixed g is correct.
+
+**R3.4 — ACCEPTED, both.** Window redefined by sample count (6000 rival-clean samples → exactly six
+disjoint blocks; wall clock was short by ~1.3 %). EWMA rationale corrected: equal-n equal-lag
+(τ = T/2); the advantages are continuity and no boundary discard; "30 s equivalent" = τ 15 s.
+
+**R3.5 — ACCEPTED; WS2.0 is now a rate sweep.** Correct that a single-rate ratio cannot separate
+p = 0.02 from a ~1 pkt/s cap; `PHASE_TX_INTERVAL_US` becomes a servo_param and the sweep's shape
+(flat vs linear) decides whether batching is worth building at all. One tunable, five minutes,
+one workstream decided — accepted verbatim into the body.
