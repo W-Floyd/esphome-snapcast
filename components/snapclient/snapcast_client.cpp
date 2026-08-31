@@ -513,6 +513,10 @@ static constexpr float DL_TI_BOOT_S = 20.0f;
 // was caught mid-swing by a hold: measured +114 against a +57 crystal, board then ran 50 ppm fast
 // and the hold kept it there). Snap it to the average; the fast path owns the position anyway.
 static constexpr float DL_INTEGRAL_SNAP_PPM = 20.0f;
+// Align bias is persisted only once it has moved this far from the stored value: the bias steps by
+// at most align_step_us per 10 s cycle, so a 5 us deadband keeps a settled board from writing NVS
+// on ordinary dither while still catching the minutes-long walks that are worth restoring.
+static constexpr int32_t ALIGN_PERSIST_DELTA_US = 5;
 // Splice in-flight horizon for the DEMOTED PREDICTION signal: half the median window, the
 // historical value -- a splice reaches a 31-chunk median after ~15 chunks.
 static constexpr uint32_t SPLICE_HORIZON_PREDICTION_CHUNKS = 15;
@@ -811,7 +815,23 @@ static constexpr int64_t UNMUTE_COMMON_US = 4000;
 static constexpr float ALIGN_KICK_MAX_PPM = 1.5f;  // 10 ppm made every align step a stair (13:24, +46 -> 0 in 5-13 us steps); 1.5 ppm ramps a 15 us step over one 10-s cycle and still beats the PI's tau by 10x
 // Largest common-bias re-centring step per align cycle (see RALIGN): the devices' cycles are not
 // synchronised, so this bounds the differential a re-centre can open between two of them.
-static constexpr int32_t ALIGN_RECENTRE_MAX_US = 2;
+// DEFAULT for the runtime tunable (servo_param align_recentre_us). NOT a constant any more,
+// because 2 us/cycle is measured to be marginal against the drive it exists to cancel:
+//
+//   2026-08-31, A and B, 34 min post-boot. The pairwise phase delta is NOT antisymmetric --
+//   median(d_A + d_B) = +22 us where it must be 0 (the same pair measured both ways), and the
+//   asymmetry's variation correlates with the pairing-AGE difference at r = -0.618 (n=61).
+//   Align integrates that common component at ~+12.6 us/min per board; the re-centre removes
+//   ~12 us/min at 2 us/cycle on the 10 s cadence. The two nearly cancel, leaving a measured
+//   +2.7 us/min creep -- which is why both biases sat at +397/+441 against a +-500 cap after
+//   11 h. It does not runaway, it CREEPS TO THE CAP, and then align has no authority left.
+//
+// Raising this is a trade with a bounded cost: the two devices' align cycles run ~4 s apart, so
+// during that window one has re-centred and the other has not, and the differential injected is
+// at most one step. Hence a knob rather than a new hardcoded number -- sweep it against the wire
+// rather than guessing. The ROOT fix is the asymmetry itself (age-compensate the peer's phase
+// before differencing); this bounds the symptom in the meantime.
+static constexpr int32_t ALIGN_RECENTRE_MAX_US_DEFAULT = 2;
 // After a position step or hard resync my measured render phase lags where the audio will be by the
 // ring's travel time (~3.5 s measured, builds 51-55); for that long the beacon carries no phase.
 static constexpr int64_t PHASE_TRANSIENT_US = 4000000;
@@ -2441,6 +2461,26 @@ void SnapcastClient::player_task_() {
       st.dl_integral_ema_valid = true;
       st.dl_cold_start = false;
       ESP_LOGI(TAG, "Delay loop: integral restored %+.2f ppm from NVS", saved);
+    }
+  }
+  // ALIGN BIAS across reboots. Guarded the same way the integral is: a value inside the cap is
+  // indistinguishable from a learned one, outside it is refused. Restoring preserves the
+  // DIFFERENTIAL immediately when both devices come back together, which is the quantity the wire
+  // sees -- without it the two biases walk opposite ways for ~2 min (measured A -8 -> +68 against
+  // B -13 -> -37, ~100 us of differential) and the absolute needs over an hour to return.
+  this->align_bias_pref_ = global_preferences->make_preference<int32_t>(fnv1_hash("snapclient_align_bias"));
+  {
+    int32_t saved_bias = 0;
+    const int32_t cap = this->tune_align_max_us_.load(std::memory_order_relaxed);
+    if (this->align_bias_pref_.load(&saved_bias) && cap > 0 && std::abs(saved_bias) <= cap) {
+      this->render_bias_us_.store(saved_bias, std::memory_order_relaxed);
+      if (this->tsf_sync_ != nullptr) {
+        this->tsf_sync_->set_render_bias_us(saved_bias);
+      }
+      ESP_LOGI(TAG, "Render align: bias restored %+" PRId32 " us from NVS (cap %" PRId32 ")", saved_bias, cap);
+    } else if (saved_bias != 0) {
+      ESP_LOGW(TAG, "Render align: stored bias %+" PRId32 " us REFUSED (cap %" PRId32 ") -- starting from 0",
+               saved_bias, cap);
     }
   }
 #endif
@@ -4716,6 +4756,23 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
     }
   }
 
+  // Persist the align bias on the same slow cadence and the same conditions as the integral above
+  // -- it is a position offset that took minutes to earn, and NVS wear is the reason both are rate
+  // limited. Saved only when it has actually moved, so a settled board writes nothing.
+  if (this->tune_persist_.load(std::memory_order_relaxed) && this->tune_align_max_us_.load(std::memory_order_relaxed) > 0) {
+    const int32_t bias_now = this->render_bias_us_.load(std::memory_order_relaxed);
+    if (std::abs(bias_now - st.align_saved_bias_us) > ALIGN_PERSIST_DELTA_US &&
+        (st.align_saved_at_us == 0 || now - st.align_saved_at_us > DL_PERSIST_MIN_INTERVAL_US)) {
+      int32_t v = bias_now;
+      if (this->align_bias_pref_.save(&v)) {
+        global_preferences->sync();
+        st.align_saved_bias_us = v;
+        st.align_saved_at_us = now;
+        ESP_LOGD(TAG, "Render align: bias %+" PRId32 " us persisted t=%" PRId64, v, now);
+      }
+    }
+  }
+
   // AUTOTUNE (master toggle, default off): adapt tau from the lag-1 autocorrelation of the
   // block-error series, one decision per 64-block (~21 s) window -- a decade slower than the
   // loop, which is what keeps an adapter wrapped around a controller from becoming a second
@@ -5050,6 +5107,21 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
       // Off means off: a bias left standing after the channel is disabled kept A's deadline
       // shifted -339 us at 15:56 with nothing able to clear it short of a reboot.
       this->render_bias_us_.store(0, std::memory_order_relaxed);
+      if (this->tsf_sync_ != nullptr) {
+        this->tsf_sync_->set_render_bias_us(0);
+      }
+      // AND CLEAR THE STORED ONE. The bias is persisted now, so a reboot is no longer the escape
+      // from a bad standing bias -- without this line `align_max_us 0` would be undone by the next
+      // restore and the hazard the comment above records would become permanent.
+      int32_t zero = 0;
+      if (this->align_bias_pref_.save(&zero)) {
+        global_preferences->sync();
+      }
+      // No ServoState reset here: `st` is a local on the player task and set_servo_param runs on
+      // the main loop. It self-corrects -- st.align_saved_bias_us still holds the old value, so the
+      // first save after align is re-enabled sees a >ALIGN_PERSIST_DELTA_US difference and writes
+      // the true bias immediately. The save block is gated on align_max_us > 0 meanwhile.
+      ESP_LOGW(TAG, "Render align: disabled -- live and STORED bias both cleared");
     }
   } else if (name == "align_bias_us" || name == "align_bias_kick_us") {
     // BENCH HOOKS: set the render bias to an absolute value -- a known deadline step on one board.
@@ -5079,6 +5151,13 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     // -339 us while the group delta GREW -124 -> -305 (15:43-15:56): self-reinforcing, sign still
     // unproven against the wire. Shadow it beside the wire until the sign is measured, then apply.
     this->tune_align_apply_.store(value != 0.0f, std::memory_order_relaxed);
+  } else if (name == "align_recentre_us") {
+    // Per-cycle cap on the re-centring step. See ALIGN_RECENTRE_MAX_US_DEFAULT: 2 us/cycle is
+    // measured marginal against the ~+12.6 us/min common-mode drive, so this is swept against the
+    // wire rather than guessed. Upper bound is the align step cap -- re-centring must never be able
+    // to move more per cycle than the correction it rides with.
+    if (!(value >= 0.0f && value <= 20.0f)) return false;
+    this->tune_align_recentre_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "align_gain") {
     if (!(value >= 0.0f && value <= 1.0f)) return false;
     this->tune_align_gain_.store(value, std::memory_order_relaxed);
@@ -6166,13 +6245,14 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
           // and aligns nothing; it only spends the +-500 us cap. It arises from any systematic
           // asymmetry in the deltas (2026-08-30: ~5 us after the sample-age fix, marching both biases
           // +3 us/min). Each device publishes its bias in the beacon and subtracts the group mean,
-          // at most ALIGN_RECENTRE_MAX_US per cycle so the devices' unsynchronised cycles never open
+          // at most align_recentre_us per cycle so the devices' unsynchronised cycles never open
           // more than that between them; the deadline shift is delivered by the kick like any step.
           this->tsf_sync_->set_render_bias_us(bias);
           if (this->tune_align_apply_.load(std::memory_order_relaxed)) {
             const int32_t gm = this->tsf_sync_->group_bias_mean_us(now_us());
             if (gm != INT32_MIN && gm != 0) {
-              const int32_t adj = std::clamp<int32_t>(gm, -ALIGN_RECENTRE_MAX_US, ALIGN_RECENTRE_MAX_US);
+              const int32_t rc = this->tune_align_recentre_us_.load(std::memory_order_relaxed);
+              const int32_t adj = std::clamp<int32_t>(gm, -rc, rc);
               bias -= adj;
               this->render_bias_us_.store(bias, std::memory_order_relaxed);
               st.align_kick_us += static_cast<float>(-adj);

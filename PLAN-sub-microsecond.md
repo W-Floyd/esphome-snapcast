@@ -2636,3 +2636,73 @@ plant.
   anyway. A line-type diff (numbers stripped, event windows vs null windows) also returned all-`inf`
   lifts from broken null sampling; fixed, it returns nothing.
 * The answer came from a monotonic counter (`played`), not from log-line archaeology.
+
+## The align bias marches to its cap — root cause (C) and mitigation (A), 2026-08-31 09:4x
+
+Raised by the operator: "still in first overshoot 1+min in". Diagnosed, with two hypotheses of mine
+retracted on the way.
+
+### What it is NOT
+
+* **Not the trim integral.** Measured static and converged through the whole transient (A
+  +56.24 -> +56.26, B +49.17 -> +49.19 in 27 s). Its NVS restore is exact, exactly as the
+  `DL_TI_BOOT_WINDOW_US` comment claims, and the cold-start fast-Ti correctly does not apply.
+* **Not a broken re-centre.** I hypothesised the re-centring step was inoperative. It is not:
+  the residual (bias change minus -gain*group) has median **-2.10 (A) / -1.95 (B)** with 79-85 % of
+  cycles at <= -1.5 -- i.e. exactly -ALIGN_RECENTRE_MAX_US every cycle. RETRACTED.
+* **Not a third group member.** I hypothesised the non-aligning observer was dragging the phase
+  mean. It publishes `RPHASE mine=unknown` (no DAC, correctly RENDER_PHASE_UNKNOWN) and appears in
+  no PHASEIN line; A and B pair only with each other. RETRACTED.
+
+### What it IS
+
+**The pairwise phase delta is not antisymmetric.** A and B pair only with each other, so their
+deltas must be negatives of one another. Measured over 61 time-matched pairs:
+
+```
+  median(d_A + d_B)      = +22.0 us      (MUST be 0 -- the same pair, measured both ways)
+  median(group_A + group_B) = -14.0 us   (MUST be 0 for a 2-member group)
+  both group deltas share a sign on 39 % of pairs   (antisymmetric => ~0 %)
+  corr(age_A - age_B, d_A + d_B) = -0.618  (n=61)   <- the pairing AGE difference drives it
+```
+
+Median pairing ages are nearly equal (629 vs 618 ms), so age explains the asymmetry's VARIANCE but
+not the whole +22 median; a residual fixed component is not yet isolated and is NOT claimed.
+
+Align integrates that common component at **~+12.6 us/min** per board (gain 0.3 on ~7 us of common
+delta, 10 s cycle). The re-centre removes **~12 us/min** (2 us/cycle). The two nearly cancel, and the
+measured net is **+2.7 us/min** -- so the bias does not run away, it **CREEPS TO THE +-500 CAP**,
+which is where both boards were found after 11 h (A +397, B +441 at 08:19). At the cap align has no
+authority left.
+
+### Shipped
+
+**C (root-cause-adjacent, made testable rather than guessed):** `ALIGN_RECENTRE_MAX_US` becomes
+`servo_param align_recentre_us` (0-20, default 2). Bumping it to 4 would win arithmetically
+(-24 vs +12.6 us/min) but it is a threshold, and the cost is bounded but real: the devices' align
+cycles run ~4 s apart, so during that window one has re-centred and the other has not and the
+injected differential is up to one step -- against a differential sd of ~9 us. So it is swept
+against the wire, not picked. **THE ROOT FIX IS THE ASYMMETRY ITSELF** (age-compensate the peer's
+phase before differencing; the packet already carries `render_phase_age_ms`), which is WS1 territory
+and is not attempted here.
+
+**A (mitigation):** the align bias is persisted to NVS, mirroring `dl_integral_pref_` --
+`snapclient_align_bias`, saved on the same slow cadence past a 5 us deadband, load guarded to the
+cap and REFUSED with a warning outside it. Rationale: the quantity that matters is the DIFFERENTIAL,
+and when both devices restore together it is preserved instantly. Without it the two biases walk
+OPPOSITE ways for the first ~2 min (A -8 -> +68, B -13 -> -37, ~100 us of differential opening) and
+the absolute needs over an hour to return.
+
+**The hazard is handled explicitly.** `align_max_us` records that "a bias left standing after the
+channel is disabled kept A's deadline shifted -339 us with nothing able to clear it short of a
+reboot" -- persisting removes the reboot as the escape, so `align_max_us 0` now clears the STORED
+value as well as the live one and logs that it did. Without that line the documented hazard would
+have become permanent, which is the sort of thing this change would deserve to be reverted for.
+
+### Predictions, recorded before the sweep
+
+* `align_recentre_us 4` should turn the +2.7 us/min creep into roughly -12 us/min decay, bias
+  settling near 0 instead of railing, at the cost of <= 4 us of transient differential per cycle.
+* Bias persistence should remove the first-2-minute opposite-direction walk entirely; the wire's
+  post-reboot ramp (measured 0 -> -51 us over 45 s) should be largely absent.
+* Neither touches the +22 us asymmetry, so the DRIVE remains and the bias will still sit off zero.

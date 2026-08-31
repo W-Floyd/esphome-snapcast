@@ -971,6 +971,9 @@ class SnapcastClient {
     /// No NVS integral was restored at boot: seed from the TSF crystal estimate at first engage
     /// and run the fast boot Ti; a fresh board otherwise winds ~56 ppm through Ki over 10+ min.
     bool dl_cold_start{true};
+    /// Align-bias persistence bookkeeping, mirroring dl_saved_integral_ppm / dl_saved_at_us.
+    int32_t align_saved_bias_us{0};
+    int64_t align_saved_at_us{0};
     // Format of the last chunk played, for keepalive silence during a delivery gap
     StreamParams keepalive_params{};
   };
@@ -1596,6 +1599,20 @@ class SnapcastClient {
   bool deadline_source_switched_{false};
   /// NVS slot for the delay loop's integral (the learned crystal offset). Player task only.
   ESPPreferenceObject dl_integral_pref_;
+  /// Align bias across reboots (WS "steady state quicker"). The bias is NOT the trim integral: the
+  /// integral restores EXACTLY because a crystal barely moves, whereas a bias is a position offset
+  /// relative to the rest of the group and can be stale if the group changed while this device was
+  /// down. It is persisted anyway because the quantity that matters is the DIFFERENTIAL, and when
+  /// both devices restore together the differential is preserved instantly -- measured cost of not
+  /// doing so: the two biases walk in OPPOSITE directions for the first ~2 min after a reboot
+  /// (A -8 -> +68, B -13 -> -37), opening ~100 us of differential, and the absolute value needs
+  /// over an hour to return.
+  ///
+  /// HAZARD, recorded at align_max_us: "a bias left standing after the channel is disabled kept
+  /// A's deadline shifted -339 us with nothing able to clear it short of a reboot". Persisting
+  /// removes the reboot as the escape, so `align_max_us 0` MUST clear the stored value too, and
+  /// the load is guarded to the cap.
+  ESPPreferenceObject align_bias_pref_;
   /// Mirror of the ServoState EMA for the shutdown save (player task writes, main loop reads).
   std::atomic<float> dl_integral_ema_mirror_{0.0f};
 
@@ -1625,6 +1642,9 @@ class SnapcastClient {
   // 5.0 us, 1-s change 0.19 us, zero events, with the channel applied at the measured sign.
   std::atomic<int32_t> tune_align_max_us_{500};  // 300 was reached within ~2 h by the ~1 us/min creep against the exchanged phase bias
   std::atomic<float> tune_align_gain_{0.3f};
+  /// Per-cycle cap on the bias re-centring step (servo_param align_recentre_us). See
+  /// ALIGN_RECENTRE_MAX_US_DEFAULT for why this is a knob and what it trades.
+  std::atomic<int32_t> tune_align_recentre_us_{2};
   std::atomic<int32_t> tune_align_deadband_us_{1};  // covers the exchanged phase's own ~10 us bias; 3 made the bias creep ~1 us/min forever
   std::atomic<int32_t> tune_align_reject_us_{500};  // pairs beyond this are not a measurement
   std::atomic<int32_t> tune_align_step_us_{20};      // per due report (~10 s): 0.4 ppm at most
