@@ -2212,3 +2212,89 @@ SF_slope scale ~1/tau (tau 240 halves them, tau 60 doubles) and the SF corner tr
 0.46 ppm × 30 s ≈ 14 µs... note the floor alone still exceeds the 1 µs budget — after the sweep,
 the tau/Ti redesign must push the loop's contribution BELOW the floor, and then the floor itself
 becomes the frontier).
+
+## WS0/WS3.4 RESULTS (2026-08-31 ~08:00, overnight capture, build 88)
+
+CAPTURE CONFIG (R10.1, quoted because it sets every n-dependent number): `test.csv` 88 MB,
+514 125 rows, 492 min span, 17.4 rows/s mean. Archived before analysis.
+
+**Instrument floor, re-measured (R11.4/R6.4).** Per-capture position noise **17.3 ns** (from
+successive differences at 11 ms lag — pure noise at that lag; `scatter_ns` median 26.1 agrees).
+Wire-slope rate estimator: SEM **0.003 ppm** per 2.5 s bin, **0.00007 ppm** per 30 s bin, against
+signals of 0.4–1.2 ppm — a 400× margin. R10.5's estimator choice is confirmed on live data; the
+`fs_*` cross-check reads **corr(wire-slope, fs_diff) = +0.958** with the sign R13.3 predicts.
+
+**Quiet-window census.** 33 of 55 five-minute blocks are clean (p2p < 100 µs); 8 carry ms-class
+p2p. The 40 % dirty fraction matches R4.3's evening figure, so the regime is unchanged overnight.
+Longest contiguous clean run: **45 minutes** (blocks 88–96) — the first span in the plan's history
+that satisfies the DoD's ≥ 30 min AND ≥ 6000 rival-clean samples in BOTH units.
+
+**FIRST REAL DoD GRADING** (`scripts/bench/dod-grade.py`, new; 45 min, n = 66 445, 24.6 rows/s):
+
+```
+  p2p   n-fixed, 66 disjoint 1000-sample blocks (41 s each):
+        median block-p2p 12.51 us (gate <= 1.0)   worst 41.12 us (gate <= 2.0)   FAIL
+        p0.5/p99.5 -35.51/+25.04 us
+  mean  time-fixed, 9 disjoint 5-min blocks spanning 45 min:
+        mean of blocks +1.878 us (gate <= 0.2)    SE 0.723 us (gate <= 0.1)      FAIL
+```
+
+Distance to goal: **12.5× on p2p, 9.4× on the mean**. Both consistent with R4.1's prediction that
+the mean gate is unreachable until the plateau comes down. The DoD is now MEASURABLE, which it was
+not before — that is the deliverable, not the pass.
+
+**SF re-baseline** (`structure-function.py` now rival-gated with timestamp-matched lags; BASE_NOW
+re-taken). On the 45-min window, SF(τ) = 1.22 / 2.40 / 4.22 / 6.37 / 9.21 / 11.12 / 13.86 µs at
+τ = 1 / 2 / 5 / 10 / 20 / 30 / 60 s. **Corner at ~60 s**, peak ~13.9 µs. SF/τ at 30 s =
+**0.371 ppm** — this is R13.4's re-take of the plan's central sizing figure (was 0.33 ppm,
+gate unrecorded); gate here is rival ≤ 0.5, hole-free 45 min, 24.6 rows/s.
+
+RETRACTED SAME SESSION: SF appeared to *decline* past 60 s (12.9/9.4/8.1 at 120/240/480 s) and the
+autocorrelation went negative — read as a loop reversing. It does not reproduce: at lag 60 s four
+independent clean windows give 0.00, +0.02, −0.09, +0.07. One-window artifact, withdrawn before it
+became a finding. Honest reading: autocorrelation decays to ~0 by 50–60 s and stays there.
+
+### WS3.4 — SF_d run, and the finding that displaces it
+
+`scripts/bench/sf-d.py` (new) ran on the 45-min window (1063 clean 2.5 s bins, gate p2p ≤ 60 µs):
+
+```
+  sd: achieved(wire) 1.239   fs_diff 1.146   trim_diff 1.181 ppm
+  tau        5s     10s     30s     60s
+  SF(d)    3.058   2.929   3.080   3.159
+  SF(trim) 1.636   1.608   1.656   1.704
+```
+
+**SF_d DOES NOT DISCRIMINATE, for a reason the specification did not anticipate**: R9.3's dichotomy
+needs one series slow and the other broadband. **Both are flat** — white at every lag from 5 to 60 s.
+The test returns neither branch. Not a null result; a mis-specified one, and it is recorded as such
+rather than forced into "downstream".
+
+**What replaced it — the mechanism, read from the code and then measured.** `trim_applied_ppm =
+p_term + trim_integral_ppm` with `p_term = kp * e` (`snapcast_client.cpp:4634`). **The P-term acts
+within one block (~1 s); `tune_tau_s_` = 120 s sets the GAIN (kp = 1/tau), not the response time.**
+Measured on both boards by regressing `trim − int` on `dl_err`:
+
+```
+  board A: n=35506  sd(dl_err) 134.5 us  sd(P-term) 2.145 ppm  fitted kp 0.01249 ppm/us  r +0.783
+  board B: n=35608  sd(dl_err) 132.5 us  sd(P-term) 2.191 ppm  fitted kp 0.01296 ppm/us  r +0.784
+```
+
+The P-term identity is confirmed live. Consequences, in order of how much they change the plan:
+
+1. **THE PLAN'S CENTRAL SIZING FACT IS WRONG.** Order-and-honesty says "a correction every ~1.5 s
+   against a fine-loop τ of 120 s — an ~80× bandwidth gap that no reference averaging closes."
+   The loop already corrects **every block (~1 s)**. There is no 80× bandwidth gap; the 120 s is a
+   gain, and the premise conflated a time constant with a response time. Everything WS3 sized from
+   that sentence needs re-sizing. (CLAUDE.md: read the mechanism before citing it by name — the
+   sentence survived thirteen review rounds without anyone reading `:4634`.)
+2. **The loop's INPUT carries ~133 µs of noise**, which the P-term converts to ~2 ppm of commanded
+   rate per board. Whether that is real position error or measurement noise is **exactly WS1's
+   question** — which is why WS1 gates this and why the render-tag work is the critical path.
+3. `corr(achieved, trim_diff) = −0.63` at lag 0 with a causal tail (−0.29 at +2.5 s, ~0 at negative
+   lags) is **R9.1's closed-loop identity, not an inversion**: with G ≈ 0.56 the identity predicts
+   −0.80 against −0.63 measured. Checked explicitly because R9.1 warned this is how a real inversion
+   gets waved through. The actuator is exonerated at this scale.
+
+**WS3.4's next experiment is therefore NOT the tau_s sweep** (it would move a gain, not a
+bandwidth). It is: establish whether the 133 µs of `dl_err` is signal or noise — WS1.
