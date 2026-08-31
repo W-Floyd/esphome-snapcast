@@ -77,3 +77,15 @@ WS0 → WS1 (blocker) → WS2 + WS3 in parallel → gates in sequence 2 µs → 
 WS1+WS2 (bias is already ±2 µs). The residual risk after all gates: crystal wander between
 corrections and dither ripple — physics of this hardware; WS3.3 measures whether the last factor
 of 2 is reachable without upstream `set_rate_adjustment`.
+
+## WS0 result (2026-08-30 21:17–21:45, build 87/88, hole-free 5-min windows)
+
+Best window (21:41): n=988, mean −4.1, med −4.6, MAD **1.68 µs**, p2p 24.4 µs [−15.2..+9.2].
+Typical: MAD 3–9 µs, p2p 27–71 µs, p1/p99 at ±15–36 µs; window means wander ±4 µs.
+Decomposition the numbers force: (a) an excursion population at ±10–40 µs sets p2p (P-term responses
+to block-noise/wander leakage — the WS2/WS3 target); (b) ±4 µs mean wander between windows (the
+tag/align bias floor — WS1's target); (c) the core is already MAD ≈ 1.7 µs in the best window, i.e.
+the rate-lock's quiet floor is within ~3× of the goal — the p2p budget is spent almost entirely by
+the tails, not the core. Gap to goal: ~25× on p2p, ~10× on mean stability. This is encouraging:
+kill the excursion tails (honest measurement + averaged reference + rate-only invariant) and the
+core is nearly there.
