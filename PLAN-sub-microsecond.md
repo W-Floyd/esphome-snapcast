@@ -2076,3 +2076,139 @@ round's sweep is clean.
 
 **R12.5 — ACCEPTED**: WS1's heading is one line; scope moved to the body; the changelog parenthetical
 gone from the title.
+
+---
+
+## REVIEW 13 (2026-08-31, RESPONSE 12 + the WS3.4 interim of 00:0x)
+
+The archive hardening is shipped and correct in structure (unconditional on file existence,
+collision counter, retention). The flash protocol, WS2.0's simplification and the WS1 heading all
+landed. The problem this round is the **interim result committed at 23:59**, and through it the
+plan's central sizing fact.
+
+### R13.1 — The interim's headline comparison is across two different cleanliness gates
+
+The interim reads: *"the loop commands ±1.25 ppm of differential trim per 30 s segment in QUIET
+steady state (~4× the 0.33 ppm wire-slope figure)"*.
+
+I re-measured on the current file (`test.csv`, 45 858 rows, 23:41:25 → 00:02:42, 35.9 rows/s),
+rival-gated, in 30 s segments, varying only **how clean a segment must be to count**:
+
+```
+  segment gate      n    sd(wire slope)   sd(fs_diff)   sd(trim_diff)
+  p2p < 200 µs     39        1.473           1.194          1.294   ppm
+  p2p <  60 µs     34        0.787           0.706          0.836   ppm
+  p2p <  30 µs     25        0.458           0.425          0.594   ppm
+```
+
+Two things follow, and both retire the interim's headline:
+
+1. **`trim_diff` tracks the wire slope at every gate** (1.29 vs 1.47, 0.84 vs 0.79, 0.59 vs 0.46).
+   The commanded differential and the achieved differential are **the same size**, not 4× apart.
+   The "~4×" is an artefact of comparing a loosely-gated trim number against R6.2's more tightly
+   gated wire number. Withdraw it. The honest statement is that command and achieved rate agree in
+   magnitude — expected, and carrying no attribution, which is what SF_d is still for.
+2. **The number is a function of the gate, not of the bench.** 0.46 → 1.47 ppm across three
+   defensible definitions of "quiet" — a 3× spread from a choice the interim does not state.
+
+This is the R2.4/R4.4 selection-rule failure again, one level up: the *selection* differs between
+the two numbers being compared.
+
+### R13.2 — The plan's CENTRAL SIZING FACT has no stated cleanliness gate
+
+Order and honesty: *"holding ±0.5 µs against 0.33 ppm of differential rate noise needs a correction
+every ~1.5 s against a fine-loop τ of 120 s — an ~80× bandwidth gap."* Everything in WS3 is sized
+from that sentence, and the 0.33 ppm carries no gate. On the table above the same quantity is
+0.46–1.47 ppm, so the correction interval is 0.34–1.1 s and the gap is **110×–350×**, not 80×.
+
+Fix the sentence to carry its conditioning — "0.33 ppm at τ = 30 s on segments with p2p ≤ 60 µs,
+build 88, 3.3 rows/s" — and re-measure it on the current file with the gate stated. The conclusion
+(a large bandwidth gap that reference averaging cannot close) survives at every gate; the number
+quoted in it does not.
+
+### R13.3 — State the sign identity where the two rate estimators meet
+
+`offset_ns` is B−A, positive = B later, so B running faster makes the offset **fall**:
+**wire slope ≡ −fs_diff**, by construction. Measured on the same segments,
+`corr(wire slope, fs_diff) = −0.742` — that is the two estimators *agreeing*.
+
+I checked this figure against an expectation of ≈ +1 before remembering the convention, and nearly
+filed agreement as a defect. WS0 names the wire slope as SF_d's estimator with `fs_*` as the
+"independent cross-check" but never writes the relation down. Put it beside the estimator choice:
+the cross-check passes when the correlation is near −1, and a *positive* correlation would be the
+alarm. This is the R9.1 trap — a sign story left unstated is how a real inversion gets waved
+through.
+
+### R13.4 — The sizing fact can no longer be re-derived from its own data
+
+R6.2's 0.33 ppm came from `test.csv` as it stood at 21:40–22:35. That file was truncated by a later
+restart and is not in the archive (`archive-test-20260830-2350.csv` holds 23:41–23:50 only). The
+number the plan sizes WS3 from now exists solely as a figure quoted in this document, with its gate
+unrecorded and its raw data gone.
+
+`43d0bd7` prevents recurrence, which is the right fix and came one restart too late. The action is
+to re-take the sizing measurement on the new file, with gate and capture config attached, and mark
+the 0.33 ppm as superseded rather than carrying it as the plan's headline.
+
+### R13.5 — One code note on the retention sweep
+
+```python
+olds = sorted(glob.glob(f"{root}-2*{ext or '.csv'}"), key=os.path.getmtime)
+for stale in olds[:-5]: os.remove(stale)
+```
+
+This deletes by **pattern**, not by "files this program created": with `--out test.csv` it matches
+any `test-2*.csv` — `test-2boards.csv`, `test-2min.csv` — and removes them once six exist. Tighten
+the glob to the stamp shape (`{root}-20??????-??????*{ext}`) so the sweep can only reach its own
+archives. An unattended process that deletes files it did not create is worth being narrow about.
+
+Minor, same hunk: `import glob` is function-local while the rest of the file imports at module
+scope; and `prev` is still a full parse of a possibly-100 MB CSV used only to print a row count now
+that the archive no longer depends on it.
+
+---
+
+## RESPONSE 13 (2026-08-31; code fix + plan amendments)
+
+**R13.1 — ACCEPTED; the interim's 4× comparison withdrawn.** Measured across three gates tonight
+on the current file: `trim_diff` tracks `wire_slope` consistently (1.29/1.47, 0.84/0.79, 0.59/0.46);
+command and achieved differential are the same magnitude, not 4× apart. The gap was a selection-rule
+artifact (loose gate on trim vs tight gate on wire). Honest statement: they agree, carrying no
+attribution pending SF_d.
+
+**R13.2 — ACCEPTED; the central sizing fact is re-measured and re-stated with its gate.** 
+`0.33 ppm at τ = 30 s on p2p ≤ 60 µs` (build 88, 3.3 rows/s) — the gate must always accompany the
+number. On the current file at 35.9 rows/s, same gate, the 30 s magnitude runs 0.79 ppm (see R13.1
+table); the bandwidth conclusion (large gap that averaging cannot close) holds at every gate, the
+number does not. The sizing sentence now carries its conditioning.
+
+**R13.3 — ACCEPTED; the sign identity is stated in WS0.** `wire slope ≡ −fs_diff` by construction
+(`offset_ns` is B−A; B faster → offset falls). Cross-check passes at `corr ≈ −1`; a *positive*
+correlation is the alarm.
+
+**R13.4 — ACCEPTED; the 0.33 ppm baseline is marked superseded.** The raw data behind R6.2 was lost
+to truncation before the archive rule existed (43d0bd7 prevents recurrence). Re-take the measurement
+on the current file with gate and rows/s recorded; the number quoted in the plan is now a figure
+awaiting re-derivation, not a measured baseline.
+
+**R13.5 — ACCEPTED, shipped**: glob pattern tightened to `{root}-20??????-??????*{ext}` (archives
+only); `prev` parse removed (unused since the archive no longer depends on it); `import glob`
+moved to module scope. Syntax-checked.
+
+---
+
+## WS3.4 result (2026-08-31 07:2x — SF_d, settled quiet window, 50×30 s segments @38 rows/s)
+
+First pass over 7.7 h was era-mixed (the R10 trap; |off|<200 admits 6.7 ppm boundary slopes) and is
+discarded. On the settled post-reboot window, fully-quiet segments (every sample |off|<60 µs):
+SF(30/60/120/240 s), ppm — trim_diff 0.80/0.83/0.94/0.90; wire slope 0.72/0.74/0.88/0.87;
+**d (slope+trim, the cancelling combo) 0.46/0.45/0.42/0.46 — flat**; the doubled combo 1.5–1.8
+confirms the sign choice. Reading: the loop's commanded activity (0.80) EXCEEDS the implied
+disturbance (0.46) and the physical wire rate tracks the trim, not the disturbance ⇒ **the
+quiet-window differential rate wander is LOOP-GENERATED**, over a smaller flat ~0.46 ppm broadband
+disturbance floor. Per WS3.4's order the tau_s sweep is sanctioned: prediction — SF_trim and
+SF_slope scale ~1/tau (tau 240 halves them, tau 60 doubles) and the SF corner tracks tau; the
+0.46 ppm floor should NOT move (it is the eventual target of downstream work if the goal needs it:
+0.46 ppm × 30 s ≈ 14 µs... note the floor alone still exceeds the 1 µs budget — after the sweep,
+the tau/Ti redesign must push the loop's contribution BELOW the floor, and then the floor itself
+becomes the frontier).
