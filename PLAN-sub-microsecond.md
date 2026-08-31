@@ -2381,3 +2381,65 @@ statistic silently loses n. Restart clears it; root cause is analyser-side (user
 sweep's first analysis run returned zero segments because the fixed sample-count threshold assumed
 38 rows/s — thresholds derived from row rate must scale with the measured rate (R10.1's lesson, in
 the analysis scripts this time).
+
+## WS3/WS4 — the align kick is a SECOND rate-noise injector (2026-08-31 08:20, observed live)
+
+Found because the observer's return made it gross: a **10 s periodic stairstep on the wire**,
+reported by the operator and then traced. It is not a new defect; it is the steady-state behaviour
+of the align channel, previously below the noise.
+
+**The commanded rate has TWO injectors, not one.** `snapcast_client.cpp:4634` then `:4651`:
+
+```
+  trim_applied = clamp(kp*e + integral)          <- P-term, every block (~0.64 s)
+  trim_applied += kick_ppm                       <- align kick, bounded ALIGN_KICK_MAX_PPM = 1.5 (:811)
+```
+
+Sizes, measured overnight: P-term = kp*sd(dl_err) = 0.008 * 133 us = **1.06 ppm/board**; the kick is
+bounded at **1.5 ppm**. Measured sd(trim - int) is **2.15 ppm/board** — which the two together
+explain and neither alone does.
+
+CORRECTION to this session's earlier number: the fitted kp of 0.0125 ppm/us regressed `trim - int`
+on `dl_err` and attributed the whole residual to the P-term. `:4651` adds the kick to
+`trim_applied` AFTER the clamp, so that regression is contaminated and the fit is biased high. The
+authoritative kp is the logged **0.008** (every DLLOOP line). The qualitative finding — the P-term
+acts every block, so `tune_tau_s_` is a GAIN and not a response time — is unaffected; the
+attribution of the 2.15 ppm between the two injectors is what changes, and it needed the A/B below
+rather than a regression.
+
+**THE 10 s STAIRSTEP, traced.** RALIGN fires every **10.0 s** on both boards, and the two are
+**~4 s out of phase**:
+
+```
+  A  08:19:42 :52  08:20:02 :12 :22 :32 :42     bias +394..+401 us (cap 500)
+  B  08:19:46 :56  08:20:06 :16 :26 :36 :46     bias +438..+443 us (cap 500)
+```
+
+Each fire delivers its bias change as a RATE RAMP at up to 1.5 ppm. Measured on the wire at
+08:19:27-08:20:15: **+35 us -> 0 over ~48 s = 0.73 ppm**, inside the cap — the kick's signature.
+Because A and B kick 4 s apart, the DIFFERENTIAL rate acquires a 10 s structure: A ramps alone for
+~4 s, then B ramps. That is the stairstep, and it is the align channel operating exactly as
+designed, on two boards whose align cycles are not phase-locked to each other.
+
+Also on the record from that trace: the standing biases are **A ~+397, B ~+441 — a 44 us
+differential** — while the group deltas being corrected are -27..+10 us. Align is holding a 44 us
+differential offset and dithering it every 10 s.
+
+**Consequence for the plan: a `tau_s` sweep alone would have been read wrong.** It moves the P-term
+only. Had the kick been the dominant injector, the sweep would have shown little and been recorded
+as "the P-term is not the mechanism" — the confound, not the plant, and exactly the class of error
+R9.1 was raised about. The experiment is therefore a decomposition, not a sweep
+(`scripts/bench/injector-ab.py`, A-B-A-B with a baseline return, graded on SF(tau <= 10 s) per
+R5.3's split):
+
+```
+  arm 0  baseline                    both injectors live
+  arm 1  align_apply 0               kick OFF (shadow mode, still logs) -> isolates the P-term
+  arm 2  align_apply 1, tau_s 480    P-term /4, kick live               -> isolates the kick
+  arm 3  baseline restored           drift control
+```
+
+PREDICTIONS, recorded before the run: kick-dominant => arm 1 cuts sd(trim-int) hard and arm 2
+barely moves it; P-term-dominant => the reverse; neither => the wander is downstream of the command
+and SF_d's "downstream" branch is reached by a route that actually discriminates. Immediate
+falsifiable sub-prediction: **`align_apply 0` removes the 10 s structure from the wire.**
