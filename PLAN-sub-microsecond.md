@@ -1545,3 +1545,14 @@ destroy exactly the clean windows WS0 hunts.
 ≥20; WS0 shipped-record replaces "PROPOSED"; WS2.3's gate restated as a matched-lag comparison —
 against a wire that moves 10 µs/30 s, tracking "within ±0.5 µs" is only well-posed against the
 same-EWMA-smoothed wire.
+
+## WS3.4 first result (2026-08-30 23:37 — corr(fs_diff, trim_diff), new columns' first product)
+
+corr = **−0.992** over 37×30 s segments (n=13 124 rows, rival-gated, |offset|<500 µs). The sign is
+the plant identity (trim opposes crystal error: fs ≈ crystal − trim, crystal stable at sd
+0.13–0.17), so r² ≈ 0.98 says the achieved-rate variation in this window was overwhelmingly
+COMMANDED — the actuator delivers faithfully, and the rate wander is the loop's own output.
+Caveat before the fork is declared: the window contained the 23:35 hole, so fs_diff sd ran 2.7 ppm
+(~8× the quiet plateau's 0.33) — this measures the big commanded excursions, not yet the quiet-hour
+plateau component. A clean-window repeat (tighter gates, hole-free) is queued; if it holds,
+"commanded" stands and the tau_s sweep is the next bench experiment per WS3.4's order.
