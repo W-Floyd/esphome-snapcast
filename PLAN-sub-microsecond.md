@@ -6,10 +6,12 @@ a frame operation (22.7 µs), and differential rate drift between corrections. "
 QUIET WINDOWS (rival-clean, no server hole inside) until the holes are gone — one hole is
 milliseconds and belongs to the server, not the servo.
 
-PROVISIONAL baseline (R1.8/R2.3: window opens 2–3 min post-flash — disturbed regime; to be re-taken
-on one build, ≥30 min, ≥15 min post-flash): build 88, 21:39–21:45, wire median −1.5 µs, MAD 5.1,
-p2p 54.5 µs; kp median 0.008 in steady state (boost scales on the differential portion); split
-escape verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
+PROVISIONAL baseline (R1.8/R2.3/R5.4: window opens 2–3 min post-flash, and its raw 6-min p2p is not
+the DoD's statistic — p2p on the same data reads 20–49 µs per 5-min block, 53.5 over 15 min, 87.7
+over 26 min; quote block-form only): build 88, 21:39–21:45, wire median −1.5 µs, MAD 5.1; kp median
+0.008 in steady state (boost scales on the differential portion); split escape verified live (one
+line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5.2): 1.3–1.5 µs at
+τ=1 s, 5.6–5.8 at 10 s, plateau 11–14 µs with corner at 60–120 s.
 
 ## WS0 — The instrument first (no firmware)
 
@@ -20,6 +22,13 @@ escape verified live (one line, 34 s recovery); injection convergence ≤ ~14 s.
   rival-clean samples / four disjoint blocks is defined, achievable in the current regime; every
   interim grade says which window size it used. If clean spans stay too rare even overnight, the
   buffer decision gets revisited with that evidence.
+* GRADING SPLIT (R5.3, at the measured 60–120 s correlation time): iterate on **SF(τ ≤ 10 s)** —
+  reproducible to ~5 % across independent 15-min windows, a usable A/B discriminator — always
+  quoted with both windows. The **plateau (τ ≥ 60 s) is the goal metric** and needs hours or a
+  paired/interleaved design; never a single before/after pair (a 4000-sample window holds only
+  ~10–20 independent wander samples, so window means/MAD/p2p measure where the wander was, not the
+  change). This also softens R4.3's cost estimate of the buffer deferral: the 2000 ms buffer hurts
+  the plateau/DoD measurements, not day-to-day grading.
 * Primary gate metric is the STRUCTURE FUNCTION (R4.2), not the histogram: SF(τ) with plateau and
   corner reported before and after every change (`scripts/bench/structure-function.py`, committed
   `8ca60e6`; the skew is bounded wander — 0.30 µs at τ=0.1 s rising to a plateau of 9.0 µs at
@@ -118,13 +127,18 @@ on-device signal shares the deadline+tag stamping, so none can see what the wire
    the only way it breaks is the tick cadence not being ~100 Hz — confirm cadence and burstiness
    from the fork's tick call site. The analyser (26 ns floor) cannot see 10 ns; do not measure what
    the arithmetic already answers. `set_rate_adjustment` is off the critical path.
-4. **Trim-loop limit cycle (R4.2 — the plateau's named owner)**: the SF corner at 10–30 s coincides
-   with the trim loop's ~24 s limit cycle at loop gain 0.79 (documented on this bench 2026-08-28)
-   — the plateau (9.0 → 6.5 µs) IS the quantity the goal is made of, it sets both the p2p tails and
-   the mean's SE (R4.1), and no other workstream touches it (crystal FF is a 100 s+ term; actuator
-   ripple is 10 ns). Mechanism work on the trim loop's cycle — gain/cadence/lag structure — judged
-   on SF(τ) plateau + corner, before/after every change. This and WS1 are jointly the plan's
-   critical path.
+4. **The SF plateau's owner (R4.2, re-pointed per R5.1/R5.2)**: the 24 s / loop-gain-0.79
+   attribution is RETIRED with its controller (TRIM_KP_RUN era; today's actuator is programmed by
+   the delay loop at kp ≈ 0.008 — the 08-28 gain was 31× the one in the path). Measured on build 88
+   (rival-gated, timestamp lags, two independent 900 s windows agreeing to ~5 % at τ ≤ 30 s): short
+   lags improved vs 08-28 (5.6–5.8 vs 6.7 µs at 10 s), but the corner moved 10 s → 60–120 s and the
+   plateau to 11–14 µs (~2× worse), with τ^0.5 growth from 5 s to 60 s. The new corner sits on
+   `tune_tau_s_` = 120 s — a two-numbers coincidence to be TESTED, not believed: **first experiment
+   is the runtime sweep `servo_param tau_s` 60/120/240** (plus ti_s, with WS3.2's crystal-wander
+   measurement as the third alternative). If the corner tracks tau_s, the plateau is the fine
+   loop's own response time — not a disturbance it fails to reject — and the tau/Ti trade re-opens
+   as the mechanism question. Judged on SF(τ) plateau + corner, before/after every change. This and
+   WS1 are jointly the plan's critical path — more so at a 2× plateau.
 5. **Gate**: quiet-window p2p ≤ 2 µs (disjoint-block form) with rate-only control, before chasing
    the last factor of 2.
 
@@ -922,6 +936,8 @@ plateau, and the critical path is stated as WS1 + WS3.4 jointly. Two limit cycle
 **R4.3 — ACCEPTED; the buffer change is promoted to WS0's precondition and the plan's FIRST
 ACTION.** Half the record millisecond-class and no 32-min clean span means nothing can be graded;
 "hygiene" was the wrong word and the (user) tag was hiding a hard dependency.
+*(SUPERSEDED by the ~22:5x user decision: buffer stays 2000 ms — see WS0 for the deferral, the
+opportunistic DoD, and R5.3's cheaper cost estimate. Kept for the record per R5.4.)*
 
 **R4.4 — ACCEPTED.** The WS0 result is re-captioned with the block distribution (MAD 3.04–7.50,
 median 4.52, none below 3.0; the 1.68 was the trough of the wander). Core distance restated as ~9×.
@@ -932,3 +948,135 @@ resolved; the two code defects stand and are now WS0 work items (rival gating to
 wire-window's population; lags from timestamps since gating drops rows), plus BASE_NOW re-baselined
 on build 88 — the shipped baselines predate three eras of control-law change and every ratio
 against them is a comparison with a bench that no longer exists.
+
+---
+
+## REVIEW 5 (2026-08-30, measured: rival-gated structure function on build 88)
+
+R4.1–R4.5 are discharged. But WS3.4 — declared this round to be jointly the plan's critical path —
+names a mechanism that is not running, and the SF it was justified by has moved. I measured it
+rather than argued it.
+
+### R5.1 — WS3.4's named owner is a retired controller
+
+WS3.4 says "the SF corner at 10–30 s coincides with the trim loop's ~24 s limit cycle at loop gain
+0.79". Reading the source for that number (`snapcast_client.cpp:212-226, 286-296`):
+
+* `loop gain = KP × 3.15 µs/ppm = 0.79` is stated **at `TRIM_KP_RUN_PPM_PER_US = 0.25`**, for the
+  loop "median → trim (KP) → achieved rate → pivot bias (3.15 µs/ppm) → median".
+* That controller no longer programs the actuator. `st.trim_applied_ppm` — the value handed to
+  `rate_lock_->set_trim_ppm()` (`:3435`, `:3464`) — is written by `delay_loop_update_` (`:4385`,
+  `:4472`), whose gain is `kp = 1/tau_eff` with `tune_tau_s_` floored at 120 s, i.e. **kp ≈ 0.008**
+  (the plan's own header says so, and every `DLLOOP` line tonight reads `kp=0.008`).
+  `TRIM_KP_RUN_PPM_PER_US` survives only as a *scale reference* inside one log line's fallback
+  (`:3596`).
+
+So the 0.25 that produced 0.79 is **31× the gain now in the path**, and the loop it belonged to has
+been replaced. Whether the delay loop has an analogous gain product must be *derived* — it is a rate
+loop on a delay error, so the 3.15 µs/ppm pivot term cannot simply be inherited — not carried over
+by the name "the trim loop".
+
+This is the same defect the plan accepted one round ago as R4.5, applied to the cause rather than
+the baseline: 08-28 numbers cited across three eras of control-law change. CLAUDE.md's rule is
+explicit — read the mechanism before citing it by name.
+
+### R5.2 — Measured: the corner moved 10 s → 60–120 s and the plateau roughly doubled
+
+Rival-gated at 0.5, timestamp-based lags (±10 % tolerance), two independent hole-free windows on
+build 88, plus the 08-28 baseline the plan is quoting:
+
+```
+  tau      21:40–21:55   22:20–22:35   |  BASE_NOW (08-28)
+  1 s          1.50          1.33      |     1.439
+  5 s          3.78          3.95      |     5.060
+  10 s         5.63          5.83      |     6.665
+  20 s         7.95          8.36      |       --
+  30 s         9.51         10.46      |     6.476   <- 08-28 had PLATEAUED here
+  60 s        10.63         13.65      |       --
+  120 s       12.91         12.30      |       --
+  240 s       12.95         16.13      |       --
+  480 s       10.63         14.44      |       --
+     (n=2789, 900 s)  (n=3102, 900 s)
+```
+
+The two windows agree to ~5 % out to 30 s and ~20 % beyond, so this is a measurement, not a window
+artefact. Three readings, all of which matter:
+
+1. **Short lags are unchanged or slightly better** than 08-28 (5.6–5.8 at 10 s vs 6.7). The KP
+   reduction did what it was for.
+2. **The 10–30 s corner is gone.** 08-28 plateaued by 10 s at ~6.5 µs; build 88 keeps climbing to
+   ~60–120 s and settles near **11–14 µs**. Growth from 5 s to 60 s is ≈ τ^0.5 — random-walk-like —
+   then flattens. The plateau is therefore **roughly 2× worse than 08-28, and four times slower**.
+   The entire regression since 08-28 lives at long lag.
+3. **The new corner sits on `tune_tau_s_` = 120 s.** That is a coincidence of two numbers and must
+   be treated as one (CLAUDE.md), but unlike the retired 24 s cycle it is *cheaply decisive*: sweep
+   `servo_param tau_s` over 60 / 120 / 240 and see whether the corner tracks it. If it does, the
+   fine loop's own time constant sets the plateau — and then WS3's "pure-rate steady state" premise
+   has to re-open the tau/Ti trade, because the plateau is not a disturbance the loop is failing to
+   reject, it is the loop's own response time. Alternatives to rule out in the same sweep: `ti_s`,
+   and genuine crystal wander (which WS3.2 is separately measuring).
+
+**WS3.4 should be re-pointed**: keep it as the plateau's owner, drop the retired-loop attribution,
+and make the tau_s sweep its first experiment. It is still the critical path — more so, since the
+plateau is 2× what the plan assumes.
+
+### R5.3 — At the measured correlation time, the plan's grading windows cannot grade
+
+With the corner at 60–120 s, a 4000-sample interim window (~21 min) contains only ~10–20
+independent samples of the wander, and a 30-min DoD window ~15–30. Any before/after comparison of
+window **mean, MAD or p2p** is therefore dominated by where in the wander each capture landed —
+which is exactly what tonight's block means show (22:20–22:40 runs −10.67, −7.52, −4.96, +0.30,
+−3.04: a trend, not scatter).
+
+The constructive consequence, and it is good news: **SF at τ ≤ 10 s is reproducible to ~5 % across
+independent windows** (3.78/3.95 at 5 s, 5.63/5.83 at 10 s). That is a usable A/B discriminator on a
+15-minute capture. So:
+
+* Grade changes on **SF(τ ≤ 10 s)**, quoted with both windows, for anything iterative.
+* Treat the **plateau (τ ≥ 60 s) as the goal metric**, requiring hours or an interleaved/paired
+  design — never a single before/after pair.
+* This also **softens my own R4.3**: if iteration is graded at short lag, the 4000-sample window is
+  ample and the 2000 ms buffer deferral costs much less than I implied. The buffer matters for the
+  *plateau* and the DoD, not for day-to-day grading.
+
+### R5.4 — Two smaller items
+
+* **The header baseline is still a 6-minute p2p.** "build 88, 21:39–21:45 … p2p 54.5 µs" sits above
+  a DoD that now correctly uses disjoint blocks. Measured on one clean stretch tonight: p2p is 20–49
+  µs per 5-min block, 53.5 µs over 15 min, 87.7 µs over 26 min — the same data, three answers. Quote
+  the baseline in the DoD's own form or drop the p2p from it; as written it invites exactly the
+  comparison R2.4 was raised to prevent.
+* **RESPONSE 4 now misstates the plan.** Its R4.3 paragraph reads "the buffer change is promoted to
+  WS0's precondition and the plan's FIRST ACTION"; commits `53c316b`/`461089e` then deferred it and
+  the body says so. Small, but it is the R2.3 defect returning — annotate the response paragraph
+  (\"superseded by the 22:5x user decision\") so the correspondence cannot be read as the plan.
+
+---
+
+## RESPONSE 5 (2026-08-30; amendments in the body)
+
+**R5.1 — ACCEPTED.** The 24 s / 0.79 attribution belonged to the retired TRIM_KP_RUN controller;
+today's actuator is programmed by the delay loop at kp ≈ 0.008 (31× lower than the gain that
+produced 0.79), and any gain product for the current loop must be derived, not inherited by the
+name "the trim loop". WS3.4 re-pointed; the citation defect is the R4.5 class applied to the cause,
+acknowledged as such.
+
+**R5.2 — ACCEPTED; measurement adopted into the baseline.** Short lags improved (the KP reduction
+did its job), the corner moved 10 s → 60–120 s, the plateau roughly doubled to 11–14 µs with τ^0.5
+growth between — the regression since 08-28 lives entirely at long lag. The corner-on-tau_s
+coincidence is treated per the two-numbers rule and made WS3.4's FIRST experiment: runtime
+`servo_param tau_s` sweep 60/120/240 (with ti_s and crystal wander as the alternatives to rule
+out). If the corner tracks tau_s, the plateau is the loop's own response time and the tau/Ti trade
+re-opens as the mechanism question — which would be the most consequential finding of the plan so
+far, and it costs zero flashes to test.
+
+**R5.3 — ACCEPTED, including the softening of R4.3.** Grading split written into WS0: iterate on
+SF(τ ≤ 10 s) (reproducible ~5 % across independent 15-min windows), reserve the plateau for
+paired/interleaved designs over hours; window means/MAD/p2p at the measured correlation time
+measure where the wander was, not the change. The buffer deferral costs the DoD and plateau
+measurements, not iteration.
+
+**R5.4 — ACCEPTED, both.** Header baseline re-stated without the raw 6-min p2p (the same data gives
+20–49/53.5/87.7 µs at three window lengths — three answers, no statistic) and now carries the SF
+baseline instead; RESPONSE 4's R4.3 paragraph annotated as superseded by the user's buffer
+decision, so the correspondence cannot be read as the plan.
