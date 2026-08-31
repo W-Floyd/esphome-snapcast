@@ -2298,3 +2298,71 @@ The P-term identity is confirmed live. Consequences, in order of how much they c
 
 **WS3.4's next experiment is therefore NOT the tau_s sweep** (it would move a gain, not a
 bandwidth). It is: establish whether the 133 µs of `dl_err` is signal or noise — WS1.
+
+## WS0 event classification (2026-08-31 08:04:22, per R8.1's standing task)
+
+R8.1 requires every excluded block be classified by cause BEFORE the quiet-window rule discards it.
+First one done under that rule, and it does not classify cleanly as either category.
+
+THE EVENT: wire +1934 us peak, 08:04:22.955-08:04:24.200 (1.25 s), **rival 0.03-0.04** — inside the
+gate, so a genuine differential displacement, not a whole-frame masquerade. Capture had ZERO gaps
+> 2 s across the window: the instrument did not blink.
+
+THE TRACE (byte-anchored, a.log/b.log, `[HH:MM:SS.mmm]` — note the ms field; a `\[08:04:2[0-6]\]`
+pattern matches NOTHING and reads as "no events"):
+
+```
+  08:04:20.3  A DLLOOP err= +500   B DLLOOP err= +491     both boards ~+0.5 ms, agreeing
+  08:04:20.5  B RECON drift=-52246 cmp=0                  52 ms accounting discontinuity
+  08:04:21.6  A RSTEP err=-13500 ok=1 step=-13500
+              B RSTEP err=-11156 ok=1 step=-11156         <- STEPS DIFFER BY 2344 us
+  08:04:24.2  A Sync corrected +829 frames (18.9 ms)
+              B Sync corrected +831 frames (18.9 ms)
+  08:04:24.8  A DLLOOP err=+11    B DLLOOP err=-8         recovered
+```
+
+**Both boards were hit by the same server-side discontinuity and corrected it by DIFFERENT
+amounts — 13 500 vs 11 156 us, a 2344 us disagreement. The wire saw 1934 us of it.**
+
+So the honest classification is **server-TRIGGERED, servo-DIFFERENTIATED**, and R8.1's rule as
+written would discard it as "a server hole" while the differential inside it is a servo defect: a
+correctly-behaved pair steps identically for a shared event and the wire never moves. This is the
+counterexample R8.1 anticipated, now with a trace. The excluded-block rule needs a third category,
+and blocks in it are IN SCOPE.
+
+Corroborating, and both WS1 territory:
+* `SHADOW err_tag=-9 err_live=-7686 diff=7677` on B — the tag-derived and live-derived errors
+  disagree by **7.7 ms** through the event, having agreed to within 23 us either side of it.
+* `gd` read -3/-8 during the step (useless at the moment of the decision) and only reached +5558
+  seconds AFTER. A and B reported `group=-7` and `group=+5558` at the same instant — values that
+  should be near-negatives of each other.
+* The step-and-verify guard DID fire here (`pend=-13061`/`-11133`), unlike R3.1's 21:37 episode —
+  consistent with R3.1's cadence finding rather than against it.
+
+### STANDING BENCH FAULT — the observer has been broken since ~02:00
+
+Found while classifying the above, unrelated to it, and it invalidates a source:
+
+```
+  observer Hard resync count per hour:  00:9  01:11  02:229  03:1712  04:1714
+                                        05:1715  06:1719  07:1712  08:234
+  observer: "Hard resync: 11160024896 ms early, inserting silence"   (= 129 DAYS early)
+  observer: "Consensus over 3 estimate(s): spread 1037434 us"
+  A and B:  "Consensus over 2 estimate(s): spread 154 us / 159 us"
+```
+
+The observer (e99574) has run a continuous hard-resync loop at ~0.5/s for **six hours**, on a
+timebase ~1.04 SECONDS from the pair, and it is broadcasting into the group while A and B consense
+without it (n=2). The "11160024896 ms" is a domain/epoch mismatch printed as a measurement —
+CLAUDE.md's sentinel-as-a-number rule, in the wild.
+
+Consequences:
+1. **observer.log from 2026-08-31 02:00 onward is not usable as a diagnostic source.** CLAUDE.md
+   names it the most under-used source and the only emitter of `PHASEIN`; tonight it is the most
+   broken one. WS1's 8x under-read evidence came from PHASEIN at 20:36 on 08-30, which PREDATES
+   this, so that evidence stands — but it must not be refreshed from tonight's file.
+2. The observer needs a power cycle before any WS1 or WS2 work reads PHASEIN again.
+3. Its beacons were live in the group all night. A and B excluded it from consensus (n=2
+   throughout), so the overnight DoD/SF results above are not contaminated — but that is a fact
+   that had to be checked, not assumed, and it is checked: every `Consensus over` line on A and B
+   in the window reads `2 estimate(s)` with spread ~155 us.
