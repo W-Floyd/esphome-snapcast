@@ -2443,3 +2443,60 @@ PREDICTIONS, recorded before the run: kick-dominant => arm 1 cuts sd(trim-int) h
 barely moves it; P-term-dominant => the reverse; neither => the wander is downstream of the command
 and SF_d's "downstream" branch is reached by a route that actually discriminates. Immediate
 falsifiable sub-prediction: **`align_apply 0` removes the 10 s structure from the wire.**
+
+## Instrument finding — RECON `drift=` is not a fault indicator (2026-08-31 08:5x)
+
+Raised because a `drift=-52245` reading was taken for a board-specific fault and a power-cycle was
+proposed on it. It is an accounting artifact, present on BOTH boards, and benign.
+
+**-52246 us is exactly 2304 frames at 44.1 kHz.** Measured over 1340 `cmp=1` rows, both boards:
+
+```
+          xfer==50000   |drift|>1ms   count
+  a.log        False        False       539
+  a.log         True         True       144
+  b.log        False        False       511
+  b.log         True         True       142
+```
+
+1. **`sum == meas` on 1340/1340 rows.** The line's own rule -- "if it matches while drift does not,
+   the missing audio is in none of the four" -- therefore says `acct` is the wrong side, not the
+   audio path.
+2. **It toggles, it does not accumulate**: -2304 frames -> 0 -> -2304, clearing in 3-7 s,
+   continuously. Lost audio does not come back.
+3. **One trigger**: `xfer == 50000` (transfer stage at its full 50 ms) on 286 of 290 split rows and
+   ZERO of 1050 clean rows. Perfect separation.
+4. **Symmetric** (144 vs 142), so it produces no differential -- the wire read p2p 10-27 us
+   throughout, against a nominal 52 ms of "missing" audio.
+
+**RULE: gate on `xfer != 50000` before treating any `drift=` value as evidence.** Documented at the
+log site. Ungated it reads as 52 ms of missing audio on roughly a fifth of reports from a healthy
+board -- the same defect class as RSTEP's `err=` (R3.2) and the held `phase_*` column (R6.1): a
+field whose value means different things in different states, in a load-bearing diagnostic.
+
+Magnitudes cluster on a 128-frame lattice (2304 = 18x128, 2176 = 17x128, 1280 = 10x128) but not
+universally -- one sample read 2867 frames -- so 128 is a LEAD, not the mechanism.
+`FAST_SPLICE_MAX_FRAMES = 128` is the only 128 in the component and is the obvious thing to check.
+
+**FOLLOW-UP OWED**: 1280 frames = -29026 us, the value CLAUDE.md records as "the equal-and-opposite
+pair signature (-29026/+29024)" of the accounting-split repair. That episode may have been this
+artifact rather than a real split; it should be re-checked against its own `xfer` before the
+accounting-split root-cause item is worked.
+
+### Retraction, same session
+
+Three fields were read as faults on board A and all three were misreadings, each answered by the
+code within a few lines of the log site:
+
+* `pad=357433` frozen -- read as "dispenser railed". `pad=` is a CUMULATIVE diagnostic and the
+  comment at its log site says so outright ("pad= is a diagnostic, not a displacement term",
+  with a tested-and-refuted displacement prediction attached). Frozen = padding STOPPED = healthy.
+* `RPUSH bad_raw=96 (100.0%)` -- read as "100 % of pushes bad". `bad_raw` is the COUNTERFACTUAL
+  for a retired frames-based pivot; the live figure is `bad_rebased`, which read 0.0 %. The line
+  exists precisely to show the re-basing works.
+* `RECON drift=-52245` -- read as A-specific. Both boards, near-identical counts (above).
+
+A board power-cycle was proposed to the operator on this basis and withdrawn before it was carried
+out. Cost: an aborted A/B run whose baseline arm was already contaminated by two ms-class events.
+The rule that would have prevented all three is the first one in CLAUDE.md, and each field's
+definition was inside the same function as the line that was quoted.

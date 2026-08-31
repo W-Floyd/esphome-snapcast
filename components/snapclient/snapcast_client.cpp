@@ -5357,6 +5357,24 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
             dbg_pushed = this->pushed_frames_total_;
             dbg_played = this->played_frames_total_;
             this->playout_mutex_.unlock();
+            // READING drift= (measured 2026-08-31, 1340 cmp=1 rows across both boards).
+            // drift IS NOT A FAULT INDICATOR ON ITS OWN. It reads ~-52245 us -- exactly 2304
+            // frames at 44.1 kHz -- on about a fifth of reports from a perfectly healthy board,
+            // and it TOGGLES (-2304 -> 0 -> -2304, clearing in 3-7 s) rather than accumulating.
+            // Three facts pin it as an accounting artifact rather than lost audio:
+            //   * sum == meas on 1340/1340 rows, so by the rule below the discrepancy is in
+            //     none of the four stages -- acct is the side that is momentarily wrong.
+            //   * it fires when and only when xfer == 50000 (the transfer stage at its full
+            //     50 ms): 286 of 290 split rows, ZERO of 1050 clean rows.
+            //   * it is symmetric across boards (144 vs 142 occurrences), so it produces no
+            //     differential and the wire shows nothing -- p2p stayed 10-27 us throughout.
+            // SO: gate on xfer != 50000 before treating a drift= value as evidence of anything.
+            // Ungated, it cost a session an hour and a proposed (unnecessary) board power-cycle.
+            // Magnitudes cluster on a 128-frame lattice (2304=18x128, 2176=17x128, 1280=10x128)
+            // but not universally -- one sample read 2867 frames -- so 128 is a lead, not the
+            // mechanism. NOTE 1280 frames = -29026 us, the value CLAUDE.md records as "the
+            // accounting-split tell"; that episode is worth re-checking against its own xfer.
+            //
             // Conservation residuals, in frames: every boundary must satisfy
             // received == passed-on + still-held, so a non-zero one names the stage losing audio.
             // These were only on the boot-phase line before, which cannot see a LATER re-baseline --
