@@ -417,12 +417,28 @@ class TsfSync {
   // device's connection and multicast is blocked.
   std::vector<uint32_t> peers_;
   std::vector<uint32_t> learned_peers_;
+  // Race-free roster mirror for the phase reports, which send from the tag-observation task while
+  // the vectors above are owned by the network task. Per-slot atomics: a reader may see a roster
+  // mid-update, which costs at most one packet to at most one address -- harmless at 50 Hz.
+  // Sized for peers_ (roster) + learned_peers_ (cap 16); zero = empty slot.
+  static constexpr size_t PUB_PEER_SLOTS = 24;
+  std::atomic<uint32_t> pub_peer_addr_[PUB_PEER_SLOTS]{};
   std::atomic<uint8_t> peer_count_{0};
 
   void learn_peer_(uint32_t addr);
   void update_peer_count_() {
     this->peer_count_.store(static_cast<uint8_t>(this->peers_.size() + this->learned_peers_.size()),
                             std::memory_order_relaxed);
+    // Refresh the phase-report roster mirror (every roster change funnels through here, on the
+    // network task). Slots beyond the roster are zeroed so a shrink cannot leave stale addresses.
+    size_t s = 0;
+    for (const uint32_t a : this->peers_) {
+      if (s < PUB_PEER_SLOTS) this->pub_peer_addr_[s++].store(a, std::memory_order_relaxed);
+    }
+    for (const uint32_t a : this->learned_peers_) {
+      if (s < PUB_PEER_SLOTS) this->pub_peer_addr_[s++].store(a, std::memory_order_relaxed);
+    }
+    for (; s < PUB_PEER_SLOTS; s++) this->pub_peer_addr_[s].store(0, std::memory_order_relaxed);
   }
 
   // Our own TSF-vs-esp_timer rate (d(tsf−local)/dt, ppm), measured on the network task: the
