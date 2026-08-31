@@ -2795,3 +2795,15 @@ feedback model identical on both boards (9999 µs/10 ms cap each). The wire deca
 to. Next: offline cross-board comparison of per-chunk RAW render phases against the analyzer's
 wire for the same span — decides whether phase-in-TSF disagrees with the wire (pairing/consensus
 exonerated, tag stamping suspect) or agrees (then the loss is in consensus/extrapolation).
+
+### 2026-08-30 20:36–20:40 — the under-read is in the phase VALUES, not the consensus
+
+Matched-window comparison (20:36:31–20:37:25): rival-clean wire −1463…−1620 µs; the observer's raw
+PHASEIN pairwise |phase(A) − phase(B)| ≤ ~200 µs over the same seconds. The render-phase values
+under-measure the physical differential ~8× during a boot/settle transient — pairing, extrapolation
+and consensus are exonerated (and GDAVG tracks the live delta through an event: +11399 vs +11407 at
+n=18 during the 20:40 hole). Suspect: the tag/feedback timestamping follows a model rather than the
+physical DMA during transients (SYNCX feedback sits at its 9999 µs/10 ms cap on both boards; a
+capped model hides exactly the differential). Deep fix is tag-stamping-side; next session. The
+analyzer also lost correlation (rival 0.89) while A drifted, so late-window wire numbers are gated
+garbage — graded spans must stay rival-clean (they were).
