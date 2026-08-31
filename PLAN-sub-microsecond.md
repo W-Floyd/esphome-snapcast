@@ -3,8 +3,13 @@
 Goal set 2026-08-30 21:45. p2p ≤ 1 µs means every sample within ±0.5 µs, so this plan is organized
 around the three things that can each individually spend the whole budget: a measurement that lies,
 a frame operation (22.7 µs), and differential rate drift between corrections. "Max" is defined over
-QUIET WINDOWS (rival-clean, no server hole inside) until the holes are gone — one hole is
-milliseconds and belongs to the server, not the servo.
+QUIET WINDOWS — and stated plainly (R8.1): **this is a servo-scope goal; "p2p ≤ 1 µs" does NOT mean
+the speakers are always within 1 µs.** Roughly half of tonight's wall-clock blocks carry ms-class
+p2p and are excluded by the rule. The exclusion is honest ONLY if the excluded blocks are
+server-caused: R3.1's 21:37 episode was 46 s of ±2.4 ms SERVO-caused sawing that the rule would
+silently discard. Therefore WS0 carries a standing task: classify every excluded block by cause
+(stream hole / hard resync / servo limit cycle — a grep) before excluding it; servo-caused dirty
+blocks are defects in scope, not events out of scope.
 
 PROVISIONAL baseline (R1.8/R2.3/R5.4: window opens 2–3 min post-flash, and its raw 6-min p2p is not
 the DoD's statistic — p2p on the same data reads 20–49 µs per 5-min block, 53.5 over 15 min, 87.7
@@ -31,20 +36,27 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
   the plateau/DoD measurements, not day-to-day grading.
 * Primary gate metric is the STRUCTURE FUNCTION (R4.2), not the histogram: SF(τ) with plateau and
   corner reported before and after every change (`scripts/bench/structure-function.py`, committed
-  `8ca60e6`; the skew is bounded wander — 0.30 µs at τ=0.1 s rising to a plateau of 9.0 µs at
-  τ≥30 s, 6.5 µs after the 08-28 fixes, corner at 10–30 s coinciding with the trim loop's ~24 s
-  limit cycle at loop gain 0.79). The plateau is what sets both the p2p tails and the mean's SE;
-  histogram/MAD/p2p stay for the excursion population but are window-length-dependent and cannot
-  be the gate. Tool work first (R4.5): add rival gating (match wire-window's), compute lags from
-  timestamps (uniform-dt assumption breaks the moment gating drops rows), and re-baseline BASE_NOW
-  on build 88 — the shipped baselines are three eras old.
-* ANALYSER INGESTION DEFECT (R6.1) — the running instance is not reading the device logs during
-  the run: `phase_a/b` frozen at run-start values for 2 h (HELD_COLS prints them per-row as if
-  measured), `dl_err_*` blank on 100 % of rows, while the logs carry 44k/75k matching lines.
-  PROPOSED fixes to `scripts/i2s-skew.py` (the user's file — changes need their sign-off): stop
-  holding `phase_*` (blank past the match window or add `fw_age_s`), restore log-follow during the
-  run, and add `trim_a/b_ppm` + `int_a/b_ppm` columns from the already-parsed `dl_trim_ppm`
-  (parsed at :1082, referenced nowhere — R6.3). `wire-vs-common.py` is a no-op until then.
+  `8ca60e6`). Current baseline (R5.2, build 88 — supersedes every 08-28 number and its retired
+  trim-loop attribution, R8.3): 1.3–1.5 µs at τ=1 s, 5.6–5.8 at 10 s, plateau 11–14 µs, corner at
+  60–120 s; the plateau is broadband differential rate noise ~0.33 ppm at 30 s (see WS3.4). The
+  plateau sets both the p2p tails and the mean's SE; histogram/MAD/p2p stay for the excursion
+  population but are window-length-dependent and cannot be the gate. Tool work first (R4.5): add
+  rival gating (match wire-window's), compute lags from timestamps (uniform-dt breaks the moment
+  gating drops rows), and re-baseline BASE_NOW on build 88.
+* ANALYSER INGESTION DEFECT (R6.1) — SHIPPED with user sign-off as `762e7a8` + the R7 fixes: the
+  root cause was tod_to_unix referenced to the RUN START (>12 h runs mapped fresh lines a day into
+  the past — phase frozen, dl blank); now referenced to read-time (live) / capture midpoint
+  (replot), with a (st_dev, st_ino)+size rotation guard, phase un-held (nearest-in-time,
+  PHASE_MATCH_S 5 s), and `trim_a/b_ppm` + `int_a/b_ppm` columns emitted. Analyser restarted
+  ~23:19; columns verified live (dl/trim/int populated; phase blank HONESTLY — the 'Render phase'
+  line is verbose-demoted, zero source lines, so the column stays empty until the firmware
+  re-emits it at D). Cross-column caveats, recorded so they are not rediscovered: phase pairs at
+  5 s tolerance vs dl at 0.7 s (same-row values can describe instants ~5 s apart — WS1's step
+  experiment must not difference them naively), and un-holding changed the column's POPULATION,
+  so phase statistics across 23:18 are not like-for-like (the R2.4 selection rule, inside the
+  instrument). BASELINE CARRY-FORWARD (R7.5/R8.6): R5.2's SF and R6.2's rate decomposition live in
+  the old-schema `test.csv` (readable — prefix headers accepted on read since the R7.1 fix); the
+  new-schema file starts fresh, and both baselines are re-taken on it as part of the WS0 re-take.
 * Instrument floor, stated once (R6.4): `scatter_ns` median 25.8 ns tonight — 400× below the 10 µs
   the SF reads at 30 s. The analyser is not the limit at any scale this plan works at.
 
@@ -55,9 +67,12 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
   Twice, on different days. Stated plainly (R4.1): tonight's block-mean sd is 2.4–4.2 µs, so the
   mean gate is UNREACHABLE by averaging (12–50 h/attempt) until the SF plateau comes down — the
   mean gate is downstream of the plateau work, by construction, and a pass before that work would
-  be a coin flip, not a result.
+  be a coin flip, not a result. SE caveat (R8.6): from six blocks the SE itself sits on 5 df
+  (~±30 % relative) — the SE ≤ 0.1 µs condition is INDICATIVE at six blocks and binding only when
+  computed over ≥ 20 blocks.
 
-## WS1 — Render-tag truth (BLOCKER for everything downstream)
+## WS1 — Render-tag truth (blocks WS2 and the honesty gates — not everything; see Order for what
+## runs before it) (retitled per R8.5)
 
 Evidence: phases/tags under-measure real differentials ~8× (20:36: wire −1.5 ms rival-clean,
 pairwise beacon phases ≤ 0.2 ms). SOURCE, per R6.1's challenge: the phase side came from the
@@ -114,6 +129,10 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
    even by the independence bound (a floor, not an estimate); WS2.3's gate is unreachable until
    WS2.0/2.1 restore ≥ ~15 pairs/s.
 3. **Gate**: GDAVG (EWMA, ~30 s equivalent) tracks the wire within ±0.5 µs over a quiet hour.
+   Meaningfulness caveat (R8.6): the wire itself moves ~10 µs per 30 s (0.33 ppm rate noise,
+   R6.2), so "tracks within ±0.5 µs" is only well-posed against a matched-lag comparison (GDAVG
+   vs the wire smoothed with the SAME EWMA), never against raw wire samples — otherwise the gate
+   asks the reference to out-resolve a non-stationary target.
 4. Then: align consumes GDAVG instead of the single-pair delta; recentre cap stays 2 µs/cycle.
    PRECONDITION (R1.4): staleness invalidation for the averaged delta (mirror of
    GROUP_DELTA_STALE_US) — today the last average stands forever when comparable packets stop.
@@ -125,7 +144,10 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
    steps clamp to zero); the deliverable is the COUNTER and its log line, which must also log the
    splice threshold in force (`splice_us` is a runtime override that can defeat the invariant).
    Instrumentation, not control work; can start today.
-2. **Crystal feed-forward — BUILD, then tune (R1.1)**: no shipped feed-forward exists
+2. **Crystal wander — MEASUREMENT ONLY (demoted R6.2; heading updated R8.3)**: no shipped
+   feed-forward exists and none is to be built — the crystal difference explains <1 % of the
+   plateau's variance, and the real target is 0.017 ppm (±0.5 µs over 30 s) against 0.33 ppm
+   measured, not the 0.05 ppm framing below. Historical build argument kept for the record:
    (`crystal_delta_ppm`'s only consumer is a log line; the 505→17 µs/100 s figure was the
    analyser's offline subtraction). Target: crystal WANDER between fine corrections (the integral
    already owns the constant part; re-measure the 0.17 ppm residual as a wander rate before any
@@ -150,12 +172,13 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
    (rival-gated, timestamp lags, two independent 900 s windows agreeing to ~5 % at τ ≤ 30 s): short
    lags improved vs 08-28 (5.6–5.8 vs 6.7 µs at 10 s), but the corner moved 10 s → 60–120 s and the
    plateau to 11–14 µs (~2× worse), with τ^0.5 growth from 5 s to 60 s. The new corner sits on
-   `tune_tau_s_` = 120 s — a two-numbers coincidence to be TESTED, not believed: **first experiment
-   is the runtime sweep `servo_param tau_s` 60/120/240** (plus ti_s, with WS3.2's crystal-wander
-   measurement as the third alternative). If the corner tracks tau_s, the plateau is the fine
-   loop's own response time — not a disturbance it fails to reject — and the tau/Ti trade re-opens
-   as the mechanism question. Judged on SF(τ) plateau + corner, before/after every change. This and
-   WS1 are jointly the plan's critical path — more so at a 2× plateau.
+   `tune_tau_s_` = 120 s — a two-numbers coincidence to be TESTED, not believed. (R8.2: the
+   superseded "sweep first" sentence is deleted — the ordering IS the finding; the sweep is the
+   SECOND experiment, run only if the correlation below says the wander is commanded, then with
+   ti_s and WS3.2's wander measurement as the alternatives.) If the corner then tracks tau_s, the
+   plateau is the fine loop's own response time — not a disturbance it fails to reject — and the
+   tau/Ti trade re-opens as the mechanism question. Judged on SF(τ) plateau + corner, before/after
+   every change. This and WS1 are jointly the plan's critical path — more so at a 2× plateau.
    RE-POINTED AGAIN (R6.2/R6.3): the plateau is broadband DIFFERENTIAL RATE noise — SF(τ)/τ reads
    0.78 / 0.58 / 0.33 / 0.20 ppm at τ = 5/10/30/60 s (falling with τ: decorrelating noise, the
    τ^0.5 growth's cause) — and the crystal is exonerated (see WS3.2). The question is now "what
@@ -209,10 +232,14 @@ differential rate noise needs a correction every ~1.5 s; the fine loop's τ is 1
 bandwidth gap that no amount of reference averaging (WS2) closes. Either the rate noise comes down
 (if uncommanded: actuator/driver/estimator work) or the loop gets faster (if commanded: the tau/Ti
 trade re-opens) — the corr(fs_diff, trim_diff) experiment decides which, and the plan commits to
-neither until it runs. Mean 0 falls
-out of WS1+WS2 (bias is already ±2 µs). Residual risk after all gates: crystal wander between
-corrections and the unresolved 1.5 ms TX-displacement mechanism constraining WS2's delivery —
-physics and one owed mechanism, both measured before they are believed.
+neither until it runs. The mean gate is DOWNSTREAM of the plateau work (R4.1/R8.4 — block-mean sd
+2.4–4.2 µs makes it unreachable by averaging; the old "mean 0 falls out of WS1+WS2" claim is
+retired). Residual risk after all gates: whatever produces the 0.33 ppm differential rate noise
+(crystal exonerated at <1 % — R6.2), plus the unresolved 1.5 ms TX-displacement mechanism
+constraining WS2's delivery. FLASHING CONSTRAINT (R8.5): the four queued firmware changes (WS2.0
+servo_param, WS3.1 counter, RSTEP raw=/tgt= split, align_bias_us range check) ship as ONE flash —
+CLAUDE.md's measured rule: reflashes are the operator's dominant disturbance, and four separate
+flashes would destroy exactly the clean windows WS0 hunts.
 
 ## WS0 result (2026-08-30 21:17–21:45, build 87/88, hole-free 5-min windows) — MISCAPTIONED, see R1.8
 (spans two firmware eras and opens 2–3 min post-flash; kept as observation; re-take pending)
@@ -1266,3 +1293,255 @@ plan; blocked only on the analyser column additions (user's file).
 **R6.4 — ACCEPTED, both.** Instrument-floor line added to WS0 (scatter 25.8 ns, 400× under
 SF(30 s)); the shared-windows caveat added to WS3.4 — tonight's SF and segment statistics are two
 quantities on the same two windows, to be repeated on an overnight window before baseline status.
+
+---
+
+## REVIEW 7 (2026-08-30, review of `762e7a8` — the analyser fix)
+
+The correspondence is discharged; this round reviews the code that shipped for R6.1/R6.3. The day-
+reference diagnosis is right and the trim/int columns are exactly what R6.3 asked for. But the
+change breaks the mode this plan is graded from, and it breaks it silently in one of the two ways.
+
+### R7.1 — `--replot` now exits on every CSV recorded before 23:18 tonight
+
+`load_existing` hard-exits on any header mismatch:
+
+```python
+if head and head != SCHEMA:
+    sys.exit(f"{path} has a different column layout: …")      # :2757-2759
+```
+
+and it is the replot entry point (`ts0, ys0, anchor0 = load_existing(args.out)`, `:4092`). Adding
+four columns therefore makes **every historical capture unreplottable**, including the `test.csv`
+that holds the WS0 histogram, R5.2's SF baseline and R6.2's rate decomposition — i.e. every measured
+number this plan currently rests on.
+
+The file's own design intent says the opposite, twice: *":2670 Older CSVs predate some columns, so a
+replot of one simply omits that trace rather than…"*, *":2695 Older files predate those columns, so
+replotting one simply shows no rate panels."* The strict equality check contradicts the stated
+contract and has just started biting.
+
+Fix: keep strict equality for **append** (mixing schemas inside one file is a genuine error, and the
+check is right there), and for **read-only/replot** accept a header that is a prefix of the current
+SCHEMA up to `reason`, marking the absent columns absent. Until then, replotting tonight's data
+requires hand-editing a header — a footgun on the file the plan is graded from.
+
+### R7.2 — The day-reference fix repairs the live path and breaks the replot path
+
+`collect_events(t_start)` is called on replot with the CSV's **historical** anchor
+(`collect_events(anchor0 or time.time())`, `:4116`), but the day mapping inside it is now
+unconditionally *now*:
+
+```python
+host_ref = time.time()
+host = lambda tod: tod_to_unix(tod, host_ref) - t_start        # :3998-3999
+```
+
+Replot a CSV recorded on an earlier day and every log line is placed on **today** while `t_start`
+is that earlier day — a uniform N×24 h offset. The very next line then filters the lot out:
+
+```python
+ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]              # :4117
+```
+
+So a replot silently reports **zero log events**, which is the same presentation as the bug just
+fixed, moved to the other mode — and CLAUDE.md already records what a silent "nothing happened"
+costs on this bench (the `--log-tail-mb 4` under-read).
+
+The reference is a property of *when the lines were read*, not a constant. Make it a parameter:
+`time.time()` from the live poll, `anchor0` (or the CSV's midpoint) from replot. Two lines.
+
+Related: the new comment asserts "the ±1-day search still covers a whole-file priming pass". It does
+not — it covers ±12 h around the reference, whatever the reference is. Tonight's `a.log` runs ~26 h
+per 200 MB, so a prime beyond roughly 90 MB folds its older half onto the wrong day. A live start is
+safe because the tail is recent; state that bound rather than assert coverage, or the next person
+raising `--log-tail-mb` (which CLAUDE.md tells them to do for `--replot`) walks into it.
+
+### R7.3 — Four smaller items in the same diff
+
+* **`phase_*` is formatted `.4g` while `dl_err_*` uses `.1f`.** Four significant digits render a
+  −29026 µs episode as `-2.903e+04`: 1 µs resolution lost precisely where the split/tug episodes
+  live, and scientific notation appearing in a column most parsers will read as an integer. Use
+  `.1f`, matching the sibling column.
+* **The rotation guard is the cheap half of the test.** `start_offset > st_size → 0` catches
+  truncation, but a logger restart that recreates the file and refills past the carried offset
+  leaves `start_offset ≤ st_size`, and the poll resumes mid-stream in unrelated content with no gap
+  indication — a *wrong* read rather than a deaf one. `st_ino` (with `st_dev`) is the complete test.
+  If the size check is deliberate for cost, say which half it covers.
+* **Two firmware series now pair at 7× different tolerances on one row** — `PHASE_MATCH_S = 5.0`
+  against `DL_MATCH_S = 0.7`. `phase_diff` and `dl_diff` on the same row can therefore describe
+  instants five seconds apart. Defensible given the cadences, but record it: a future comparison of
+  those two columns inherits the skew silently, and WS1's step experiment is exactly such a
+  comparison.
+* **Un-holding `phase_*` changes the column's population, not only its freshness.** Phase statistics
+  across 23:18 tonight are not like-for-like — the same selection-rule failure as R2.4/R4.4, now
+  inside the instrument. One line in the plan so it is not rediscovered as a finding.
+
+### R7.4 — A pre-existing arity bug, now on the replot path
+
+```python
+ts, ys, anchor = [], [], None
+if not os.path.exists(path):
+    return ts, ys          # two values; every caller unpacks three   :2730-2731
+```
+
+`load_existing` returns 2 values when the file is missing and 3 otherwise (`:4092`, `:4180` both
+unpack three), so a missing `--out` raises `ValueError` instead of the intended message. This is
+character-for-character the defect the same file fixes elsewhere and comments on — *"Same arity as
+the normal return: it was short by one, so an unreadable log would have crashed the caller's
+unpacking rather than being skipped."* Worth the one-line fix while the file is open.
+
+### R7.5 — Plan/code drift
+
+RESPONSE 6 says the analyser fixes are "PROPOSED in WS0 (the analyser is the user's file; changes
+need their sign-off)", and `762e7a8` then implemented them. Record what shipped in WS0, and note the
+consequence R7.1 forces: with the schema bumped, the **new** captures start a fresh file, so R5.2's
+SF baseline and R6.2's rate decomposition live in the old-schema `test.csv` and must be either
+carried forward explicitly or re-taken on the new file before anything is graded against them.
+
+---
+
+## REVIEW 8 (2026-08-30, the plan body read cold, ignoring the correspondence)
+
+Asked directly whether the plan itself is now sound. It is not, and the failures are of a different
+kind from rounds 1–7: those were wrong claims, these are **contradictions left behind by the
+corrections**. A reader executing the body top-down today would run the wrong experiment twice and
+cite two retired numbers.
+
+### R8.1 — The metric excludes the servo's own worst behaviour, by definition, and nothing owns it
+
+The header says: *"Max is defined over QUIET WINDOWS … until the holes are gone — one hole is
+milliseconds and belongs to the server, not the servo."*
+
+Two problems, and together they are the biggest thing left in the plan.
+
+* **"Belongs to the server" is not established, and one counterexample is already in this file.**
+  R3.1's 21:37 episode is 46 seconds of ±2.4 ms sawing produced by the servo's own step loop — a
+  sustained limit cycle, not a server hole. It lands inside the 21:35 block, which the quiet-window
+  rule discards as an event. So the selection rule is currently discarding servo defects along with
+  server holes, and the plan's own headline disturbance is invisible to its own metric.
+* **"Until the holes are gone" has no owner.** WS4's only lever was the buffer, deferred by user
+  decision; nothing else in WS0–WS4 acts on the ms-class population. Measured tonight: **12 of 24
+  rival-gated 5-min blocks carry a ms-class p2p** (R4.3). So roughly half of wall-clock time is
+  excluded from the goal, permanently as the plan stands.
+
+That is a defensible scope for a *servo* goal, but the plan must say it plainly, because "p2p ≤ 1 µs"
+currently reads as "the speakers are within 1 µs" and it does not mean that. Concretely: classify
+the 12 dirty blocks by cause (stream hole / hard resync / servo limit cycle) before excluding them
+by rule — the classification is a grep, and it decides whether the exclusion is honest or is hiding
+WS4's mechanism work.
+
+### R8.2 — WS3.4 contains two contradictory "first experiments"
+
+Within one item:
+
+> **first experiment is the runtime sweep `servo_param tau_s` 60/120/240**  … *(paragraph 1)*
+> the FIRST experiment is no longer the tau_s sweep: it is corr(fs_diff, trim_diff) … *(paragraph 2)*
+
+Both bolded, the first one read first. R6.3's whole point is that running the sweep first can cost
+an evening and five membership changes for a null result. Delete the superseded sentence rather than
+appending the correction under it — this is the one item where the ordering *is* the finding.
+
+### R8.3 — Three retired numbers are still asserted in the body
+
+* **WS0, gate-metric bullet**: still describes the skew as "plateau of 9.0 µs at τ≥30 s, 6.5 µs
+  after the 08-28 fixes, corner at 10–30 s coinciding with the trim loop's ~24 s limit cycle at loop
+  gain 0.79". R5.1 retired the attribution (that controller no longer programs the actuator) and
+  R5.2 replaced the numbers (plateau 11–14 µs, corner 60–120 s). The plan's own header carries the
+  new SF baseline eleven lines above. **One file, two answers, and the wrong one is in the bullet
+  that defines the gate.**
+* **Order and honesty**: "WS3.4 (the trim-loop limit cycle that owns the SF plateau)" — the same
+  retired name, after WS3.4 was re-pointed twice.
+* **WS3.2 heading**: still reads "**Crystal feed-forward — BUILD, then tune**" with the full build
+  argument, and is contradicted by its own last paragraph ("DEMOTED to a measurement item … build
+  nothing here"). Its "0.05 ppm target / 280×" framing is also superseded — R6.2 sizes the target at
+  0.017 ppm (±0.5 µs over 30 s) against 0.33 ppm measured.
+
+### R8.4 — Two summary sentences now contradict the DoD they summarise
+
+In "Order and honesty":
+
+* *"Mean 0 falls out of WS1+WS2 (bias is already ±2 µs)."* The DoD paragraph says the opposite —
+  the mean gate is **downstream of the plateau work**, unreachable by averaging, with block-mean sd
+  2.4–4.2 µs. This sentence survives from the pre-R4.1 plan and is the one a skim reader takes away.
+* *"Residual risk after all gates: crystal wander …"* — crystal was exonerated at <1 % of the
+  plateau's variance in R6.2, which is why WS3.2 was demoted three paragraphs earlier.
+
+### R8.5 — "BLOCKER for everything downstream" is no longer true, and the flashing schedule is unmanaged
+
+* WS1's title claims it blocks everything; the body then lists WS3.1, WS3.2, WS2.0, the RSTEP split
+  and the SF re-baseline as start-today, and names WS3.4 as co-critical-path. Retitle it — an
+  overstated blocker distorts sequencing decisions that are now being made against it.
+* **Nothing in the plan batches the reflashes.** The start-today list contains at least four
+  firmware changes: WS2.0's `PHASE_TX_INTERVAL_US` servo_param, WS3.1's invariant counter, the RSTEP
+  `raw=`/`tgt=` split, and WS1.1's `align_bias_us` range check. CLAUDE.md's measured rule is
+  explicit — every reflash costs five consensus membership changes, |median error| 154 µs vs 93 µs
+  within 15 s of one, and "thirteen reflashes in one session made the operator the dominant
+  disturbance on the bench". The plan is *simultaneously* asking to hunt opportunistic 32-minute
+  clean windows overnight. Four separate flashes would destroy exactly what WS0 is hunting. Add the
+  constraint: **one flash carrying all four changes, then hands off.**
+
+### R8.6 — Smaller, but worth fixing while the file is open
+
+* **The DoD's SE gate is estimated from six numbers.** "SE ≤ 0.1 µs … from block-means variance"
+  with six disjoint blocks means the SE is a χ² estimate on 5 df — roughly ±30 % relative
+  uncertainty on the gate's own gate. Either say the SE is indicative rather than binding, or
+  require more blocks for the SE than for the p2p.
+* **WS0 still describes the analyser fixes as "PROPOSED … changes need their sign-off"** while
+  `762e7a8` implemented them tonight (and, per R7.1, broke `--replot` on every existing CSV in the
+  process). Record what shipped, and record that the SF/rate baselines the plan quotes live in an
+  old-schema file.
+* **WS2.2's "n≈33 → ≥1.6 µs" now sits beside R6.2's finding** that the wire's own 30 s-scale
+  behaviour is 0.33 ppm of rate noise. Worth one line stating whether the GDAVG gate (±0.5 µs
+  against the wire over a quiet hour, WS2.3) is even meaningful when the wire itself moves ~10 µs
+  per 30 s — the gate may be asking the reference to track a target that is not stationary at that
+  tolerance.
+
+---
+
+## RESPONSE 7+8 (2026-08-30/31; code fixes shipped, plan-body contradictions purged)
+
+**R7.1 — ACCEPTED, shipped.** `load_existing` now accepts prefix headers on read (columns are
+append-only before `reason`), warning that appending to a prefix-header file mixes row widths;
+hard exit only for genuinely foreign layouts. Every historical capture is replottable again.
+
+**R7.2 — ACCEPTED, shipped.** `host_ref` is a parameter: read-time for live polls, the CSV's
+midpoint for replot. The over-claiming comment is replaced with the ±12 h bound stated as a bound.
+
+**R7.3 — ACCEPTED, all four.** phase format `.1f`; rotation guard upgraded to (st_dev, st_ino) +
+size (the size check alone caught only the deaf half — the wrong-read half needed identity); the
+5 s-vs-0.7 s tolerance skew and the population change are recorded in WS0 so neither is
+rediscovered as a finding.
+
+**R7.4 — ACCEPTED, shipped.** Missing-file return now three-valued, with the file's own arity
+comment echoed.
+
+**R7.5 — ACCEPTED.** WS0 records what shipped (762e7a8 + these), the honest phase-blank (the
+source line is verbose-demoted; zero lines in the log), and the baseline carry-forward: R5.2/R6.2
+live in the old-schema file, re-taken on the new file as part of the WS0 re-take.
+
+**R8.1 — ACCEPTED; the scope statement is now the header's second paragraph.** "Servo-scope goal;
+p2p ≤ 1 µs does not mean the speakers are always within 1 µs", with the standing task: classify
+every excluded block by cause before excluding it — R3.1's 21:37 episode proves servo-caused dirty
+blocks exist and must count as in-scope defects, not out-of-scope events.
+
+**R8.2 — ACCEPTED; the superseded sentence is deleted**, not annotated — the ordering is the
+finding.
+
+**R8.3 — ACCEPTED, all three**: the WS0 gate bullet now carries only the R5.2 baseline (08-28
+numbers and the retired attribution removed); Order's "trim-loop limit cycle that owns the
+plateau" phrasing replaced; WS3.2 retitled "Crystal wander — MEASUREMENT ONLY" with the 0.017 ppm
+target correcting the 0.05 ppm framing (historical build argument kept, labeled historical).
+
+**R8.4 — ACCEPTED, both sentences fixed**: "mean 0 falls out of WS1+WS2" retired in place (the
+mean gate is downstream of the plateau work); residual risk now names the 0.33 ppm unknown, with
+crystal explicitly exonerated.
+
+**R8.5 — ACCEPTED, both**: WS1 retitled to what it actually blocks; the ONE-FLASH constraint added
+to Order — the four queued firmware changes ship together, because four separate flashes would
+destroy exactly the clean windows WS0 hunts.
+
+**R8.6 — ACCEPTED, all three**: DoD's SE marked indicative at six blocks (5 df, ~±30 %), binding at
+≥20; WS0 shipped-record replaces "PROPOSED"; WS2.3's gate restated as a matched-lag comparison —
+against a wire that moves 10 µs/30 s, tracking "within ±0.5 µs" is only well-posed against the
+same-EWMA-smoothed wire.

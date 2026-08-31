@@ -1011,11 +1011,16 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
         # would have crashed the caller's unpacking rather than being skipped.
         return [], start_offset, state, [], [], {}, [], [], [], []
     # ROTATION / TRUNCATION GUARD: a logger restart that recreates the file leaves the carried
-    # offset beyond EOF, and seek() past EOF reads nothing forever -- the poll silently goes
-    # deaf for the rest of the run. Detect shrinkage and re-prime as if from scratch.
+    # offset pointing into unrelated content (or beyond EOF, which reads nothing forever). The
+    # size check alone only catches shrinkage (R7.3): a recreated file already refilled past the
+    # offset resumes mid-stream with no gap indication -- a WRONG read, not a deaf one. The
+    # (st_dev, st_ino) identity is the complete test; both trigger a re-prime from scratch.
     try:
-        if start_offset > os.fstat(f.fileno()).st_size:
+        fst = os.fstat(f.fileno())
+        ident = (fst.st_dev, fst.st_ino)
+        if state.get("_ident") not in (None, ident) or start_offset > fst.st_size:
             start_offset = 0
+        state["_ident"] = ident
     except OSError:
         pass
     if start_offset == 0 and tail_bytes:
@@ -2729,7 +2734,9 @@ def load_existing(path):
     """
     ts, ys, anchor = [], [], None
     if not os.path.exists(path):
-        return ts, ys
+        # Same arity as the normal return (R7.4): short by one, a missing --out crashed the
+        # caller's unpacking instead of starting fresh.
+        return ts, ys, anchor
     head = ""
     for line in open(path):
         if line.startswith("elapsed_s"):
@@ -2757,8 +2764,21 @@ def load_existing(path):
         print("probe calibration: NONE -- absolute offsets carry the rig's zero error "
               "(~25 us measured once); run scripts/probe-cal.py")
     if head and head != SCHEMA:
-        sys.exit(f"{path} has a different column layout:\n  found  {head}\n  "
-                 f"expect {SCHEMA}\nPass a different --out, or move the old file aside.")
+        # PREFIX HEADERS ARE READABLE (R7.1): columns are append-only before `reason`, so an
+        # older file's header is the current SCHEMA minus a tail. Hard-exiting made every
+        # historical capture unreplottable the moment a column was added -- including the file
+        # the current baselines live in -- contradicting the stated contract ("a replot of one
+        # simply omits that trace"). Reading only needs the shared prefix; appending to a
+        # prefix-header file mixes row widths, so warn rather than allow it silently.
+        old_cols = head.rstrip().rstrip(",").split(",")
+        new_cols = SCHEMA.split(",")
+        old_body = [c for c in old_cols if c != "reason"]
+        if old_body == new_cols[: len(old_body)]:
+            print(f"  {path}: older schema ({len(old_cols)} cols); absent columns read as "
+                  f"absent. Appending will MIX ROW WIDTHS -- prefer a fresh --out.")
+        else:
+            sys.exit(f"{path} has a different column layout:\n  found  {head}\n  "
+                     f"expect {SCHEMA}\nPass a different --out, or move the old file aside.")
     for line in open(path):
         if line[:1] in "#e":
             continue
@@ -3969,7 +3989,7 @@ def main():
             print(f"  live plot: http://127.0.0.1:{port}/   "
                   f"(canvas, streamed; {args.plot} still written)")
 
-    def collect_events(t_start, offsets=None):
+    def collect_events(t_start, offsets=None, host_ref=None):
         """Log events as (elapsed_seconds, kind, label), relative to the run start."""
         out = []
         if not args.annotate:
@@ -3989,16 +4009,18 @@ def main():
             # why a single offset across a log spanning reboots lands nowhere. Each series is
             # anchored from its own rows, in log order, so the epoch split is well defined.
             #
-            # DAY REFERENCE IS NOW, NOT THE RUN START. tod_to_unix picks the day (of -1/0/+1
-            # around the reference's midnight) that puts the dateless log time nearest the
-            # reference. Referenced to t_start, a run older than ~12 h maps every FRESH line a
-            # day into the past: measured 2026-08-30 on a 31 h run, phase_a/b froze at the
-            # previous evening's values for two hours of rows and dl_err_* went blank on 100 %
-            # of rows -- the points were still appended, just placed 24 h early, outside every
-            # nearest-in-time window. Lines read by a live poll were just written, so "now" is
-            # the honest reference; the +-1-day search still covers a whole-file priming pass.
-            host_ref = time.time()
-            host = lambda tod: tod_to_unix(tod, host_ref) - t_start
+            # DAY REFERENCE IS A PROPERTY OF WHEN THE LINES WERE READ (R7.2), not a constant.
+            # tod_to_unix picks the day (of -1/0/+1 around the reference's midnight) that puts
+            # the dateless log time nearest the reference -- i.e. it covers +-12 h around the
+            # reference, no more. Referenced to t_start, a run older than ~12 h mapped every
+            # FRESH line a day into the past (measured 2026-08-30 on a 31 h run: phase_a/b
+            # frozen, dl_err_* blank on 100 % of rows). A live poll's lines were just written,
+            # so its reference is now; a REPLOT's lines belong to the capture's own era, so the
+            # caller passes the CSV's midpoint. A priming pass or replot spanning more than
+            # +-12 h of log still folds the far half onto the wrong day -- that is the bound,
+            # not "covered".
+            ref = host_ref if host_ref is not None else time.time()
+            host = lambda tod: tod_to_unix(tod, ref) - t_start
             jit_all, n_all = [], 0
             for key, pts in xt.items():
                 placed, jit, nst = place_device_times(pts, lambda r: host(r[0]), lambda r: r[1])
@@ -4113,7 +4135,8 @@ def main():
         INJECTS.clear()
         DEV_ANCHOR.clear()
         DL_DIFF.clear()
-        ev, _ = collect_events(anchor0 or time.time())
+        ev, _ = collect_events(anchor0 or time.time(),
+                               host_ref=(anchor0 + ts0[-1] / 2) if (anchor0 and ts0) else None)
         ev = [e for e in ev if -1 <= e[0] <= ts0[-1] + 1]
         # The overlay comes from the CSV on a replot, not from a second pass over the logs:
         # the column IS the pairing that was made when the row was written, and recomputing
@@ -4506,7 +4529,7 @@ def main():
             # phase_us: nearest-in-time (see the HELD_COLS note) -- blank past PHASE_MATCH_S.
             pha = nearest_value(FIRMWARE.get(("a", "phase_us"), []), elapsed, tol=PHASE_MATCH_S)
             phb = nearest_value(FIRMWARE.get(("b", "phase_us"), []), elapsed, tol=PHASE_MATCH_S)
-            phase_cols = ",".join("" if v is None else f"{v:.4g}" for v in (pha, phb))
+            phase_cols = ",".join("" if v is None else f"{v:.1f}" for v in (pha, phb))
             # Nearest-in-time, not held: see DL_MATCH_S. errA - errB is the firmware's own
             # view of the quantity measured on the wire, so it goes on the same row as the
             # measurement and the two can be differenced offline rather than only by eye.
