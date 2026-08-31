@@ -2765,3 +2765,19 @@ source) — the drop actor must be named, not guessed; (2) revisit re-arming the
 repair when the tag/ledger disagreement is large and persistent while tags are live (b291c42
 disarmed it wholesale; the split, not the tug, is the invariant to remove); (3) the server-side
 jumbo holes are the user's lever (snapserver buffer 2000→4000, or the Pi host).
+
+### 2026-08-30 ~20:30 — build 84: 50 Hz phase exchange, averaged group delta (SHADOW)
+
+Toward <1 µs (user-directed): the live gd pairs one phase sample per block per side (~1 pairing/s,
+~10 µs-class noise each side) — the floor under align and the sub-arm gate. Raising the beacon rate
+alone adds nothing (a re-sent sample creates no new sample instants), so the SAMPLE rate moves:
+phases measured per tagged chunk (~94 Hz), shipped every 20 ms in no_mapping=1 packets the receive
+path already parses (multicast only — touching the unicast roster from the player-side task would
+race set_peers). Each peer sample pairs with the nearest own sample (≤60 ms; own ring at chunk
+cadence, guarded by mapping_mutex_), rolls into a 1 s windowed mean, published as
+render_group_delta_avg_us() and logged as `GDAVG avg= n= live=`. Nothing consumes it (shadow).
+**Prediction:** n≈40–50 pairs/s (some multicast loss); GDAVG's second-to-second scatter well under
+the live gd's (if pairs were independent, ~2 µs vs ~10; correlation will keep it above the √n
+line — the shadow measures how far). If GDAVG tracks the wire's slow differential with µs-class
+noise, it becomes align's input next; if it inherits the live gd's bias pathologies (the tail-era
+3–5× under-read), that under-read is upstream of pairing and the investigation moves there.
