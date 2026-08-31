@@ -157,7 +157,7 @@ it. Start today, before the WS1 blocker resolves: SF-tool fixes + re-baseline (R
 re-take (SF plateau + histogram), WS2.0 delivery rate sweep, WS3.1 invariant counter, WS3.2 wander
 measurement + common-mode check, and the RSTEP raw=/tgt= field split (R3.2 — precondition for both
 WS4's mechanism work and WS1's step experiment; all instrumentation or measurement). Critical path
-to the GOAL is now explicitly twofold: WS1 (honest measurement) and WS3.5 (the trim-loop limit
+to the GOAL is now explicitly twofold: WS1 (honest measurement) and WS3.4 (the trim-loop limit
 cycle that owns the SF plateau). Then WS1 (blocker) → WS2 (gated on WS1 for honesty AND on WS2.0/2.1 for delivery) +
 WS3.2 build → gates in sequence 2 µs → 1 µs (disjoint-block statistic throughout). Mean 0 falls
 out of WS1+WS2 (bias is already ±2 µs). Residual risk after all gates: crystal wander between
@@ -912,8 +912,8 @@ defined.
 **R4.2 — ACCEPTED in full; this is the round's real finding.** The bench retired sd two days ago
 and the plan rebuilt its gate out of sd's family. SF(τ) plateau + corner is now the primary gate
 metric; the histogram is demoted to excursion bookkeeping. The trim-loop ~24 s limit cycle at loop
-gain 0.79 — documented 08-28, absent from every workstream — is now WS3.5, named owner of the
-plateau, and the critical path is stated as WS1 + WS3.5 jointly. Two limit cycles in one stack
+gain 0.79 — documented 08-28, absent from every workstream — is now WS3.4, named owner of the
+plateau, and the critical path is stated as WS1 + WS3.4 jointly. Two limit cycles in one stack
 (R3.1's coarse-step, this one) is also now on the record.
 
 **R4.3 — ACCEPTED; the buffer change is promoted to WS0's precondition and the plan's FIRST
