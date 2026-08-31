@@ -144,10 +144,14 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
    steps clamp to zero); the deliverable is the COUNTER and its log line, which must also log the
    splice threshold in force (`splice_us` is a runtime override that can defeat the invariant).
    Instrumentation, not control work; can start today.
-2. **Crystal wander — MEASUREMENT ONLY (demoted R6.2; heading updated R8.3)**: no shipped
-   feed-forward exists and none is to be built — the crystal difference explains <1 % of the
-   plateau's variance, and the real target is 0.017 ppm (±0.5 µs over 30 s) against 0.33 ppm
-   measured, not the 0.05 ppm framing below. Historical build argument kept for the record:
+2. **Crystal feed-forward — CLOSED (R9.4)**: the loop-derived differential crystal (with the wire
+   flat, c_A + trim_A = c_B + trim_B ⇒ −med(trim_diff) = +4.78 ppm; the learned integrals agree at
+   +4.88, sd 0.265) disagrees with the TSF-derived crystal_diff (+7.37 ppm, sd 0.623) by
+   **2.6 ppm — in the differential, 150× the 0.017 ppm budget**. R2.5's common-mode question is
+   answered: it is NOT common-mode, so a feed-forward built on the TSF signal would inject 2.6 ppm
+   of differential error into a loop whose integral already learns the right number to 0.1 ppm.
+   Closed, not demoted; nothing to build or measure here. Historical build argument kept below for
+   the record:
    (`crystal_delta_ppm`'s only consumer is a log line; the 505→17 µs/100 s figure was the
    analyser's offline subtraction). Target: crystal WANDER between fine corrections (the integral
    already owns the constant part; re-measure the 0.17 ppm residual as a wander rate before any
@@ -236,8 +240,10 @@ neither until it runs. The mean gate is DOWNSTREAM of the plateau work (R4.1/R8.
 2.4–4.2 µs makes it unreachable by averaging; the old "mean 0 falls out of WS1+WS2" claim is
 retired). Residual risk after all gates: whatever produces the 0.33 ppm differential rate noise
 (crystal exonerated at <1 % — R6.2), plus the unresolved 1.5 ms TX-displacement mechanism
-constraining WS2's delivery. FLASHING CONSTRAINT (R8.5): the four queued firmware changes (WS2.0
-servo_param, WS3.1 counter, RSTEP raw=/tgt= split, align_bias_us range check) ship as ONE flash —
+constraining WS2's delivery. FLASHING CONSTRAINT (R8.5): the FIVE queued firmware changes (WS2.0
+servo_param, WS3.1 counter, RSTEP raw=/tgt= split, align_bias_us range check, and 'Render phase'
+restored to DEBUG on both boards — R9.5: without it WS1.1's decisive experiment has no phase
+column to record, phase_a/b being honestly blank on 0 of 32 935 rows) ship as ONE flash —
 CLAUDE.md's measured rule: reflashes are the operator's dominant disturbance, and four separate
 flashes would destroy exactly the clean windows WS0 hunts.
 
@@ -1548,11 +1554,160 @@ same-EWMA-smoothed wire.
 
 ## WS3.4 first result (2026-08-30 23:37 — corr(fs_diff, trim_diff), new columns' first product)
 
-corr = **−0.992** over 37×30 s segments (n=13 124 rows, rival-gated, |offset|<500 µs). The sign is
-the plant identity (trim opposes crystal error: fs ≈ crystal − trim, crystal stable at sd
-0.13–0.17), so r² ≈ 0.98 says the achieved-rate variation in this window was overwhelmingly
-COMMANDED — the actuator delivers faithfully, and the rate wander is the loop's own output.
-Caveat before the fork is declared: the window contained the 23:35 hole, so fs_diff sd ran 2.7 ppm
-(~8× the quiet plateau's 0.33) — this measures the big commanded excursions, not yet the quiet-hour
-plateau component. A clean-window repeat (tighter gates, hole-free) is queued; if it holds,
-"commanded" stands and the tau_s sweep is the next bench experiment per WS3.4's order.
+corr = −0.992 over 37×30 s segments — WITHDRAWN AS EVIDENCE (R9.1): in closed loop
+fs = d + trim with trim ≈ −G·d forces corr(fs, trim) → −1 whatever the actuator does; a command
+anticorrelated with its own plant output is the feedback identity, not actuator fidelity, and the
+R6.3 dichotomy that framed the experiment was too loose. The sign story is also corrected: the
+plant is fs ≈ crystal + trim (set_trim_ppm: positive = play faster); the minus sign is the loop's,
+not the plant's — a wrong sign story on record is exactly how an inverted actuator gets waved
+through. The number stands only as a feedback-identity observation (sd(d)=13.8 ppm > either input
+is the same arithmetic). THE DISCRIMINATING TEST (R9.3) is spectral: SF of the implied disturbance
+d = fs_diff − trim_diff beside SF of trim_diff at τ = 5/10/30/60 s on a hole-free window — d slow
+while trim_diff carries the broadband component ⇒ the loop generates the wander ⇒ tau_s sweep; d
+broadband ⇒ downstream (rate-lock delivery / driver / fs estimator) ⇒ sweep reads null.
+Instrument floor stated beside any such result (R9.2): per-board per-capture fs noise is
+1.6–2.0 ppm, so even 30 s means carry ~0.2 ppm of estimator noise against a 0.33 ppm signal —
+row-level correlations on quiet windows read ~0 by construction and must not be scored as
+"downstream". (The queued clean repeat already aggregates to 30 s means; its output is read under
+these caveats and superseded by SF_d.)
+
+---
+
+## REVIEW 9 (2026-08-31, RESPONSE 7+8 and the WS3.4 first result)
+
+Body contradictions are purged; the four script fixes are in. R7.1's prefix reader, R7.2's
+parameterised `host_ref`, R7.3's `(st_dev, st_ino)` identity and R7.4's arity all read correctly
+(`state` is normalised at `:988`, so the new `state.get("_ident")` cannot fault on the first call).
+One of the four has a regression, and the WS3.4 result needs its inference withdrawn.
+
+### R9.1 — The correlation experiment cannot answer the question, and the framing was mine
+
+**I got R6.3 wrong and the result inherits the error.** In closed loop the achieved rate is
+`fs = d + trim` and the loop commands `trim ≈ −G·d`, so `fs = d(1−G)` and `corr(fs, trim) → −1`
+*whatever the actuator does*. A strong negative correlation between a command and its own plant
+output is an identity of feedback, not evidence of fidelity. So `r² ≈ 0.98` does **not** license
+"the actuator delivers faithfully, and the rate wander is the loop's own output". Withdraw that
+sentence; the measurement is fine, the inference is not, and it is my R6.3 dichotomy
+("correlated ⇒ commanded / uncorrelated ⇒ downstream") that was too loose.
+
+**The sign story is also wrong, though the number is not.** Measured on the new-schema `test.csv`
+(14 099 rival-gated rows with both boards, 21 min), with B−A on *both* sides:
+
+```
+  fs_diff (B−A)    med −0.077  sd 7.064 ppm
+  trim_diff (B−A)  med −4.780  sd 7.292 ppm
+  corr(fs_diff, trim_diff) = −0.851
+```
+
+The plan explains the negative sign as "the plant identity (trim opposes crystal error:
+fs ≈ crystal − trim)". That identity is backwards: `set_trim_ppm()`'s contract is *positive = play
+faster*, so the plant is `fs ≈ crystal + trim`. The minus sign comes from the feedback loop, not
+from the plant. Leave a wrong sign story in place and an actually-inverted actuator is exactly what
+gets waved through — record the mechanism correctly.
+
+### R9.2 — The queued clean-window repeat will be read backwards, for instrument reasons
+
+Per-capture frequency noise is **≈1.6–2.0 ppm per board** (`fs_a_hz` sd 0.090 Hz, `fs_b_hz` 0.070 Hz
+over a quiet 15-min window). The quiet-hour signal WS3.4 is chasing is **0.33 ppm at 30 s**. So a
+row-level `corr(fs_diff, trim_diff)` on a hole-free window is ~0 *by construction* — and the plan's
+dichotomy scores "uncorrelated" as "downstream of the command", i.e. the instrument noise floor
+would be reported as a mechanism.
+
+Before the repeat: aggregate both series to **≥30 s means** (which is where the 0.33 ppm figure was
+measured in the first place), and state the estimator floor beside the result. The current 21-min
+window's r = −0.85 survives only because the excursion it contains is ~7 ppm — 4× the noise and 20×
+the quiet signal.
+
+### R9.3 — The test that does discriminate is the residual's structure function
+
+`d = fs_diff − trim_diff` is the implied disturbance — what the differential rate would be at zero
+trim. The question WS3.4 actually needs is spectral, not correlational: **does `d` carry the
+broadband 0.33 ppm component at τ ≤ 30 s, or is `d` slow while `trim_diff` carries it?**
+
+* `d` slow, `trim_diff` broadband ⇒ the loop is *generating* the wander ⇒ tau_s/ti_s is the lever
+  and the sweep is right.
+* `d` broadband ⇒ the wander enters downstream of the command (rate-lock delivery, driver, or the
+  fs estimator) ⇒ the sweep reads null.
+
+In the present window `sd(d) = 13.8 ppm`, *larger than either input* (7.06 and 7.29) — which is what
+strong anticorrelation forces arithmetically, and is one more sign that the correlation is measuring
+the feedback identity rather than the plant. Compute SF_d(τ) at 5/10/30 s beside SF_fs(τ) on a
+hole-free window and the answer is unambiguous.
+
+### R9.4 — New, and it closes WS3.2: the TSF crystal difference is 2.6 ppm wrong in the differential
+
+The loops' own trims give the true differential crystal directly. With the wire stable
+(`fs_diff` median −0.077 ppm ⇒ no differential drift), `c_A + trim_A = c_B + trim_B`, so
+
+```
+  true (rate_B − rate_A) at zero trim  =  trim_A − trim_B  =  −med(trim_diff)  =  +4.78 ppm
+  learned integrals agree:              −med(int_diff)     =  +4.88 ppm   (sd 0.265 — very stable)
+```
+
+The TSF-derived signal says something else. `crystal_ppm` is `d(tsf − local)/dt`, so
+`crystal_B − crystal_A = −(rate_B − rate_A)`; measured `med(crystal_diff B−A) = −7.37 ppm`
+(sd 0.623) ⇒ **+7.37 ppm**. Same sign as the loops — I checked that twice, the convention inverts
+it — but **2.6 ppm apart**, against a budget of 0.017 ppm (±0.5 µs over 30 s). That is **150×**.
+
+This is the measured answer to R2.5's outstanding "is the ~14 ppm offset common-mode?" question:
+**it is not** — 2.6 ppm of it survives into the differential, which is the only component a
+differential feed-forward would apply. WS3.2 can be closed rather than left as a measurement item:
+a crystal feed-forward built on this signal would inject 2.6 ppm of differential error into a loop
+whose integral already learns the right number to 0.1 ppm.
+
+### R9.5 — WS1's decisive experiment currently has no signal to record
+
+`phase_a_us` / `phase_b_us` are **0 of 32 935 rows** on the new file — the honest blank R6.1 asked
+for, but RESPONSE 7 notes the source line is now VERBOSE, so nothing is emitted. WS1.1 says "record
+what FRACTION the pairwise phases and gd report"; there is presently no phase column to record it
+in. Put `Render phase` back at DEBUG on **both** boards as part of R8.5's single flash, or WS1's
+decisive experiment cannot be graded when it runs.
+
+Also worth a line: `dl_diff_us` pairs on only **42.6 %** of rows (both boards within tolerance),
+against `dl_err_a` 52.3 % and `dl_err_b` 53.6 %. Any statistic taken on `dl_diff` is conditioned on
+both boards having logged within 0.7 s, which is not a random subset.
+
+### R9.6 — R7.1's fix regressed `--append`
+
+`load_existing` now *warns* on a prefix header and returns, but it is called from the append path
+too (`:4203`), which then does `log = open(args.out, "a")` with `new = False` — so no new header is
+written and **24-field rows go into a 20-field file**. The old hard exit was wrong for replot and
+right for append; the fix removed it for both.
+
+Consequence is silent: a `DictReader` on the 20-column header puts fields 19–23 into `restkey`, so
+`reason` becomes unreadable by name while positional readers get `trim_a_ppm` where `reason` was.
+Add the flag — `load_existing(path, for_append=False)`, hard-exit on a prefix header only when
+appending — which is the two-line version of what the warning already says ("prefer a fresh
+`--out`").
+
+---
+
+## RESPONSE 9 (2026-08-31; inference withdrawn, WS3.2 closed, code regression fixed)
+
+**R9.1 — ACCEPTED in full, including the reviewer's own retraction of R6.3's dichotomy.** The
+−0.992 is the feedback identity (fs = d(1−G) forces corr → −1); "actuator delivers faithfully /
+wander is the loop's own output" is WITHDRAWN in the body, and the sign story corrected to the real
+plant (fs ≈ crystal + trim, positive = faster; the minus is the loop's). The measurement stands
+only as an identity observation.
+
+**R9.2 — ACCEPTED with one factual note**: the queued repeat already aggregates to 30 s means, so
+it is not row-level — but even at 30 s means the estimator noise (~0.2 ppm) sits against a 0.33 ppm
+signal, so the floor is now stated beside any result and "~0 on a quiet window" is never scored as
+"downstream".
+
+**R9.3 — ACCEPTED; SF_d replaces correlation as WS3.4's discriminating test** (d = fs_diff −
+trim_diff at τ = 5/10/30/60 s beside SF of trim_diff; a hole-free-window job is queued). sd(d) >
+either input in the present window is noted as the same feedback arithmetic.
+
+**R9.4 — ACCEPTED; WS3.2 is CLOSED, not demoted.** The loop-derived differential (+4.78 trims /
++4.88 integrals, sd 0.265) vs TSF (+7.37, sd 0.623): 2.6 ppm survives into the differential —
+150× the budget — answering R2.5's common-mode question in the negative. No feed-forward on the
+TSF signal, ever; the integral already learns the truth to 0.1 ppm.
+
+**R9.5 — ACCEPTED**: 'Render phase' back at DEBUG on both boards is item five of the single flash
+(WS1.1 has no phase column to grade without it); the dl_diff 42.6 % pairing-conditioning is on the
+record — statistics on dl_diff are conditioned on both boards logging within 0.7 s.
+
+**R9.6 — ACCEPTED, shipped**: `load_existing(path, for_append=False)`; prefix headers hard-stop on
+append (mixing 24-field rows into a 20-field file shunts the tail into restkey), read-only paths
+keep the R7.1 acceptance. Syntax-checked.

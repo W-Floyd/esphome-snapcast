@@ -2725,7 +2725,7 @@ def load_rates(path):
     return ra, rb
 
 
-def load_existing(path):
+def load_existing(path, for_append=False):
     """Rows from a previous run, but only if the file is really ours.
 
     Returns (elapsed, offsets_ns, anchor) where anchor is the wall-clock time that
@@ -2774,6 +2774,12 @@ def load_existing(path):
         new_cols = SCHEMA.split(",")
         old_body = [c for c in old_cols if c != "reason"]
         if old_body == new_cols[: len(old_body)]:
+            if for_append:
+                # R9.6: reading a prefix header is fine; APPENDING to one writes 24-field rows
+                # into a 20-field file -- DictReader shunts the tail into restkey and positional
+                # readers get trim_a_ppm where reason was. Hard stop, as before the R7.1 fix.
+                sys.exit(f"{path} has an older column layout; appending would mix row widths.\n"
+                         f"Pass a fresh --out (or drop --append to replace it).")
             print(f"  {path}: older schema ({len(old_cols)} cols); absent columns read as "
                   f"absent. Appending will MIX ROW WIDTHS -- prefer a fresh --out.")
         else:
@@ -4200,7 +4206,7 @@ def main():
 
     ts, ys, anchor = [], [], None
     if args.append:
-        ts, ys, anchor = load_existing(args.out)
+        ts, ys, anchor = load_existing(args.out, for_append=True)
         if ts:
             gap = time.time() - (anchor + ts[-1]) if anchor else float("nan")
             print(f"appending to {len(ts)} existing rows in {args.out}; continuing that "
