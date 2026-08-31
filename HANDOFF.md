@@ -650,3 +650,18 @@ the analyzer's ~100 s blindness after an I2S restart; the observer's own bailout
   read zero); the hard-resync tag door is now the critical path (~3.4 s) and could go frame-exact
   like pend; the group delta under-reads the physical differential ~3–5× in tails (phase pairing /
   extrapolation — unexplained, the wire and err_tag agree with each other).
+
+## Builds 82–83 and the 18:53 regime change (2026-08-30 evening)
+
+The <10 s result above held only until the server's holes changed class at ~18:53: bursts of 964 ms
+to 6.3 s of lateness every few minutes (observer bailouts 17:50 / 18:57 / 19:02 / 19:19). Under
+those, every refill plants a tag/ledger split (tags+wire see early audio, ledger reads ~0) and the
+window's tag steps then fight an unattributed per-chunk drop actor in a stable ~10 s limit cycle;
+TAGFAULT→reconnect used to heal it, but a reconnect's own refill burst plants the next split (A
+looped through 3 TAGFAULTs; broken by a reboot). Two machinery defects found and fixed on the way:
+82 made ledger steps subtract in-flight corrections (the 18:54 seven-step storm), and its err−pend
+arithmetic was itself unstable at boot — 83 replaced it with serial step-and-verify (never step
+while a step is in flight; frame-exact landing test). B rode the same regime settled at +35 µs.
+State at 19:26: both boards settled on 83, injections stopped, PLAN carries the standing decisions:
+actor-tagged corrected counters first, then revisit re-arming the split repair on large persistent
+disagreement; the jumbo holes themselves are server-side (buffer 2000→4000 / the Pi).
