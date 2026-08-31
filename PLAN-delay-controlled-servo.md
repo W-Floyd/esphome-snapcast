@@ -2880,3 +2880,19 @@ boost_err = min(|e|, |gd|·n/(n−1)), |e| when gd unknown. Mechanism and eviden
 differential = the ±30–50 µs teeth). **Prediction:** during common wander (e ~200 µs, gd tens) kp
 stays ≤ ~0.02 and the teeth vanish from the 15-s medians; post-event tails (gd ≈ e) keep the fast
 decay, so injection recoveries stay ≤ ~14 s; boot (gd unknown) unchanged.
+
+### 2026-08-30 21:45 — goal sharpened by the user: mean 0 µs, max p2p 1 µs
+
+p2p ≤ 1 µs = every sample within ±0.5 µs. Consequences, beyond the <1 µs roadmap:
+* Steady state must be PURE RATE control — one frame = 22.7 µs, so any steer trim/splice blows the
+  budget 20×. (Quiet hours already show corrected −0/+0; becomes an invariant to enforce.)
+* "Max" is definable only over quiet windows unless the server holes are eliminated (one hole = ms).
+* The fine loop must act on 10–30 s averages (block noise ~9 µs), which requires differential rate
+  ≤ ~0.05 ppm BETWEEN corrections → the beaconed crystal feed-forward (existing; measured residual
+  0.17 ppm over 100 s) needs a ~3× tightening, and the dithered divider's own ripple must be
+  measured on the wire before trusting it at 0.1 ppm scale.
+Queue addition: quiet-hour wire histogram of the current rate-lock-only regime — decomposes today's
+±3–8 µs into rate ripple vs measurement noise, i.e. how far the actuator alone is from 1 µs.
+Boot ring (build-88 era): full-gain tag steps vs a straddling average at boot, r≈1.75 → factor
+0.75/round → 45 s. A/B queued: resync_gain 0.6 (|1−0.6·1.75|≈0.05, one round; costs ~one round on
+clean tails).
