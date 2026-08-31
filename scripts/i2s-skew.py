@@ -4215,16 +4215,31 @@ def main():
         log = open(args.out, "a", buffering=1)
     else:
         prev = load_existing(args.out)[0] if os.path.exists(args.out) else []
-        if prev:
-            # ARCHIVE BEFORE TRUNCATING (R11.3): a manual archive can only catch whatever fragment
-            # happens to be current -- two captures' raw data were lost tonight to exactly this
-            # open("w"). Rename is atomic and free; the dated file is the archive.
+        if os.path.exists(args.out) and os.path.getsize(args.out) > 0:
+            # ARCHIVE BEFORE TRUNCATING (R11.3, hardened R12.3): a manual archive can only catch
+            # whatever fragment happens to be current -- two captures' raw data were lost tonight
+            # to exactly this open("w"). Rename is atomic and free. Gated on the file existing,
+            # not on rows having PARSED (an unparseable file still deserves the archive).
             stamp = time.strftime("%Y%m%d-%H%M%S")
             root, ext = os.path.splitext(args.out)
             keep = f"{root}-{stamp}{ext or '.csv'}"
+            n_c = 0
+            while os.path.exists(keep):     # never silently overwrite an archive (same-second restarts)
+                n_c += 1
+                keep = f"{root}-{stamp}-{n_c}{ext or '.csv'}"
             os.replace(args.out, keep)
             print(f"replacing {args.out} ({len(prev)} rows from a previous run; "
                   f"archived to {keep})")
+            # RETENTION: keep the newest 5 archives for this root; a 105 MB csv times unbounded
+            # restarts fills the disk, and a full disk kills the capture mid-window, silently.
+            import glob
+            olds = sorted(glob.glob(f"{root}-2*{ext or '.csv'}"), key=os.path.getmtime)
+            for stale in olds[:-5]:
+                try:
+                    os.remove(stale)
+                    print(f"  retention: removed old archive {stale}")
+                except OSError:
+                    pass
         new = True
         log = open(args.out, "w", buffering=1)
     if new:

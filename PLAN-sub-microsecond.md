@@ -81,12 +81,15 @@ line, 34 s recovery); injection convergence ≤ ~14 s. SF baseline (build 88, R5
   (~±30 % relative) — the SE ≤ 0.1 µs condition is INDICATIVE at six blocks and binding only when
   computed over ≥ 20 blocks. Every quoted baseline carries its capture configuration
   (rows/s and --samples) the way rival is already mandatory — the row rate silently sets
-  every n-dependent number in this file. ARCHIVE RULE (R10.1): cp test.csv to a dated name
-  before any analyser restart; test.csv was recreated twice tonight and the raw files behind
-  R5.2/R6.2 no longer exist under that name.
+  every n-dependent number in this file. ARCHIVE RULE (R10.1 → R11.3/R12.4): the analyser itself
+  archives on restart (dated rename before open("w"), `ba18638`) — NO manual step; the manual rule
+  demonstrated its failure mode the night it was written (the raw files behind R5.2/R6.2 were lost
+  to it).
 
-## WS1 — Render-tag truth (blocks WS2 and the honesty gates — not everything; see Order for what
-## runs before it) (retitled per R8.5)
+## WS1 — Render-tag truth
+
+Scope (R8.5/R12.5): blocks WS2 and the honesty gates — not everything; see Order for what runs
+before it.
 
 Evidence: phases/tags under-measure real differentials ~8× (20:36: wire −1.5 ms rival-clean,
 pairwise beacon phases ≤ 0.2 ms). SOURCE, per R6.1's challenge: the phase side came from the
@@ -124,10 +127,13 @@ sharing the deadline+tag stamping, so none can see what the wire sees.
    (GDAVG n = 1.1/s against 50 pkt/s; 16/s existed only in the build-85 unicast era). A ratio at one
    rate cannot separate the loss models (p = 0.02 and a ~1 pkt/s cap both explain it); the models
    differ in how delivery responds to RATE. Make `PHASE_TX_INTERVAL_US` a servo_param and sweep
-   5/10/25/50 Hz for a minute each, plotting delivered pkt/s (sent-vs-received counters, one log
-   line each side). Flat ⇒ rate cap ⇒ batching wins ~10× and WS2.1 is worth building. Linear in
-   send rate ⇒ probabilistic ⇒ batching wins nothing and the unicast question is the only path.
-   One tunable, five minutes, decides the workstream. No WS2 build work before this.
+   5/10/25/50 Hz for a minute each; the delivered rate is read from the EXISTING `GDAVG n=` line
+   (R12.2 — own samples arrive at ~94 Hz so essentially every arriving peer sample pairs, making n
+   a delivered-packet counter; it is the same series R2.1's table was built from). Sent rate is the
+   swept parameter itself. NO new counters, no sixth flash item. Flat n vs send rate ⇒ rate cap ⇒
+   batching wins ~10× and WS2.1 is worth building. Linear ⇒ probabilistic ⇒ batching wins nothing
+   and the unicast question is the only path. One tunable, five minutes, decides the workstream.
+   No WS2 build work before this.
 1. **WS2's actual blocker (R2.1.3)**: the only regime that ever produced a usable reference
    (n≈16/s) is the one that displaced audio 1.5 ms. The task is "recover build 85's delivery
    without its damage" — the unicast displacement mechanism (per-destination blocking / ARP path /
@@ -233,6 +239,10 @@ range check, and item five REVISED: the render-phase delta emitted from the PLAY
 same format as the snap_net original (which STAYS VERBOSE — it sat on the stack of the 07:51
 logger-ring crash; this is the Crystal-line precedent, not a re-levelling) — because separate
 flashes destroy the clean windows WS0 hunts (CLAUDE.md's measured reflash cost).
+FLASH PROTOCOL (R12.1): after the OTA, verify `device_info` compilation_time on BOTH boards over
+the API before anything is graded — a silent rollback under five changes presents as five
+independent null results — then HANDS OFF for ≥ 15 minutes before any window counts (the
+membership-change disturbance, generalized from R1.8).
 CRITICAL PATH: WS1 (honest measurement; gates WS2) and WS3.4 (the SF plateau, owner unknown —
 SF_d decides loop-generated vs downstream, then the tau_s sweep only if loop-generated).
 THE PLAN'S CENTRAL SIZING FACT (R6.2): holding ±0.5 µs against 0.33 ppm of differential rate noise
@@ -1952,3 +1962,117 @@ feedback identity (no inference drawn). The number worth carrying: **the loop co
 differential trim per 30 s segment in QUIET steady state** (~4× the 0.33 ppm wire-slope figure;
 estimator SEM ~0.04–0.26 ppm depending on row-rate mix across the 23:41 restart). Attribution still
 waits on SF_d.
+
+---
+
+## REVIEW 12 (2026-08-31, RESPONSE 11)
+
+The archive fix is shipped at the right place — inside the analyser, before `open("w")`, atomic
+rename — and the DoD's two statistics now carry their own units. Flash item five is correctly
+revised. Five things left, two of which are about the flash itself, which is now the plan's single
+highest-stakes action.
+
+### R12.1 — The single flash has no verification step and no quarantine
+
+Everything downstream is graded against one flash carrying five changes. CLAUDE.md records what
+happens when that goes unverified:
+
+> A replug 40 s after an OTA reboot rolled both boards back to the previous firmware while the OTA
+> log said "successful"; a persist gate then "did not work" for a whole build because the build was
+> not running. `device_info`'s `compilation_time` is the witness.
+
+The flash paragraph says what ships and why it ships together. It does not say **verify
+`compilation_time` on both boards over the API before anything is graded** — and with five changes
+riding on it, a silent rollback would invalidate WS0's re-take, WS2.0's sweep, WS3.1's counter and
+WS1.1's phase column at once, presenting as five independent null results.
+
+Second: no post-flash quarantine is stated in Order. R1.8 established ≥ 15 min (membership-change
+disturbance: |median error| 154 µs vs 93 µs within 15 s, p90 674 vs 286) but only for the baseline
+re-take. Make it general — **flash, verify both boards' compilation_time, then hands off for ≥ 15 min
+before any window counts.**
+
+### R12.2 — WS2.0 needs a sixth firmware change that is not in the flash, and does not need it
+
+WS2.0 asks for "delivered pkt/s (**sent-vs-received counters, one log line each side**)". Those
+counters do not exist; the flash list has five items and this is not one of them. So as written,
+WS2.0 either cannot run after the flash or forces a sixth change into it.
+
+It is not needed. Both quantities are already available:
+
+* **Sent rate** is the swept parameter itself — `1 / PHASE_TX_INTERVAL_US`, known exactly at each
+  step of the sweep.
+* **Received rate** is `GDAVG n=`, already logged (`tsf_sync.cpp:691`, every third 1 s roll). It
+  counts pairs, and the code's own note says own samples arrive at ~94 Hz so essentially every
+  arriving peer sample pairs — which makes `n` a delivered-packet counter for this purpose, and it
+  is exactly the series R2.1's 1.1/s-vs-16/s table was built from.
+
+So WS2.0 reduces to: sweep the servo_param, read `GDAVG n=`, plot n against send rate. Flat ⇒ rate
+cap; linear ⇒ probabilistic. **One tunable, no new counters, no sixth flash item** — and the
+measurement is then continuous with the evidence that motivated it, rather than a new instrument
+introduced at the moment of the test.
+
+### R12.3 — The archive fix is right, but has no retention bound
+
+`os.replace(args.out, keep)` before `open("w")` is the correct point and the correct primitive.
+Three gaps, in order:
+
+1. **No retention policy.** `test.csv` reached **105 MB** earlier today, and the analyser restarted
+   at least three times tonight. Unbounded dated copies fill the disk, and a full disk kills the
+   capture — silently, in the middle of the overnight window the DoD depends on. Keep the newest N
+   (or cap total archive bytes) and say so where the rule is documented.
+2. **Silent collision.** `%Y%m%d-%H%M%S` has one-second resolution and `os.replace` overwrites
+   without complaint, so two restarts inside a second lose the first archive — the same silent-loss
+   class the fix exists to end. Append a counter, or refuse to overwrite an existing archive name.
+3. **Archiving is conditional on `prev` being non-empty**, i.e. on rows having parsed. A file whose
+   header is a readable prefix but whose rows fail to parse is still truncated unarchived. Narrow,
+   but the guard costs an `os.path.exists`.
+
+### R12.4 — The DoD still prescribes the manual rule the analyser now implements
+
+The DoD closes with: *"ARCHIVE RULE (R10.1): **cp test.csv to a dated name before any analyser
+restart**"*. R11.3 replaced that with the in-analyser rename precisely because the manual rule
+"polls too late by construction" — RESPONSE 11's own words. Leaving the manual instruction in the
+gate definition invites someone to rely on it. Replace with "the analyser archives on restart
+(`ba18638`); no manual step".
+
+This is the same pattern as R8.2/R10.2: the correction lands in the response and in one part of the
+body, and the operative instruction elsewhere still says the old thing. It has now happened in four
+consecutive rounds — worth a mechanical check (grep the body for the retired phrase) as part of each
+response, which RESPONSE 10 did once and RESPONSE 11 did not.
+
+### R12.5 — WS1's heading is split across two heading lines
+
+```
+## WS1 — Render-tag truth (blocks WS2 and the honesty gates — not everything; see Order for what
+## runs before it) (retitled per R8.5)
+```
+
+Line 89 starts with `##`, so it renders as a second section titled "runs before it) (retitled per
+R8.5)" and any table of contents gains a phantom entry between WS1 and WS2. Join them, and move the
+parenthetical to the body — the title is doing three jobs (name, scope, changelog) and only the
+first belongs in a heading.
+
+---
+
+## RESPONSE 12 (2026-08-31; amendments in body + analyser; body grep-swept this round and every round hereafter)
+
+**R12.1 — ACCEPTED**: the flash paragraph now carries the protocol — compilation_time verified on
+both boards over the API before anything is graded (a silent rollback under five changes = five
+fake null results), then hands-off ≥ 15 min before any window counts.
+
+**R12.2 — ACCEPTED, and it improves the experiment**: WS2.0 reads delivery from the existing
+`GDAVG n=` series — the same series the motivating evidence came from — sent rate being the swept
+parameter itself. No new counters; the flash stays at five items.
+
+**R12.3 — ACCEPTED, all three, shipped**: retention keeps the newest 5 archives per root (a 105 MB
+csv × unbounded restarts fills the disk and kills the capture silently); same-second collisions get
+a counter suffix instead of a silent overwrite; archiving is gated on the file existing, not on
+rows having parsed. Syntax-checked.
+
+**R12.4 — ACCEPTED**: the DoD's manual-archive instruction is replaced by "the analyser archives on
+restart; no manual step". The four-rounds-running pattern is answered mechanically: the body (above
+REVIEW 1) is grep-swept for retired phrases as part of this and every future response — this
+round's sweep is clean.
+
+**R12.5 — ACCEPTED**: WS1's heading is one line; scope moved to the body; the changelog parenthetical
+gone from the title.
