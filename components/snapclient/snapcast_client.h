@@ -1164,8 +1164,9 @@ class SnapcastClient {
   ErrorView active_error(const ServoState &st) const;
   /// St3b. One visibility horizon: how long until a correction shows up in the measurement.
   /// Replaces the five independent encodings (blank_ms / resync_blank_ms / travel_horizon /
-  /// PHASE_TRANSIENT_US); see the definition.
-  int64_t visibility_horizon_us() const;
+  /// PHASE_TRANSIENT_US). @p clamp_us is the caller's per-use floor (0 = the unclamped live
+  /// travel value).
+  int64_t visibility_horizon_us(int64_t clamp_us = 0) const;
 
   /// St4. One position arbiter: given ErrorView + gates + pending-motion ledger, returns the
   /// frames to move this chunk. Hard resync / window step / splice / bang-bang become four

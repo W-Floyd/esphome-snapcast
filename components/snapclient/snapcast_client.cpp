@@ -1293,9 +1293,8 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
       // ring-of-old-deadline audio as a hard resync (A TAGFAULTed +11.8 ms through this path at
       // 16:59:21 with the resync-path blank already fixed).
       this->dl_blank_until_us_ =
-          timestamp_us +
-          std::max<int64_t>(static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000,
-                            this->travel_horizon_us_());
+          timestamp_us + this->visibility_horizon_us(
+                             static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000);
       this->dl_acc_n_ = 0;
       this->dl_acc_sum_us_ = 0.0;
     }
@@ -4203,7 +4202,8 @@ void SnapcastClient::rebaseline_after_starvation_(ServoState &st, const ChunkRec
       // The reseed moves the prediction the tag anchor extrapolates from; tags rendering pre-drain
       // audio for the next ring travel read the displacement (A, 16:59:05: err_tag +16.6 ms vs
       // ledger +6.6 five seconds after this line ran). Blank them for the same horizon as a step.
-      this->dl_blank_until_us_ = std::max(this->dl_blank_until_us_, now_us() + this->travel_horizon_us_());
+      this->dl_blank_until_us_ = std::max(
+          this->dl_blank_until_us_, now_us() + this->visibility_horizon_us());
       this->fb_samples_ = 0;
       // The counters just jumped; anything remembered against them is now meaningless. Seed the
       // histories at this instant so the next reading has something honest to compare against.
@@ -4514,12 +4514,19 @@ ErrorView SnapcastClient::active_error(const ServoState &st) const {
 }
 
 // St3b. ONE VISIBILITY HORIZON. "How long until a correction shows up in the measurement" was
-// encoded five ways (blank_ms, resync_blank_ms, the per-chunk ring+pipeline+2*block, travel_horizon_us_,
-// PHASE_TRANSIENT_US). Those are the same physical quantity from the same inputs with different
-// clamps; this is the single source they all derive from.
-int64_t SnapcastClient::visibility_horizon_us() const {
+// encoded five ways: blank_ms (500 ms), resync_blank_ms (1200 ms), the per-chunk computed
+// ring + pipeline + 2*block (the resync-window judging blank), travel_horizon_us_ (the live
+// travel value, clamped 1-5 s), and the flat PHASE_TRANSIENT_US (4 s). Four of the five are the
+// same physical quantity -- how long a position change or deadline step takes to reach the tags --
+// with different clamps. This is the single source they all derive from.
+//
+// @param clamp_us  the caller's per-use clamp (blank_ms / resync_blank_ms / PHASE_TRANSIENT_US),
+//                  0 for the unclamped live travel value. Returns max(computed, clamp) so a clamp
+//                  that must sit ABOVE the travel is honored exactly as each call site did.
+int64_t SnapcastClient::visibility_horizon_us(int64_t clamp_us) const {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
-  return this->travel_horizon_us_();
+  const int64_t travel = this->travel_horizon_us_();
+  return clamp_us > 0 ? std::max<int64_t>(clamp_us, travel) : travel;
 #else
   return PHASE_TRANSIENT_US;
 #endif
@@ -5268,8 +5275,8 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
   // reconnect followed -- five times on B alone, 2026-08-30 14:26-14:55. PHASE_TRANSIENT_US is the
   // same measured horizon the beacon quieting uses.
   this->dl_blank_until_us_ =
-      now + std::max<int64_t>(static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000,
-                              this->travel_horizon_us_());
+      now + this->visibility_horizon_us(
+                static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000);
   this->dl_acc_n_ = 0;
   this->dl_acc_sum_us_ = 0.0;
   this->playout_mutex_.unlock();
