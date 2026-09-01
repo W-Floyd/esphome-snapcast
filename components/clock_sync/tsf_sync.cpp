@@ -1013,6 +1013,7 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
   if (mine == RENDER_PHASE_UNKNOWN) {
     this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
+    this->group_delta_n_.store(0, std::memory_order_relaxed);
     return;
   }
   // PAIR ONLY PHASES SAMPLED AT ROUGHLY THE SAME INSTANT. These are absolute TSF-vs-server
@@ -1030,6 +1031,13 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   double vals[MAX_PEERS + 1];
   size_t n = 0;
   vals[n++] = 0.0;  // differenced against our own phase, so the doubles carry us of spread
+  // STAGE 1 GDIN shadow: the pairing inputs of the MOST RECENT paired peer -- the raw pairwise
+  // difference BEFORE self-inclusion (the un-halved quantity the analyser can grade against the
+  // wire), the pairing gap, and the drift extrapolation. Shadow-only: nothing here steers. The
+  // plan's pass condition is raw tracks the rival-clean wire at slope 1.0 +-0.15; gd (the halved
+  // control-path delta) is logged beside it so the two are never confused.
+  int64_t gdin_raw = 0, gdin_gap = 0, gdin_n = 0;
+  double gdin_drift = 0.0, gdin_extrap = 0.0;
   for (size_t i = 0; i < MAX_PEERS && n < MAX_PEERS + 1; i++) {
     if (!this->peer_[i].used || this->peer_[i].phase_us == RENDER_PHASE_UNKNOWN ||
         local_now_us - this->peer_[i].phase_seen_us > PHASE_STALE_US) {
@@ -1043,8 +1051,15 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
     // (~41 ppm here), so a sample pair_gap older reads earlier by drift x gap. Measured 2026-08-30 13:25
     // without this: each board read the other ~18 us LATER (A: d=+16, B: d=+20 at ages 0.8-1.5 s) -- a
     // common-mode bias the re-centring absorbed but that inflated every delta.
-    vals[n++] = static_cast<double>(this->peer_[i].phase_us - mine) -
-                static_cast<double>(this->map_drift_ppm_) * 1e-6 * static_cast<double>(pair_gap);
+    vals[n] = static_cast<double>(this->peer_[i].phase_us - mine) -
+              static_cast<double>(this->map_drift_ppm_) * 1e-6 * static_cast<double>(pair_gap);
+    // Keep the freshest pairing's inputs for GDIN (the last scanned peer that paired).
+    gdin_raw = this->peer_[i].phase_us - mine;
+    gdin_gap = pair_gap;
+    gdin_drift = this->map_drift_ppm_;
+    gdin_extrap = static_cast<double>(this->map_drift_ppm_) * 1e-6 * static_cast<double>(pair_gap);
+    gdin_n = static_cast<int64_t>(n) + 1;  // self + peers so far, matching the n used for the delta
+    n++;
   }
   if (n < 2) {
     // No peer paired closely enough THIS time. Keep the last valid delta rather than reporting
@@ -1063,9 +1078,18 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
       static_cast<int32_t>(std::max<int64_t>(INT32_MIN + 1, std::min<int64_t>(INT32_MAX, d)));
   this->render_group_delta_us_.store(d_clamped, std::memory_order_relaxed);
   this->group_delta_at_us_ = local_now_us;
+  this->group_delta_n_.store(static_cast<uint8_t>(n), std::memory_order_relaxed);
   // Held copy: same value, never aged out here. See render_group_delta_held_us().
   this->group_delta_held_us_.store(d_clamped, std::memory_order_relaxed);
   this->group_delta_held_at_us_.store(local_now_us, std::memory_order_relaxed);
+  // SHADOW GDIN (~1/s on the network task): the raw pairwise difference (un-halved, pre-mean)
+  // beside the control-path halved delta, so Stage 1 can grade raw against the analyser's wire.
+  // Short, fixed fields; names first, numeric tail last -- a truncation hits t= and not a name.
+  if (gdin_n > 0 && local_now_us - this->last_gdin_log_us_ >= 1000000) {
+    this->last_gdin_log_us_ = local_now_us;
+    ESP_LOGV(TAG, "GDIN raw=%+" PRId64 " gd=%+" PRId64 " n=%" PRId64 " gap=%+" PRId64 " drift=%+.2f extrap=%+.2f t=%" PRId64,
+             gdin_raw, d, gdin_n, gdin_gap, gdin_drift, gdin_extrap, local_now_us);
+  }
 }
 
 // GROUP-RELATIVE DIAGNOSTICS. Depth, crystal rate and render phase against the MEAN of the peers

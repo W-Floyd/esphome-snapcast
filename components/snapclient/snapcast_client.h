@@ -46,6 +46,35 @@ using i2s_rate_lock::RateLock;
 using clock_sync::TsfSync;
 #endif
 
+/// @brief The three physical error classes that the v2 architecture assigns one actuator per row:
+/// Rate — frequency drift between the two DACs (~0.33 ppm differential)
+/// Step — a displacement: join, refill, hard resync, timebase adoption
+/// Bias — my idea of the group's timeline is biased relative to the wire
+enum class ErrClass { Rate, Step, Bias, None };
+
+/// @brief The three error sources: Tag (tag-derived render phase), Ledger (deadline loop error),
+/// or None (no differential evidence). One owner per row.
+enum class ErrSource { Tag, Ledger, None };
+
+/// @brief A view of the currently active error, classified by source and class.
+/// Emitted by active_error() — one selector, one place.
+struct ErrorView {
+  int64_t us;
+  ErrSource src;
+  int64_t age_us;
+  bool trusted;
+  ErrClass cls;
+};
+
+/// @brief How long until a correction shows up in the measurement". See the cpp for the single
+/// horizon function that replaces the five independent encodings.
+enum class Horizon {
+  TagBlank,
+  CoarseBlank,
+  PhaseTransient,
+  SpliceInFlight
+};
+
 /// @brief Compile-time configuration for SnapcastClient, built by the hub's codegen setters.
 struct SnapcastClientConfig {
   std::string server_host;  // empty: discover the server via mDNS (_snapcast._tcp)
@@ -961,6 +990,7 @@ class SnapcastClient {
     int64_t rskip_log_at_us{0};         // block the last RSKIP line described (one line per block)
     int64_t resync_step_at_us{0};       // last in-window position step of ANY source (ledger steps wait out the blank too)
     int64_t phase_transient_until_us{0};  // my render phase does not describe my audio until then (steps, hard resyncs, deadline source changes)
+    int64_t decide_log_us{0};            // last Stage 2 DECIDE emit (idle throttle, <= 2 Hz)
     int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
     uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
     float align_kick_us{0.0f};  // render_align bias change not yet delivered as position (ALIGN KICK)
@@ -1129,6 +1159,33 @@ class SnapcastClient {
   int64_t travel_horizon_us_() const;  // ring + pipeline + two blocks: how long a position change takes to reach the tags
 #endif
 
+  /// St3a. One error selector: classifies the currently active error. The single point every
+  /// consumer of error signals goes through; see the definition for the tag/ledger arbitration.
+  ErrorView active_error(const ServoState &st) const;
+  /// St3b. One visibility horizon: how long until a correction shows up in the measurement.
+  /// Replaces the five independent encodings (blank_ms / resync_blank_ms / travel_horizon /
+  /// PHASE_TRANSIENT_US); see the definition.
+  int64_t visibility_horizon_us() const;
+
+  /// St4. One position arbiter: given ErrorView + gates + pending-motion ledger, returns the
+  /// frames to move this chunk. Hard resync / window step / splice / bang-bang become four
+  /// policies inside it, not four sites.
+  int32_t position_arbiter_(ServoState &st, const ErrorView &ev, int64_t now_us);
+  /// St4. The one in-flight ledger, frame-exact, shared by every position policy. Serial
+  /// step-and-verify: never step while a step is in flight.
+  struct InFlightLedger {
+    int32_t target_frames{0};
+    int32_t landed_frames{0};
+    int64_t step_at_us{0};
+    bool in_flight{false};
+  };
+  InFlightLedger in_flight_;
+
+  /// St5a. Pending timebase step (us) fed forward from a consensus adoption or deadline-source
+  /// switch. The size of the move is known at the instant it happens; the arbiter starts from it
+  /// instead of rediscovering it as error over the next several blocks.
+  int64_t pending_timebase_step_us_{0};
+  int64_t timebase_step_at_us_{0};
   /// Forces one repair cycle after a re-lock, if configured; a no-op otherwise. Called once per
   /// chunk from the player loop, after the convergence gate.
   void reanchor_after_relock_(ServoState &st);

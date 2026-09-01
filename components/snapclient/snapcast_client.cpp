@@ -916,7 +916,7 @@ bool SnapcastClient::start() {
   if (this->config_.tsf_observer) {
     ESP_LOGI(TAG, "TSF observer mode: phase inputs logged");
   }
-  if (this->config_.render_align_max_us > 0) {
+  if (this->config_.render_align_max_us >= 0) {
     this->tune_align_max_us_.store(static_cast<int32_t>(this->config_.render_align_max_us), std::memory_order_relaxed);
   }
 #endif
@@ -2806,6 +2806,14 @@ void SnapcastClient::player_task_() {
     // inside 90 us, because the servo was faithfully hitting a target that had been
     // moved.
     const int64_t error_us = predicted - deadline;  // >0: this chunk would play late
+    // STAGE 2 CENSUS (DECIDE). This chunk's servo-ladder resolution, captured as it resolves
+    // and logged from a single point per chunk (see the decide_log lambda below). frames is
+    // signed: + = dropped, - = inserted, and reconciles against soft_dropped_frames /
+    // soft_inserted_frames / hard_resyncs in the sync report -- the census's pass condition.
+    int32_t decide_frames = 0;
+    int64_t decide_pend_us = 0;
+    int decide_act = 0;                // 0 none, 1 trim, 2 splice, 3 step, 4 resync
+    const char *decide_gate = nullptr;  // first refusing gate, or null for an acted decision
     // COARSE DECISIONS ON THE MEASURED ERROR WHILE TAGS ARE LIVE. The prediction is built from the
     // ledger; repaired, the repair moves real audio (-29/+29 ms pairs, 21:37), unrepaired, its bias
     // rides the common wander into the 50 ms hard-resync threshold (three 50-53 ms resyncs on A in
@@ -2926,6 +2934,37 @@ void SnapcastClient::player_task_() {
     }
     const bool coarse_on_tags = tags_fresh && now_us() >= st.tag_fault_until_us;
     const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
+    // ONE DECIDE PER CHUNK, FROM A SINGLE POINT, FIXED FIELDS, NO VARIABLE-LENGTH TAIL.
+    // Throttled to <= 2 Hz for idle (act=none) chunks -- those dominate steady state and a
+    // per-chunk line is the documented ~38 lines/s that stalls an OTA -- every non-idle decision
+    // always logs. Names first, numeric tail last, so a truncation hits t= and never a name.
+    auto decide_log = [&]() {
+      const int64_t decide_t = now_us();
+      if (decide_act == 0 && decide_t - st.decide_log_us < 500000) {
+        return;  // idle throttle: at most one act=none line per 500 ms
+      }
+      st.decide_log_us = decide_t;
+      const char *act_name = "none";
+      switch (decide_act) {
+        case 1: act_name = "trim"; break;
+        case 2: act_name = "splice"; break;
+        case 3: act_name = "step"; break;
+        case 4: act_name = "resync"; break;
+        default: break;
+      }
+      char gd_buf[16];
+      const char *gd_str = "unknown";
+      if (this->tsf_sync_ != nullptr) {
+        const int32_t gd = this->tsf_sync_->render_group_delta_us();
+        if (gd != INT32_MIN) {
+          snprintf(gd_buf, sizeof(gd_buf), "%+" PRId32, gd);
+          gd_str = gd_buf;
+        }
+      }
+      ESP_LOGD(TAG, "DECIDE src=%s cls=none gate=%s act=%s frames=%+d pend=%+" PRId64 " gd=%s t=%" PRId64,
+               coarse_on_tags ? "tag" : "ledger", decide_gate != nullptr ? decide_gate : "none", act_name,
+               decide_frames, decide_pend_us, gd_str, decide_t);
+    };
     // Is the LEDGER reading stable enough to step on? During a refill burst it bounces tens of ms
     // chunk to chunk (17:41:53: +41.8, +27.7, +36.4, +42.2 ms on consecutive chunks) and a first step
     // taken then left 1-14 ms for extra correction rounds (build 77 injections: 20/15/10/32 s, the
@@ -3191,6 +3230,9 @@ void SnapcastClient::player_task_() {
       }
       st.converged = st.converged && !mute_now;
       st.resync_drops++;
+      decide_act = 4;                             // resync
+      decide_frames = static_cast<int32_t>(frames);  // whole chunk dropped
+      decide_log();                                // emit here: the branch continues
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
@@ -3220,6 +3262,8 @@ void SnapcastClient::player_task_() {
                  -error_us / 1000, st.storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
       }
       st.converged = st.converged && !mute_now;
+      decide_act = 4;                                     // resync
+      decide_frames = -static_cast<int32_t>(fill);         // silence inserted
       this->push_silence_(fill, rec.params);
     } else if (std::abs(coarse_on_tags ? coarse_err_us : median_err_us) >
                    (resync_window
@@ -3429,6 +3473,10 @@ void SnapcastClient::player_task_() {
             this->pushed_frames_total_ + static_cast<int64_t>(frames);
         st.win_step_idx = (st.win_step_idx + 1) % ServoState::WIN_STEPS;
       }
+      decide_act = 3;                       // step
+      decide_frames = adjust;                // signed: + dropped, - inserted
+      decide_pend_us = pending_us;
+      decide_gate = coarse_step_ok ? nullptr : "gd";  // no differential evidence -> PI owns it
       st.steer_dir = 0;
     } else if (st.err_window_filled == MEDIAN_WINDOW) {
       // Steering servo (reference design): engage when the median error exceeds
@@ -3477,6 +3525,7 @@ void SnapcastClient::player_task_() {
         // which is what "hold the last trim, never the last error" means concretely. The gain
         // schedule, bumpless transfer, conditional integration and the clamp all live inside.
         this->delay_loop_update_(st);
+        decide_act = 1;  // trim (rate lock steering this chunk); frame paths below override
         // THE SPLIT-PENDING TRIM HOLD IS DELETED, not improved: it existed because the rate loop
         // steered on a prediction the split detector was about to declare wrong, and the loop no
         // longer consumes that prediction at all. Its inter-device cost was the largest identified
@@ -3547,15 +3596,22 @@ void SnapcastClient::player_task_() {
           }
         }
         if (st.steer_dir > 0) {
+          decide_act = 2;                       // splice
+          decide_frames = static_cast<int32_t>(steer_frames);
           drop_frames = steer_frames;
           st.soft_dropped_frames += steer_frames;
         } else if (st.steer_dir < 0) {
+          decide_act = 2;                       // splice
+          decide_frames = -static_cast<int32_t>(steer_frames);
           st.soft_inserted_frames += steer_frames;
           if (st.converged) {
             this->push_repeat_frame_(rec.params);
           } else {
             this->push_silence_(steer_frames, rec.params);
           }
+        } else {
+          decide_act = 0;                       // in the deadband: nothing to move
+          decide_gate = "band";
         }
       } else {
         // The rate lock is steering, so the block above is off. A standing offset therefore has
@@ -3600,14 +3656,20 @@ void SnapcastClient::player_task_() {
           }
         }
         if (fast > 0) {
+          decide_act = 2;                       // splice
+          decide_frames = static_cast<int32_t>(fast);
           drop_frames = static_cast<uint32_t>(fast);
           st.soft_dropped_frames += static_cast<uint32_t>(fast);
         } else if (fast < 0) {
+          decide_act = 2;                       // splice
+          decide_frames = static_cast<int32_t>(fast);
           st.soft_inserted_frames += static_cast<uint32_t>(-fast);
           this->push_repeat_frame_(rec.params);
         }
       }
     }
+
+    decide_log();  // one DECIDE per chunk; the late-resync branch emitted its own above
 
 #ifdef USE_I2S_RATE_LOCK
     // Integrate the REALISED trim over this chunk's audio time. Placed after the whole servo
@@ -4423,6 +4485,104 @@ void SnapcastClient::publish_render_phase_sample_() {
 #endif
 }
 
+// St3a. ONE ERROR SELECTOR. Classify the currently active error from the servo state. The single
+// point every consumer of error signals goes through; the plan collapses the independently
+// recomputed tag/ledger staleness tests (coarse_on_tags, tag_err_live, tags_fresh, the tag-fault
+// judge, the split-repair disarm, the unmute gate) onto `trusted`. `cls` is deliberately left
+// None here: the arbiter (St4) owns the class decision.
+ErrorView SnapcastClient::active_error(const ServoState &st) const {
+  const int64_t now = now_us();
+  const int64_t tag_stale_us = static_cast<int64_t>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed)) * 1000;
+  const bool tags_live = st.dl_have_err && st.dl_err_at_us != 0 && now - st.dl_err_at_us < DL_ERR_STALE_US &&
+                         now - this->dl_acc_last_us_ < tag_stale_us;
+  const bool tag_fault = now < st.tag_fault_until_us;
+  if (tags_live && !tag_fault) {
+    return ErrorView{st.dl_err_us, ErrSource::Tag, now - st.dl_err_at_us, true, ErrClass::None};
+  }
+  // Tags absent or distrusted: the ledger prediction. trusted=false -- it is the demoted
+  // estimate, and Rule 4 ("no evidence -> tracking gain, never max") is enforced by the arbiter
+  // rather than by pretending a held prediction is a measurement.
+  if (st.err_window_filled == MEDIAN_WINDOW) {
+    int64_t sorted[MEDIAN_WINDOW];
+    memcpy(sorted, st.err_window, sizeof(sorted));
+    std::nth_element(sorted, sorted + MEDIAN_WINDOW / 2, sorted + MEDIAN_WINDOW);
+    const int64_t med = sorted[MEDIAN_WINDOW / 2];
+    return ErrorView{med, ErrSource::Ledger, st.dl_err_at_us != 0 ? now - st.dl_err_at_us : 0, false,
+                     ErrClass::None};
+  }
+  return ErrorView{0, ErrSource::None, 0, false, ErrClass::None};
+}
+
+// St3b. ONE VISIBILITY HORIZON. "How long until a correction shows up in the measurement" was
+// encoded five ways (blank_ms, resync_blank_ms, the per-chunk ring+pipeline+2*block, travel_horizon_us_,
+// PHASE_TRANSIENT_US). Those are the same physical quantity from the same inputs with different
+// clamps; this is the single source they all derive from.
+int64_t SnapcastClient::visibility_horizon_us() const {
+#ifdef CLOCK_SYNC_TSF_ACTIVE
+  return this->travel_horizon_us_();
+#else
+  return PHASE_TRANSIENT_US;
+#endif
+}
+
+// St4. ONE POSITION ARBITER. Given ErrorView + gates + the pending-motion ledger, returns the
+// frames to move this chunk. Hard resync / window step / splice / bang-bang are four POLICIES
+// inside it, not four sites -- so a correction can never be applied twice because neither policy
+// knew about the other's. Serial step-and-verify: never step while a step is in flight. The
+// classifier lives here (active_error leaves cls=None); rate and bias rows are owned by other
+// actuators and the arbiter deliberately moves nothing for them.
+int32_t SnapcastClient::position_arbiter_(ServoState &st, const ErrorView &ev, int64_t now_us) {
+  if (!ev.trusted || ev.src == ErrSource::None) {
+    return 0;  // Rule 4: no usable evidence, nothing to move
+  }
+
+  // FEED-FORWARD (Rule 5 / St5a): a consensus step or deadline-source switch of known size is a
+  // pending displacement. Deliver it before the loop rediscovers it as error over several blocks.
+  if (this->pending_timebase_step_us_ != 0 && now_us - this->timebase_step_at_us_ < 5000000) {
+    if (!this->in_flight_.in_flight) {
+      const int32_t frames = static_cast<int32_t>(
+          std::llround(static_cast<double>(this->pending_timebase_step_us_) / 26214.4));
+      if (frames != 0) {
+        this->in_flight_.target_frames = frames;
+        this->in_flight_.step_at_us = now_us;
+        this->in_flight_.in_flight = true;
+        this->pending_timebase_step_us_ = 0;  // consumed
+        return frames;
+      }
+    }
+  }
+
+  // STEP POLICY: a known large displacement (join, refill, hard resync). Below the splice
+  // threshold the rate PI owns the error -- a position correction against a rate error is a limit
+  // cycle by construction -- so only frame-exact large steps move here.
+  const int32_t splice_override = this->tune_splice_us_.load(std::memory_order_relaxed);
+  const int64_t splice_threshold = splice_override >= 0
+                                       ? static_cast<int64_t>(splice_override)
+                                       : static_cast<int64_t>(this->config_.fast_splice_threshold_us);
+  if (ev.us >= splice_threshold || ev.us <= -splice_threshold) {
+    if (this->in_flight_.in_flight) {
+      return 0;  // serial: a step is in flight, wait for its landing
+    }
+    const uint32_t sr = this->tag_sample_rate_.load(std::memory_order_relaxed);
+    if (sr == 0) {
+      return 0;
+    }
+    const int64_t frame_us = 1000000 / static_cast<int64_t>(sr);
+    const int32_t frames =
+        static_cast<int32_t>(std::llround(static_cast<double>(ev.us) / static_cast<double>(frame_us)));
+    if (frames == 0) {
+      return 0;
+    }
+    this->in_flight_.target_frames = frames;
+    this->in_flight_.step_at_us = now_us;
+    this->in_flight_.in_flight = true;
+    return frames;
+  }
+
+  // RATE / BIAS rows: owned by the trim and the deadline respectively, never corrected here.
+  return 0;
+}
+
 void SnapcastClient::delay_loop_update_(ServoState &st) {
   // WS3.1 GATE, SET AT A SINGLE POINT THAT ALWAYS EXECUTES. dl_oor means "the loop is NOT in clean
   // in-range steady state", and it is asserted here on entry and cleared only on the one path that
@@ -4650,12 +4810,12 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   float boost_err = std::abs(e);
   if (this->tsf_sync_ != nullptr) {
     const int32_t gd_boost = this->tsf_sync_->render_group_delta_us();
-    const int32_t n_cons = this->tsf_sync_->consensus_n();
-    if (gd_boost != INT32_MIN && n_cons > 1) {
+    const int32_t n_phase = this->tsf_sync_->group_delta_n();
+    if (gd_boost != INT32_MIN && n_phase > 1) {
       boost_err = std::min(boost_err,
-                           std::abs(static_cast<float>(gd_boost)) * static_cast<float>(n_cons) /
-                               static_cast<float>(n_cons - 1));
-    } else if (n_cons > 1) {
+                           std::abs(static_cast<float>(gd_boost)) * static_cast<float>(n_phase) /
+                               static_cast<float>(n_phase - 1));
+    } else if (n_phase > 1) {
       // PEERS EXIST BUT gd IS PAST ITS 10 s FRESHNESS GATE. Two stages, because the boost needs a
       // MAGNITUDE BOUND and not a value to steer on -- a delta tens of seconds old still answers
       // "is this error differential or common", which is the only question asked of it here.
@@ -4667,8 +4827,8 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
       const int32_t gd_held = this->tsf_sync_->render_group_delta_held_us(now, &gd_age);
       if (gd_held != INT32_MIN && gd_age <= BOOST_GD_HOLD_US) {
         boost_err = std::min(boost_err,
-                             std::abs(static_cast<float>(gd_held)) * static_cast<float>(n_cons) /
-                                 static_cast<float>(n_cons - 1));
+                             std::abs(static_cast<float>(gd_held)) * static_cast<float>(n_phase) /
+                                 static_cast<float>(n_phase - 1));
         if (!st.boost_blind) {
           st.boost_blind = true;
           ESP_LOGD(TAG, "BOOSTHOLD gd stale %.1f s, bound from held %+" PRId32 " us (err %+.0f) t=%" PRId64,
@@ -4680,11 +4840,11 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
           st.boost_blind = true;
           ESP_LOGD(TAG, "BOOSTBLIND no gd within %.0f s with n=%" PRId32 " peers: tracking gain "
                         "(err %+.0f us) t=%" PRId64,
-                   static_cast<double>(BOOST_GD_HOLD_US) / 1e6, n_cons, e, now);
+                   static_cast<double>(BOOST_GD_HOLD_US) / 1e6, n_phase, e, now);
         }
       }
     }
-    if (gd_boost != INT32_MIN || n_cons <= 1) {
+    if (gd_boost != INT32_MIN || n_phase <= 1) {
       st.boost_blind = false;
     }
   }
@@ -4927,8 +5087,7 @@ int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sa
   // RESYNC WINDOW (ServoState::post_event_until_us): right after an event the error is a known
   // displacement, not wander, so the splice arms at resync_splice_us and immediately; in steady
   // state the configured threshold and the persistence wait keep it off the common wander.
-  // Inside the resync window the coarse path does step-and-verify corrections (see the player loop);
-  // the continuous splice is off so the two never act on the same block error (build 33 thrash).
+  // Inside the resync window the continuous splice is off so the two never act on the same block error (build 33 thrash).
   const bool post_event = now_us() < st.post_event_until_us;
   const int64_t cfg_threshold = static_cast<int64_t>(this->config_.fast_splice_threshold_us);
   const int64_t threshold = post_event ? 0 : cfg_threshold;  // 0 = disabled below

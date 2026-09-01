@@ -163,6 +163,11 @@ class TsfSync {
   int32_t render_group_delta_us() const {
     return this->render_group_delta_us_.load(std::memory_order_relaxed);
   }
+  /// @brief How many contributions went into the last group delta (self + paired peers). This is
+  /// the `n` for the delta's self-inclusion factor n/(n-1), and it differs from consensus_n()
+  /// which counts MAPPING contributors (an observer contributes a mapping but no phase). 0 when
+  /// no delta is currently computed.
+  uint8_t group_delta_n() const { return this->group_delta_n_.load(std::memory_order_relaxed); }
   /// @brief The last computed group delta REGARDLESS of freshness, with its age in us; age is
   /// INT64_MAX when none was ever computed. For consumers that need a MAGNITUDE BOUND rather than a
   /// value to act on -- the delay loop's boost clamp is the case: it only needs to know roughly
@@ -435,6 +440,8 @@ class TsfSync {
   Peer *find_peer_(const uint8_t mac[6], int64_t local_now_us);
 
   std::atomic<int32_t> render_group_delta_us_{INT32_MIN};
+  /// Phase-contributor count used for the last group delta (self + paired peers). 0 = unknown.
+  std::atomic<uint8_t> group_delta_n_{0};
   /// Local time render_group_delta_us_ was last computed from a VALID pairing.
   ///
   /// A failed pairing must not wipe a good delta. recompute runs on every beacon arrival, but
@@ -451,6 +458,9 @@ class TsfSync {
   void recompute_group_delta_(int64_t local_now_us);
   bool warned_tx_{false};
   uint32_t rx_peer_count_{0};  // accepted packets (diagnostics)
+  /// Stage 1 GDIN throttle: the pairing-input shadow line emits at most ~1/s. recompute runs on
+  /// every beacon arrival, and per-arrival logging is the documented flood that stalls an OTA.
+  int64_t last_gdin_log_us_{0};
 
   // Unicast peers (network task only) + count for diagnostics. peers_ comes from
   // the server roster; learned_peers_ from received packets' source addresses --

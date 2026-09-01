@@ -5,12 +5,16 @@ binary protocol directly and plays through ESPHome's own audio stack, so announc
 volume and mixing work as usual. Structured after upstream `sendspin`: a hub owning the
 protocol client, plus a `media_source` feeding the `speaker_source` pipeline.
 
-> **Alpha — expect breaking changes, without deprecation periods.** Component names,
-> option names and defaults all still move. Recent examples: `audio_timing` was renamed
-> `clock_sync` and had `rate_lock` moved out to a new `i2s_rate_lock` component, and
-> `rate_lock` now takes `i2s_audio_id` (naming the bus) instead of `i2s_port`. Pin a ref
-> if you need a config that keeps working — `github://W-Floyd/esphome-snapcast@<tag>` —
-> and read the commit log before moving it.
+> **Alpha — plays, but audio stability is still being reworked (PLAN-timing-v2, stages 0–4 in progress).** Component names,
+> option names and defaults all still move. The clock-sync reference (`render_group_delta_us`) under-measures
+> the wire differential ~8×; the PI boost clamp uses the wrong contributor count (`consensus_n` vs phase `n`);
+> `render_align_max: 0` has been running at 500 µs; and the position path (splice / window step / resync)
+> has four copy-pasted sites rather than one arbiter. These are being fixed now — do not rely on
+> sub-millisecond sync until Stage 1 (honest reference) and Stage 4 (one arbiter + one ledger) close.
+> Recent examples: `audio_timing` was renamed `clock_sync` and had `rate_lock` moved out to a new
+> `i2s_rate_lock` component, and `rate_lock` now takes `i2s_audio_id` (naming the bus) instead of
+> `i2s_port`. Pin a ref if you need a config that keeps working —
+> `github://W-Floyd/esphome-snapcast@<tag>` — and read the commit log before moving it.
 
 | Component | |
 |---|---|
