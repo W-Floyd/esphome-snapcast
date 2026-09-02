@@ -82,8 +82,18 @@ def main():
                 # -hupcl/clocal: do NOT drop DTR on close and ignore modem lines --
                 # DTR/RTS transitions are exactly how esptool resets an ESP32 and
                 # drives it into ROM download mode, so a logger must never toggle them.
-                subprocess.run(["stty", "-f", device, args.baud, "raw", "-echo", "-hupcl", "clocal"],
-                               check=False, capture_output=True)
+                #
+                # BSD stty takes -f, GNU stty takes -F, and the call is check=False, so on
+                # the wrong one it fails silently and leaves the tty in cooked mode with
+                # echo on. Try both and keep whichever the platform accepts.
+                settings = [args.baud, "raw", "-echo", "-hupcl", "clocal"]
+                for flag in ("-f", "-F"):
+                    if subprocess.run(["stty", flag, device] + settings,
+                                      check=False, capture_output=True).returncode == 0:
+                        break
+                else:
+                    print(f"{stamp()} --- WARNING: stty failed; tty may not be raw ---",
+                          flush=True)
                 print(f"{stamp()} --- serial attached ---", flush=True)
 
             select.select([fd], [], [], 1.0)
