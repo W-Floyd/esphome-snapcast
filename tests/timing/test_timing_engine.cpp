@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <vector>
+#include <algorithm>
 
 using namespace esphome::snapclient::timing;
 
@@ -324,6 +326,66 @@ int main() {
     const float slow = run_at(650000);    // ~1.5 Hz, per 64-arrival block
     printf("        crystal at 40 Hz %.2f ppm, at 1.5 Hz %.2f ppm\n", fast, slow);
     check(std::fabs(fast - slow) < 1.0, "crystal learned equally at both cadences", slow, fast);
+  }
+
+  printf("\n10. a WRONG restored crystal must not cost position accuracy while it unwinds\n");
+  {
+    // Board a booted with +112 ppm in NVS against a plant that did not need it, because a limit
+    // cycle had been credited as rate. The engine must keep the position error bounded WHILE it
+    // unlearns that -- steering is what holds position, so anything that suspends the rate path
+    // pays for it in skew. Blind-holding for the visibility horizon passed every other property
+    // here and still regressed the bench 9x (median |offset| 25 us -> 224 us), because this case
+    // was not tested: with the crystal already correct, coasting costs nothing.
+    Profile pw = p;
+    pw.visibility_us = 3000000;   // the bench's own horizon
+    Engine eng(pw);
+    eng.set_crystal_ppm(60.0f);   // wrong by 60 ppm: nothing in the plant asks for it
+    Plant plant;
+    plant.frame_us = pw.frame_us();
+    plant.plant_ppm = 0.0;
+    std::deque<std::pair<int64_t, double>> history;
+    uint64_t pid = 0; int32_t pf = 0; bool live = false; int64_t land = 0;
+    std::vector<double> errs;
+    const int64_t tick = 25000;
+    for (int64_t t = 0; t < 900000000; t += tick) {
+      if (live && t >= land) {
+        plant.apply_frames(pf);
+        eng.confirm_position_landed(pid, t);
+        live = false;
+      }
+      history.emplace_back(t, plant.error_us);
+      double seen = history.front().second;
+      while (history.size() > 1 && history.front().first <= t - pw.visibility_us) {
+        seen = history.front().second;
+        history.pop_front();
+      }
+      Command c = eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), true},
+                           GroupEvidence{});
+      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + 350000; live = true; }
+      plant.advance(tick, c.rate_ppm);
+      // WHILE it unwinds, not after: measure from 30 s (past the initial acquisition) to 400 s,
+      // which is where the crystal is still wrong and corrections are still firing. Sampling the
+      // last 300 s instead measures a settled loop that has stopped correcting, so no blind
+      // window ever opens and the property cannot fail -- it passed against the blind-hold build
+      // that regressed the bench 9x.
+      if (t > 30000000 && t < 400000000) errs.push_back(std::fabs(plant.error_us));
+    }
+    std::sort(errs.begin(), errs.end());
+    const double med = errs[errs.size() / 2];
+    const double p90 = errs[static_cast<size_t>(0.9 * errs.size())];
+    printf("        crystal %.1f -> %.1f ppm; |error| while unwinding: median %.0f us, p90 %.0f us\n",
+           60.0, eng.crystal_ppm(), med, p90);
+    check(std::fabs(eng.crystal_ppm()) < 30.0f, "the wrong crystal is unlearned",
+          eng.crystal_ppm(), 0.0);
+    // 150 us is what this design ACHIEVES here, not what it should: a regression guard, not a
+    // target. The bound is set by how fast the crystal can unwind, and the crystal only moves via
+    // position credit -- capped at CREDIT_MAX_PPM_PER_WINDOW over CREDIT_BASELINE_HORIZONS, so
+    // 60 ppm takes ~6 minutes. There is no true integral in the fine regime: the proportional
+    // term is capped at the noise budget (6.7 ppm at a 3 s horizon) and cannot null a 60 ppm
+    // plant error on its own. Board a booted at +112 ppm for exactly this reason. Compensation
+    // scores 100 us here against the blind hold's 482 us, which is the 4.8x that matches the
+    // bench's 25 us vs 224 us -- but neither is 20 us, and closing that is the next change.
+    check(med < 150.0, "position error stays bounded while it unwinds", med, 150.0);
   }
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all properties hold", failures,

@@ -45,7 +45,8 @@ void Engine::reset() {
   in_flight_id_ = 0;
   in_flight_frames_ = 0;
   in_flight_since_us_ = 0;
-  blind_until_us_ = 0;
+  pending_disp_us_ = 0;
+  pending_visible_at_us_ = 0;
   last_obs_us_ = 0;
   suppressed_ = 0;
 }
@@ -99,10 +100,10 @@ void Engine::credit_position_correction(int32_t frames, int64_t now_us) {
 
 void Engine::confirm_position_landed(uint64_t correction_id, int64_t now_us) {
   if (!in_flight_ || correction_id != in_flight_id_) return;
-  // The plant has moved, so the filtered error must move with it. Without this the engine keeps
-  // deciding from an error it has already corrected and re-issues the same correction as the
-  // filter slowly catches up -- two accountings of one displacement.
-  err_mean_us_ -= static_cast<float>(in_flight_frames_) * static_cast<float>(profile_.frame_us());
+  // No feed-forward into err_mean_us_ here. step() compensates every observation by the pending
+  // displacement until it becomes visible, so the filter is already in post-correction
+  // coordinates; stepping it here as well would count one displacement twice. This is the audio
+  // having moved, which is what credit is owed against -- not the move becoming observable.
   credit_position_correction(in_flight_frames_, now_us);
   in_flight_ = false;
   in_flight_id_ = 0;
@@ -124,34 +125,26 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     return cmd;
   }
 
-  const int64_t e = obs.error_us;
-  cmd.decision.error_us = e;
-
-  // A correction has been delivered, but the measurement cannot show it yet. Every observation
-  // until the visibility horizon passes describes the position we have already left, so feeding
-  // them to the filter drags it back onto the error the correction just removed and buys a second
-  // correction for one displacement. Hold, and take nothing in.
+  // A correction has been delivered, but the measurement cannot show it until the visibility
+  // horizon passes, so until then every observation describes the position we have already left.
+  // Those samples are not useless: they are wrong by an amount we know exactly, because we
+  // applied it. Shift them into post-correction coordinates instead of discarding them.
   //
-  // Not the same interlock as in_flight_. That one ends when the audio moves, one pipeline depth
-  // away (~350 ms); this one ends when the move is observable, one visibility horizon away
-  // (1-5 s). Releasing on the first was measured on the bench as 40 corrections and 2.5 ms of
-  // residual for a 3-frame step -- see test 4, which sweeps the whole visibility range.
-  if (blind_until_us_ != 0) {
-    if (now_us < blind_until_us_) {
-      cmd.rate_ppm = crystal_ppm_;
-      cmd.decision.act = Decision::Act::Hold;
-      cmd.decision.why = Decision::Why::InFlight;
-      cmd.decision.rate_ppm = cmd.rate_ppm;
-      suppressed_++;
-      return cmd;
-    }
-    blind_until_us_ = 0;
-    // No observation was taken in during the blind window, so this is not a long observation
-    // interval -- it is the first sample of a new one. Without this, dt spans the whole horizon,
-    // alpha approaches 1, and the filter jumps onto a single noisy sample, discarding the
-    // feed-forward estimate confirm_position_landed() already applied.
-    last_obs_us_ = now_us;
+  // apply_frames() moves the plant by -frames * frame_us, so an observation that predates
+  // visibility reads high by that much.
+  //
+  // Discarding them instead -- holding blind for the whole horizon -- was measured on the bench as
+  // a 9x REGRESSION in absolute skew (median |offset| 25 us -> 224 us, p90 211 us -> 696 us).
+  // Stairstepping fell from 25% of captures to 3.6%, but only because the loop stopped
+  // correcting: the hold suppressed the rate path too, so for up to 5 s after every correction
+  // the board coasted on a crystal estimate that could be tens of ppm wrong. The measurement
+  // being stale is a reason to correct it, not a reason to stop steering.
+  if (pending_visible_at_us_ != 0 && now_us >= pending_visible_at_us_) {
+    pending_visible_at_us_ = 0;
+    pending_disp_us_ = 0;
   }
+  const int64_t e = obs.error_us - pending_disp_us_;
+  cmd.decision.error_us = e;
 
   // Track the error and its own noise. alpha comes from the elapsed time, so the filter has the
   // same timescale whether observations arrive per chunk or per tag arrival.
@@ -213,7 +206,10 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
                              : 0;
 
   if (frames != 0 && differential) {
-    if (in_flight_) {
+    // Serialise on visibility, not on the pipeline landing: a second correction issued while the
+    // first is still invisible would need its displacement stacked onto the first one's, and one
+    // pending displacement is all this tracks.
+    if (in_flight_ || pending_visible_at_us_ != 0) {
       cmd.rate_ppm = crystal_ppm_;
       cmd.decision.act = Decision::Act::Hold;
       cmd.decision.why = Decision::Why::InFlight;
@@ -224,7 +220,14 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     in_flight_id_ = next_id_++;
     in_flight_frames_ = frames;
     in_flight_since_us_ = now_us;
-    blind_until_us_ = now_us + profile_.visibility_us;
+    pending_disp_us_ = static_cast<int64_t>(frames) * frame_us;
+    pending_visible_at_us_ = now_us + profile_.visibility_us;
+    // Compensation is a change of coordinates, so the filter's STATE moves with its inputs, at
+    // the same instant. Shifting only the inputs leaves err_mean_us_ holding the pre-correction
+    // value and decaying toward the compensated stream over ERR_TAU_S, which crosses the coarse
+    // gate again on the way down and buys 2-3 extra corrections (measured in test 4). Shifting
+    // both is not the double-count that a feed-forward plus RAW observations would be.
+    err_mean_us_ -= static_cast<float>(pending_disp_us_);
     cmd.frames = frames;
     cmd.correction_id = in_flight_id_;
     // Rate holds the learned offset only; chasing the same error would deliver it twice.

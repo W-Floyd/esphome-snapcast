@@ -136,10 +136,13 @@ class Engine {
   int64_t credit_since_us_ = 0;
   uint32_t credit_count_ = 0;
 
-  /// While set, the measurement still describes the position the last correction left. Distinct
-  /// from in_flight_: that ends when the audio moves (a pipeline depth), this when the move
-  /// becomes observable (a visibility horizon), and they are an order of magnitude apart.
-  int64_t blind_until_us_ = 0;
+  /// A correction has been applied but is not yet visible in the measurement. Observations before
+  /// pending_visible_at_us_ are in pre-correction coordinates and are shifted by pending_disp_us_
+  /// rather than discarded. Distinct from in_flight_: that ends when the audio moves (a pipeline
+  /// depth), these when the move becomes observable (a visibility horizon), an order of magnitude
+  /// apart.
+  int64_t pending_disp_us_ = 0;
+  int64_t pending_visible_at_us_ = 0;
   bool in_flight_ = false;
   uint64_t next_id_ = 1;
   uint64_t in_flight_id_ = 0;
