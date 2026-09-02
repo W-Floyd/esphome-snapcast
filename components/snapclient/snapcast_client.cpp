@@ -986,8 +986,16 @@ void SnapcastClient::loop() {
       // feeding, so a fresh boot trips this once for ~7 s and a line that cries wolf at every boot
       // is one nobody reads. A wedge always has chunks behind it, so the real case still fires.
       this->player_stall_log_us_ = now;
+      // Order MUST match PlayerPhase. The bounds check below turns a missing name into "?", which
+      // is safe and useless: a phase the watchdog cannot name is a wedge nobody can locate.
       static const char *const PHASE_NAMES[] = {"idle(record queue)", "keepalive", "ring read",
-                                                "servo", "write", "discard"};
+                                                "servo", "write", "discard", "query_audio",
+                                                "ledger(playout_mutex)", "query_latency", "mixer",
+                                                "filter(filter_mutex)"};
+      static_assert(sizeof(PHASE_NAMES) / sizeof(PHASE_NAMES[0]) ==
+                        static_cast<size_t>(PlayerPhase::FILTER) + 1,
+                    "PHASE_NAMES must cover every PlayerPhase -- an unnamed phase is a wedge that "
+                    "reports itself as '?'");
       const uint8_t phase = this->player_phase_.load(std::memory_order_relaxed);
       // HEAP, because the wedge is not confined to audio. A wedged board answers no ping, no API
       // (6053), no OTA (3232) and no mDNS, while its main loop keeps logging and its radio still
@@ -2564,6 +2572,8 @@ void SnapcastClient::player_task_() {
     } else {
       this->playout_mutex_.unlock();
     }
+    // Past this point IDLE would be a lie: the record is in hand and everything below is
+    // processing. Each blocking call in the stretch stamps its own phase.
     if (xQueueReceive(this->record_queue_, &rec, pdMS_TO_TICKS(100)) != pdTRUE) {
       // No record. Normal between chunks; a WEDGE if it lasts, and this branch logged nothing at
       // all, which is why a wedged player task looked identical to a dead one. Throttled, and it
@@ -2632,6 +2642,7 @@ void SnapcastClient::player_task_() {
     // the listener walk costs nothing in steady state.
     if (st.padding_debt_frames > 0 && now_us() >= st.padding_repay_at_us) {
       audio::AudioDepth lat_now, own_now;
+      this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::QUERY_AUDIO), std::memory_order_relaxed);
       if (this->audio_listener_ != nullptr && this->audio_listener_->on_query_latency(lat_now) &&
           this->audio_listener_->on_query_audio(own_now)) {
         const int64_t pad_now_us =
@@ -2654,6 +2665,7 @@ void SnapcastClient::player_task_() {
         // the span that was resident at the seed -- `latency` at that instant -- and the DAC plays
         // at real time. pad_now is still read, for the diagnostic only.
 
+        this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::LEDGER), std::memory_order_relaxed);
         this->playout_mutex_.lock();
         // NEVER below `played`. The debt is a frame count recorded at seed time, but by the time
         // it is repaid the DAC may already have consumed everything the seed covered -- and then
@@ -2744,6 +2756,7 @@ void SnapcastClient::player_task_() {
         vTaskDelay(pdMS_TO_TICKS(10));
       }
       if (!st.warned_no_sync) {
+        this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::FILTER), std::memory_order_relaxed);
         this->filter_mutex_.lock();
         st.warned_no_sync = !this->time_filter_.has_estimate();
         this->filter_mutex_.unlock();
@@ -2772,8 +2785,14 @@ void SnapcastClient::player_task_() {
       audio::AudioDepth measured;
       int64_t accounted_frames = 0;
       bool comparable = false;
+      // Stamped before the call, not after: the point is to name what we are INSIDE when the
+      // wedge is sampled.
+      this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::QUERY_AUDIO),
+                                std::memory_order_relaxed);
       if (this->audio_listener_ != nullptr && frame_bytes > 0 &&
           this->audio_listener_->on_query_audio(measured)) {
+        this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::LEDGER),
+                                  std::memory_order_relaxed);
         this->playout_mutex_.lock();
         comparable = this->accounted_at_(measured.as_of_us, accounted_frames);
         // A SNAPSHOT TAKEN INSIDE A BLOCKING WRITE IS NOT COMPARABLE. RECON drift read exactly
@@ -3058,6 +3077,7 @@ void SnapcastClient::player_task_() {
     st.last_deadline_us = deadline;
     st.last_deadline_server_ts = rec.server_ts_us;
     // Published for the speaker callback, which cannot see this player-task local.
+    this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::LEDGER), std::memory_order_relaxed);
     this->playout_mutex_.lock();
     this->tag_anchor_deadline_us_ = deadline;
     this->tag_anchor_server_ts_ = rec.server_ts_us;
@@ -3093,6 +3113,7 @@ void SnapcastClient::player_task_() {
       st.raw_sample_countdown = RAW_SAMPLE_EVERY_CHUNKS;
       int64_t raw_tsf = 0, raw_local = 0, raw_width = 0;
       if (TsfSync::raw_tsf_sample(raw_tsf, raw_local, raw_width)) {
+        this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::LEDGER), std::memory_order_relaxed);
         this->playout_mutex_.lock();
         const int64_t r_played = this->played_frames_total_;
         const int64_t r_pushed = this->pushed_frames_total_;
@@ -3209,6 +3230,7 @@ void SnapcastClient::player_task_() {
         // every flap is what wound the integral 4x too fast (see the flat-gain note in
         // delay_loop_update_). A genuinely large disagreement is announced by the out-of-range
         // hold and corrected by the fast path regardless.
+        this->player_phase_.store(static_cast<uint8_t>(PlayerPhase::LEDGER), std::memory_order_relaxed);
         this->playout_mutex_.lock();
         this->dl_blank_until_us_ =
             now_us() + static_cast<int64_t>(this->tune_blank_ms_.load(std::memory_order_relaxed)) * 1000;

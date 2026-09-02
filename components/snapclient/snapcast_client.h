@@ -1286,13 +1286,31 @@ class SnapcastClient {
   /// So the report comes from a thread that is provably alive -- the main loop, which keeps
   /// logging wifi_diag throughout every wedge. The player only has to stamp where it is; it does
   /// not have to be well enough to complain.
+  /// WHERE THE PLAYER IS. Read by the PLAYER STALLED watchdog, so its resolution is the
+  /// resolution of every wedge diagnosis.
+  ///
+  /// IDLE used to cover everything from the top of the loop to the servo arithmetic -- about a
+  /// thousand lines, several blocking calls and two mutexes -- so a wedge reported
+  /// "phase=idle(record queue)" whether it was waiting on the queue (normal) or blocked inside
+  /// chunk processing (the bug). The bench observer wedged in that stretch on 2026-09-02 with
+  /// records=112 waiting and iters=+0, and the phase field could not tell the two apart; nor
+  /// could the playout_mutex_ probe, which runs at the TOP of an iteration and therefore never
+  /// runs when the block is mid-iteration.
+  ///
+  /// The added values subdivide exactly that stretch, each stamped immediately before the call
+  /// that can block, so the next occurrence names the call instead of the region.
   enum class PlayerPhase : uint8_t {
-    IDLE = 0,        // waiting on the record queue
-    KEEPALIVE = 1,   // pushing silence to hold the pipeline
-    RING_READ = 2,   // waiting for a popped record's PCM
-    SERVO = 3,       // in the servo/deadline arithmetic
-    WRITE = 4,       // writing audio downstream
-    DISCARD = 5,     // draining a chunk it will not play
+    IDLE = 0,          // waiting on the record queue -- and ONLY that, now
+    KEEPALIVE = 1,     // pushing silence to hold the pipeline
+    RING_READ = 2,     // waiting for a popped record's PCM
+    SERVO = 3,         // in the servo/deadline arithmetic
+    WRITE = 4,         // writing audio downstream
+    DISCARD = 5,       // draining a chunk it will not play
+    QUERY_AUDIO = 6,   // inside on_query_audio(): the audio listener's own locks
+    LEDGER = 7,        // holding playout_mutex_ for the accounting
+    QUERY_LATENCY = 8, // inside on_query_latency()
+    MIXER = 9,         // inside a mixer/depth call
+    FILTER = 10,       // holding filter_mutex_
   };
   std::atomic<uint8_t> player_phase_{static_cast<uint8_t>(PlayerPhase::IDLE)};
   /// Bumped every time the player completes a chunk. The main loop watches it for movement, so a
