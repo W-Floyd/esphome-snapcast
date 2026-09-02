@@ -157,8 +157,18 @@ def pair(gdin, wire, tol):
     return pairs, unmatched
 
 
+def hms(t):
+    return f"{int(t // 3600) % 24:02d}:{int(t % 3600 // 60):02d}:{int(t % 60):02d}"
+
+
 def grade(pairs, block_s, min_n):
-    """Per-block Theil-Sen slope of wire against raw."""
+    """Per-block Theil-Sen slope of wire against raw.
+
+    Blocks are anchored on the first PAIRED sample, not the first GDIN line -- with the wire
+    absent for a stretch (a wedged analyser) those differ by however long the outage lasted, and
+    a block index read against the wrong anchor attributes events to the wrong block. Hence the
+    wall-clock column: the mapping is printed, never inferred.
+    """
     if not pairs:
         return []
     t0 = pairs[0][0]
@@ -168,13 +178,14 @@ def grade(pairs, block_s, min_n):
     out = []
     for b in sorted(blocks):
         pts = blocks[b]
+        span = (hms(t0 + b * block_s), hms(t0 + (b + 1) * block_s))
         if len(pts) < min_n:
-            out.append((b, len(pts), float("nan"), float("nan")))
+            out.append((b, len(pts), float("nan"), float("nan"), span))
             continue
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
         slope = theil_sen(xs, ys)
         resid = statistics.median([abs(y - slope * x) for x, y in zip(xs, ys)])
-        out.append((b, len(pts), slope, resid))
+        out.append((b, len(pts), slope, resid, span))
     return out
 
 
@@ -191,6 +202,7 @@ def self_test():
     pairs, un = pair(gdin, wire, 0.5)
     assert un == 0, un
     rows = grade(pairs, 300, 20)
+    assert all(len(r) == 5 for r in rows), "grade() rows carry their wall-clock span"
     slopes = [r[2] for r in rows if r[1] >= 20]
     assert len(slopes) >= 6, len(slopes)
     assert all(abs(s - 1.0) < 0.01 for s in slopes), slopes
@@ -273,14 +285,14 @@ def main():
         return 2
 
     rows = grade(pairs, args.block, args.min_n)
-    print(f"\n  {'block':>5} {'n':>6} {'slope':>8} {'|resid| med':>12}")
+    print(f"\n  {'block':>5} {'window':>19} {'n':>6} {'slope':>8} {'|resid| med':>12}")
     good = []
-    for b, n, slope, resid in rows:
+    for b, n, slope, resid, span in rows:
         mark = ""
         if n >= args.min_n:
             mark = "  <-- outside 1.0 +-{:.2f}".format(SLOPE_TOL) if abs(slope - 1.0) > SLOPE_TOL else ""
             good.append(slope)
-        print(f"  {b:>5} {n:>6} {slope:>8.3f} {resid:>12.1f}{mark}")
+        print(f"  {b:>5} {span[0]}..{span[1]} {n:>6} {slope:>8.3f} {resid:>12.1f}{mark}")
 
     print()
     if len(good) < MIN_BLOCKS:
