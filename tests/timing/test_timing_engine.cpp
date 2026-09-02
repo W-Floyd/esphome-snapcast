@@ -169,7 +169,11 @@ int main() {
   // visibility adds the filter's lag on top. Keeping the relationship explicit here means a
   // profile in a test cannot accidentally make the two equal again.
   p.observation_delay_us = 1000000;
-  p.visibility_us = p.observation_delay_us + Engine::filter_lag_us();
+  p.visibility_us = p.observation_delay_us + Engine::filter_lag_us(p.observation_delay_us);
+  // Swept: 88-100 ppm is where frame corrections stop, set by the plant's own +-30-40 ppm
+  // wander rather than by the actuator's range. The actuator accepts +-2000, but authority
+  // that large lets rate accept errors it then overshoots by A*T through the transport delay.
+  p.rate_authority_ppm = 100.0f;
   p.target_position_us = 20;
 
   printf("profile: frame %lld us, budget %.3f ppm, Kp cap implied %.5f ppm/us\n",
@@ -199,17 +203,22 @@ int main() {
     // steady cadence for ever, the integral is not learning -- the failure seen on the bench.
     // 30 ppm, so corrections definitely fire before the offset is learned. The previous version
     // used 3.35 ppm, produced zero corrections in both runs, and compared 0 against 0.
-    Run early = simulate(p, 30.0, 60.0);
+    // Restated. This used to assert that corrections fire early and then taper, which encoded the
+    // old division of labour: position did the coarse work and rate was capped at the noise budget
+    // (~5 ppm), so a 30 ppm plant HAD to be paid for in frames. With authority separated from the
+    // noise budget, rate absorbs 30 ppm outright and the correct property is that position never
+    // moves at all -- a frame correction here would be a shortcut, not a necessity.
     Run late = simulate(p, 30.0, 900.0);
-    const double rate_early = early.position_corrections / 60.0;
-    const double rate_late = late.position_corrections / 900.0;
-    printf("        early %.3f/s over 60s, late %.3f/s over 900s\n", rate_early, rate_late);
-    check(rate_early > 0.0, "corrections do fire before the offset is learned", rate_early, 0.0);
-    check(rate_late < rate_early * 0.6, "correction rate falls as the offset is learned",
-          rate_late, rate_early * 0.6);
+    printf("        30 ppm plant: %d corrections over 900 s, crystal %+.2f ppm, final err %+.1f us\n",
+           late.position_corrections, late.final_crystal_ppm, late.final_error_us);
+    check(late.position_corrections == 0,
+          "a 30 ppm plant is absorbed by rate, with no frame corrections",
+          late.position_corrections, 0);
+    check(std::fabs(late.final_crystal_ppm - 30.0) < 3.0,
+          "and the crystal still learns it", late.final_crystal_ppm, 30.0);
   }
 
-  printf("\n4. large step (one frame equivalent): delivered once, not repeatedly\n");
+  printf("\n4. a step beyond RATE'S AUTHORITY: delivered once, not repeatedly\n");
   // Swept across the WHOLE visibility range travel_horizon_us_() can produce -- it is clamped to
   // [1 s, 5 s] and varies with ring and pipe depth at runtime, so the property has to hold across
   // it, not at one value. Testing only 1 s hid this: there the stale window is 0.65 s and the
@@ -217,11 +226,16 @@ int main() {
   for (int64_t vis_us : {1000000, 2000000, 3000000, 4000000, 5000000}) {
     Profile pv = p;
     pv.observation_delay_us = vis_us;
-    pv.visibility_us = vis_us + Engine::filter_lag_us();
+    pv.visibility_us = vis_us + Engine::filter_lag_us(vis_us);
     Engine eng(pv);
     Plant plant;
     plant.frame_us = pv.frame_us();
-    plant.error_us = 3.0 * static_cast<double>(pv.frame_us());  // 3 frames late
+    // 40 frames (~907 us). Rate's authority is 100 ppm, so removing this inside one horizon needs
+    // 907/vis_s ppm -- 181 ppm at the longest horizon tested, 907 at the shortest -- and is out of
+    // reach at every one of them, which is what makes a frame correction the right answer here.
+    // The old 3-frame (68 us) case now needs 14-68 ppm and is absorbed by rate with ZERO
+    // corrections; it is kept as its own check below.
+    plant.error_us = 40.0 * static_cast<double>(pv.frame_us());
     int corrections = 0;
     uint64_t pend_id = 0;
     int32_t pend_frames = 0;
@@ -256,9 +270,25 @@ int main() {
     }
     printf("        visibility %lld ms: %d corrections, residual %+.1f us\n",
            static_cast<long long>(vis_us / 1000), corrections, plant.error_us);
-    check(corrections <= 2, "3-frame error costs at most 2 corrections", corrections, 2);
+    check(corrections >= 1, "a step out of rate's reach IS delivered", corrections, 1);
+    check(corrections <= 2, "and costs at most 2 corrections", corrections, 2);
     check(std::fabs(plant.error_us) < static_cast<double>(pv.frame_us()),
           "settles inside one frame", plant.error_us, 0.0);
+  }
+
+  printf("\n4b. and a step WITHIN rate's authority costs no frames at all\n");
+  {
+    // The complement of case 4, and the property the loop was failing on the bench: a few frames
+    // of error is rate's job. Measured there as a correction every 4.0 s -- the entire
+    // serialisation window -- at 8-9 frames each, while P contributed 0.4 ppm.
+    Profile ps = p;
+    ps.observation_delay_us = 2000000;
+    ps.visibility_us = ps.observation_delay_us + Engine::filter_lag_us(ps.observation_delay_us);
+    Run r = simulate(ps, 0.0, 600.0, 80.0);
+    printf("        3-frame-scale error, 80 us noise: %d corrections over 600 s\n",
+           r.position_corrections);
+    check(r.position_corrections == 0, "no frame corrections within rate's reach",
+          r.position_corrections, 0);
   }
 
   printf("\n5. measurement noise must not be amplified into the rate command\n");
@@ -363,7 +393,7 @@ int main() {
     // was not tested: with the crystal already correct, coasting costs nothing.
     Profile pw = p;
     pw.observation_delay_us = 2000000;   // bench: ring 1724 ms + pipe 247 ms
-    pw.visibility_us = pw.observation_delay_us + Engine::filter_lag_us();
+    pw.visibility_us = pw.observation_delay_us + Engine::filter_lag_us(pw.observation_delay_us);
     Engine eng(pw);
     eng.set_crystal_ppm(60.0f);   // wrong by 60 ppm: nothing in the plant asks for it
     Plant plant;
@@ -437,7 +467,7 @@ int main() {
     // property is satisfied by a loop that oscillates about the right answer.
     Profile pq = p;
     pq.observation_delay_us = 1000000;
-    pq.visibility_us = pq.observation_delay_us + Engine::filter_lag_us();
+    pq.visibility_us = pq.observation_delay_us + Engine::filter_lag_us(pq.observation_delay_us);
     Engine eng(pq);
     Plant plant;
     plant.plant_ppm = 3.35;
@@ -478,7 +508,7 @@ int main() {
     // railing both boards to 200 ppm inside one boot, while the host suite was green.
     Profile pt = p;
     pt.observation_delay_us = 2000000;
-    pt.visibility_us = pt.observation_delay_us + Engine::filter_lag_us();
+    pt.visibility_us = pt.observation_delay_us + Engine::filter_lag_us(pt.observation_delay_us);
     Engine eng(pt);
     Plant plant;
     plant.plant_ppm = 3.35;

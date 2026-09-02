@@ -43,6 +43,11 @@ struct Profile {
   int64_t observation_delay_us = 1000000;
   /// Position accuracy aimed at; sets the rate-command noise budget.
   int64_t target_position_us = 20;
+  /// How much rate the loop may command on top of the crystal, from the transport that owns the
+  /// actuator. AUTHORITY, not noise: Kp = budget/sigma_e already bounds the injected noise, so
+  /// clamping the output to the budget as well capped correction at one sigma and made position
+  /// pay for every plant wander. Not a constant in this file -- it is a property of the hardware.
+  float rate_authority_ppm = 100.0f;
 
   int64_t frame_us() const { return 1000000 / static_cast<int64_t>(frame_rate_hz); }
 
@@ -79,6 +84,15 @@ struct Decision {
   float rate_ppm = 0.0f;
   float crystal_ppm = 0.0f;
   uint32_t suppressed = 0;   ///< decisions folded into this one, so the census stays complete
+
+  // Why the step was UNAVOIDABLE, or wasn't. "why = CoarseError" only restates that the error
+  // crossed the gate; it says nothing about whether rate could have answered it instead, which
+  // is the only question worth asking about a step. Recorded on every decision so a step can be
+  // audited after the fact rather than reconstructed from drift rates.
+  int64_t filtered_us = 0;    ///< the error the gate actually tested
+  int64_t gate_us = 0;        ///< the threshold it was tested against
+  float needed_ppm = 0.0f;    ///< rate that would remove filtered_us within one horizon
+  float authority_ppm = 0.0f; ///< rate the loop was allowed to command
 };
 
 /// The two actuators. Separate fields: doing position work through the rate field requires
@@ -116,9 +130,11 @@ class Engine {
   /// budget/sigma_e, so a noisier measurement earns less gain.
   float sigma_e_us() const;
 
-  /// Lag the error filter adds, us. The caller's visibility horizon is the pipeline it can
-  /// measure plus this: a correction is not visible until the filter has caught up with it.
-  static int64_t filter_lag_us();
+  /// Lag the error filter adds, us, for a given transport delay. The caller's visibility horizon
+  /// is the transport it can measure plus this: a correction is not visible until the filter has
+  /// caught up with it. Takes the delay as an argument rather than owning a time of its own, so
+  /// the filter's timescale follows the buffer and the rate instead of this file.
+  static int64_t filter_lag_us(int64_t observation_delay_us);
 
   void reset();
 

@@ -27,10 +27,27 @@ constexpr float CREDIT_MAX_PPM_PER_WINDOW = 5.0f;
 constexpr float CRYSTAL_DELAY_MARGIN = 3.0f;
 /// A crystal is tens of ppm; hundreds means the estimate is tracking something else.
 constexpr float CRYSTAL_LIMIT_PPM = 200.0f;
-/// Error-filter time constant. A TIME, not a weight: a fixed weight makes the filter's timescale
-/// depend on how often observations arrive, so changing the observation cadence would silently
-/// retune the loop. alpha is derived from dt per step.
-constexpr float ERR_TAU_S = 2.0f;
+/// NOTE: authority now arrives as Profile::rate_authority_ppm, from the transport that owns the
+/// actuator. The text below is kept because it is the measurement that motivated separating
+/// authority from the noise budget at all.
+///
+/// How much rate the loop may command on top of the crystal. This is AUTHORITY, not noise: the
+/// noise guarantee comes from Kp = budget/sigma_e, which bounds the injected noise to the budget
+/// whatever this is set to. Clamping the P OUTPUT to the budget as well capped authority at one
+/// sigma -- with sigma floored at a frame, P saturated at |e| ~ 23 us while the coarse gate sat at
+/// 23-30 us, so rate ran out of authority at exactly the error where stepping began, and position
+/// paid for every plant wander. Measured: P contributed 0.4 ppm median against a plant wandering
+/// +-30 ppm, and corrections fired every 4.0 s (the whole serialisation window) at 8-9 frames.
+/// The value belongs to the hardware: it is what the trim actuator accepts, which the transport
+/// knows and this file cannot.
+/// Error-filter time constant, in TRANSPORT DELAYS rather than seconds. Still a time and not a
+/// weight -- a fixed weight makes the filter's timescale depend on the observation cadence -- but
+/// the timescale now comes from the plant instead of from this file. Averaging for longer than
+/// the plant's own delay adds lag without adding information, and averaging for much less passes
+/// noise the loop could not act on before the delay expires anyway, so one delay is the natural
+/// scale. A hardcoded 2.0 s happened to be right for a 1724 ms ring; it would have been wrong for
+/// any other buffer size, sample rate or network condition, and nothing would have said so.
+constexpr float ERR_TAU_HORIZONS = 1.0f;
 }  // namespace
 
 void Engine::set_crystal_ppm(float ppm) {
@@ -56,7 +73,9 @@ void Engine::reset() {
   suppressed_ = 0;
 }
 
-int64_t Engine::filter_lag_us() { return static_cast<int64_t>(ERR_TAU_S * 1e6f); }
+int64_t Engine::filter_lag_us(int64_t observation_delay_us) {
+  return static_cast<int64_t>(ERR_TAU_HORIZONS * static_cast<float>(observation_delay_us));
+}
 
 float Engine::sigma_e_us() const {
   // Floored at ONE FRAME, which is what caps Kp at budget/frame_us -- the gain at which the P
@@ -177,7 +196,9 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     } else {
       const int64_t dt = last_obs_us_ > 0 ? now_us - last_obs_us_ : 0;
       const float dt_s = dt > 0 ? static_cast<float>(dt) / 1e6f : 0.0f;
-      const float alpha = dt_s > 0.0f ? 1.0f - std::exp(-dt_s / ERR_TAU_S) : 0.0f;
+      const float tau_s =
+          std::max(1e-3f, static_cast<float>(filter_lag_us(profile_.observation_delay_us)) / 1e6f);
+      const float alpha = dt_s > 0.0f ? 1.0f - std::exp(-dt_s / tau_s) : 0.0f;
       err_mean_us_ += alpha * (x - err_mean_us_);
       // Noise from CONSECUTIVE DIFFERENCES, not from the spread about the mean. |x - mean|
       // counts the loop's own slow excursion as measurement noise, and since Kp = budget/sigma_e
@@ -219,17 +240,38 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // so noise alone cannot trigger one. No magic margin -- it is derived from the measured noise.
   // The filter's residual noise: sd_out ~ sd_in * sqrt(alpha/2) for an EMA, with alpha the
   // effective per-observation weight implied by the current interval and ERR_TAU_S.
+  const float tau_gate_s =
+      std::max(1e-3f, static_cast<float>(filter_lag_us(profile_.observation_delay_us)) / 1e6f);
   const float obs_dt_s =
       last_obs_us_ > 0 && now_us > last_obs_us_
           ? static_cast<float>(now_us - last_obs_us_) / 1e6f
-          : ERR_TAU_S;
-  const float alpha_eff = std::min(1.0f, 1.0f - std::exp(-obs_dt_s / ERR_TAU_S));
+          : tau_gate_s;
+  const float alpha_eff = std::min(1.0f, 1.0f - std::exp(-obs_dt_s / tau_gate_s));
   const float sigma_filtered = sigma_e_us() * std::sqrt(std::max(1e-6f, alpha_eff) / 2.0f);
   const int64_t coarse_gate_us =
       frame_us + static_cast<int64_t>(std::llround(2.0f * sigma_filtered));
-  const int32_t frames = (frame_us > 0 && std::llabs(e_filtered) >= coarse_gate_us)
-                             ? static_cast<int32_t>(e_filtered / frame_us)
-                             : 0;
+  // Rate owns anything it can still reach. needed_ppm is what would remove the filtered error
+  // within one horizon; while that is inside the loop's authority, a frame correction is not a
+  // last resort but a shortcut -- and an irreversible one, quantised to 22.68 us, against an
+  // actuator that is continuous. Position is for what rate CANNOT do.
+  // Judged over the OBSERVATION delay, not visibility. visibility carries the position delay and
+  // the filter lag on top, and a horizon that long claims rate can absorb an error it will in fact
+  // overshoot: at a 10 s visibility a 907 us step needs only 91 ppm, passes as "within reach", and
+  // settles 290 us the other side. INTERIM -- the honest quantity is rate's own dead time (the
+  // measurement lag, ~pipe), which needs the three-horizon split; measured at median |e| 9 us
+  // against 60 us for the horizon we ship.
+  const float reach_s = static_cast<float>(profile_.observation_delay_us) / 1e6f;
+  const float needed_ppm =
+      reach_s > 0.0f ? static_cast<float>(e_filtered) / reach_s : 0.0f;
+  const bool rate_can_fix = std::fabs(needed_ppm) <= profile_.rate_authority_ppm;
+  const int32_t frames =
+      (frame_us > 0 && std::llabs(e_filtered) >= coarse_gate_us && !rate_can_fix)
+          ? static_cast<int32_t>(e_filtered / frame_us)
+          : 0;
+  cmd.decision.filtered_us = e_filtered;
+  cmd.decision.gate_us = coarse_gate_us;
+  cmd.decision.needed_ppm = needed_ppm;
+  cmd.decision.authority_ppm = profile_.rate_authority_ppm;
 
   if (frames != 0 && differential) {
     // Serialise on VISIBILITY -- the filtered error is what this branch decides from, so a second
@@ -308,13 +350,16 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   }
   last_obs_us_ = now_us;
 
-  // The P term is clamped to the budget. Deriving Kp from a measured sigma_e is only as good as
-  // the estimate; clamping makes "command noise <= budget" hold by construction. Sustained error
-  // larger than the budget is the integral's job, not P's.
-  const float budget = profile_.rate_noise_budget_ppm();
-  const float p_raw =
-      differential ? proportional_gain_ppm_per_us() * static_cast<float>(e) : 0.0f;
-  const float p_term = std::clamp(p_raw, -budget, budget);
+  // P acts on the FILTERED error and is clamped to AUTHORITY, not to the noise budget.
+  //   * filtered, because the raw error carries transients of tens of milliseconds (bench census:
+  //     max +197 ms) and Kp * 197000 us would slam the actuator across its whole range on one
+  //     bad sample. The filter is what makes a large clamp safe.
+  //   * clamped to authority, because Kp = budget/sigma_e ALREADY bounds the injected noise to the
+  //     budget -- and to sigma_filtered * Kp here, which is smaller still. Clamping the output to
+  //     the budget as well conflated "how much noise may I add" with "how much error may I
+  //     correct", and cost a frame correction every horizon.
+  const float p_raw = differential ? proportional_gain_ppm_per_us() * err_mean_us_ : 0.0f;
+  const float p_term = std::clamp(p_raw, -profile_.rate_authority_ppm, profile_.rate_authority_ppm);
   cmd.rate_ppm = crystal_ppm_ + p_term;
   cmd.decision.act = differential ? Decision::Act::Rate : Decision::Act::Hold;
   cmd.decision.why =

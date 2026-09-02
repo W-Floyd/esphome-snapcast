@@ -2850,9 +2850,10 @@ void SnapcastClient::player_task_() {
       // mean straddled the landing -- tag error flat at +5.5 ms for the whole 2.6 s after a +3.0 ms
       // ledger step, dropping 3.4 s after it (02:03:35-39). A block mean is wholly post-step only once
       // a full block has elapsed after the landing.
+      const int64_t transport_now =
+          ring_us_now + st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
       const int64_t horizon_now =
-          ring_us_now + st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
-          timing::Engine::filter_lag_us();
+          transport_now + timing::Engine::filter_lag_us(transport_now);
       blank_us = std::max(blank_us, horizon_now);
     }
     // JUDGE ONLY AFTER THE MEASUREMENT CAN SHOW THE EFFECT. The action cadence (blank_us, 200 ms in
@@ -4050,7 +4051,9 @@ int64_t SnapcastClient::travel_horizon_us_() const {
   // ring and pipe are measured; the third term is the error filter's own lag, since a correction
   // is not visible until the filter has caught up with it. It used to be 2 * block_n arrivals,
   // which modelled the lag of averaging 64 arrivals -- an average that no longer exists.
-  return std::clamp<int64_t>(ring + pipe + timing::Engine::filter_lag_us(), 1000000, 5000000);
+  const int64_t transport = ring + pipe;
+  return std::clamp<int64_t>(transport + timing::Engine::filter_lag_us(transport), 1000000,
+                             5000000);
 }
 
 // The transport delay alone: how long before a delivered correction appears in a RAW render-phase
@@ -4066,7 +4069,10 @@ int64_t SnapcastClient::observation_delay_us_() const {
   if (travel <= 0) {
     // Mirrors cold: fall back to the horizon minus the lag we know we added to it, floored so a
     // zero here can never disable compensation altogether.
-    return std::max<int64_t>(PHASE_TRANSIENT_US - timing::Engine::filter_lag_us(), 100000);
+    // Cold mirrors: split the fallback horizon into transport + its own filter lag, using the
+    // same ratio the engine uses, rather than subtracting a fixed lag from it.
+    return std::max<int64_t>(
+        static_cast<int64_t>(PHASE_TRANSIENT_US / (1.0 + 1.0)), 100000);
   }
   return std::clamp<int64_t>(travel, 100000, 5000000);
 }
@@ -4158,6 +4164,17 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   prof.frame_rate_hz = sample_rate ? sample_rate : 44100;
   prof.visibility_us = this->visibility_horizon_us();
   prof.observation_delay_us = this->observation_delay_us_();
+  // Authority is sized by the PLANT'S WANDER, which is a ppm quantity and so independent of rate,
+  // buffer size and codec -- measured on this bench at |de/dt| median 16 ppm, p90 30 ppm. Swept in
+  // the host harness: frame corrections stop at 88-100 ppm and the saturation point is the same at
+  // 1 s and 2 s transport delays, confirming it follows the wander and not the horizon.
+  //
+  // NOT the actuator's +-TRIM_CLAMP_MAX_PPM. Authority that large lets rate accept an error it
+  // cannot then settle: proportional control through a transport delay overshoots by ~A*T, so a
+  // 907 us step was accepted and left an 85-290 us residual instead of being handed to position.
+  // The clamp was doing stability duty as well as noise duty, and only the noise part was
+  // documented.
+  prof.rate_authority_ppm = 100.0f;
   prof.target_position_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
 
@@ -4193,6 +4210,20 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
         ESP_LOGD(TAG, "Crystal offset %+.2f ppm persisted t=%" PRId64, x, obs.at_us);
       }
     }
+  }
+
+  // STEPDBG: why a step was UNAVOIDABLE, on its own short line. "why=CoarseError" only restates
+  // that the error crossed the gate; what matters is whether rate could have answered it instead,
+  // and that needs the filtered error, the gate it was tested against, the rate that would have
+  // removed it within one horizon, and the authority available. Logged on steps only, so it
+  // cannot flood, and with a fixed field count so nothing falls off the 256-byte ceiling.
+  if (cmd.frames != 0) {
+    ESP_LOGD(TAG,
+             "STEPDBG frames=%+" PRId32 " ef=%+" PRId64 " gate=%" PRId64 " need=%+.1f auth=%.0f "
+             "avoidable=%d",
+             cmd.frames, cmd.decision.filtered_us, cmd.decision.gate_us, cmd.decision.needed_ppm,
+             cmd.decision.authority_ppm,
+             std::fabs(cmd.decision.needed_ppm) <= cmd.decision.authority_ppm ? 1 : 0);
   }
 
   const int64_t tnow = obs.at_us;
