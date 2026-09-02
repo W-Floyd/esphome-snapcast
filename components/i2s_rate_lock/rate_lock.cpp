@@ -1,5 +1,7 @@
 #include "rate_lock.h"
 
+#include "frac_select.h"
+
 #if defined(USE_ESP32) && defined(USE_I2S_RATE_LOCK)
 
 #include "esphome/core/log.h"
@@ -46,8 +48,6 @@ static const char *const TAG = "snapclient.rate_lock";
 // that explicitly below. 5000 ppm is 0.5% pitch, at the audibility JND, so this also
 // caps a runaway caller at "noticeable" rather than "unlistenable".
 static constexpr float TRIM_CLAMP_PPM = 5000.0f;
-// x/y/z are 9-bit fields; denominators up to 511 give ~0.15 ppm rational spacing
-static constexpr uint32_t MAX_DENOMINATOR = 511;
 
 // Baseline correction. Trims are relative to the baseline divider, so an error in
 // the divider the I2S DRIVER chose would be a DC offset the servo must cancel out of
@@ -77,33 +77,7 @@ static constexpr double MULT_MATCH_TOL = 0.01;
 // tx_clkm_div_conf field layout: z[8:0] y[17:9] x[26:18] yn1[27]
 static constexpr uint32_t FRAC_FIELDS_MASK = 0x0FFFFFFF;
 
-static uint32_t encode_frac(uint32_t b, uint32_t a) {
-  uint32_t x = 0, y = 0, z = 0, yn1 = 0;
-  if (b != 0) {
-    yn1 = (2 * b > a) ? 1 : 0;
-    z = yn1 ? a - b : b;
-    x = a / z - 1;
-    y = a % z;
-  }
-  return (z & 0x1FF) | ((y & 0x1FF) << 9) | ((x & 0x1FF) << 18) | (yn1 << 27);
-}
 
-/// Inverts the encoding: a = (x+1)*z + y, b = yn1 ? a-z : z. z == 0 is a pure
-/// integer divider (b = 0). @return false on an undecodable field combination.
-static bool decode_frac(uint32_t val, uint32_t &b, uint32_t &a) {
-  const uint32_t z = val & 0x1FF;
-  const uint32_t y = (val >> 9) & 0x1FF;
-  const uint32_t x = (val >> 18) & 0x1FF;
-  const uint32_t yn1 = (val >> 27) & 0x1;
-  if (z == 0) {
-    b = 0;
-    a = 1;
-    return val == 0;
-  }
-  a = (x + 1) * z + y;
-  b = yn1 ? a - z : z;
-  return b < a;
-}
 
 static i2s_dev_t *i2s_hw(uint8_t port) { return port == 0 ? &I2S0 : &I2S1; }
 
@@ -226,32 +200,17 @@ bool RateLock::set_trim_ppm(float ppm) {
   // The two achievable ratios that bracket the target fraction: the largest b/a <= frac
   // and the smallest b/a >= frac over all denominators (~1000 float ops, a few times per
   // second). Where one of them IS the target (err < 1e-9) there is nothing to dither.
-  uint32_t lo_b = 0, lo_a = 1, hi_b = 1, hi_a = 1;
-  double lo_v = 0.0, hi_v = 1.0;
-  for (uint32_t a = 2; a <= MAX_DENOMINATOR; a++) {
-    const double fa = frac * a;
-    const auto bl = static_cast<uint32_t>(std::min(static_cast<long>(std::floor(fa)), static_cast<long>(a - 1)));
-    const auto bh = static_cast<uint32_t>(std::min(static_cast<long>(std::ceil(fa)), static_cast<long>(a - 1)));
-    const double vl = static_cast<double>(bl) / a, vh = static_cast<double>(bh) / a;
-    if (vl <= frac && vl > lo_v) {
-      lo_v = vl;
-      lo_b = bl;
-      lo_a = a;
-    }
-    if (vh >= frac && vh < hi_v) {
-      hi_v = vh;
-      hi_b = bh;
-      hi_a = a;
-    }
-  }
-  const uint32_t lo_val = encode_frac(lo_b, lo_a);
-  const uint32_t hi_val = encode_frac(hi_b, hi_a);
+  // Bracket search and duty live in frac_select.h so they can be tested off-target
+  // (tests/rate_lock/run.sh); this file cannot be compiled on the host.
+  const FracChoice fc = pick_frac(frac);
+  const uint32_t lo_val = encode_frac(fc.lo_b, fc.lo_a);
+  const uint32_t hi_val = encode_frac(fc.hi_b, fc.hi_a);
+  const double lo_v = fc.lo_v, hi_v = fc.hi_v;
   const double gap = hi_v - lo_v;
-  const bool exact = gap < 1e-9 || (frac - lo_v) < 1e-9 || (hi_v - frac) < 1e-9;
 
-  if (exact) {
+  if (fc.exact) {
     // Single value: whichever end coincides with the target
-    const bool use_lo = (frac - lo_v) <= (hi_v - frac);
+    const bool use_lo = fc.use_lo;
     const uint32_t val = use_lo ? lo_val : hi_val;
     this->dither_on_.store(false, std::memory_order_relaxed);
     if (val != this->last_frac_val_.load(std::memory_order_relaxed)) {
@@ -268,7 +227,7 @@ bool RateLock::set_trim_ppm(float ppm) {
     // old bracket. tick() writes the register from here on; nothing is written now, so
     // the current value (one of the previous bracket, or the last single value) stays
     // until the first tick -- at most one 10 ms interval at the old rate.
-    const double duty = (frac - lo_v) / gap;
+    const double duty = fc.duty;
     this->dither_lo_.store(lo_val, std::memory_order_relaxed);
     this->dither_hi_.store(hi_val, std::memory_order_relaxed);
     this->dither_duty_.store(static_cast<uint32_t>(std::lround(duty * 65536.0)), std::memory_order_relaxed);
@@ -290,14 +249,9 @@ void RateLock::tick() {
   // First-order sigma-delta in 1/65536 units: the accumulator carries the running
   // shortfall between the requested duty and the hi-ticks delivered, so the long-run
   // share of hi equals duty and the instantaneous error never exceeds one tick.
-  this->sd_acc_ += this->dither_duty_.load(std::memory_order_relaxed);
-  uint32_t want;
-  if (this->sd_acc_ >= 65536u) {
-    this->sd_acc_ -= 65536u;
-    want = this->dither_hi_.load(std::memory_order_relaxed);
-  } else {
-    want = this->dither_lo_.load(std::memory_order_relaxed);
-  }
+  const bool hi = sigma_delta_step(this->dither_duty_.load(std::memory_order_relaxed), this->sd_acc_);
+  const uint32_t want = hi ? this->dither_hi_.load(std::memory_order_relaxed)
+                           : this->dither_lo_.load(std::memory_order_relaxed);
   if (want != this->last_frac_val_.load(std::memory_order_relaxed)) {
     // Single 32-bit store: the fraction changes atomically
     i2s_hw(this->port_)->tx_clkm_div_conf.val = want;

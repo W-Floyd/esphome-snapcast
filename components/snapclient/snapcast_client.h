@@ -1150,6 +1150,12 @@ class SnapcastClient {
   /// Position accuracy the engine aims at (us); sets its rate-command noise budget.
   std::atomic<int32_t> tune_timing_target_us_{20};
   timing::Engine timing_engine_{timing::Profile{}};
+  /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
+  /// pushed past the frame index it was applied at. Until then the engine issues no further
+  /// correction, and the crystal earns no credit for this one.
+  uint64_t pending_correction_id_{0};
+  int64_t pending_correction_at_frame_{0};
+
   /// Last crystal value written to NVS, and when: the save is gated on 2 ppm or 10 minutes.
   float crystal_saved_ppm_{0.0f};
   int64_t crystal_saved_at_us_{0};

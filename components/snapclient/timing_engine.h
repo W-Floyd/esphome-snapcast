@@ -134,6 +134,7 @@ class Engine {
   // the net over a long baseline is.
   int32_t credit_frames_ = 0;
   int64_t credit_since_us_ = 0;
+  uint32_t credit_count_ = 0;
 
   bool in_flight_ = false;
   uint64_t next_id_ = 1;

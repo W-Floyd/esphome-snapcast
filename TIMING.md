@@ -241,6 +241,13 @@ never written live (IDF's "double division" workaround bursts MCLK ~6.5× and is
 running channel). Sigma-delta dither between bracketing ratios at the speaker callback cadence;
 residual ~10 ns.
 
+**The ~0.15 ppm figure is the spacing AT THE BASELINE, not a bound.** Measured on the host
+(`tests/rate_lock/run.sh`): the representable fractions crowd near high-denominator targets and
+thin out near simple ones, so the bracket is 0.15 ppm around 76/441 but reaches **23 ppm** where
+the fraction passes 1/6 (inside the servo's own ±500 ppm) and **27.7 ppm** near 1/5 (inside the
+±5000 ppm clamp). That costs *ripple*, not accuracy: the dithered mean is the requested rate to
+**0.0003 ppm**, and the worst bracket puts 0.28 µs of position ripple per 10 ms tick.
+
 Trims are *relative to a baseline*, so a wrong baseline is a DC offset the servo must cancel out
 of its own authority. For 44.1 kHz × 256 from 160 MHz the ideal divider is `6250/441 = 14 + 76/441`
 — exactly representable, so where the driver picks a worse approximation we recompute. After the

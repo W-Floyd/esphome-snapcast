@@ -12,6 +12,13 @@ constexpr int MAX_IN_FLIGHT_HORIZONS = 3;
 /// Baseline for the rate credit, in horizons. One correction says nothing about rate; the net
 /// over a long baseline does, because noise-driven corrections have mixed signs and cancel.
 constexpr int CREDIT_BASELINE_HORIZONS = 10;
+/// A rate offset shows up as a STREAM of same-signed corrections; a one-off displacement shows
+/// up as a single large one. Requiring several before crediting is what separates them.
+constexpr uint32_t CREDIT_MIN_CORRECTIONS = 3;
+/// And cap what one window may contribute. Measured 2026-09-02: a 1.5 ms displacement corrected
+/// in one 69-frame step implied 156 ppm of "rate", which wound the estimate to its clamp. A
+/// sustained offset still converges, over several windows.
+constexpr float CREDIT_MAX_PPM_PER_WINDOW = 5.0f;
 /// A crystal moves with temperature over minutes, so learn it slowly.
 constexpr float CRYSTAL_TAU_S = 300.0f;
 /// A crystal is tens of ppm; hundreds means the estimate is tracking something else.
@@ -31,6 +38,7 @@ void Engine::reset() {
   crystal_ppm_ = 0.0f;
   crystal_at_us_ = 0;
   credit_frames_ = 0;
+  credit_count_ = 0;
   credit_since_us_ = 0;
   err_seeded_ = false;
   in_flight_ = false;
@@ -66,20 +74,25 @@ void Engine::credit_position_correction(int32_t frames, int64_t now_us) {
   // avoid. Mixed-sign noise cancels in the net; a real offset accumulates.
   if (credit_since_us_ == 0) credit_since_us_ = now_us;
   credit_frames_ += frames;
+  credit_count_++;
 
   const int64_t baseline_us =
       static_cast<int64_t>(CREDIT_BASELINE_HORIZONS) * profile_.visibility_us;
   const int64_t dt_us = now_us - credit_since_us_;
   if (dt_us < baseline_us) return;
 
-  if (credit_frames_ != 0) {
+  // A single correction in the window is a displacement, not a rate: crediting it is how a
+  // one-off 1.5 ms catch-up became 156 ppm and wound the estimate to its clamp.
+  if (credit_frames_ != 0 && credit_count_ >= CREDIT_MIN_CORRECTIONS) {
     const float moved_us =
         static_cast<float>(credit_frames_) * static_cast<float>(profile_.frame_us());
     const float implied_ppm = 1e6f * moved_us / static_cast<float>(dt_us);
     // Dropped frames (positive) mean we were late, which needs a positive trim: same sign.
-    crystal_ppm_ = std::clamp(crystal_ppm_ + implied_ppm, -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
+    const float step = std::clamp(implied_ppm, -CREDIT_MAX_PPM_PER_WINDOW, CREDIT_MAX_PPM_PER_WINDOW);
+    crystal_ppm_ = std::clamp(crystal_ppm_ + step, -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
   }
   credit_frames_ = 0;
+  credit_count_ = 0;
   credit_since_us_ = now_us;
 }
 

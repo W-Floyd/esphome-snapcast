@@ -3254,6 +3254,16 @@ void SnapcastClient::player_task_() {
       st.trim_samples++;
     }
 #endif
+    // Confirm a landing before deciding anything else: the engine holds position while one is in
+    // flight, and the crystal is credited only on confirmation. Frame-exact, not "probably by
+    // now" -- the correction has landed once the player has pushed past the frame index it was
+    // applied at, plus a margin for what was already queued.
+    if (this->pending_correction_id_ != 0 &&
+        this->played_frames_total_ >= this->pending_correction_at_frame_) {
+      this->timing_engine_.confirm_position_landed(this->pending_correction_id_, now_us());
+      this->pending_correction_id_ = 0;
+    }
+
     const int32_t applied_frames = engine_cmd.frames;
     if (applied_frames > 0) {
       drop_frames = static_cast<uint32_t>(applied_frames);
@@ -3267,6 +3277,12 @@ void SnapcastClient::player_task_() {
     if (applied_frames != 0) {
       st.phase_transient_until_us =
           std::max(st.phase_transient_until_us, now_us() + this->visibility_horizon_us());
+      // Landing target: everything queued now, plus this chunk. Recorded in frames so the
+      // confirmation cannot drift with the wall clock.
+      this->pending_correction_id_ = engine_cmd.correction_id;
+      this->pending_correction_at_frame_ =
+          this->played_frames_total_ + static_cast<int64_t>(st.pipe_depth_frames) +
+          static_cast<int64_t>(rec.params.sample_rate) / 20;  // + ~50 ms of margin
     }
 
 

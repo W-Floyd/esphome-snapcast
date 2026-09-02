@@ -244,6 +244,28 @@ int main() {
           r48.final_crystal_ppm, r44.final_crystal_ppm);
   }
 
+  printf("\n9b. a one-off displacement must not be credited as rate\n");
+  {
+    // The failure seen on hardware: 1.5 ms of accumulated error corrected in one step implied
+    // 156 ppm and wound the crystal to its clamp. A displacement is not a rate.
+    Engine eng(p);
+    Plant plant;
+    plant.plant_ppm = 0.0;                      // no rate error at all
+    plant.frame_us = p.frame_us();
+    plant.error_us = 1500.0;                    // but 1.5 ms of displacement
+    uint64_t pid = 0; int32_t pf = 0; bool live = false; int64_t land = 0;
+    for (int64_t t = 0; t < 600000000; t += 25000) {
+      if (live && t >= land) { plant.apply_frames(pf); eng.confirm_position_landed(pid, t); live = false; }
+      Observation obs{t, static_cast<int64_t>(std::llround(plant.error_us)), true};
+      Command c = eng.step(t, obs, GroupEvidence{});
+      if (c.frames != 0) { pid = c.correction_id; pf = c.frames; land = t + p.visibility_us; live = true; }
+      plant.advance(25000, c.rate_ppm);
+    }
+    printf("        crystal after a pure 1.5 ms displacement: %.2f ppm\n", eng.crystal_ppm());
+    check(std::fabs(eng.crystal_ppm()) < 10.0,
+          "displacement does not become rate", eng.crystal_ppm(), 0.0);
+  }
+
   printf("\n9. observation cadence must not retune the loop\n");
   {
     // Same plant, same duration, observations 25x apart in cadence. A fixed filter weight would
