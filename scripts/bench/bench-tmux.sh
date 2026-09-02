@@ -562,7 +562,10 @@ cmd_flash() {
     # an OTA log saying "successful" does not, since a replug inside the first minute rolls
     # both halves back and the log still reads clean.
     for role in ${FLASH_ROLES}; do
-        before="$("$(pyexe)" scripts/bench/device-info.py "$(get HOST "${role}")" 2>/dev/null | cut -f2)"
+        # `|| true`: an unreachable board is an ANSWER here, not a failure -- it is the normal
+        # case for a board that is mid-reboot or newly joined. Without it, pipefail makes the
+        # empty result kill the flash before it starts.
+        before="$("$(pyexe)" scripts/bench/device-info.py "$(get HOST "${role}")" 2>/dev/null | cut -f2 || true)"
         set_ WAS "${role}" "${before:-unknown}"
         printf '    %-9s %-34s running build %s\n' "${role}" "$(get HOST "${role}")" "${before:-UNREACHABLE (API)}"
     done
@@ -599,7 +602,7 @@ cmd_flash() {
         after=""
         local i=0
         while [ "${i}" -lt 30 ]; do
-            after="$("$(pyexe)" scripts/bench/device-info.py "${host}" 2>/dev/null | cut -f2)"
+            after="$("$(pyexe)" scripts/bench/device-info.py "${host}" 2>/dev/null | cut -f2 || true)"
             [ -n "${after}" ] && break
             i=$((i + 1)); sleep 2
         done
