@@ -543,9 +543,32 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     // owns the error and the integral has nothing to say about it. The superseded fixed-tau form
     // was robust here for this reason, integrating clamp(Kp e, +-budget) rather than e; keeping
     // that property while taking the delay-limited bandwidth is the point of this line.
-    const float e_bounded = std::clamp(static_cast<float>(e),
-                                       -static_cast<float>(frame_us),
-                                       static_cast<float>(frame_us));
+    // TRIED AND REVERTED: integrating only the COMMON part (e - e_diff), so the differential
+    // could not leak into the crystal. It broke differential correction outright -- group case 2
+    // went from 16 us of skew to 199 us -- because a differential caused by a PLANT RATE
+    // difference needs integral action to null it, and that change removed the differential from
+    // the only integrator there is. P alone leaves a steady-state error of (rate difference)/Kp.
+    //
+    // Each board's crystal must therefore keep learning its OWN plant from its own deadline
+    // error, which is what makes two boards with different crystals converge in rate at all.
+    // CLAMP EACH COMPONENT SEPARATELY, or a large common error clips the differential away.
+    //
+    // The clamp exists to stop measurement transients winding the estimate (test 12), and it must
+    // stay. But applied to the whole error it saturates on whichever component is larger: with a
+    // 40 ppm common drift the error grows fast, the clamp pins at one frame, and the few
+    // microseconds of DIFFERENTIAL riding on top are discarded -- so the crystal can never learn
+    // the plant difference, and P is left holding it alone at a steady-state error of
+    // (rate difference)/Kp.
+    //
+    // Measured in tests/group: common drift alone 1 us of skew, a differential alone 16 us, and
+    // the two TOGETHER 90 us -- a nonlinear interaction, and this clamp is the only nonlinearity
+    // on the path. Bounding the parts independently keeps the transient protection while leaving
+    // the differential visible to the integral.
+    const float e_common_f = static_cast<float>(have_diff ? e - e_diff : e);
+    const float e_diff_f = static_cast<float>(have_diff ? e_diff : 0);
+    const float fu = static_cast<float>(frame_us);
+    const float e_bounded =
+        std::clamp(e_common_f, -fu, fu) + std::clamp(e_diff_f, -fu, fu);
     // BOUND THE STEP BY BOUNDING dt. dt_s is the time since the last observation, and during a
     // storm observations stop for seconds -- so the integral was applying wn^2 * bound * dt in
     // ONE step, as though it had been watching the whole time. With the horizon collapsed to its
@@ -572,13 +595,28 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   //     budget -- and to sigma_filtered * Kp here, which is smaller still. Clamping the output to
   //     the budget as well conflated "how much noise may I add" with "how much error may I
   //     correct", and cost a frame correction every horizon.
-  // TRIED AND REVERTED: P on the differential error instead of the deadline error. The reasoning
-  // was that rate steering to this board's OWN deadline fights position steering to the group
-  // when the two deadlines disagree. That reasoning may still be right, but it did NOT fix the
-  // re-anchor case (384 ms of skew either way, because the RESYNC path is what yanks each board
-  // to its own re-anchored deadline) and it cost group test 3 -- skew 77 us against a 44 us
-  // bound -- so it is not carried on an argument the numbers do not support.
-  const float p_raw = differential ? proportional_gain_ppm_per_us() * err_mean_us_ : 0.0f;
+  // NO BOOLEAN ON A CONTINUOUS ACTUATOR. `differential` gates POSITION, and a threshold suits it:
+  // frames are quantised and a correction is irreversible, so there is a real question of whether
+  // to spend one. Rate is continuous and reversible, and gating it on the same boolean made the
+  // command switch between 0 and its rail instead of ramping.
+  //
+  // Measured on the bench 2026-09-02, once the frame corrections were gone and the trace was
+  // still jagged: why=Common on 164/269 decisions (61%) on board a and 130/263 (49%) on b, so P
+  // was exactly 0 on most decisions and up to +-100 ppm on the rest -- single-step jumps of
+  // 100.78 ppm, commanded-rate sd 35.8 ppm against a crystal sd of 5.7. The crystal was smooth;
+  // the switch was doing all the jumping.
+  //
+  // And the two halves disagreed about which error they were about: the gate tested the
+  // DIFFERENTIAL (>= target_position_us, 20 us) while P was computed from the DEADLINE error
+  // (median 102 us, p90 351 us). So 21 us of differential unlocked a 100 ppm response driven by
+  // an unrelated 350 us number. With sigma_e pinned at its one-frame floor, Kp saturates P past
+  // 44 us of error, which is why the rail was reached at all.
+  //
+  // So P acts on the error position is judged on, continuously: no boolean, and the same quantity
+  // throughout. A differential of 21 us now asks for 10 ppm, not 100. Where there is no group to
+  // be differential from, it falls back to the deadline error, which is correct for a lone client
+  // -- tracking the server is then the only meaning "in sync" has.
+  const float p_raw = proportional_gain_ppm_per_us() * static_cast<float>(e_position);
   const float p_term = std::clamp(p_raw, -profile_.rate_authority_ppm, profile_.rate_authority_ppm);
   cmd.rate_ppm = crystal_ppm_ + p_term;
   cmd.decision.act = differential ? Decision::Act::Rate : Decision::Act::Hold;
