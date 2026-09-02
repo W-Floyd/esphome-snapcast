@@ -45,6 +45,7 @@ void Engine::reset() {
   in_flight_id_ = 0;
   in_flight_frames_ = 0;
   in_flight_since_us_ = 0;
+  blind_until_us_ = 0;
   last_obs_us_ = 0;
   suppressed_ = 0;
 }
@@ -126,6 +127,32 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   const int64_t e = obs.error_us;
   cmd.decision.error_us = e;
 
+  // A correction has been delivered, but the measurement cannot show it yet. Every observation
+  // until the visibility horizon passes describes the position we have already left, so feeding
+  // them to the filter drags it back onto the error the correction just removed and buys a second
+  // correction for one displacement. Hold, and take nothing in.
+  //
+  // Not the same interlock as in_flight_. That one ends when the audio moves, one pipeline depth
+  // away (~350 ms); this one ends when the move is observable, one visibility horizon away
+  // (1-5 s). Releasing on the first was measured on the bench as 40 corrections and 2.5 ms of
+  // residual for a 3-frame step -- see test 4, which sweeps the whole visibility range.
+  if (blind_until_us_ != 0) {
+    if (now_us < blind_until_us_) {
+      cmd.rate_ppm = crystal_ppm_;
+      cmd.decision.act = Decision::Act::Hold;
+      cmd.decision.why = Decision::Why::InFlight;
+      cmd.decision.rate_ppm = cmd.rate_ppm;
+      suppressed_++;
+      return cmd;
+    }
+    blind_until_us_ = 0;
+    // No observation was taken in during the blind window, so this is not a long observation
+    // interval -- it is the first sample of a new one. Without this, dt spans the whole horizon,
+    // alpha approaches 1, and the filter jumps onto a single noisy sample, discarding the
+    // feed-forward estimate confirm_position_landed() already applied.
+    last_obs_us_ = now_us;
+  }
+
   // Track the error and its own noise. alpha comes from the elapsed time, so the filter has the
   // same timescale whether observations arrive per chunk or per tag arrival.
   {
@@ -197,6 +224,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     in_flight_id_ = next_id_++;
     in_flight_frames_ = frames;
     in_flight_since_us_ = now_us;
+    blind_until_us_ = now_us + profile_.visibility_us;
     cmd.frames = frames;
     cmd.correction_id = in_flight_id_;
     // Rate holds the learned offset only; chasing the same error would deliver it twice.

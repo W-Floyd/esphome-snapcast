@@ -10,6 +10,7 @@
 #include "../../components/snapclient/timing_engine.h"
 
 #include <cmath>
+#include <deque>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -59,8 +60,16 @@ struct Run {
   double rate_sd_ppm = 0.0;
 };
 
-/// Run the closed loop for `seconds`, observing every `tick_us`, landing corrections after the
-/// visibility horizon.
+/// Run the closed loop for `seconds`, observing every `tick_us`.
+///
+/// The plant moves when the frames are actually dropped -- one pipeline depth away, ~350 ms --
+/// but the MEASUREMENT does not show it for a whole visibility horizon (ring + pipe + the error
+/// filter's own lag). Those are different times and the harness used to collapse them into one,
+/// landing the plant and confirming at t + visibility together. That made the harness incapable
+/// of expressing the hardware's actual behaviour: on the bench the engine sees a full visibility
+/// window of pre-correction observations after it has already corrected, and re-issues.
+///
+/// So observations here come from a delay line, `visibility_us` behind the plant.
 Run simulate(Profile p, double plant_ppm, double seconds, double noise_us = 0.0,
              bool group_present = false, int64_t group_delta_us = 0, uint8_t contributors = 2) {
   Engine eng(p);
@@ -70,9 +79,13 @@ Run simulate(Profile p, double plant_ppm, double seconds, double noise_us = 0.0,
   plant.noise_us = noise_us;
 
   const int64_t tick_us = 25000;  // ~40 Hz observations; the engine assumes no cadence
+  const int64_t pipe_us = 350000;  // when the dropped frames actually leave the pipeline
   Run r{};
   double sum = 0.0, sumsq = 0.0;
   int n = 0;
+
+  // Delay line: what the measurement reports now is where the plant was visibility_us ago.
+  std::deque<std::pair<int64_t, double>> history;
 
   struct Pending {
     uint64_t id;
@@ -89,7 +102,14 @@ Run simulate(Profile p, double plant_ppm, double seconds, double noise_us = 0.0,
       pend.live = false;
     }
 
-    Observation obs{t, static_cast<int64_t>(std::llround(plant.observe())), true};
+    // Record the truth, then report it visibility_us late.
+    history.emplace_back(t, plant.observe());
+    double seen = history.front().second;
+    while (history.size() > 1 && history.front().first <= t - p.visibility_us) {
+      seen = history.front().second;
+      history.pop_front();
+    }
+    Observation obs{t, static_cast<int64_t>(std::llround(seen)), true};
     GroupEvidence g{};
     g.present = group_present;
     g.delta_us = group_delta_us;
@@ -98,7 +118,7 @@ Run simulate(Profile p, double plant_ppm, double seconds, double noise_us = 0.0,
     Command cmd = eng.step(t, obs, g);
     if (cmd.frames != 0) {
       r.position_corrections++;
-      pend = {cmd.correction_id, cmd.frames, t + p.visibility_us, true};
+      pend = {cmd.correction_id, cmd.frames, t + pipe_us, true};
     }
     plant.advance(tick_us, cmd.rate_ppm);
 
@@ -164,35 +184,53 @@ int main() {
   }
 
   printf("\n4. large step (one frame equivalent): delivered once, not repeatedly\n");
-  {
-    Engine eng(p);
+  // Swept across the WHOLE visibility range travel_horizon_us_() can produce -- it is clamped to
+  // [1 s, 5 s] and varies with ring and pipe depth at runtime, so the property has to hold across
+  // it, not at one value. Testing only 1 s hid this: there the stale window is 0.65 s and the
+  // filter (tau 2 s) cannot climb back over the coarse gate. At 3 s it can.
+  for (int64_t vis_us : {1000000, 2000000, 3000000, 4000000, 5000000}) {
+    Profile pv = p;
+    pv.visibility_us = vis_us;
+    Engine eng(pv);
     Plant plant;
-    plant.frame_us = p.frame_us();
-    plant.error_us = 3.0 * static_cast<double>(p.frame_us());  // 3 frames late
+    plant.frame_us = pv.frame_us();
+    plant.error_us = 3.0 * static_cast<double>(pv.frame_us());  // 3 frames late
     int corrections = 0;
     uint64_t pend_id = 0;
     int32_t pend_frames = 0;
     bool live = false;
     int64_t land = 0;
+    // Same two-timescale model as simulate(): the plant moves at the pipeline depth, the
+    // measurement follows a visibility horizon later. Landing and visibility were one time here
+    // too, which is why this property passed while the bench re-issued.
+    std::deque<std::pair<int64_t, double>> history;
     for (int64_t t = 0; t < 20000000; t += 25000) {
       if (live && t >= land) {
         plant.apply_frames(pend_frames);
         eng.confirm_position_landed(pend_id, t);
         live = false;
       }
-      Observation obs{t, static_cast<int64_t>(std::llround(plant.error_us)), true};
+      history.emplace_back(t, plant.error_us);
+      double seen = history.front().second;
+      while (history.size() > 1 && history.front().first <= t - pv.visibility_us) {
+        seen = history.front().second;
+        history.pop_front();
+      }
+      Observation obs{t, static_cast<int64_t>(std::llround(seen)), true};
       Command cmd = eng.step(t, obs, GroupEvidence{});
       if (cmd.frames != 0) {
         corrections++;
         pend_id = cmd.correction_id;
         pend_frames = cmd.frames;
-        land = t + p.visibility_us;
+        land = t + 350000;  // pipeline depth, NOT the visibility horizon
         live = true;
       }
       plant.advance(25000, cmd.rate_ppm);
     }
+    printf("        visibility %lld ms: %d corrections, residual %+.1f us\n",
+           static_cast<long long>(vis_us / 1000), corrections, plant.error_us);
     check(corrections <= 2, "3-frame error costs at most 2 corrections", corrections, 2);
-    check(std::fabs(plant.error_us) < static_cast<double>(p.frame_us()),
+    check(std::fabs(plant.error_us) < static_cast<double>(pv.frame_us()),
           "settles inside one frame", plant.error_us, 0.0);
   }
 
