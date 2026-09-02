@@ -107,9 +107,10 @@ Every convergence win below is feed-forward or a better measurement.
 
 ---
 
-## 3. Stage 0 — the two things to fix before anything else
+## 3. Stage 0 — two live defects (done, `638c714`)
 
-Neither is a refactor; both are live defects found while reading.
+Neither was a refactor; both were live defects found while reading. Recorded because one of them
+invalidates earlier measurements.
 
 **0a. `render_align_max: 0` does not disable render_align. [C]**
 [L919](components/snapclient/snapcast_client.cpp#L919) only copies the YAML value into
@@ -119,9 +120,9 @@ Neither is a refactor; both are live defects found while reading.
 [L6254](components/snapclient/snapcast_client.cpp#L6254) says "0 = off". It has been running at a
 500 µs cap with `align_apply` true. Fix the seeding to store unconditionally.
 
-Consequence to state plainly: **every measurement taken while the operator believed align was off
-was taken with a third controller live**, including the quiet-window numbers in `HANDOFF.md`.
-Re-baseline before grading anything against them.
+Consequence: **every measurement taken while the operator believed align was off was taken with a
+third controller live**, including the quiet-window numbers in `HANDOFF.md`. Those numbers are not
+a baseline; re-baseline before grading anything against them.
 
 **0b. `fast_splice_`'s docblock contradicts its code. [C]** The opening comment says the splice
 "arms at `resync_splice_us` and immediately" inside the resync window; the code sets
@@ -132,172 +133,82 @@ already read the wrong one and reported it as behaviour.
 
 ---
 
-## 4. Stage 1 — find the reference's missing factor (blocking)
+## 4. Stage 1 — the reference (closed)
 
-> **MEASURED 2026-09-02, and the premise does not reproduce. See "Stage 1 result" at the end of
-> this section before reading the candidate list below** — the candidates are retained as the
-> record of what was suspected, not as open work.
-
-**Nothing downstream can be graded until this closes.** But the question is now much narrower than
-it was, because two of the three candidates are eliminated by source reading.
-
-### What is already excluded [C]
-
-**The stamp is a hardware capture.** Read in the fork (`speaker-render-latency`, `dd14d50`):
-`esp_timer_get_time()` is taken inside the I2S TX-done ISR `i2s_on_sent_cb` (`IRAM_ATTR`,
-[i2s_audio_speaker.cpp:336](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp#L336)),
-queued per completed DMA descriptor, paired 1:1 with its write record, and reduced by the
-descriptor's trailing silence
-([i2s_audio_speaker_standard.cpp:285](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp#L285)).
-The mixer forwards it **unchanged** to the tagging source only
-([mixer_speaker.cpp:475](../esphome/esphome/components/mixer/speaker/mixer_speaker.cpp#L475)).
-There is no pivot, no EWMA, no model anywhere in the path.
-
-**The phase derivation adds nothing modelled.** `publish_render_phase_sample_`
-([L4397-L4423](components/snapclient/snapcast_client.cpp#L4397-L4423)) walks back `frames` from
-that stamp, converts through a fresh TSF sandwich, and subtracts the tag's own server time.
-
-So `HANDOFF.md`'s standing suspect — the tag/feedback stamping — **is exonerated**, and the
-proposal to "make the render phase honest with a TX-done timestamp" is a proposal to build what
-already exists. Record it as answered; do not re-derive it.
-
-### What accounts for a factor of 2 [C]
-
-`render_group_delta_us` includes **our own phase in the group** (`vals[0] = 0.0`), and
-`robust_mean` short-circuits to the plain mean for `n < 3`
-([tsf_sync.cpp:794-802](components/clock_sync/tsf_sync.cpp#L794-L802)). With two publishing
-speakers — and the observer publishes none, `publish_render_phase_` returns early on
-`tsf_observer` ([L4378](components/snapclient/snapcast_client.cpp#L4378)) — the delta is exactly
-**half** the A–B disagreement. That is correct for control: each device corrects half the gap and
-they meet in the middle. It is wrong for *grading*, and the neighbouring
-`update_group_diagnostics_` excludes self for precisely this reason, in a comment that says a
-two-device pair would otherwise "read half its true disagreement"
-([tsf_sync.cpp:1078](components/clock_sync/tsf_sync.cpp#L1078)).
-
-**[M] First thing to check, and it is free:** whether the "≤0.2 ms" in the 08-30 comparison came
-from `render_group_delta_us` (halved) or from raw pairwise `peer.phase_us − mine` (not halved). If
-the former, ~2× of the ~8× is this and is not a defect at all.
-
-### What remains
-
-After the stamp and the self-inclusion, **~4× is genuinely unexplained.** The remaining candidates,
-in the order they cost least to test:
-
-1. **The drift extrapolation.** Each peer's phase is extrapolated to our sample instant by
-   `map_drift_ppm_ × pair_gap` ([tsf_sync.cpp:1042](components/clock_sync/tsf_sync.cpp#L1042)).
-   A wrong drift rate or a wrong `pair_gap` sign scales the delta directly.
-2. **`PHASE_STALE_US` / pairing selection bias.** Pairs that survive the 300 ms window may not be
-   a fair sample of the disagreement — if the phase moves most during exactly the intervals that
-   fail to pair, the survivors under-report by construction. This is the CLAUDE.md
-   "a search narrow enough to confirm an expectation" shape, applied to a data selector.
-3. **`RENDER_TAG_MAX_AGE_US` (100 ms) plus transient gating.** A board that is moving publishes
-   `RENDER_PHASE_UNKNOWN`; if the differential is largest while moving, the exchange systematically
-   samples the quiet part of the distribution.
-
-Note that (2) and (3) are both *selection* effects, not measurement errors, and neither is fixed by
-averaging harder. That distinction decides the fix.
-
-**[M] Test:** shadow-log the pairing inputs per computed delta — one short fixed-field line
-(`GDIN`: `mine`, `peer`, `pair_gap`, `drift_ppm`, `extrap`, `n`, the raw pairwise difference
-*before* self-inclusion), no variable-length tail. Grade against the analyser over a window
-containing a known differential.
-
-**Pass condition:** the raw pairwise difference tracks the rival-clean wire at slope 1.0 ± 0.15
-over ≥ 6 disjoint 5-minute blocks. Report the halved control-path delta beside it, so the two are
-never confused again.
-
-**Implemented 2026-09-02:** `scripts/bench/gdin-wire.py` grades exactly this — Theil-Sen slope per
-block, wire gated on `rival` *and* `pcm_coef`, gaps and reboots refused, sign preserved (a negative
-slope is an orientation mismatch, not a firmware result). `--self-test` covers slope 1, the 4×
-case, 10 % whole-frame outliers and an inversion, so it can be trusted before the bench is.
-
-Two facts about the signal, both of which look like faults and are not:
-
-* **A board with no render phase of its own emits no GDIN at all.** `recompute_group_delta_`
-  returns early on `RENDER_PHASE_UNKNOWN`, so the observer — which drives no DAC — never emits
-  one. That is why it publishes `PHASEIN` instead. Do not read observer GDIN silence as a
-  regression.
-* **GDIN describes the last *scanned* peer that paired**, i.e. `peer_[]` order, not the freshest
-  or the closest. With one phase-contributing peer that is the only peer; with two it is an
-  arbitrary choice among them.
-
-**Do not skip to Stage 8 on the strength of an averaging argument.** Averaging a signal that is
-wrong by 4× produces a precise wrong number, and the 30 Hz averaged own-phase ring already exists
-([tsf_sync.h:136](components/clock_sync/tsf_sync.h#L136)) — it is not the missing piece.
-
-### One thing to fix regardless [C]
-
-`|gd|` is used as a **magnitude bound** on the PI's boost, as
-`min(|e|, |gd|·n_cons/(n_cons−1))` ([L4646](components/snapclient/snapcast_client.cpp#L4646)).
-The `n/(n−1)` factor is the self-inclusion correction — it un-halves the delta — and at `n = 2` it
-is exactly 2. **But `n` there is `consensus_n()`, which counts MAPPING contributors, while the
-delta is averaged over PHASE contributors, and those are not the same set. [C]**
-
-`consensus_n_` is set from the count of lines with a valid, fresh *mapping*
-([tsf_sync.cpp:876-888](components/clock_sync/tsf_sync.cpp#L876-L888)). The observer beacons a
-mapping — `observer-supermini.yaml` inherits `tsf_sync: true` from the base package and only adds
-`tsf_observer: true` — but publishes **no phase** ([L4378](components/snapclient/snapcast_client.cpp#L4378)).
-So on the bench `consensus_n = 3` while the phase group is `n = 2`: the boost applies
-`3/2 = 1.5×` where the correct un-halving is `2×`.
-
-The bound is therefore **25 % too tight**, and the error grows with every mapping-only member.
-Direction is conservative — too tight means tracking gain where the boost was warranted, not a
-runaway — but it is wrong, it is silent, and it means the bench's boost behaviour is not the
-behaviour a speakers-only group would get. Fix: have `tsf_sync` expose the phase-contributor count
-used to compute the delta, and let this consumer read that.
-
-**[M] Then check every other consumer for the same factor:** the window step's `resync_local_us`
-sanity check and the unmute group-agreement gate both compare `|gd|` against thresholds expressed
-in wire microseconds. If they do not carry the un-halving, they are comparing a half-gap against a
-full-gap threshold and are 2× too permissive on a pair.
-
-### Stage 1 result — measured 2026-09-02 [M]
-
-**The ~4× is not present in this build and configuration.** One 30-minute window (00:39–01:09),
-gap-free and reboot-free, both probed boards, MLS44, `rival`+`pcm_coef` gated wire, graded by
-`scripts/bench/gdin-wire.py`:
+**The reference is honest, and this stage no longer gates anything.** Measured over a clean
+30-minute window on both probed boards (MLS44, `rival`+`pcm_coef` gated wire,
+`scripts/bench/gdin-wire.py`, 2026-09-02):
 
     (n = 1398 A / 1370 B paired samples)              board A     board B
     median |wire|                                      80.5        80.2  us
     median |raw|                                       83.0        82.0  us
     median |raw| / median |wire|                        1.03        1.02
     median |gd|  / median |wire|                        0.51        0.51
-    raw - wire: median                                 +2.2        -2.2  us
-    raw - wire: MAD                                     6.8         6.9  us
+    raw - wire: median / MAD                       +2.2 / 6.8  -2.2 / 6.9  us
     raw - wire: sd                                     58.4       129.9  us
 
-`raw` tracks the wire 1:1 in slope AND magnitude, with a typical disagreement of ~7 µs on an
-80 µs signal. `gd` is 0.51× the wire, which for two phase contributors is the *correct* value:
-a board's deviation from the mean of {A,B} is (A−B)/2, and the `n/(n−1)` factor un-halves it.
-So the pairing inputs and the halving are both sound, and none of the three candidates below
-(drift extrapolation, `PHASE_STALE_US` selection, `RENDER_TAG_MAX_AGE_US` gating) is implicated
-in a *gain* error, because there is no gain error to explain.
+The raw pairwise difference tracks the wire 1:1 in slope and magnitude, disagreeing by ~7 µs MAD
+on an 80 µs signal. There is no gain error to explain.
 
-**Part of the original discrepancy was probably the mixed-group `n`.** The boost clamp un-halved
-`gd` with `consensus_n()` (MAPPING contributors) while the delta averages PHASE contributors. On
-this exact group — two speakers plus an observer that publishes a mapping but no phase — that is
-`n/(n−1)` = 1.5 where 2 is correct, a 1.33× under-correction. Fixed in `638c714`, which is in the
-build measured above, so the measurement cannot see what it was like before.
+### Four properties of the reference, each of which looks like a defect and is not
 
-**THREE THINGS THIS DOES NOT SETTLE**, and they are the live work:
+State these before touching anything that consumes the delta; each has already been proposed as a
+bug at least once.
 
-1. **The residual is heavy-tailed, and asymmetrically so.** MAD 6.8 vs sd 58 on A is a ratio of
-   8.6; B is MAD 6.9 vs sd **129.9**, twice A's tail on an identical median. Rare large
-   excursions, not a noisy signal — and `sd` alone overstated it by 8× when first computed, which
-   is the CLAUDE.md median/MAD rule collecting another scar. **What makes B's tail twice A's is
-   the most interesting open question in this data.**
-2. **One window, well-converged boards.** The differential's dynamic range within a block sets how
-   well any slope can be estimated; the quietest block had `wire` p2p of 102 µs and produced the
-   least trustworthy number.
-3. **The grader's own verdict is not yet reliable.** It reported FAIL (Theil-Sen median 0.93,
-   4/6 blocks in band) on data whose true slope is ~1.0. Theil-Sen is biased under
-   errors-in-variables — noise lives in `raw`, not in the wire — and the finding above came from
-   the regression BRACKET instead: `OLS(wire|raw)` = 0.58/0.21 (attenuated) against
-   `1/OLS(raw|wire)` = 1.04/1.02 (clustering at 1.0 in every block, both boards). The reverse
-   regression pinning to 1.0 while the forward one tracks `r` is the signature of
-   `raw = wire + noise`. **The self-test could not have caught this: it generated the wire as an
-   exact function of `raw`, so it validated the estimator on the one case where the bias vanishes.**
-   Report the bracket, and add x-noise to the self-test, before quoting a slope again.
+**`gd` is half the pairwise difference, by design.** `render_group_delta_us` includes our own
+phase (`vals[0] = 0.0`) and `robust_mean` short-circuits to the plain mean for `n < 3`
+([tsf_sync.cpp:794-802](components/clock_sync/tsf_sync.cpp#L794-L802)). With two publishing
+speakers the delta is exactly half the A–B disagreement — correct for control, since each device
+corrects half the gap and they meet in the middle. `update_group_diagnostics_` excludes self for
+precisely this reason ([tsf_sync.cpp:1078](components/clock_sync/tsf_sync.cpp#L1078)). Measured
+`|gd|/|wire|` = 0.51 on both boards, which is the expected value, not a shortfall.
+
+**The observer publishes no phase, so `n` = 2 on this bench.** `publish_render_phase_` returns
+early on `tsf_observer` ([L4378](components/snapclient/snapcast_client.cpp#L4378)), and
+`recompute_group_delta_` returns early on `RENDER_PHASE_UNKNOWN` — so the observer contributes a
+mapping but no phase, and emits no `GDIN` at all. That is its normal state, not a missing signal;
+it publishes `PHASEIN` instead. Any consumer un-halving the delta must therefore use
+`group_delta_n()` (phase contributors) and never `consensus_n()` (mapping contributors): on two
+speakers plus an observer the latter gives `n/(n−1)` = 1.5 where 2 is correct.
+
+**The stamp is a hardware capture, with nothing modelled in the path.**
+`esp_timer_get_time()` is taken inside the I2S TX-done ISR `i2s_on_sent_cb` (`IRAM_ATTR`,
+[i2s_audio_speaker.cpp:336](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker.cpp#L336)),
+queued per completed DMA descriptor, paired 1:1 with its write record, and reduced by the
+descriptor's trailing silence
+([i2s_audio_speaker_standard.cpp:285](../esphome/esphome/components/i2s_audio/speaker/i2s_audio_speaker_standard.cpp#L285));
+the mixer forwards it unchanged
+([mixer_speaker.cpp:475](../esphome/esphome/components/mixer/speaker/mixer_speaker.cpp#L475)), and
+`publish_render_phase_sample_`
+([L4397-L4423](components/snapclient/snapcast_client.cpp#L4397-L4423)) only walks back `frames`,
+converts through a fresh TSF sandwich, and subtracts the tag's own server time. No pivot, no EWMA,
+no model. **"Make the render phase honest with a TX-done timestamp" is a proposal to build what
+exists** — do not re-derive it.
+
+**`GDIN` names the last *scanned* peer that paired**, i.e. `peer_[]` order, which is arrival
+order rather than recency or proximity. With one phase-contributing peer that is the only peer;
+with two it is an arbitrary choice among them.
+
+### What is still open
+
+**Board B's residual tail is twice board A's** — `sd` 129.9 against 58.4 on an identical MAD of
+~6.9. So both boards agree with the wire in the typical case and differ only in how often they
+depart from it, which no averaging will explain and which is the one Stage 1 thread still live.
+`raw − wire` is the signal to characterise; `GDIN`'s `gap`, `drift` and `extrap` fields are
+already logged beside it.
+
+Two constraints on that work, learned the expensive way:
+
+* **Use median/MAD, not `sd`.** On this residual `sd` overstates the noise by 8×, and the first
+  number computed from it ("σ ≈ 55 µs") was wrong by that factor.
+* **The grader's own verdict is not yet trustworthy.** `gdin-wire.py` reports a Theil-Sen slope,
+  which is biased under errors-in-variables — the noise is in `raw`, not in the wire — and it
+  printed FAIL on the data above, whose true slope is ~1.0. The finding came from the regression
+  bracket instead: `OLS(wire|raw)` = 0.58/0.21 (attenuated) against `1/OLS(raw|wire)` = 1.04/1.02,
+  the latter clustering at 1.0 in every block on both boards, which is the signature of
+  `raw = wire + noise`. The self-test cannot catch this because it generates the wire as an exact
+  function of `raw`, the one case where the bias vanishes. **Report the bracket and add x-noise to
+  the self-test before quoting a slope again.**
 
 ---
 
@@ -320,12 +231,12 @@ DECIDE src=tag|ledger|none cls=rate|step|bias|none gate=<first refusing gate>
 `act` and one `gate`, and the counts reconcile with `soft_dropped_frames`,
 `soft_inserted_frames` and `hard_resyncs`.
 
-**Do not reconcile against the `Sync:` line's chunk field.** It prints `st.err_count` — the
-count of error samples, which fires the report AT 128 and so is *always* 128 — not a chunk
-census. It was labelled `chunks` until 2026-09-02 and that label alone produced a 4.2 %
-"mismatch" against DECIDE's accounting, for the sole reason that the two count different things.
-The frame sums are the pass condition; they reconcile exactly on a clean window (verified on both
-boards, 2026-09-01). Throttled chunks are carried in `sk=` so the census stays complete. **If that reconciliation fails, `TIMING.md`'s
+**The frame sums are the pass condition, and they reconcile on both boards over a clean window.**
+Throttled chunks are carried in `sk=`, so the census still accounts for every chunk. **Do not
+reconcile against the `Sync:` line's `err samples` field**: it is `st.err_count`, which fires the
+report *at* 128 and is therefore always 128 — an error-sample count, not a chunk census. It was
+labelled `chunks` once, and that label alone bought a 4.2 % "mismatch" against DECIDE for the sole
+reason that the two count different things. **If that reconciliation fails, `TIMING.md`'s
 description of the ladder is wrong and this plan is built on a wrong map** — that is the point of
 running it first.
 
@@ -614,12 +525,8 @@ medians within ±8 µs, over a quiet hour — the numbers `HANDOFF.md` records f
 
 ```
 0   live defects (align seeding, stale comment)      ── DONE 638c714
-1   the reference's missing ~4x                      ── MEASURED 2026-09-02: does not reproduce.
-                                                        raw tracks the wire 1:1 (MAD 6.8 us), gd is
-                                                        the correct n=2 half. Unblocked. Open: B's
-                                                        residual tail is 2x A's.
-2   DECIDE line + parser                             ── frame sums reconcile on both boards
-                                                        (2026-09-01); prerequisite for 4, 7, 8c
+1   the reference                                    ── CLOSED. Open: B's residual tail is 2x A's
+2   DECIDE line + parser                             ── frame sums reconcile; prereq for 4, 7, 8c
 3a  one error selector          (pure refactor)      ── shadow, zero-mismatch bar
 3b  one visibility horizon      (pure refactor)      ── shadow, >=99% reproduction bar
 4   one position arbiter        (structure)          ── convergence bars unchanged
@@ -637,15 +544,10 @@ fallback paths are what several gates fall back *to*, and a census taken before 
 measures the old system. 8c comes last because it audits the gains that 5, 6 and 8b introduce, not
 only the ones that exist today.
 
-**Stage 1 genuinely blocks — and as of 2026-09-02 it is measured and does not block any more:**
-the ~4× does not reproduce, so the reference is honest to ~7 µs MAD and the stages gated on it may
-proceed. What follows is the reasoning as written before that measurement; it stands as the record
-of why the stage was gated, and its escape hatch still applies to the *tail* asymmetry, which is
-unexplained.
-
-**Stage 1 genuinely blocks.** If the remaining ~4× cannot be explained, say so and cap the goal at
-what a 4×-attenuated reference can deliver, rather than proceeding and attributing the residual to
-the controller.
+**Stage 1 is measured and does not block:** the reference tracks the wire 1:1 to ~7 µs MAD, so the
+stages gated on it may proceed. The rule it was written to enforce still stands for what remains —
+if board B's residual tail cannot be explained, cap the goal at what a reference with that tail can
+deliver rather than proceeding and attributing the residual to the controller.
 
 ---
 
