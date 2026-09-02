@@ -47,10 +47,27 @@ struct Plant {
     // Dropping frames (positive) removes lateness.
     error_us -= static_cast<double>(frames) * static_cast<double>(frame_us);
   }
+  /// Rate of large one-sample excursions, per observation. The bench sees transients of tens of
+  /// milliseconds on an otherwise quiet run (census: min -26 ms, max +50 ms), from resyncs,
+  /// membership changes and starved chunks. A Gaussian-only model has none, which is what let an
+  /// integrator fed raw error reach the 200 ppm clamp on hardware while every test here passed.
+  double transient_rate = 0.0;
+  double transient_us = 30000.0;
+
   double observe() {
-    if (noise_us <= 0.0) return error_us;
-    std::normal_distribution<double> d(0.0, noise_us);
-    return error_us + d(rng);
+    double v = error_us;
+    if (noise_us > 0.0) {
+      std::normal_distribution<double> d(0.0, noise_us);
+      v += d(rng);
+    }
+    if (transient_rate > 0.0) {
+      std::uniform_real_distribution<double> u(0.0, 1.0);
+      if (u(rng) < transient_rate) {
+        std::uniform_real_distribution<double> sgn(-1.0, 1.0);
+        v += (sgn(rng) < 0.0 ? -1.0 : 1.0) * transient_us;
+      }
+    }
+    return v;
   }
 };
 
@@ -385,7 +402,13 @@ int main() {
     // plant error on its own. Board a booted at +112 ppm for exactly this reason. Compensation
     // scores 100 us here against the blind hold's 482 us, which is the 4.8x that matches the
     // bench's 25 us vs 224 us -- but neither is 20 us, and closing that is the next change.
-    check(med < 30.0, "position error stays bounded while it unwinds", med, 30.0);
+    // 50 us, and the number encodes a trade rather than an aspiration. Bounding the integral's
+    // input to one frame (test 12) caps its slew at wn^2 * frame_us, so unwinding a wrong crystal
+    // is slower: 39 us here against 1 us with an unbounded input, and 100 us with the superseded
+    // fixed-tau integral. The unbounded version is the one that railed both boards to 200 ppm on
+    // hardware. A wrong stored crystal is a one-off at boot; measurement transients are
+    // continuous, so transient immunity is worth more than unwind speed.
+    check(med < 50.0, "position error stays bounded while it unwinds", med, 50.0);
   }
 
   printf("\n11. the rate loop must not limit-cycle on a quiet measurement\n");
@@ -428,6 +451,45 @@ int main() {
            m, sd, errs[errs.size() / 2]);
     check(sd < 1.0, "the rate command settles instead of swinging", sd, 1.0);
     check(errs[errs.size() / 2] < 5.0, "and the error settles with it", errs[errs.size() / 2], 5.0);
+  }
+
+  printf("\n12. measurement transients must not wind the crystal\n");
+  {
+    // Tens-of-ms excursions on an otherwise quiet measurement, which is what the bench actually
+    // delivers. The estimate must stay a crystal estimate: a real one is tens of ppm, so reaching
+    // the CRYSTAL_LIMIT_PPM clamp means it is tracking something else. Measured on hardware
+    // railing both boards to 200 ppm inside one boot, while the host suite was green.
+    Profile pt = p;
+    pt.visibility_us = 3000000;
+    Engine eng(pt);
+    Plant plant;
+    plant.plant_ppm = 3.35;
+    plant.frame_us = pt.frame_us();
+    plant.noise_us = 80.0;
+    plant.transient_rate = 0.02;   // ~1 in 50 observations
+    plant.transient_us = 30000.0;  // 30 ms, mid-range for what the census shows
+    std::deque<std::pair<int64_t, double>> history;
+    uint64_t pid = 0; int32_t pf = 0; bool live = false; int64_t land = 0;
+    double peak_abs_xtal = 0.0;
+    const int64_t tick = 25000;
+    for (int64_t t = 0; t < 900000000; t += tick) {
+      if (live && t >= land) { plant.apply_frames(pf); eng.confirm_position_landed(pid, t); live = false; }
+      history.emplace_back(t, plant.observe());
+      double seen = history.front().second;
+      while (history.size() > 1 && history.front().first <= t - pt.visibility_us) {
+        seen = history.front().second;
+        history.pop_front();
+      }
+      Command c = eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), true},
+                           GroupEvidence{});
+      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + 350000; live = true; }
+      plant.advance(tick, c.rate_ppm);
+      peak_abs_xtal = std::max(peak_abs_xtal, std::fabs((double) eng.crystal_ppm()));
+    }
+    printf("        crystal peak |%.1f| ppm, final %+.2f ppm (plant %+.2f)\n",
+           peak_abs_xtal, eng.crystal_ppm(), 3.35);
+    check(peak_abs_xtal < 100.0, "transients do not wind the estimate toward its clamp",
+          peak_abs_xtal, 100.0);
   }
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all properties hold", failures,

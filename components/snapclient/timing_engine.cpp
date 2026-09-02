@@ -285,7 +285,17 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     // The delay-limited law showed no instability at any K or horizon tested.
     const float vis_s = static_cast<float>(profile_.visibility_us) / 1e6f;
     const float wn = vis_s > 0.0f ? 1.0f / (CRYSTAL_DELAY_MARGIN * vis_s) : 0.0f;
-    crystal_ppm_ = std::clamp(crystal_ppm_ + wn * wn * static_cast<float>(e) * dt_s,
+    // BOUNDED input. The error carries transients of tens of milliseconds -- the bench census
+    // shows min -26 ms, max +50 ms on a quiet run -- and an integrator fed raw error winds them
+    // straight into the estimate: measured railing both boards to the 200 ppm clamp within one
+    // 10-minute boot. One frame is the natural bound, because past that the position actuator
+    // owns the error and the integral has nothing to say about it. The superseded fixed-tau form
+    // was robust here for this reason, integrating clamp(Kp e, +-budget) rather than e; keeping
+    // that property while taking the delay-limited bandwidth is the point of this line.
+    const float e_bounded = std::clamp(static_cast<float>(e),
+                                       -static_cast<float>(frame_us),
+                                       static_cast<float>(frame_us));
+    crystal_ppm_ = std::clamp(crystal_ppm_ + wn * wn * e_bounded * dt_s,
                               -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
   }
   last_obs_us_ = now_us;
