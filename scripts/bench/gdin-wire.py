@@ -44,7 +44,10 @@ import sys
 
 GDIN = re.compile(
     r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*?\bGDIN raw=([+-]\d+) gd=([+-]\d+) n=(\d+) "
-    r"gap=([+-]\d+) drift=([+-]?\d+\.\d+) extrap=([+-]?\d+\.\d+)(?: t=(\d+))?"
+    r"gap=([+-]\d+) drift=([+-]?\d+\.\d+) extrap=([+-]?\d+\.\d+)"
+    # steady= postdates the first GDIN builds and is optional, like t=. Absent means "not
+    # reported", NOT "steady": a log without it is graded ungated and says so.
+    r"(?: steady=([01]))?(?: t=(\d+))?"
 )
 STAMP = re.compile(r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]")
 MIN_COEF = 0.99          # see wire-window.py
@@ -60,13 +63,16 @@ def sod(h, m, s, ms=0):
 
 
 def read_gdin(path, negate=False):
+    """(sec, raw, gd, n, steady) -- steady is True/False, or None when the build predates it."""
     out = []
     for line in open(path, errors="replace"):
         m = GDIN.search(line)
         if m:
             raw = int(m.group(5))
+            st = m.group(11)
             out.append((sod(m.group(1), m.group(2), m.group(3), m.group(4)),
-                        -raw if negate else raw, int(m.group(6)), int(m.group(7))))
+                        -raw if negate else raw, int(m.group(6)), int(m.group(7)),
+                        None if st is None else st == "1"))
     return out
 
 
@@ -189,7 +195,7 @@ def pair(gdin, wire, tol):
     """Nearest wire capture within tol seconds. Returns (pairs, unmatched)."""
     times = [w[0] for w in wire]
     pairs, unmatched = [], 0
-    for t, raw, gd, n in gdin:
+    for t, raw, gd, n, _steady in gdin:
         i = bisect.bisect_left(times, t)
         best, bestd = None, tol
         for j in (i - 1, i, i + 1):
@@ -274,7 +280,7 @@ def self_test():
             w = k * truth + random.gauss(0, ynoise)
             if outlier and random.random() < outlier:
                 w += 22680.0                                  # one whole frame
-            gdin.append((t, raw, raw / 2, 2))
+            gdin.append((t, raw, raw / 2, 2, True))
             wire.append((t + 0.05, w))
         return gdin, wire
 
@@ -341,6 +347,11 @@ def main():
     ap.add_argument("--min-n", type=int, default=20, help="minimum pairs for a block to count")
     ap.add_argument("--allow-dirty", action="store_true",
                     help="grade even with capture gaps or reboots in the window")
+    ap.add_argument("--include-transient", action="store_true",
+                    help="grade samples the board itself flags as non-steady (steady=0). Off by "
+                         "default: while its resync window is open a board keeps measuring its "
+                         "phase locally although its audio is being stepped, so those samples "
+                         "cannot agree with the wire and grading them measures the transient.")
     ap.add_argument("--self-test", action="store_true")
     args = ap.parse_args()
 
@@ -370,6 +381,26 @@ def main():
         print(f"{args.log}: no GDIN lines. Emitted at DEBUG since 2026-09-02; a board with no "
               f"render phase of its own (the observer) emits none by design.")
         return 2
+    # STEADY GATE. A board in transient stops beaconing but keeps using its phase locally, by
+    # design (snapcast_client.cpp:4468) -- so these samples are computed from a phase whose audio
+    # is being stepped. Absent flag means "not reported", never "steady": an older log is graded
+    # ungated and told so, rather than silently dropping every sample or silently keeping them.
+    flagged = [g for g in gdin if g[4] is not None]
+    n_trans = sum(1 for g in flagged if g[4] is False)
+    if not flagged:
+        print(f"  NOTE: no steady= field in this log (build predates it) -- grading UNGATED. "
+              f"Read the verdict together with the window's hard-resync count.")
+    elif args.include_transient:
+        print(f"  including {n_trans} transient sample(s) on request (--include-transient)")
+    else:
+        gdin = [g for g in gdin if g[4] is not False]
+        print(f"  steady gate: {n_trans} of {len(flagged)} samples dropped as non-steady "
+              f"({100.0 * n_trans / len(flagged):.1f}%)")
+        if not gdin:
+            print("  nothing left after the steady gate: the board was in transient for the "
+                  "whole window, which is itself the finding.")
+            return 2
+
     wire, dropped = read_wire(args.csv)
     if not wire:
         print(f"{args.csv}: no rows passed the gate (rival <= {MAX_RIVAL}, pcm_coef >= {MIN_COEF})")

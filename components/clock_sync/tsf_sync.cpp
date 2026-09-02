@@ -1098,8 +1098,19 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
     // the bench builds at DEBUG, so this line did not exist in the binary at all -- zero GDIN
     // lines in 46 MB of logs while the parser, its self-test and dl-window all reported green.
     // Stage 1 cannot be graded on a signal that is never emitted.
-    ESP_LOGD(TAG, "GDIN raw=%+" PRId64 " gd=%+" PRId64 " n=%" PRId64 " gap=%+" PRId64 " drift=%+.2f extrap=%+.2f t=%" PRId64,
-             gdin_raw, d, gdin_n, gdin_gap, gdin_drift, gdin_extrap, local_now_us);
+    // steady= is the emitting board's own transient state, straight off the flag
+    // publish_render_phase_(!in_transient) already sets -- no new plumbing. It matters for
+    // GRADING and not for control: a board in transient stops beaconing but keeps measuring and
+    // using its phase locally, on purpose (the resync gate needs it while its window is open),
+    // so those samples are computed from a phase whose audio is being stepped and cannot be
+    // compared against the wire. Measured 2026-09-02: board B's only block that excluded slope
+    // 1.0 was the one carrying 5 hard resyncs, and its residual sd was 2x board A's on an
+    // identical MAD. Without this field a grader cannot tell those samples apart.
+    ESP_LOGD(TAG,
+             "GDIN raw=%+" PRId64 " gd=%+" PRId64 " n=%" PRId64 " gap=%+" PRId64
+             " drift=%+.2f extrap=%+.2f steady=%d t=%" PRId64,
+             gdin_raw, d, gdin_n, gdin_gap, gdin_drift, gdin_extrap,
+             this->render_phase_broadcast_.load(std::memory_order_relaxed) ? 1 : 0, local_now_us);
   }
 }
 
