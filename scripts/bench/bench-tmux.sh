@@ -183,6 +183,10 @@ pane_id_for() {  # <window> <title> -> pane id, or empty
         [ "${t}" = "${title}" ] && { echo "${id}"; return; }
     done < <(tmux list-panes -t "${SESSION}:${win}" \
              -F "#{pane_id}$(printf '\t')#{pane_title}" 2>/dev/null)
+    # "no such pane" is a normal answer, not a failure. Without this the loop falls out on the
+    # failed read and returns 1, and under `set -e` the caller's id="$(pane_id_for ...)" takes
+    # that status and kills the script -- silently, right after the first pane came up.
+    return 0
 }
 
 pane_dead() { [ -n "$1" ] && [ "$(tmux display-message -p -t "$1" '#{pane_dead}' 2>/dev/null)" = 1 ]; }
