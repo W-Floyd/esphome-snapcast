@@ -224,23 +224,53 @@ def stream_reader(args, depth=16):
     shows up as a reported gap instead of a stall.
     """
     q = queue.Queue(maxsize=depth)
-    state = {"dropped": 0, "error": None, "done": False}
+    state = {"dropped": 0, "error": None, "done": False, "restarts": 0}
+
+    # THE ACQUISITION MUST BE REBUILDABLE, or one transient ends the run.
+    #
+    # Every board reboot -- an OTA, in practice -- stops both I2S buses for a few seconds. sigrok
+    # then delivers a short acquisition, stream_blocks counts three of those in a row and raises
+    # "will not sustain samplerate", and before this change that killed the reader THREAD: the
+    # generator was gone, state["error"] was latched, and take() raised the same message for ever
+    # while the boards played on happily. Twice tonight (2026-09-02, both after an OTA) the
+    # analyser sat at "no BCLK edges" until it was restarted by hand, with the CSV frozen and
+    # nothing but the operator to notice.
+    #
+    # So a failed acquisition is retried with backoff, and only a run of them is fatal. The error
+    # is latched only after MAX_RESTARTS, which keeps the CaptureFailures contract intact: the
+    # process still exits rather than looping for ever, just not on the first transient.
+    MAX_RESTARTS = 6
 
     def run():
-        try:
-            for blk in stream_blocks(args):
-                try:
-                    q.put_nowait(blk)
-                except queue.Full:
-                    state["dropped"] += 1
-        except Exception as e:                      # surfaced on the consumer side
-            state["error"] = e
-        finally:
-            state["done"] = True
+        while True:
             try:
-                q.put_nowait(None)
-            except queue.Full:
-                pass
+                for blk in stream_blocks(args):
+                    if state["restarts"]:
+                        # A block got through: the acquisition is healthy again.
+                        print(f"  acquisition recovered after {state['restarts']} restart(s)",
+                              file=sys.stderr, flush=True)
+                        state["restarts"] = 0
+                    try:
+                        q.put_nowait(blk)
+                    except queue.Full:
+                        state["dropped"] += 1
+                # Generator returned without raising: stream_blocks loops for ever, so this is
+                # not expected -- treat it as a restartable end rather than a silent stop.
+                raise RuntimeError("acquisition generator ended")
+            except Exception as e:
+                state["restarts"] += 1
+                if state["restarts"] > MAX_RESTARTS:
+                    state["error"] = e              # surfaced on the consumer side
+                    break
+                print(f"  acquisition failed ({e}); restart "
+                      f"{state['restarts']}/{MAX_RESTARTS} in {2 * state['restarts']}s",
+                      file=sys.stderr, flush=True)
+                time.sleep(2 * state["restarts"])
+        state["done"] = True
+        try:
+            q.put_nowait(None)
+        except queue.Full:
+            pass
 
     threading.Thread(target=run, daemon=True).start()
 
@@ -255,7 +285,9 @@ def stream_reader(args, depth=16):
                     raise RuntimeError("stream ended")
                 continue
             if blk is None:
-                raise RuntimeError("stream ended")
+                # Prefer the latched cause: "stream ended" says nothing, and the reason the
+                # acquisition gave up is exactly what the operator needs to read.
+                raise RuntimeError(str(state["error"]) if state["error"] else "stream ended")
             return blk
 
     return take, state
