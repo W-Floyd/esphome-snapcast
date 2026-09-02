@@ -194,7 +194,7 @@ with two it is an arbitrary choice among them.
 **The residual's tail is transient samples, by design.** Board B's `raw − wire` has `sd` 129.9
 against board A's 58.4 on an identical MAD of ~6.9 — same typical agreement, twice the excursions
 — and B's only block that excludes slope 1.0 is the one carrying 5 hard resyncs and a `raw` p2p of
-4704 µs against ~500 µs elsewhere. B took 14 hard resyncs in that window to A's 5.
+4704 µs against ~500 µs elsewhere.
 
 A board in transient stops *beaconing* its phase but keeps measuring and using it locally, on
 purpose: `publish_render_phase_(!in_transient)` only sets the broadcast flag, and the comment at
@@ -209,9 +209,19 @@ from a phase that is moving — right for control, and not comparable to the wir
    `gdin-wire.py` must gate on it. Grading the reference on samples the firmware itself does not
    treat as steady measures the transient, not the reference. Until that flag exists, read a
    window's verdict together with its hard-resync count.
-2. **Why B resyncs 3× as often as A** is then the real question, and it is a different question
-   from the reference's accuracy. `DECIDE`'s `act=resync` census and the `OUT OF RANGE` counts are
-   the inputs; both boards run the same build on the same stream.
+2. **The two boards fail differently, and that is the next question.** Not *rate*: over the full
+   logs they hard-resync equally (33 on A, 32 on B) — the 14-vs-5 that started this was one
+   window, not a board property. What differs is the *shape*, on identical firmware and stream:
+
+       resync spacing, median              A  9.4 s      B  2.4 s   (B bursts)
+       resyncs preceded by a stall <=10 s  A  0/33       B  7/32
+       OUT OF RANGE                        A   225       B   115
+       DLLOOP err, median                  A  +219 us    B  +101 us
+
+   So B's resyncs cluster and follow starvation, while A's follow nothing yet A carries twice the
+   out-of-range count and double the standing loop error. Two different failure modes, both
+   already instrumented — `DECIDE`'s `act=resync`, `PLAYER STALLED`, and the `OUT OF RANGE`
+   census are the inputs, and no new logging is needed to pursue either.
 
 **One statistical constraint on all of it:** use median/MAD, not `sd`. On this residual `sd`
 overstates the disagreement by 8×, and the first figure computed from it was wrong by that factor.
