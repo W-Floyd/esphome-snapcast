@@ -68,6 +68,49 @@ struct ErrorView {
 
 /// @brief How long until a correction shows up in the measurement". See the cpp for the single
 /// horizon function that replaces the five independent encodings.
+/// St7 ABLATION MASK. One bit per guard, set = that guard is DISABLED. Default 0 = every guard
+/// active, i.e. today's behaviour exactly.
+///
+/// WHY A RUNTIME MASK AND NOT #if / commented-out code: an ablation per build costs a flash, a
+/// capture gap and ~5 consensus membership changes per board, so a dozen guards would cost a
+/// dozen windows and could only ever be compared against a remembered baseline. One build with a
+/// mask can A/B a guard against itself inside a single session.
+///
+/// HOW TO READ AN ABLATION, because the obvious reading is wrong: **"guard off changed nothing
+/// over a quiet window" is NOT evidence the guard is unneeded.** Almost every one of these exists
+/// for a rare event -- a storm, a starvation, a split repair, a reboot -- which a quiet window
+/// does not contain. Ablating there measures nothing while looking like a pass, which is the
+/// CLAUDE.md "search narrow enough to confirm an expectation" failure applied to a control law.
+/// Each guard below names WHAT FIRES IT; ablate it together with that trigger or not at all.
+enum GuardBit : uint32_t {
+  /// Tag samples arriving inside dl_blank_until_us_ are accepted. Fires on: any action that sets
+  /// the blank (window step, hard resync, splice), i.e. inject_split / inject_starvation.
+  GUARD_TAG_BLANK = 1u << 0,
+  /// No blank after a feedback gap. Fires on: a render gap / late-stamped catch-up burst, i.e.
+  /// inject_starvation.
+  GUARD_GAP_BLANK = 1u << 1,
+  /// A window step no longer waits for two consistent ledger readings (L3350). Fires on: a
+  /// refill burst, i.e. inject_starvation.
+  GUARD_LEDGER_STABLE = 1u << 2,
+  /// The splice may act while the rate lock is holding a pending trim (L3640). Fires on:
+  /// inject_split.
+  ///
+  /// THIS ONE IS THE POSITIVE CONTROL FOR THE WHOLE EXERCISE. Its value is already measured:
+  /// PLAN-delay-controlled-servo.md records -101.5 us for the version without the hold. So if an
+  /// ablation of this bit shows "no difference", the ablation protocol is blind and its other
+  /// results mean nothing. Run it first, expect a regression, and only trust the rest if you see
+  /// one.
+  GUARD_TRIM_HOLD = 1u << 3,
+};
+
+// NOT WIRED, and deliberately absent from the enum rather than present and inert:
+//   * the tag-fault judge -- the block at L2920 RE-TRUSTS tags (sets tag_fault_until_us to now);
+//     the setter that opens the distrust window is elsewhere and needs finding first.
+//   * in-flight step serialisation -- it lives in position_arbiter_, which is Stage 4 shadow code
+//     that nothing calls, so a bit for it would toggle nothing.
+//   * the ~10 `st.converged` conjuncts (the WS3.1 invariant). One bit cannot express them; they
+//     need to be enumerated site by site, and the invariant is documented as load-bearing.
+
 enum class Horizon {
   TagBlank,
   CoarseBlank,
@@ -1180,6 +1223,13 @@ class SnapcastClient {
   /// PHASE_TRANSIENT_US). @p clamp_us is the caller's per-use floor (0 = the unclamped live
   /// travel value).
   int64_t visibility_horizon_us(int64_t clamp_us = 0) const;
+  /// True when this guard has been ablated via servo_param("guards", mask). Reads one relaxed
+  /// atomic; safe from any task.
+  bool guard_off(uint32_t bit) const {
+    return (this->tune_guard_mask_.load(std::memory_order_relaxed) & bit) != 0;
+  }
+  /// St7 ablation mask; 0 = every guard active. See GuardBit.
+  std::atomic<uint32_t> tune_guard_mask_{0};
 
   /// St4. One position arbiter: given ErrorView + gates + pending-motion ledger, returns the
   /// frames to move this chunk. Hard resync / window step / splice / bang-bang become four

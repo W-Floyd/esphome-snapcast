@@ -1229,7 +1229,8 @@ void SnapcastClient::notify_audio_played_tagged(uint32_t frames, int64_t adjuste
   // DELAY LOOP control block. Gated on the blanking instant by the RENDER time of the observation,
   // not by wall clock at arrival -- the point of the blank is "this audio was scheduled against the
   // old deadline", which is a property of when it rendered.
-  if (err_tag_valid && first_frame_local >= this->dl_blank_until_us_) {
+  if (err_tag_valid &&
+      (first_frame_local >= this->dl_blank_until_us_ || this->guard_off(GUARD_TAG_BLANK))) {
     if (this->dl_acc_n_ == 0) {
       this->dl_acc_first_us_ = adjusted_ts;
     }
@@ -1285,7 +1286,8 @@ void SnapcastClient::notify_audio_played(uint32_t frames, int64_t timestamp_us) 
     // A gap well beyond the speaker's DMA cadence means the DAC was starved
     // (pipeline underrun); surfaced in the periodic sync report for diagnostics
     const int64_t gap = timestamp_us - this->played_last_ts_us_;
-    if (gap > static_cast<int64_t>(this->tune_gap_blank_ms_.load(std::memory_order_relaxed)) * 1000) {
+    if (gap > static_cast<int64_t>(this->tune_gap_blank_ms_.load(std::memory_order_relaxed)) * 1000 &&
+        !this->guard_off(GUARD_GAP_BLANK)) {
       // Late-stamped catch-up burst incoming (see FEEDBACK_GAP_BLANK_US): every tagged arrival
       // for the next stretch carries a render instant off by up to the stall. Already under
       // playout_mutex_ here, so write the blank directly rather than through mark_kp_event_.
@@ -3347,7 +3349,8 @@ void SnapcastClient::player_task_() {
                 // ... the first step, on a STABLE reading: during a refill burst the ledger bounces
                 // tens of ms chunk-to-chunk (17:41:53) and a step taken then left 1-14 ms of residual
                 // for extra rounds -- the whole variance of build 77's 20/15/10/32 s injections.
-                (st.resync_step_at_us == 0 && st.ledger_stable_streak >= 2))) {
+                (st.resync_step_at_us == 0 &&
+                 (st.ledger_stable_streak >= 2 || this->guard_off(GUARD_LEDGER_STABLE))))) {
       // In the window a tag-based step needs the error to have PERSISTED across a block boundary:
       // the block used for the previous decision may not be used again (one block, one step), and
       // with the arm at 100 us this is what keeps the +-60 us block noise from being stepped on.
@@ -3637,7 +3640,7 @@ void SnapcastClient::player_task_() {
 #endif
       // While muted (pre-convergence) audibility doesn't constrain splice size, so
       // steer hard to reach the band quickly, then single frames for the end-game
-      if (!trim_holds && !coarse_on_tags) {
+      if ((!trim_holds || this->guard_off(GUARD_TRIM_HOLD)) && !coarse_on_tags) {
         const uint32_t steer_frames = (st.converged || std::abs(median_err_us) <= this->config_.converge_fine_us)
                                           ? 1
                                           : startup_steer_frames(frames);
@@ -5369,6 +5372,16 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "splice_us") {
     if (!(value == -1.0f || (value >= 0.0f && value <= 10000.0f))) return false;
     this->tune_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "guards") {
+    // St7 ABLATION. Bitmask, set = guard disabled; 0 restores today's behaviour. Logged at INFO
+    // on every change because a window graded without knowing which guards were live is
+    // ungradeable -- the mask is part of the measurement, not a setting.
+    const uint32_t mask = static_cast<uint32_t>(value);
+    this->tune_guard_mask_.store(mask, std::memory_order_relaxed);
+    ESP_LOGI(TAG,
+             "GUARDS mask=0x%02" PRIx32 " tag_blank=%d gap_blank=%d ledger_stable=%d trim_hold=%d t=%" PRId64,
+             mask, (mask & GUARD_TAG_BLANK) ? 0 : 1, (mask & GUARD_GAP_BLANK) ? 0 : 1,
+             (mask & GUARD_LEDGER_STABLE) ? 0 : 1, (mask & GUARD_TRIM_HOLD) ? 0 : 1, now_us());
   } else if (name == "tag_stale_ms") {
     if (!(value >= 200.0f && value <= 10000.0f)) return false;
     this->tune_tag_stale_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
