@@ -681,6 +681,40 @@ int main() {
     }
   }
 
+  printf("\n15. an observation GAP must not move the crystal by tens of ppm\n");
+  {
+    // The storm engine. dt_s in the integral is the time since the last observation, so a gap --
+    // a resync, a starvation hold, anything that stops the measurement -- was integrated in ONE
+    // step as though the loop had been watching throughout. With the horizon collapsed to its
+    // floor (a drained ring, wn^2 = 2.95) a 2 s gap moved the estimate 119 ppm instantly.
+    //
+    // Measured on board a as single steps of -93.8, -105.7 and -110.5 ppm, ending railed at
+    // -200 ppm from a +179 peak. Neither credit (5 ppm/window) nor the steady integral
+    // (0.59 ppm/s at a healthy horizon) can do that; an unbounded dt can.
+    Profile pg = p;
+    pg.measurement_lag_us = 47000;
+    pg.position_delay_us = 100000;   // the clamp floor: a fully drained ring
+    pg.buffer_floor_us = 200000;
+    double worst = 0.0;
+    for (int64_t gap_us : {25000, 500000, 2000000, 5000000, 15000000}) {
+      Engine eng(pg);
+      int64_t t = 0;
+      for (int i = 0; i < 20; i++) {
+        eng.step(t, Observation{t, 20, true, 1724000}, GroupEvidence{});
+        t += 25000;
+      }
+      const float before = eng.crystal_ppm();
+      t += gap_us;
+      eng.step(t, Observation{t, 20, true, 1724000}, GroupEvidence{});
+      const double step = std::fabs(eng.crystal_ppm() - before);
+      worst = std::max(worst, step);
+    }
+    printf("        worst single-step crystal move across gaps up to 15 s: %.2f ppm\n", worst);
+    // A crystal is tens of ppm in total, so no single observation may move the ESTIMATE by an
+    // appreciable fraction of the whole range, however long the loop was blind.
+    check(worst < 20.0, "one observation cannot slew the estimate", worst, 20.0);
+  }
+
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all properties hold", failures,
          failures == 1 ? "" : "s");
   return failures ? 1 : 0;

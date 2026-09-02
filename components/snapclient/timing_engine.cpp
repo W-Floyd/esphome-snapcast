@@ -475,7 +475,20 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     const float e_bounded = std::clamp(static_cast<float>(e),
                                        -static_cast<float>(frame_us),
                                        static_cast<float>(frame_us));
-    crystal_ppm_ = std::clamp(crystal_ppm_ + wn * wn * e_bounded * dt_s,
+    // BOUND THE STEP BY BOUNDING dt. dt_s is the time since the last observation, and during a
+    // storm observations stop for seconds -- so the integral was applying wn^2 * bound * dt in
+    // ONE step, as though it had been watching the whole time. With the horizon collapsed to its
+    // floor (wn^2 = 2.95) a 2 s gap moves the estimate 134 ppm instantly.
+    //
+    // Measured on board a, single steps: -93.8 ppm within one log second, -105.7 ppm over 1 s,
+    // -110.5 ppm over 2 s, ending railed at -200 ppm from a +179 peak. Neither credit (5 ppm per
+    // window) nor the steady integral (0.59 ppm/s at a healthy horizon) can move it that fast;
+    // an unbounded dt can.
+    //
+    // A gap longer than the loop's own horizon means observability was lost, and integrating
+    // across it is not justified by anything: past that the estimate should wait, not extrapolate.
+    const float dt_int_s = std::min(dt_s, std::max(1e-3f, rate_h_s));
+    crystal_ppm_ = std::clamp(crystal_ppm_ + wn * wn * e_bounded * dt_int_s,
                               -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
   }
   last_obs_us_ = now_us;

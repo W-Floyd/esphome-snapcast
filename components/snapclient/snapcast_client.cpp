@@ -3602,6 +3602,24 @@ void SnapcastClient::player_task_() {
         this->ring_capacity_us_.store(static_cast<int64_t>(this->config_.buffer_size) * 1000000 /
                                           (static_cast<int64_t>(fb_h) * rec.params.sample_rate),
                                       std::memory_order_relaxed);
+        // SLOW ring depth, for anything that sizes a GAIN.
+        //
+        // The horizons are derived from ring + pipe, and every gain is derived from the horizons
+        // (wn = 1/(K * rate_horizon), so Ki goes as 1/h^2). Using the LIVE fill couples buffer
+        // level to loop gain: when the ring drains from 1724 ms to 26 ms the horizon collapses
+        // from 2.0 s to 0.3 s and wn^2 grows 47x, so the integral becomes hyper-aggressive
+        // exactly when the board is already in trouble. Measured 2026-09-02: board a's crystal
+        // swung +167 -> +124 -> -71 ppm in two minutes, 119 ppm/min against a healthy-ring slew
+        // limit of 35 ppm/min, and it closed a storm loop -- drain, gains explode, error
+        // explodes, more corrections, drain further.
+        //
+        // A 30 s time constant, so a transient drain cannot move the gains while a genuine
+        // change in server buffering still arrives.
+        const int64_t live_ring = this->ring_depth_us_.load(std::memory_order_relaxed);
+        const int64_t prev_slow = this->ring_depth_slow_us_.load(std::memory_order_relaxed);
+        this->ring_depth_slow_us_.store(
+            prev_slow <= 0 ? live_ring : prev_slow + (live_ring - prev_slow) / 64,
+            std::memory_order_relaxed);
       }
     }
     this->playout_mutex_.unlock();
@@ -4093,7 +4111,7 @@ void SnapcastClient::accumulate_achieved_rate_(ServoState &st, const ChunkRecord
 // to the fixed 4 s when the mirrors are cold. Clamped: below 1 s nothing travels that fast, above 5 s
 // something is mis-measured and a fixed bound beats an unbounded blank.
 int64_t SnapcastClient::travel_horizon_us_() const {
-  const int64_t ring = this->ring_depth_us_.load(std::memory_order_relaxed);
+  const int64_t ring = this->ring_depth_slow_us_.load(std::memory_order_relaxed);
   const int64_t pipe = this->pipe_depth_us_.load(std::memory_order_relaxed);
   if (ring <= 0 && pipe <= 0) {
     return PHASE_TRANSIENT_US;
@@ -4113,7 +4131,9 @@ int64_t SnapcastClient::travel_horizon_us_() const {
 // + pipe 247 ms against a 3971 ms horizon, so compensating over the horizon invented a phantom
 // error of -displacement for two seconds and the loop corrected it back.
 int64_t SnapcastClient::observation_delay_us_() const {
-  const int64_t ring = this->ring_depth_us_.load(std::memory_order_relaxed);
+  // SLOW ring depth: this feeds the horizons, and the horizons size the gains. See where
+  // ring_depth_slow_us_ is updated for why the live fill must not be used here.
+  const int64_t ring = this->ring_depth_slow_us_.load(std::memory_order_relaxed);
   const int64_t pipe = this->pipe_depth_us_.load(std::memory_order_relaxed);
   const int64_t travel = ring + pipe;
   if (travel <= 0) {

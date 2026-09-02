@@ -1134,6 +1134,10 @@ class SnapcastClient {
   int64_t observation_delay_us_() const;
   /// Measured observation cadence: how often the engine is told the error. Supplies
   /// Profile::measurement_lag_us, which is rate's dead time.
+  /// Slow-filtered ring depth (tau ~30 s). Anything that sizes a GAIN uses this; the live fill
+  /// collapses under starvation and would make the loop most aggressive when it is least able to
+  /// afford it.
+  std::atomic<int64_t> ring_depth_slow_us_{0};
   std::atomic<int64_t> ring_capacity_us_{0};  ///< ring capacity in us; see buffer_floor_us
   int64_t last_timing_obs_us_{0};
   int64_t timing_obs_interval_us_{0};  // ring + pipeline + two blocks: how long a position change takes to reach the tags
