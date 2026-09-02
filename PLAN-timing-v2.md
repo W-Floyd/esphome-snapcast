@@ -134,6 +134,10 @@ already read the wrong one and reported it as behaviour.
 
 ## 4. Stage 1 — find the reference's missing factor (blocking)
 
+> **MEASURED 2026-09-02, and the premise does not reproduce. See "Stage 1 result" at the end of
+> this section before reading the candidate list below** — the candidates are retained as the
+> record of what was suspected, not as open work.
+
 **Nothing downstream can be graded until this closes.** But the question is now much narrower than
 it was, because two of the three candidates are eliminated by source reading.
 
@@ -246,6 +250,54 @@ used to compute the delta, and let this consumer read that.
 sanity check and the unmute group-agreement gate both compare `|gd|` against thresholds expressed
 in wire microseconds. If they do not carry the un-halving, they are comparing a half-gap against a
 full-gap threshold and are 2× too permissive on a pair.
+
+### Stage 1 result — measured 2026-09-02 [M]
+
+**The ~4× is not present in this build and configuration.** One 30-minute window (00:39–01:09),
+gap-free and reboot-free, both probed boards, MLS44, `rival`+`pcm_coef` gated wire, graded by
+`scripts/bench/gdin-wire.py`:
+
+    (n = 1398 A / 1370 B paired samples)              board A     board B
+    median |wire|                                      80.5        80.2  us
+    median |raw|                                       83.0        82.0  us
+    median |raw| / median |wire|                        1.03        1.02
+    median |gd|  / median |wire|                        0.51        0.51
+    raw - wire: median                                 +2.2        -2.2  us
+    raw - wire: MAD                                     6.8         6.9  us
+    raw - wire: sd                                     58.4       129.9  us
+
+`raw` tracks the wire 1:1 in slope AND magnitude, with a typical disagreement of ~7 µs on an
+80 µs signal. `gd` is 0.51× the wire, which for two phase contributors is the *correct* value:
+a board's deviation from the mean of {A,B} is (A−B)/2, and the `n/(n−1)` factor un-halves it.
+So the pairing inputs and the halving are both sound, and none of the three candidates below
+(drift extrapolation, `PHASE_STALE_US` selection, `RENDER_TAG_MAX_AGE_US` gating) is implicated
+in a *gain* error, because there is no gain error to explain.
+
+**Part of the original discrepancy was probably the mixed-group `n`.** The boost clamp un-halved
+`gd` with `consensus_n()` (MAPPING contributors) while the delta averages PHASE contributors. On
+this exact group — two speakers plus an observer that publishes a mapping but no phase — that is
+`n/(n−1)` = 1.5 where 2 is correct, a 1.33× under-correction. Fixed in `638c714`, which is in the
+build measured above, so the measurement cannot see what it was like before.
+
+**THREE THINGS THIS DOES NOT SETTLE**, and they are the live work:
+
+1. **The residual is heavy-tailed, and asymmetrically so.** MAD 6.8 vs sd 58 on A is a ratio of
+   8.6; B is MAD 6.9 vs sd **129.9**, twice A's tail on an identical median. Rare large
+   excursions, not a noisy signal — and `sd` alone overstated it by 8× when first computed, which
+   is the CLAUDE.md median/MAD rule collecting another scar. **What makes B's tail twice A's is
+   the most interesting open question in this data.**
+2. **One window, well-converged boards.** The differential's dynamic range within a block sets how
+   well any slope can be estimated; the quietest block had `wire` p2p of 102 µs and produced the
+   least trustworthy number.
+3. **The grader's own verdict is not yet reliable.** It reported FAIL (Theil-Sen median 0.93,
+   4/6 blocks in band) on data whose true slope is ~1.0. Theil-Sen is biased under
+   errors-in-variables — noise lives in `raw`, not in the wire — and the finding above came from
+   the regression BRACKET instead: `OLS(wire|raw)` = 0.58/0.21 (attenuated) against
+   `1/OLS(raw|wire)` = 1.04/1.02 (clustering at 1.0 in every block, both boards). The reverse
+   regression pinning to 1.0 while the forward one tracks `r` is the signature of
+   `raw = wire + noise`. **The self-test could not have caught this: it generated the wire as an
+   exact function of `raw`, so it validated the estimator on the one case where the bias vanishes.**
+   Report the bracket, and add x-noise to the self-test, before quoting a slope again.
 
 ---
 
@@ -561,9 +613,13 @@ medians within ±8 µs, over a quiet hour — the numbers `HANDOFF.md` records f
 ## 12. Order, and what may not be combined
 
 ```
-0   live defects (align seeding, stale comment)      ── minutes, no measurement needed
-1   the reference's missing ~4x                      ── BLOCKING; nothing downstream grades without it
-2   DECIDE line + parser                             ── prerequisite for 4, 7, 8c
+0   live defects (align seeding, stale comment)      ── DONE 638c714
+1   the reference's missing ~4x                      ── MEASURED 2026-09-02: does not reproduce.
+                                                        raw tracks the wire 1:1 (MAD 6.8 us), gd is
+                                                        the correct n=2 half. Unblocked. Open: B's
+                                                        residual tail is 2x A's.
+2   DECIDE line + parser                             ── frame sums reconcile on both boards
+                                                        (2026-09-01); prerequisite for 4, 7, 8c
 3a  one error selector          (pure refactor)      ── shadow, zero-mismatch bar
 3b  one visibility horizon      (pure refactor)      ── shadow, >=99% reproduction bar
 4   one position arbiter        (structure)          ── convergence bars unchanged
@@ -580,6 +636,12 @@ demonstrate identical behaviour before 5 and 6 change any. 7 comes after 5 and 6
 fallback paths are what several gates fall back *to*, and a census taken before those change
 measures the old system. 8c comes last because it audits the gains that 5, 6 and 8b introduce, not
 only the ones that exist today.
+
+**Stage 1 genuinely blocks — and as of 2026-09-02 it is measured and does not block any more:**
+the ~4× does not reproduce, so the reference is honest to ~7 µs MAD and the stages gated on it may
+proceed. What follows is the reasoning as written before that measurement; it stands as the record
+of why the stage was gated, and its escape hatch still applies to the *tail* asymmetry, which is
+unexplained.
 
 **Stage 1 genuinely blocks.** If the remaining ~4× cannot be explained, say so and cap the goal at
 what a 4×-attenuated reference can deliver, rather than proceeding and attributing the residual to
