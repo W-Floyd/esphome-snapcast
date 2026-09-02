@@ -4416,7 +4416,15 @@ def main():
     # afterwards is pure blind time. Kick off the next capture before processing this
     # one and it overlaps instead, taking the duty cycle from ~79% to ~95%. Only ever
     # one sigrok-cli at a time: the next is submitted after the previous has returned.
+    # TWO DIFFERENT THINGS, TWO NAMES. `pending` was the prefetch Future AND the held frame-lag
+    # candidate (an int) in one scope. In --stream, prefetch is off and only the lag use runs, so
+    # the collision was invisible until the process exited: `finally: pending.cancel()` then hit
+    # an int and raised AttributeError, REPLACING the reason the run ended. That is how the
+    # capture governor's "GIVING UP: 40 consecutive capture failures" -- working exactly as
+    # designed -- reached the operator as a confusing traceback about `int` having no `.cancel`,
+    # four times before anyone read the code (2026-09-02).
     pool = pending = None
+    pending_lag = None
     if args.prefetch and not args.simulate:
         pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
     try:
@@ -4623,12 +4631,12 @@ def main():
 
             if math.isfinite(off):
                 if prefer is not None and abs(k - prefer) > args.max_jump_frames:
-                    if pending is not None and abs(k - pending) <= 4:
+                    if pending_lag is not None and abs(k - pending_lag) <= 4:
                         lag_hist.clear()               # confirmed twice: a real resync
                         lag_hist.append(k)
-                        prefer, pending = k, None
+                        prefer, pending_lag = k, None
                     else:
-                        pending = k
+                        pending_lag = k
                         reason = (f"frame lag jumped {k - prefer:+d} frames -- ambiguous "
                                   f"match or resync; held until the next capture agrees")
                         off, ppm = float("nan"), float("nan")
@@ -4640,7 +4648,7 @@ def main():
                     # A tie broken toward one recent outlier propagates, because that outlier
                     # then becomes the tie-breaker for the next capture.
                     lag_hist.append(k)
-                    pending = None
+                    pending_lag = None
                     prefer = (None if (args.no_disambiguation or unambiguous)
                               else int(sorted(lag_hist)[len(lag_hist) // 2]))
             # RIVAL MARGIN, CHECKED ON EVERY ROW. This used to be gated on `prefer is None`, so
@@ -4844,10 +4852,16 @@ def main():
     except KeyboardInterrupt:
         print("\ninterrupted")
     finally:
-        if pending is not None:
-            pending.cancel()
-        if pool is not None:
-            pool.shutdown(wait=False)
+        # Never let cleanup raise: whatever brought the loop down -- a SystemExit from the capture
+        # governor, most usefully -- is what the operator needs to read, and an exception in here
+        # replaces it.
+        try:
+            if pending is not None:
+                pending.cancel()
+            if pool is not None:
+                pool.shutdown(wait=False)
+        except Exception as exc:
+            print(f"  (cleanup: {type(exc).__name__}: {exc})", file=sys.stderr)
 
     if ts:      # always leave a current plot behind, whatever the throttle did
         # Fitted once, at the end: the run is complete here, and a fit per plot tick would
