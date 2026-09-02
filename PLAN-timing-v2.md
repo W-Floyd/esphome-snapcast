@@ -189,7 +189,32 @@ exists** — do not re-derive it.
 order rather than recency or proximity. With one phase-contributing peer that is the only peer;
 with two it is an arbitrary choice among them.
 
-### What is still open
+### Pass condition met, both boards, steady-gated
+
+`GDIN` now carries the emitting board's `steady=` flag and the grader drops non-steady samples.
+On a clean 30-minute window (01:45–02:15, no gaps, no reboots):
+
+    board                                       A            B
+    blocks consistent with slope 1.0          6/6          6/6
+    median |raw| / median |wire|             1.08         1.11
+    residual raw-wire: median / MAD     +4.5 / 7.6   -4.4 / 7.4  us
+    residual raw-wire: sd                    54.1         52.2   us
+    samples dropped as non-steady            9.9%            -
+
+**The tail asymmetry was transient samples, as predicted.** Ungated, board B's residual `sd` was
+129.9 against A's 58.4; gated, it is 52.2 against 54.1 — the two boards are now indistinguishable,
+and B's block that excluded slope 1.0 no longer does. The prediction was recorded before the
+measurement and the number came back where it was expected, which is the only reason to trust the
+explanation rather than merely fit it.
+
+**One thing the gate revealed rather than removed:** the residual medians are equal and opposite,
+`+4.5` µs on A against `−4.4` µs on B (and `+2.2`/`−2.2` in the earlier window). Each board reads
+the other as ~4.5 µs later. That is a differential bias, not scatter — paired, signed and stable
+across two windows — and it is small enough to have been invisible under the transient tail. It is
+now the smallest live discrepancy on the bench, and the candidates are probe skew (the analyser's
+own zero error, which `scripts/probe-cal.py` measures) and a real asymmetry in the pairing.
+
+### Previously open, now explained
 
 **The residual's tail is transient samples, by design.** Board B's `raw − wire` has `sd` 129.9
 against board A's 58.4 on an identical MAD of ~6.9 — same typical agreement, twice the excursions
