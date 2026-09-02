@@ -569,6 +569,13 @@ deliver rather than proceeding and attributing the residual to the controller.
 
 ## 13. Bench protocol, for every stage
 
+**After any flash, restart the analyser** (`bench-tmux.sh restart-analyzer`; `flash` does it for
+you). Its running acquisition does not survive both I2S buses going down: it serves edge-free data
+and reports "no BCLK edges" indefinitely, raising nothing, while a fresh one locks in two seconds.
+Measured three times on 2026-09-02, once per OTA. A frozen `test.csv` after a flash is this, not a
+dead bench.
+
+
 Unchanged from what already works, restated so no stage skips it:
 
 1. `scripts/bench/preflight.py` — refuses unless all boards are latency 0 on the same stream.

@@ -27,6 +27,7 @@
 #   scripts/bench/bench-tmux.sh status       # is it actually capturing?
 #   scripts/bench/bench-tmux.sh pins         # probe pins <-> board roles, the sign of B−A
 #   scripts/bench/bench-tmux.sh flash a b    # OTA those boards, batched, capture left running
+#   scripts/bench/bench-tmux.sh restart-analyzer   # after ANY flash, incl. one from another host
 #   scripts/bench/bench-tmux.sh attach
 #   scripts/bench/bench-tmux.sh stop
 #
@@ -641,6 +642,12 @@ cmd_flash() {
             printf '    %-9s %-34s now %s\n' "${role}" "${host}" "${after}"
         fi
     done
+    # The boards' buses were down for the duration; see cmd_restart_analyzer.
+    if have_session && [ -n "$(pane_id_for analyzer analyzer)" ]; then
+        echo
+        cmd_restart_analyzer
+    fi
+
     cat >&2 <<'EOF'
 
     Do NOT replug a board for the next minute: a replug that soon after the OTA reboot rolls
@@ -649,6 +656,22 @@ cmd_flash() {
     elevated error for ~15 s and do not grade a window that overlaps it.
 EOF
     return "${rc}"
+}
+
+# THE ANALYSER DOES NOT SURVIVE THE BOARDS REBOOTING. Measured three times on 2026-09-02, once
+# after each OTA: while both I2S buses are down its running acquisition starts serving edge-free
+# data, and it never comes back -- "no BCLK edges" for ever, test.csv frozen, while a direct
+# sigrok capture shows 141k BCLK edges and a freshly started analyser locks within two seconds.
+# The 60 s acquisition restart inside stream_blocks does not clear it and no error is raised, so
+# nothing upstream can detect it either. Until that is understood, restarting is the fix, and it
+# belongs in the flash path rather than in the operator's memory.
+cmd_restart_analyzer() {
+    have_session || die "session '${SESSION}' is not running"
+    load_conf
+    note "restarting the analyser (its acquisition does not survive a board reboot)"
+    tmux kill-window -t "${SESSION}:analyzer" 2>/dev/null || true
+    start_analyzer
+    return 0
 }
 
 cmd_stop() {
@@ -665,6 +688,7 @@ CMD=start
 while [ $# -gt 0 ]; do
     case "$1" in
         start|status|stop|attach|discover|pins) CMD="$1"; shift ;;
+        restart-analyzer) CMD=restart_analyzer; shift ;;
         flash) CMD=flash; shift ;;
         --all) FLASH_ROLES="${ROLES}"; shift ;;
         --force-build-here) FLASH_FORCE=1; shift ;;
