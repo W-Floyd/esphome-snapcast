@@ -330,6 +330,14 @@ number:
     type: gap_blank_ms
     snapclient_id: snap
     name: Gap Blank
+  # The LEARNED plant rate offset, writable so a poisoned estimate can be cleared without a
+  # serial NVS erase. Unlike the knobs above this one does NOT restore its own copy at boot --
+  # the firmware persists what it learns, and a knob re-applying a stale copy every boot would
+  # never let the learner keep its answer. Set it to 0 to make a board relearn from scratch.
+  - platform: snapclient
+    type: crystal_ppm
+    snapclient_id: snap
+    name: Crystal Offset
   # SuperMini antennas distort at high power, so LOWER often connects better. The driver
   # quantizes and clamps the request, so only the readback set_max_tx_power logs is real.
   - platform: template

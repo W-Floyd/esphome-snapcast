@@ -1712,6 +1712,9 @@ class SnapcastClient {
   /// outside its bounds. Names: tau_s [2..120], ti_s [10..1200], block_n [8..64], splice_us [0..10000, -1=config],
   /// tag_stale_ms [200..10000], blank_ms [100..2000], gap_blank_ms [10..500], autotune {0,1}, persist {0,1}.
   bool set_servo_param(const std::string &name, float value);
+  /// Current value of a servo parameter the FIRMWARE owns, for knobs that track it live rather
+  /// than holding the last typed number. NaN when the name has no live value to report.
+  float servo_param_value(const std::string &name) const;
   /// Save the integral's slow average to NVS now (shutdown hook); see persist_now() in the .cpp.
   void persist_now();
 

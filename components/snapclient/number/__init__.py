@@ -34,7 +34,16 @@ SERVO_PARAM_NUMBERS = {
     "blank_ms": ("blank_ms", UNIT_MILLISECOND, 0.0, 5000.0, 10.0, "mdi:blur-off"),
     "gap_blank_ms": ("gap_blank_ms", UNIT_MILLISECOND, 0.0, 2000.0, 10.0, "mdi:blur-off"),
     "tag_stale_ms": ("tag_stale_ms", UNIT_MILLISECOND, 100.0, 10000.0, 50.0, "mdi:timer-sand"),
+    # LEARNED, so adjustable but never restored -- see NO_RESTORE_PARAMS. Writable so a poisoned
+    # estimate can be zeroed without a serial NVS erase: board a came back from three reflashes at
+    # +92 then +200 railed, having converged to ~50 ppm earlier the same day, and every
+    # measurement taken from such a seed carries it.
+    "crystal_ppm": ("crystal_ppm", "ppm", -2000.0, 2000.0, 0.01, "mdi:sine-wave"),
 }
+
+# Knobs whose value the FIRMWARE owns and persists. The number stays writable but does not restore
+# its own copy at boot, which would otherwise overwrite the learned value every time.
+NO_RESTORE_PARAMS = {"crystal_ppm"}
 
 CONFIG_SCHEMA = cv.All(
     cv.typed_schema(
@@ -78,6 +87,8 @@ async def to_code(config):
     kind = config[CONF_TYPE]
     if kind in SERVO_PARAM_NUMBERS:
         param, _unit, lo, hi, step, _icon = SERVO_PARAM_NUMBERS[kind]
+        if kind in NO_RESTORE_PARAMS:
+            cg.add(var.set_no_restore(True))
         await number.register_number(var, config, min_value=lo, max_value=hi, step=step)
         cg.add(var.set_param(param))
     else:

@@ -9,6 +9,7 @@
 
 #include "esphome/core/application.h"
 #include "esphome/core/log.h"
+#include <cmath>
 
 namespace esphome::snapclient {
 
@@ -188,6 +189,10 @@ void SnapclientHub::on_shutdown() {
   if (this->client_ != nullptr) {
     this->client_->persist_now();
   }
+}
+
+float SnapclientHub::servo_param_value(const std::string &name) const {
+  return this->client_ != nullptr ? this->client_->servo_param_value(name) : NAN;
 }
 
 void SnapclientHub::set_servo_param(const std::string &name, float value) {

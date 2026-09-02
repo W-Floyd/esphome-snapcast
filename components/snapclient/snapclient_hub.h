@@ -132,6 +132,9 @@ class SnapclientHub final : public Component,
   /// @brief TUNING HOOK: forwards to SnapcastClient::set_servo_param(); see there for the names
   /// and bounds. Lets a tuning campaign run over the native API with no reflash.
   void set_servo_param(const std::string &name, float value);
+  /// Forwards to SnapcastClient::servo_param_value(): the live value of a parameter the firmware
+  /// owns, for knobs that track it rather than holding the last typed number.
+  float servo_param_value(const std::string &name) const;
   /// Persist the delay loop's crystal estimate before a reboot (OTA, restart button).
   void on_shutdown() override;
 

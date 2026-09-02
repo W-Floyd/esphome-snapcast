@@ -35,11 +35,19 @@ class SnapclientServoParamNumber final : public SnapclientChild, public number::
   void setup() override;
   void dump_config() override;
   void set_param(const std::string &name) { this->param_ = name; }
+  /// A knob that must NOT restore-and-reapply at boot. For a quantity the firmware LEARNS, where
+  /// the learned value has its own persistence: restoring here would overwrite it with whatever
+  /// was last typed, every boot, and the learner would never keep its own answer.
+  void set_no_restore(bool v) { this->no_restore_ = v; }
+  void loop() override;
 
  protected:
   void control(float value) override;
 
   std::string param_;
+  bool no_restore_{false};
+  uint32_t last_track_ms_{0};
+  float last_shown_{NAN};
   ESPPreferenceObject pref_;
 };
 

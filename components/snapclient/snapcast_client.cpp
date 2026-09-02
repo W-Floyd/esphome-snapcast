@@ -4486,6 +4486,13 @@ void SnapcastClient::persist_now() {
 // TUNING HOOK. THREAD CONTEXT: main loop (API); every consumer reads atomics. WARN-logged so the
 // analyser's timeline carries each change; NOT persisted, so a reboot restores the flashed
 // defaults -- a bad experiment is one power cycle from gone.
+float SnapcastClient::servo_param_value(const std::string &name) const {
+  if (name == "crystal_ppm") {
+    return this->timing_engine_.crystal_ppm();
+  }
+  return NAN;
+}
+
 bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   if (name == "tau_s") {
     if (!(value >= 2.0f && value <= 600.0f)) return false;
@@ -4497,6 +4504,23 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     this->tune_timing_engine_.store(value != 0.0f ? 1u : 0u, std::memory_order_relaxed);
     ESP_LOGI(TAG, "timing_engine = %u (0 = old ladder + PI) t=%" PRId64,
              this->tune_timing_engine_.load(std::memory_order_relaxed), now_us());
+  } else if (name == "crystal_ppm") {
+    // Set the learned plant offset directly, and PERSIST it, so a poisoned estimate can be
+    // cleared without a serial NVS erase.
+    //
+    // persist_now() saves at OTA shutdown, so a bad crystal survives every flash and seeds the
+    // next run: board a came back from three reflashes at +92, then +200 railed, having converged
+    // to ~50 ppm earlier in the day. Every measurement taken from such a seed carries it, and I
+    // produced one wrong conclusion this morning by not noticing that.
+    if (!std::isfinite(value) || std::abs(value) > TRIM_CLAMP_MAX_PPM) return false;
+    this->timing_engine_.set_crystal_ppm(value);
+    const float v = this->timing_engine_.crystal_ppm();
+    if (this->dl_integral_pref_.save(&v)) {
+      global_preferences->sync();
+      this->crystal_saved_ppm_ = v;
+      this->crystal_saved_at_us_ = now_us();
+    }
+    ESP_LOGI(TAG, "crystal_ppm = %+.2f ppm (set and persisted) t=%" PRId64, v, now_us());
   } else if (name == "timing_target_us") {
     this->tune_timing_target_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
     ESP_LOGI(TAG, "timing_target_us = %" PRId32 " t=%" PRId64,
