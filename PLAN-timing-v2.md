@@ -191,24 +191,30 @@ with two it is an arbitrary choice among them.
 
 ### What is still open
 
-**Board B's residual tail is twice board A's** — `sd` 129.9 against 58.4 on an identical MAD of
-~6.9. So both boards agree with the wire in the typical case and differ only in how often they
-depart from it, which no averaging will explain and which is the one Stage 1 thread still live.
-`raw − wire` is the signal to characterise; `GDIN`'s `gap`, `drift` and `extrap` fields are
-already logged beside it.
+**The residual's tail is transient samples, by design.** Board B's `raw − wire` has `sd` 129.9
+against board A's 58.4 on an identical MAD of ~6.9 — same typical agreement, twice the excursions
+— and B's only block that excludes slope 1.0 is the one carrying 5 hard resyncs and a `raw` p2p of
+4704 µs against ~500 µs elsewhere. B took 14 hard resyncs in that window to A's 5.
 
-Two constraints on that work, learned the expensive way:
+A board in transient stops *beaconing* its phase but keeps measuring and using it locally, on
+purpose: `publish_render_phase_(!in_transient)` only sets the broadcast flag, and the comment at
+[L4468](components/snapclient/snapcast_client.cpp#L4468) is explicit that the resync gate needs its
+own delta while its window is open. So a board that is stepping its audio still computes a delta
+from a phase that is moving — right for control, and not comparable to the wire.
 
-* **Use median/MAD, not `sd`.** On this residual `sd` overstates the noise by 8×, and the first
-  number computed from it ("σ ≈ 55 µs") was wrong by that factor.
-* **The grader's own verdict is not yet trustworthy.** `gdin-wire.py` reports a Theil-Sen slope,
-  which is biased under errors-in-variables — the noise is in `raw`, not in the wire — and it
-  printed FAIL on the data above, whose true slope is ~1.0. The finding came from the regression
-  bracket instead: `OLS(wire|raw)` = 0.58/0.21 (attenuated) against `1/OLS(raw|wire)` = 1.04/1.02,
-  the latter clustering at 1.0 in every block on both boards, which is the signature of
-  `raw = wire + noise`. The self-test cannot catch this because it generates the wire as an exact
-  function of `raw`, the one case where the bias vanishes. **Report the bracket and add x-noise to
-  the self-test before quoting a slope again.**
+**[M] Two things follow, in order:**
+
+1. **`GDIN` must carry the emitting board's steady/transient state** (one flag; `in_transient` is
+   already computed at [L4720](components/snapclient/snapcast_client.cpp#L4720)), and
+   `gdin-wire.py` must gate on it. Grading the reference on samples the firmware itself does not
+   treat as steady measures the transient, not the reference. Until that flag exists, read a
+   window's verdict together with its hard-resync count.
+2. **Why B resyncs 3× as often as A** is then the real question, and it is a different question
+   from the reference's accuracy. `DECIDE`'s `act=resync` census and the `OUT OF RANGE` counts are
+   the inputs; both boards run the same build on the same stream.
+
+**One statistical constraint on all of it:** use median/MAD, not `sd`. On this residual `sd`
+overstates the disagreement by 8×, and the first figure computed from it was wrong by that factor.
 
 ---
 
