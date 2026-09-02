@@ -549,21 +549,56 @@ error at all.
 same magnitude, wire-graded, n ≥ 6 steps each. Pass: position delivery reaches the same wire
 displacement with fewer µs of overshoot and no trim excursion.
 
-### 8b. Differential rate feed-forward — but decide it, do not assume it
+### 8b. Differential rate feed-forward — MEASURED, and the premise does not hold
 
-The steady-state floor is set by ~0.33 ppm of differential rate noise: at 0.33 ppm a 1 µs error
-accrues in ~3 ms, against a fine-loop τ of 120 s. That is a ~40000× bandwidth gap and **no gain
-increase closes it.** Only two things can: stop generating the 0.33 ppm, or cancel it by
-feed-forward.
+**SF_d was run on 2026-09-02 (6.0 h, 147 937 rows, 7473 bins, p2p gate 60 µs — quote the gate,
+the same quantity spans 3× across gate choices). Both of this stage's premises failed.**
 
-Which one applies is a single measurement, and it has not been run:
+    tau     SF(d_wire)   SF(trim_diff)   SF(achieved)   ratio d/trim
+     5s         6.280         5.317          4.381         1.18
+    10s         7.341         6.441          5.179         1.14
+    30s         8.357         7.833          5.382         1.07
+    60s         8.594         8.000          5.626         1.07
+
+    sd: achieved(wire) 3.712   fs_diff 3.740   trim_diff 4.818 ppm
+
+**1. The disturbance is broadband and downstream.** `SF(d)` moves +3 % between τ = 30 s and 60 s,
+i.e. it has saturated: `d` carries essentially no structure at the timescales the fine loop works
+on (τ = 120 s). Gain cannot reject what lies outside the loop's bandwidth, and `SF(achieved)` 5.38
+against `SF(d)` 8.36 says the loop already removes ~35 % and no more is available that way. **A
+τ/Ti sweep reads null. Do not run one.**
+
+**2. Feed-forward does not address it either.** Feed-forward cancels a *predictable* term.
+Broadband noise entering downstream of the command is not predictable, so the crystal
+feed-forward this section was built around cannot cancel it. Both of the stage's two levers are
+answered by one measurement, and the answer is neither.
+
+**3. The sizing fact was wrong by 11×.** This stage was written around ~0.33 ppm of differential
+rate noise (1 µs in ~3 ms). Measured: **3.71 ppm achieved, 4.82 ppm commanded** — 1 µs in 0.27 ms.
+
+**What is left is the source.** `sf-d.py` names the candidates: rate-lock delivery, the I2S
+driver, the `fs` estimator. And the commanded 4.82 ppm is the same quantity that produces the
+visible sawtooth in the live plot — position is the integral of rate, the rate is held constant
+between updates, so straight ramps with slope changes are what a rate actuator doing position work
+draws. Measured 2026-09-02: `trim` sd 4.59 ppm on board A integrated over the offset's ~3 s
+correlation time is 13.8 µs, against 15.1 µs of observed position wander — the commanded rate
+noise accounts for essentially all of it. **Shrinking the commanded noise is now the stage, and it
+is upstream of both original levers.**
+
+Which one applies is a single measurement:
 
 ```
 d = fs_diff − trim_diff       (per-capture, from the analyser CSV)
-SF(d) ≈ SF(trim_diff)   → the loop's own response IS the plateau; τ/Ti reopens
-SF(d) ≈ 0               → the plateau is downstream; the loop cannot reject it,
-                          and feed-forward against the LOOP-DERIVED crystal is the path
+SF(d) FLAT across tau     → d is broadband: it enters DOWNSTREAM of the command, outside the
+                            loop's bandwidth. A tau/Ti sweep reads null.
+SF(d) GROWING with tau    → d is slow: the loop can see it, so tau/Ti is the lever.
 ```
+
+**The rule above was stated inverted in this plan until 2026-09-02**, against `sf-d.py`'s own
+docstring and against the definition of a structure function — SF grows with τ for a *slow*
+signal and saturates for a broadband one. Read backwards it sends you to a gain sweep for a
+disturbance the loop cannot see, at five membership changes a try. The tool is authoritative; this
+paragraph now agrees with it.
 
 **Run SF_d before writing any code for this stage.** The test is already written —
 `scripts/bench/sf-d.py` — and it takes the achieved differential rate from the *wire slope*, not
