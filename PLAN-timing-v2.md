@@ -202,6 +202,21 @@ containing a known differential.
 over ≥ 6 disjoint 5-minute blocks. Report the halved control-path delta beside it, so the two are
 never confused again.
 
+**Implemented 2026-09-02:** `scripts/bench/gdin-wire.py` grades exactly this — Theil-Sen slope per
+block, wire gated on `rival` *and* `pcm_coef`, gaps and reboots refused, sign preserved (a negative
+slope is an orientation mismatch, not a firmware result). `--self-test` covers slope 1, the 4×
+case, 10 % whole-frame outliers and an inversion, so it can be trusted before the bench is.
+
+Two facts about the signal, both of which look like faults and are not:
+
+* **A board with no render phase of its own emits no GDIN at all.** `recompute_group_delta_`
+  returns early on `RENDER_PHASE_UNKNOWN`, so the observer — which drives no DAC — never emits
+  one. That is why it publishes `PHASEIN` instead. Do not read observer GDIN silence as a
+  regression.
+* **GDIN describes the last *scanned* peer that paired**, i.e. `peer_[]` order, not the freshest
+  or the closest. With one phase-contributing peer that is the only peer; with two it is an
+  arbitrary choice among them.
+
 **Do not skip to Stage 8 on the strength of an averaging argument.** Averaging a signal that is
 wrong by 4× produces a precise wrong number, and the 30 Hz averaged own-phase ring already exists
 ([tsf_sync.h:136](components/clock_sync/tsf_sync.h#L136)) — it is not the missing piece.
@@ -251,7 +266,14 @@ DECIDE src=tag|ledger|none cls=rate|step|bias|none gate=<first refusing gate>
 
 **Pass condition:** over a quiet 30-minute window every chunk is accounted for by exactly one
 `act` and one `gate`, and the counts reconcile with `soft_dropped_frames`,
-`soft_inserted_frames` and `hard_resyncs`. **If that reconciliation fails, `TIMING.md`'s
+`soft_inserted_frames` and `hard_resyncs`.
+
+**Do not reconcile against the `Sync:` line's chunk field.** It prints `st.err_count` — the
+count of error samples, which fires the report AT 128 and so is *always* 128 — not a chunk
+census. It was labelled `chunks` until 2026-09-02 and that label alone produced a 4.2 %
+"mismatch" against DECIDE's accounting, for the sole reason that the two count different things.
+The frame sums are the pass condition; they reconcile exactly on a clean window (verified on both
+boards, 2026-09-01). Throttled chunks are carried in `sk=` so the census stays complete. **If that reconciliation fails, `TIMING.md`'s
 description of the ladder is wrong and this plan is built on a wrong map** — that is the point of
 running it first.
 

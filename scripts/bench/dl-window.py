@@ -59,7 +59,10 @@ GDIN = re.compile(
 # Sync: avg X us, peak Y us, median Z us | corrected -D/+I frames, H hard resyncs over N chunks
 SYNC = re.compile(
     r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*?\bSync: avg [-+]?\d+ us, peak [-+]?\d+ us, "
-    r"median [-+]?\d+ us \| corrected -(\d+)/\+(\d+) frames, (\d+) hard resyncs over (\d+) chunks"
+    # "chunks" pre-2026-09-02, "err samples" after: the field always carried err_count, and the
+    # rename only made it say so. Accept both so a log spanning the change parses throughout.
+    r"median [-+]?\d+ us \| corrected -(\d+)/\+(\d+) frames, (\d+) hard resyncs over (\d+) "
+    r"(?:chunks|err samples)"
 )
 
 # Timespan of a "quiet 30-minute window", in seconds, for the reconciliation pass-condition.

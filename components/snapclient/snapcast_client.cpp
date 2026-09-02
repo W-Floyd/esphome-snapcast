@@ -6526,9 +6526,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       // error fields widened -- measured post-split at 14:40:26 -- because a bounded-looking field
       // plus unbounded numbers still reaches the ceiling. TRIMDBG carries the trim series, and the
       // analyser now reads it from there, so this line has no unbounded tail left to lose.
+      // "err samples", NOT "chunks". This field is st.err_count: it counts the calls to
+      // log_sync_report_ that carried a valid error, so a chunk with no error sample never
+      // increments it -- and since the report fires AT 128, the number printed is always
+      // exactly 128. Labelled "chunks" it read as a per-window chunk census and invited a
+      // reconciliation against DECIDE's chunk accounting, which came out 4.2 % apart for the
+      // sole reason that the two count different things (2026-09-02).
       ESP_LOGD(TAG,
                "Sync: avg %" PRId64 " us, peak %" PRId64 " us, median %" PRId64
-               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs over %" PRIu32 " chunks",
+               " us | corrected -%" PRIu32 "/+%" PRIu32 " frames, %" PRIu32 " hard resyncs over %" PRIu32 " err samples",
                st.err_accum_us / st.err_count, st.err_peak_us, median_err_us, st.soft_dropped_frames,
                st.soft_inserted_frames, st.hard_resyncs, st.err_count);
       ESP_LOGD(TAG, "SYNCX feedback %" PRId64 " us mean / %" PRId64 " ms max, buffered %" PRIu32 " ms, pipeline %" PRId32
