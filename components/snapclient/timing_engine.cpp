@@ -368,7 +368,20 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   const float reach_s = static_cast<float>(profile_.rate_horizon_us()) / 1e6f;
   const float needed_ppm =
       reach_s > 0.0f ? static_cast<float>(e_position) / reach_s : 0.0f;
-  const bool rate_can_fix = std::fabs(needed_ppm) <= profile_.rate_authority_ppm;
+  // Rate can fix it only if rate can also HOLD the fix. needed_ppm within authority says the
+  // proportional term could reach the error; it says nothing about whether the integral can take
+  // over afterwards. When the crystal is already at its clamp in the direction the error demands,
+  // it cannot: P corrects transiently, P decays as the error does, and the error returns. Position
+  // then stands down for work rate is structurally unable to finish.
+  //
+  // Measured in test 14 at a 150 ppm deadline drift, past the crystal's 200 ppm clamp: needed
+  // 92 ppm against 100 authority read as "rate can fix it", the loop spent ZERO frames, and the
+  // error peaked at 162 ms.
+  const bool crystal_spent =
+      (crystal_ppm_ >= CRYSTAL_LIMIT_PPM && needed_ppm > 0.0f) ||
+      (crystal_ppm_ <= -CRYSTAL_LIMIT_PPM && needed_ppm < 0.0f);
+  const bool rate_can_fix =
+      !crystal_spent && std::fabs(needed_ppm) <= profile_.rate_authority_ppm;
   int32_t frames = (frame_us > 0 && std::llabs(e_position) >= coarse_gate_us && !rate_can_fix)
                        ? static_cast<int32_t>(e_position / frame_us)
                        : 0;

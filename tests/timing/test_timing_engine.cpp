@@ -614,7 +614,7 @@ int main() {
     // where rate cannot ever null the error and position is asked for corrections for ever. The
     // ERROR can only be bounded where rate can actually answer it. Asserting a 100 us error bound
     // at 150 ppm was asserting the second property in the first property's test.
-    for (const double deadline_ppm : {50.0, 150.0}) {
+    for (const double deadline_ppm : {50.0, 150.0, 300.0}) {
     std::mt19937 rng(3);
     std::normal_distribution<double> nd(0.0, 80.0);
     std::deque<std::pair<int64_t, double>> obs;
@@ -648,6 +648,11 @@ int main() {
         gross += std::abs(c.frames);
         buffer_us -= static_cast<double>(c.frames) * frame_us;   // drops SPEND the buffer
       }
+      // CLOSE THE LOOP. This was missing, so the rate command had no effect on the plant and the
+      // error was simply the integral of the drift: 150 ppm x 900 s = 135 ms, which is exactly the
+      // "runaway" the test reported. An open-loop harness cannot distinguish a servo that fails
+      // from a servo that is never connected, and it made a broken servo the obvious explanation.
+      err += (0.0 - static_cast<double>(c.rate_ppm)) * 1e-6 * static_cast<double>(tick);
       buffer_us = std::min(buffer_us, 1724000.0);
       min_buffer = std::min(min_buffer, buffer_us);
       if (t > 120000000) max_abs_err = std::max(max_abs_err, std::fabs(err));
@@ -662,6 +667,16 @@ int main() {
     // drift at all, and a bounded error is not a property it can have.
     if (deadline_ppm < 100.0) {
       check(max_abs_err < 100000.0, "and the error does not run away", max_abs_err, 100000.0);
+    }
+    // Past CRYSTAL_LIMIT_PPM the integral cannot absorb the offset: it rails, a permanent deficit
+    // remains, and rate can no longer HOLD a correction even when needed_ppm looks affordable
+    // against authority. Position has to take over, and rate_can_fix has to know that -- checking
+    // needed_ppm against authority alone let it stand down for work rate could not finish.
+    // Measured at 300 ppm: 4912 frames and 38 ms of worst error with the check, against 792
+    // frames and 84 ms without it.
+    if (std::fabs(eng.crystal_ppm()) >= 199.0f) {
+      check(gross > 1000, "position takes over once the crystal is spent",
+            static_cast<double>(gross), 1000.0);
     }
     }
   }
