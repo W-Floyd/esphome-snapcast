@@ -120,10 +120,21 @@ host_up() {  # BSD ping: -t <seconds>. GNU ping: -W <seconds>, and -t is a TTL.
 # extra needs installing; fall back to the system python3, which on Linux still works via
 # ports.py's sysfs backend.
 pyexe() {
-    local p
+    local line first second p
     if command -v esphome >/dev/null 2>&1; then
-        p=$(head -1 "$(command -v esphome)" | sed 's/^#!//')
-        [ -x "${p}" ] && { echo "${p}"; return; }
+        line=$(head -1 "$(command -v esphome)" | sed 's/^#!//')
+        # The shebang can carry FLAGS ("/path/to/python -E", as pipx writes it) and can be
+        # "env python3". Taking the line whole makes "$(pyexe) script" a command whose name
+        # contains a space: it is not executable, so this fell through to the system python3
+        # -- which has neither aioesphomeapi nor pyserial, so every board reported itself
+        # unreachable over the API and port enumeration quietly used the sysfs fallback. The
+        # degraded path worked well enough to hide the fact that the wrong interpreter ran.
+        first="${line%% *}"; second="${line#* }"; second="${second%% *}"
+        case "${first}" in
+            env|*/env) p="$(command -v "${second}" 2>/dev/null || true)" ;;
+            *) p="${first}" ;;
+        esac
+        [ -n "${p}" ] && [ -x "${p}" ] && { echo "${p}"; return; }
     fi
     echo python3
 }
