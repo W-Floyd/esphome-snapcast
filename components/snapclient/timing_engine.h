@@ -199,6 +199,9 @@ class Engine {
   ///                            second correction until then.
   int64_t pending_disp_us_ = 0;
   int64_t pending_comp_until_us_ = 0;
+  /// The filtered error recorded when the correction was issued: the value the measurement keeps
+  /// reporting until the move lands, and the reference the landing test compares against.
+  int64_t pending_ref_us_ = 0;
   int64_t serialise_until_us_ = 0;
   bool in_flight_ = false;
   uint64_t next_id_ = 1;

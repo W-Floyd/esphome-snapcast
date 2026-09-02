@@ -539,6 +539,60 @@ int main() {
           peak_abs_xtal, 100.0);
   }
 
+  printf("\n13. a WRONG configured position delay must not inject error into a synced board\n");
+  {
+    // The bench's actual situation. position_delay comes from buffer accounting -- ring fill from
+    // available() and pushed-minus-played disagree 7x, and the latter is rebaselined on feedback
+    // gaps -- while the wire says the real landing is ~1.25 s. Compensating past the landing
+    // subtracts a displacement the observation already contains, inventing an error of -D. On a
+    // board that is ALREADY in sync that is not a missed correction, it is an injected one: the
+    // wire showed it stepping away from zero and back, every settle window.
+    //
+    // So: tell the engine a delay that is wrong in both directions and require it to cope.
+    for (double factor : {0.5, 2.0, 4.0}) {
+      const int64_t true_land = 1250000;                 // what the wire measured
+      Profile pb = p;
+      pb.position_delay_us = static_cast<int64_t>(true_land * factor);   // what we believe
+      Engine eng(pb);
+      Plant plant;
+      plant.plant_ppm = 0.0;                             // already synced
+      plant.frame_us = pb.frame_us();
+      plant.noise_us = 80.0;
+      plant.error_us = 26.0 * static_cast<double>(pb.frame_us());  // one real step to correct
+      std::deque<std::pair<int64_t, double>> history;
+      uint64_t pid = 0; int32_t pf = 0; bool live = false; int64_t land = 0;
+      int corr = 0; long gross = 0;
+      std::vector<double> errs;
+      const int64_t tick = 25000;
+      for (int64_t t = 0; t < 600000000; t += tick) {
+        if (live && t >= land) { plant.apply_frames(pf); eng.confirm_position_landed(pid, t); live = false; }
+        history.emplace_back(t, plant.observe());
+        double seen = history.front().second;
+        while (history.size() > 1 && history.front().first <= t - pb.measurement_lag_us) {
+          seen = history.front().second;
+          history.pop_front();
+        }
+        Command c = eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), true},
+                             GroupEvidence{});
+        if (c.frames != 0 && !live) {
+          pid = c.correction_id; pf = c.frames; land = t + true_land; live = true;
+          corr++; gross += std::abs(c.frames);
+        }
+        plant.advance(tick, c.rate_ppm);
+        if (t > 120000000) errs.push_back(std::fabs(plant.error_us));
+      }
+      std::sort(errs.begin(), errs.end());
+      const double med = errs[errs.size() / 2];
+      printf("        believed %.1fx the true landing: %d corrections, gross %ld frames, "
+             "settled |e| median %.0f us\n", factor, corr, gross, med);
+      // One real correction for the real step. More than a handful means the loop is correcting
+      // its own phantom, which is the failure this guards.
+      check(corr <= 3, "a wrong delay does not buy extra corrections", corr, 3);
+      check(med < 3.0 * static_cast<double>(pb.frame_us()),
+            "and the board stays synced", med, 3.0 * static_cast<double>(pb.frame_us()));
+    }
+  }
+
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all properties hold", failures,
          failures == 1 ? "" : "s");
   return failures ? 1 : 0;

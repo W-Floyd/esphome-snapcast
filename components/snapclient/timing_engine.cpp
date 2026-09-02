@@ -68,6 +68,7 @@ void Engine::reset() {
   in_flight_since_us_ = 0;
   pending_disp_us_ = 0;
   pending_comp_until_us_ = 0;
+  pending_ref_us_ = 0;
   serialise_until_us_ = 0;
   last_obs_us_ = 0;
   suppressed_ = 0;
@@ -177,9 +178,27 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // includes the move, and subtracting it again invents an error of exactly -displacement --
   // measured on the bench as err +444 us -> a 19-frame (431 us) correction -> err -344 us, an
   // equal-and-opposite pair, repeating as a multi-frame ladder up to 12 frames.
-  if (pending_comp_until_us_ != 0 && now_us >= pending_comp_until_us_) {
-    pending_comp_until_us_ = 0;
-    pending_disp_us_ = 0;
+  // Stop compensating on EVIDENCE, not on a computed deadline. The deadline is
+  // position_delay + measurement_lag, and position_delay comes from buffer accounting that has
+  // been wrong twice: ring fill (available(), 1724 ms) and pushed-minus-played (247 ms) disagree
+  // 7x for what should be nearly the same quantity, because the latter is rebaselined on feedback
+  // gaps -- and the wire says the real landing is ~1.25 s. Compensating past the landing subtracts
+  // a displacement the observation already contains, which invents an error of -D and steps a
+  // SYNCED board away from sync and back. Observed on the wire as exactly that, and in the log as
+  // a 590 us correction followed by a 600 us error, every settle window.
+  //
+  // The landing is detectable: before it, a raw observation sits near the error we recorded at
+  // issue; after it, near that error minus the displacement. Whichever it is closer to says which
+  // side of the landing we are on, and for the corrections that matter (26 frames = 590 us against
+  // ~80 us of noise) that is unambiguous. The computed deadline stays as an upper bound only.
+  if (pending_comp_until_us_ != 0) {
+    const int64_t as_not_landed = std::llabs(obs.error_us - pending_ref_us_);
+    const int64_t as_landed = std::llabs(obs.error_us - (pending_ref_us_ - pending_disp_us_));
+    if (as_landed < as_not_landed || now_us >= pending_comp_until_us_) {
+      pending_comp_until_us_ = 0;
+      pending_disp_us_ = 0;
+      pending_ref_us_ = 0;
+    }
   }
   const int64_t e = obs.error_us - pending_disp_us_;
   cmd.decision.error_us = e;
@@ -222,13 +241,33 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
 
   // Group evidence answers one question: is this error mine or the group's? Only a differential
   // error is audible, and correcting a common one moves the pair apart. Not a gain input.
+  // How much of MY error is differential -- not merely whether the group delta is small.
+  //
+  // The old test was `|gd| * unhalve >= target_position_us`, which asks the wrong question. On the
+  // bench gd reads 8-42 us between boards that agree with each other to within tens of us while
+  // each sits ~600 us off its own deadline: nearly all of that error is COMMON, yet a gd of 21 us
+  // crosses a 20 us threshold, the whole 600 us is declared differential, and position steps it.
+  // Both boards do so at different moments, so the pair is pulled apart -- the wire showed a
+  // synced board stepped AWAY from zero and back every settle window, 64 frames spent in the
+  // two-board simulator on an error that was never audible.
+  //
+  // Only a differential error is audible, so position's error signal IS the differential one when
+  // the group can supply it. Tracking the deadline is left to rate and the crystal, which is where
+  // it belongs.
+  // NO unhalve. group.delta_us is this board's deviation from the group MEAN, and every board in
+  // the group is correcting its own at the same time: if each moves by its deviation, they meet.
+  // The n/(n-1) factor converts "deviation from the mean" into "error against the others,
+  // excluding me", which is the right quantity only for a SOLE corrector. Applied while everyone
+  // corrects, each board traverses the whole gap instead of half of it, the pair swaps places, and
+  // the consensus oscillates -- 330 corrections and 269 us of skew in the two-board simulator on a
+  // purely common drift, against 8 corrections for the old gate.
   bool differential = true;
+  int64_t e_diff = 0;
+  bool have_diff = false;
   if (group.present && group.contributors > 1) {
-    const float unhalve =
-        static_cast<float>(group.contributors) / static_cast<float>(group.contributors - 1);
-    const int64_t mine = static_cast<int64_t>(
-        std::llround(std::fabs(static_cast<float>(group.delta_us)) * unhalve));
-    differential = mine >= profile_.target_position_us;
+    e_diff = group.delta_us;
+    have_diff = true;
+    differential = std::llabs(e_diff) >= profile_.target_position_us;
   }
 
   // Coarse: whole frames, one at a time, verified. Decided on the FILTERED error, not the latest
@@ -258,15 +297,20 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // carries the ring and would claim rate can absorb an error it will in fact overshoot (at a 10 s
   // horizon a 907 us step needs only 91 ppm, passes as "within reach", and settles 290 us the
   // other side).
+  // Position's own error signal: the differential where the group supplies one, else the deadline
+  // error (a lone client has nothing to be differential from). Everything below judges position on
+  // THIS, including whether rate could have reached it -- judging reach on the deadline error
+  // while stepping the differential one would compare two different quantities.
+  const int64_t e_position = have_diff ? e_diff : e_filtered;
   const float reach_s = static_cast<float>(profile_.rate_horizon_us()) / 1e6f;
   const float needed_ppm =
-      reach_s > 0.0f ? static_cast<float>(e_filtered) / reach_s : 0.0f;
+      reach_s > 0.0f ? static_cast<float>(e_position) / reach_s : 0.0f;
   const bool rate_can_fix = std::fabs(needed_ppm) <= profile_.rate_authority_ppm;
   const int32_t frames =
-      (frame_us > 0 && std::llabs(e_filtered) >= coarse_gate_us && !rate_can_fix)
-          ? static_cast<int32_t>(e_filtered / frame_us)
+      (frame_us > 0 && std::llabs(e_position) >= coarse_gate_us && !rate_can_fix)
+          ? static_cast<int32_t>(e_position / frame_us)
           : 0;
-  cmd.decision.filtered_us = e_filtered;
+  cmd.decision.filtered_us = e_position;
   cmd.decision.gate_us = coarse_gate_us;
   cmd.decision.needed_ppm = needed_ppm;
   cmd.decision.authority_ppm = profile_.rate_authority_ppm;
@@ -290,6 +334,8 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     in_flight_since_us_ = now_us;
     pending_disp_us_ = static_cast<int64_t>(frames) * frame_us;
     pending_comp_until_us_ = now_us + profile_.compensation_us();
+    // The error as the measurement will keep reporting it until the move lands.
+    pending_ref_us_ = static_cast<int64_t>(std::llround(err_mean_us_));
     serialise_until_us_ = now_us + profile_.settle_us();
     // Compensation is a change of coordinates, so the filter's STATE moves with its inputs, at
     // the same instant. Shifting only the inputs leaves err_mean_us_ holding the pre-correction
