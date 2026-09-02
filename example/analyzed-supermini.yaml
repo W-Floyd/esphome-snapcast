@@ -1,0 +1,21 @@
+substitutions:
+  name: analyzed-supermini
+  friendly_name: Analyzed SuperMini
+
+  board: esp32-s3-devkitc-1
+  flash_size: 4MB
+  psram_mode: quad              # the S3FH4R2's 2 MB PSRAM is quad, not octal
+  psram_speed: 80MHz
+
+  pin_lrclk: GPIO4
+  pin_bclk: GPIO5
+  pin_dout: GPIO6
+  pin_led: GPIO48
+
+packages:
+  base: !include snapclient-base.yaml
+
+# This antenna is poorly matched and distorts at high power, giving "Auth Expired" loops
+# even at full RX bars: pin the boot power low and trim up from the runtime number.
+wifi:
+  output_power: 8.5dB

@@ -2936,6 +2936,11 @@ void SnapcastClient::player_task_() {
     const bool coarse_on_tags = tags_fresh && now_us() >= st.tag_fault_until_us;
     const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
 
+    // One engine decision per chunk, from the measured error when tags are live. Computed here
+    // because this is where the error is known; applied at the two seams below.
+    const timing::Command engine_cmd =
+        this->timing_step_(st, rec.params.sample_rate, tags_fresh, coarse_err_us);
+
     // ── St3a SHADOW: active_error() beside the live selector, ACTING ON NOTHING ──────────────
     // Counters only. The two differ by construction -- active_error() also demands
     // dl_err_at_us != 0 and an accumulator fresher than tune_tag_stale_ms_ -- so what this
@@ -3511,12 +3516,17 @@ void SnapcastClient::player_task_() {
         // reference-step response and never counts against the quiet invariant. Kept explicit
         // rather than omitted, so the asymmetry with the two sites below is deliberate and visible.
       }
-      if (adjust > 0) {
-        drop_frames = adjust;
-        st.soft_dropped_frames += adjust;
-      } else if (adjust < 0) {
-        st.soft_inserted_frames += -adjust;
-        this->push_silence_(-adjust, rec.params);
+      // POSITION SEAM. With the engine owning the path its frame count is what gets applied; the
+      // ladder above is decision-dead, though its gate and blank side effects still run (removing
+      // those is the second pass, hence the surviving references to `adjust` below).
+      const int32_t applied_frames =
+          this->tune_timing_engine_.load(std::memory_order_relaxed) ? engine_cmd.frames : adjust;
+      if (applied_frames > 0) {
+        drop_frames = applied_frames;
+        st.soft_dropped_frames += applied_frames;
+      } else if (applied_frames < 0) {
+        st.soft_inserted_frames += -applied_frames;
+        this->push_silence_(-applied_frames, rec.params);
       }
       if (resync_window && adjust != 0) {
         st.resync_step_at_us = now_us();
@@ -3603,7 +3613,11 @@ void SnapcastClient::player_task_() {
           st.trim_railed++;
         }
   #endif
-        // Programmed EVERY chunk with whatever the loop last demanded -- this line is the hold.
+        // RATE SEAM. The engine's command replaces the PI's output; the line below is still the
+        // hold, programmed every chunk.
+        if (this->tune_timing_engine_.load(std::memory_order_relaxed)) {
+          st.trim_applied_ppm = engine_cmd.rate_ppm;
+        }
         trim_holds = this->rate_lock_->set_trim_ppm(st.trim_applied_ppm);
         if (!trim_holds) {
           st.rate_lock_ok = false;
@@ -4648,6 +4662,45 @@ int32_t SnapcastClient::position_arbiter_(ServoState &st, const ErrorView &ev, i
   return 0;
 }
 
+timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rate,
+                                            bool err_valid, int64_t err_us) {
+  timing::Profile prof;
+  prof.frame_rate_hz = sample_rate ? sample_rate : 44100;
+  prof.visibility_us = this->visibility_horizon_us();
+  prof.target_position_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
+  this->timing_engine_.set_profile(prof);
+
+  timing::Observation obs;
+  obs.at_us = now_us();
+  obs.error_us = err_us;
+  obs.valid = err_valid;
+
+  timing::GroupEvidence grp;
+  if (this->tsf_sync_ != nullptr) {
+    const int32_t gd = this->tsf_sync_->render_group_delta_us();
+    if (gd != INT32_MIN) {
+      grp.present = true;
+      grp.delta_us = gd;
+      grp.contributors = this->tsf_sync_->group_delta_n();
+    }
+  }
+
+  const timing::Command cmd = this->timing_engine_.step(obs.at_us, obs, grp);
+
+  const int64_t tnow = obs.at_us;
+  if (cmd.frames != 0 || tnow - this->timing_log_us_ >= 2000000) {
+    this->timing_log_us_ = tnow;
+    ESP_LOGD(TAG,
+             "ENGINE err=%+" PRId64 " act=%d why=%d frames=%+" PRId32 " rate=%+.2f xtal=%+.2f "
+             "sigma=%.1f sup=%" PRIu32 " t=%" PRId64,
+             cmd.decision.error_us, static_cast<int>(cmd.decision.act),
+             static_cast<int>(cmd.decision.why), cmd.decision.frames, cmd.decision.rate_ppm,
+             cmd.decision.crystal_ppm, this->timing_engine_.sigma_e_us(),
+             cmd.decision.suppressed, tnow);
+  }
+  return cmd;
+}
+
 void SnapcastClient::delay_loop_update_(ServoState &st) {
   // WS3.1 GATE, SET AT A SINGLE POINT THAT ALWAYS EXECUTES. dl_oor means "the loop is NOT in clean
   // in-range steady state", and it is asserted here on entry and cleared only on the one path that
@@ -5406,6 +5459,14 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     this->tune_boost_floor_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
     ESP_LOGI(TAG, "boost_floor_us = %" PRId32 " (0 = boost on any gd, as before) t=%" PRId64,
              this->tune_boost_floor_us_.load(std::memory_order_relaxed), now_us());
+  } else if (name == "timing_engine") {
+    this->tune_timing_engine_.store(value != 0.0f ? 1u : 0u, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "timing_engine = %u (0 = old ladder + PI) t=%" PRId64,
+             this->tune_timing_engine_.load(std::memory_order_relaxed), now_us());
+  } else if (name == "timing_target_us") {
+    this->tune_timing_target_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+    ESP_LOGI(TAG, "timing_target_us = %" PRId32 " t=%" PRId64,
+             this->tune_timing_target_us_.load(std::memory_order_relaxed), now_us());
   } else if (name == "guards") {
     // St7 ABLATION. Bitmask, set = guard disabled; 0 restores today's behaviour. Logged at INFO
     // on every change because a window graded without knowing which guards were live is

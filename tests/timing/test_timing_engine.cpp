@@ -7,14 +7,14 @@
 // Simulates a plant with a known rate offset, feeds the engine its own commands, and checks the
 // properties the design claims. The bench cannot produce most of these cases on demand.
 
-#include "timing_engine.h"
+#include "../../components/snapclient/timing_engine.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
 
-using namespace snapclient::timing;
+using namespace esphome::snapclient::timing;
 
 namespace {
 

@@ -3,8 +3,7 @@
 #include <algorithm>
 #include <cmath>
 
-namespace snapclient {
-namespace timing {
+namespace esphome::snapclient::timing {
 
 namespace {
 /// Unconfirmed corrections expire after this many visibility horizons. Expressed in horizons
@@ -211,5 +210,4 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   return cmd;
 }
 
-}  // namespace timing
-}  // namespace snapclient
+}  // namespace esphome::snapclient::timing

@@ -27,8 +27,7 @@
 
 #include <cstdint>
 
-namespace snapclient {
-namespace timing {
+namespace esphome::snapclient::timing {
 
 /// Rate- and codec-dependent values, supplied by the transport.
 struct Profile {
@@ -98,6 +97,7 @@ class Engine {
   /// then: two in flight cannot be distinguished from one that failed.
   void confirm_position_landed(uint64_t correction_id, int64_t now_us);
 
+
   /// Learned per-board plant rate offset, ppm.
   float crystal_ppm() const { return crystal_ppm_; }
 
@@ -137,5 +137,4 @@ class Engine {
   uint32_t suppressed_ = 0;
 };
 
-}  // namespace timing
-}  // namespace snapclient
+}  // namespace esphome::snapclient::timing

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "timing_engine.h"
+
 #include "esphome/core/defines.h"
 
 #ifdef USE_ESP32
@@ -1234,6 +1236,11 @@ class SnapcastClient {
   /// PHASE_TRANSIENT_US). @p clamp_us is the caller's per-use floor (0 = the unclamped live
   /// travel value).
   int64_t visibility_horizon_us(int64_t clamp_us = 0) const;
+
+  /// St-new: one decision per chunk from timing::Engine. Builds the profile and observation from
+  /// live state; steers nothing itself -- the caller applies cmd.rate_ppm and cmd.frames.
+  timing::Command timing_step_(ServoState &st, uint32_t sample_rate, bool err_valid,
+                               int64_t err_us);
   /// True when this guard has been ablated via servo_param("guards", mask). Reads one relaxed
   /// atomic; safe from any task.
   bool guard_off(uint32_t bit) const {
@@ -1241,6 +1248,13 @@ class SnapcastClient {
   }
   /// St7 ablation mask; 0 = every guard active. See GuardBit.
   std::atomic<uint32_t> tune_guard_mask_{0};
+  /// The new engine owns both actuators. 0 falls back to the old ladder + PI, for one flash's
+  /// worth of comparison; the old paths go once this holds.
+  std::atomic<uint32_t> tune_timing_engine_{1};
+  /// Position accuracy the engine aims at (us); sets its rate-command noise budget.
+  std::atomic<int32_t> tune_timing_target_us_{20};
+  timing::Engine timing_engine_{timing::Profile{}};
+  int64_t timing_log_us_{0};
   /// St8: noise floor (us) subtracted from the differential evidence before it earns the gd
   /// boost. 0 = today's behaviour. See the comment at the boost_err computation for why: the
   /// boost was paying up to 12.5x gain for an estimate whose noise (80 us sd) exceeds the true
