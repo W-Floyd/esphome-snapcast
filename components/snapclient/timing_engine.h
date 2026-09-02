@@ -32,8 +32,15 @@ namespace esphome::snapclient::timing {
 /// Rate- and codec-dependent values, supplied by the transport.
 struct Profile {
   uint32_t frame_rate_hz = 44100;
-  /// Time for a correction to become visible in the measurement (pipeline + ring + blocks).
+  /// Time for a correction to become visible in the FILTERED error: the transport delay plus the
+  /// error filter's own lag. Sets the noise budget, the credit baseline and position serialisation.
   int64_t visibility_us = 3000000;
+  /// Time for a correction to appear in a RAW observation: the transport delay alone (ring +
+  /// pipe), with no filter lag in it. This is the only correct window for compensating stale
+  /// observations, and it is much shorter than visibility_us -- measured on the bench at 1971 ms
+  /// against 3971 ms, so compensating over the latter subtracts a displacement the measurement
+  /// has already accounted for, for two whole seconds, and the loop corrects the phantom back.
+  int64_t observation_delay_us = 1000000;
   /// Position accuracy aimed at; sets the rate-command noise budget.
   int64_t target_position_us = 20;
 
@@ -137,13 +144,16 @@ class Engine {
   int64_t credit_since_us_ = 0;
   uint32_t credit_count_ = 0;
 
-  /// A correction has been applied but is not yet visible in the measurement. Observations before
-  /// pending_visible_at_us_ are in pre-correction coordinates and are shifted by pending_disp_us_
-  /// rather than discarded. Distinct from in_flight_: that ends when the audio moves (a pipeline
-  /// depth), these when the move becomes observable (a visibility horizon), an order of magnitude
-  /// apart.
+  /// A correction has been applied but the measurement has not caught up. THREE different times
+  /// are involved and conflating any two of them has produced a distinct bench failure:
+  ///   * in_flight_          -- the audio has moved (one pipeline depth, ~250 ms)
+  ///   * pending_comp_until_ -- a RAW observation includes the move (ring + pipe, ~1971 ms).
+  ///                            Observations before this are shifted by pending_disp_us_.
+  ///   * serialise_until_    -- the FILTERED error includes it (+ filter lag, ~3971 ms). No
+  ///                            second correction until then.
   int64_t pending_disp_us_ = 0;
-  int64_t pending_visible_at_us_ = 0;
+  int64_t pending_comp_until_us_ = 0;
+  int64_t serialise_until_us_ = 0;
   bool in_flight_ = false;
   uint64_t next_id_ = 1;
   uint64_t in_flight_id_ = 0;

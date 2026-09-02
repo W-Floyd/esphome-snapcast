@@ -50,7 +50,8 @@ void Engine::reset() {
   in_flight_frames_ = 0;
   in_flight_since_us_ = 0;
   pending_disp_us_ = 0;
-  pending_visible_at_us_ = 0;
+  pending_comp_until_us_ = 0;
+  serialise_until_us_ = 0;
   last_obs_us_ = 0;
   suppressed_ = 0;
 }
@@ -151,8 +152,12 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // correcting: the hold suppressed the rate path too, so for up to 5 s after every correction
   // the board coasted on a crystal estimate that could be tens of ppm wrong. The measurement
   // being stale is a reason to correct it, not a reason to stop steering.
-  if (pending_visible_at_us_ != 0 && now_us >= pending_visible_at_us_) {
-    pending_visible_at_us_ = 0;
+  // Compensation runs for the TRANSPORT delay only. Past that the raw observation already
+  // includes the move, and subtracting it again invents an error of exactly -displacement --
+  // measured on the bench as err +444 us -> a 19-frame (431 us) correction -> err -344 us, an
+  // equal-and-opposite pair, repeating as a multi-frame ladder up to 12 frames.
+  if (pending_comp_until_us_ != 0 && now_us >= pending_comp_until_us_) {
+    pending_comp_until_us_ = 0;
     pending_disp_us_ = 0;
   }
   const int64_t e = obs.error_us - pending_disp_us_;
@@ -227,10 +232,11 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
                              : 0;
 
   if (frames != 0 && differential) {
-    // Serialise on visibility, not on the pipeline landing: a second correction issued while the
-    // first is still invisible would need its displacement stacked onto the first one's, and one
-    // pending displacement is all this tracks.
-    if (in_flight_ || pending_visible_at_us_ != 0) {
+    // Serialise on VISIBILITY -- the filtered error is what this branch decides from, so a second
+    // correction must wait for the filter to have seen the first, not merely for the transport to
+    // have delivered it. Compensation is the shorter window (see above); these are different
+    // times and using one for both is what produced the equal-and-opposite ladder.
+    if (in_flight_ || now_us < serialise_until_us_) {
       cmd.rate_ppm = crystal_ppm_;
       cmd.decision.act = Decision::Act::Hold;
       cmd.decision.why = Decision::Why::InFlight;
@@ -243,7 +249,8 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     in_flight_frames_ = frames;
     in_flight_since_us_ = now_us;
     pending_disp_us_ = static_cast<int64_t>(frames) * frame_us;
-    pending_visible_at_us_ = now_us + profile_.visibility_us;
+    pending_comp_until_us_ = now_us + profile_.observation_delay_us;
+    serialise_until_us_ = now_us + profile_.visibility_us;
     // Compensation is a change of coordinates, so the filter's STATE moves with its inputs, at
     // the same instant. Shifting only the inputs leaves err_mean_us_ holding the pre-correction
     // value and decaying toward the compensated stream over ERR_TAU_S, which crosses the coarse

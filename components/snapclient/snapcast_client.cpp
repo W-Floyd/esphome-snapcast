@@ -4053,6 +4053,24 @@ int64_t SnapcastClient::travel_horizon_us_() const {
   return std::clamp<int64_t>(ring + pipe + timing::Engine::filter_lag_us(), 1000000, 5000000);
 }
 
+// The transport delay alone: how long before a delivered correction appears in a RAW render-phase
+// observation. travel_horizon_us_() adds the error filter's lag on top of this, which is right for
+// the noise budget and for serialising corrections but WRONG for compensating stale observations --
+// past this point the observation already contains the move. Measured on the bench at ring 1724 ms
+// + pipe 247 ms against a 3971 ms horizon, so compensating over the horizon invented a phantom
+// error of -displacement for two seconds and the loop corrected it back.
+int64_t SnapcastClient::observation_delay_us_() const {
+  const int64_t ring = this->ring_depth_us_.load(std::memory_order_relaxed);
+  const int64_t pipe = this->pipe_depth_us_.load(std::memory_order_relaxed);
+  const int64_t travel = ring + pipe;
+  if (travel <= 0) {
+    // Mirrors cold: fall back to the horizon minus the lag we know we added to it, floored so a
+    // zero here can never disable compensation altogether.
+    return std::max<int64_t>(PHASE_TRANSIENT_US - timing::Engine::filter_lag_us(), 100000);
+  }
+  return std::clamp<int64_t>(travel, 100000, 5000000);
+}
+
 void SnapcastClient::publish_render_phase_(bool steady) {
 #ifdef CLOCK_SYNC_TSF_ACTIVE
   if (this->tsf_sync_ == nullptr || this->config_.tsf_observer) {
@@ -4139,6 +4157,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   timing::Profile prof;
   prof.frame_rate_hz = sample_rate ? sample_rate : 44100;
   prof.visibility_us = this->visibility_horizon_us();
+  prof.observation_delay_us = this->observation_delay_us_();
   prof.target_position_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
 
