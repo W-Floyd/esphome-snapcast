@@ -362,6 +362,24 @@ struct __attribute__((packed)) TsfPacket {
   // timebase in BOTH directions, which is expensive, and an appended field cannot be misread by
   // an older receiver -- it simply is not there. The receiver accepts both lengths.
   float crystal_ppm;
+  // THE SENDER'S ADOPTED MAPPING, evaluated at tsf_base_us above so it is comparable without
+  // agreeing on any other instant. TMS_ADOPT_UNKNOWN when it holds none.
+  //
+  // This design's correctness condition is stated at "ADOPT THE MEAN EXACTLY": every device
+  // holding the same estimate set steps to the same value at the same time, so the mapping's own
+  // error is common-mode and cancels between devices -- which is how inputs wandering
+  // +-100-300 us held 3.6 us on the wire. Nothing verified it. Devices hold different sets for up
+  // to PEER_MAP_STALE_US whenever a beacon is lost or membership changes, and their mappings then
+  // differ by a wandering fraction of the group spread (measured live at 40-934 us between two
+  // devices) which lands straight on the wire, invisibly.
+  //
+  // One field makes it checkable: a receiver evaluates its OWN adopted mapping at this tsf_base
+  // and subtracts. Diagnostics only -- it never feeds the timebase, because a device that
+  // steered by its peers' adopted values would be slewing, and slewing was measured WORSE for
+  // exactly the reason above (sd 3.6 -> 9.7 us).
+  //
+  // Appended at the END with no version bump, per the rule the fields above follow.
+  int64_t adopted_tms_at_base_us;
   // STREAM IDENTITY: FNV-1a of the snapcast stream this sender is playing, 0 when unknown.
   //
   // render_phase_us above is only comparable between devices playing the SAME stream -- its own
@@ -396,6 +414,16 @@ struct __attribute__((packed)) TsfPacket {
 // dropping would make a mixed fleet lose the timebase in the direction the version note was
 // careful to keep working.
 static constexpr size_t TSF_PACKET_MIN_BYTES = offsetof(TsfPacket, crystal_ppm);
+
+/// "I hold no adopted mapping." A sentinel, never printed as a number and never differenced --
+/// subtracting it would give 2^63 of overflow that looks like a divergence measurement.
+static constexpr int64_t TMS_ADOPT_UNKNOWN = INT64_MIN;
+
+/// Report an adopted-mapping divergence beyond this. Two devices holding the same set agree
+/// EXACTLY (the mean is deterministic), so anything above the arithmetic's own noise means the
+/// sets differ. Set at one frame at 44.1 kHz: below that the divergence is inaudible even if real,
+/// above it the wire carries it.
+static constexpr int64_t MAP_DIVERGENCE_REPORT_US = 23;
 
 TsfSync::~TsfSync() {
   if (this->sock_ >= 0) {
@@ -562,6 +590,10 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       }
       pkt.render_phase_age_ms = 0xFFFF;  // older sender: pair by receipt, as before
       pkt.render_bias_us = INT32_MIN;
+      if (n < static_cast<ssize_t>(offsetof(TsfPacket, adopted_tms_at_base_us) +
+                                   sizeof(pkt.adopted_tms_at_base_us))) {
+        pkt.adopted_tms_at_base_us = TMS_ADOPT_UNKNOWN;  // sender predates the field
+      }
     }
     if (pkt.magic != TSF_MAGIC || pkt.version != TSF_VERSION) {
       continue;
@@ -745,6 +777,38 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       }
     }
     this->warned_rejected_ = false;
+    // SET DIVERGENCE. The design is correct only while every device holds the same estimate set:
+    // the mean is deterministic, so identical sets give identical mappings and the mapping's own
+    // error is common-mode and cancels. Sets differ for up to PEER_MAP_STALE_US after a lost
+    // beacon or a membership change, and the mappings then differ by a wandering fraction of the
+    // group spread -- 40-934 us measured between two devices -- which lands directly on the wire
+    // with nothing reporting it. This is that check, and it is the design's own correctness
+    // condition rather than a new rule.
+    if (pkt.adopted_tms_at_base_us != TMS_ADOPT_UNKNOWN) {
+      this->mapping_mutex_.lock();
+      const bool have_map = this->mapping_valid_;
+      const int64_t mb = this->map_tsf_minus_server_us_;
+      const int64_t tb = this->map_tsf_base_us_;
+      const float dr = this->map_drift_ppm_;
+      this->mapping_mutex_.unlock();
+      if (have_map) {
+        // Ours at THEIR tsf_base, so no third instant has to be agreed on.
+        const int64_t mine_at_theirs =
+            mb + static_cast<int64_t>(static_cast<double>(dr) * 1e-6 *
+                                      static_cast<double>(pkt.tsf_base_us - tb));
+        const int64_t div = pkt.adopted_tms_at_base_us - mine_at_theirs;
+        if (std::abs(div) > MAP_DIVERGENCE_REPORT_US &&
+            local_now_us - this->last_mapdiv_log_us_ >= 5000000) {
+          this->last_mapdiv_log_us_ = local_now_us;
+          ESP_LOGW(TAG,
+                   "MAPDIV %02X%02X adopted %+" PRId64 " us from ours (theirs %" PRId64
+                   ", ours %" PRId64 " at their base) -- the sets differ, so the mapping error is "
+                   "NOT common-mode and this lands on the wire",
+                   pkt.sender_mac[4], pkt.sender_mac[5], div, pkt.adopted_tms_at_base_us,
+                   mine_at_theirs);
+        }
+      }
+    }
     peer->map_valid = true;
     peer->map_seen_us = local_now_us;
     peer->tsf_base_us = pkt.tsf_base_us;
@@ -1313,6 +1377,9 @@ void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_
   // multicast only. Mapping fields stay zero because a receiver seeing no_mapping != 0 records
   // the phase and returns before reading them.
   TsfPacket pkt = {};
+  // Zero-init would send 0 here, which reads as a real adopted mapping. These senders carry
+  // no tsf_base either, so the value would not be comparable even if it were true.
+  pkt.adopted_tms_at_base_us = TMS_ADOPT_UNKNOWN;
   pkt.magic = TSF_MAGIC;
   pkt.version = TSF_VERSION;
   memcpy(pkt.bssid, this->bssid_, 6);
@@ -1403,6 +1470,9 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   this->pub_drift_ppm_ = drift_ppm;
 
   TsfPacket pkt = {};
+  // Defensive default only: the real adopted value is filled in below, once tsf_base is set.
+  // Zero-init would otherwise send 0 here, which reads as a genuine adopted mapping.
+  pkt.adopted_tms_at_base_us = TMS_ADOPT_UNKNOWN;
   pkt.magic = TSF_MAGIC;
   pkt.version = TSF_VERSION;
   memcpy(pkt.bssid, this->bssid_, 6);
@@ -1412,6 +1482,21 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   pkt.no_mapping = 0;
   pkt.tsf_base_us = tsf_now;
   pkt.tsf_minus_server_us = tms_pub;
+  // Our ADOPTED mapping at this same tsf_base, so a receiver can compare it against its own
+  // without needing any other shared instant. Sentinel when we hold none -- never a number,
+  // because the receiver subtracts this field.
+  {
+    this->mapping_mutex_.lock();
+    const bool have_map = this->mapping_valid_;
+    const int64_t mb = this->map_tsf_minus_server_us_;
+    const int64_t tb = this->map_tsf_base_us_;
+    const float dr = this->map_drift_ppm_;
+    this->mapping_mutex_.unlock();
+    pkt.adopted_tms_at_base_us =
+        have_map ? mb + static_cast<int64_t>(static_cast<double>(dr) * 1e-6 *
+                                             static_cast<double>(tsf_now - tb))
+                 : TMS_ADOPT_UNKNOWN;
+  }
   pkt.drift_ppm = drift_ppm;
   // From the player task's mirror: offset_rate_ppm_ is measured there and must not be read
   // directly from this task.
@@ -1489,6 +1574,9 @@ void TsfSync::send_phase_report(int64_t local_now_us) {
   }
   this->phase_tx_last_us_ = local_now_us;
   TsfPacket pkt = {};
+  // Zero-init would send 0 here, which reads as a real adopted mapping. These senders carry
+  // no tsf_base either, so the value would not be comparable even if it were true.
+  pkt.adopted_tms_at_base_us = TMS_ADOPT_UNKNOWN;
   pkt.magic = TSF_MAGIC;
   pkt.version = TSF_VERSION;
   memcpy(pkt.bssid, this->bssid_, 6);

@@ -519,6 +519,7 @@ class TsfSync {
   bool mapping_valid_{false};
   /// Throttle for the CONSIN "solo" dump: n==1 adoption is common and the point is to see WHICH
   /// mapping was taken on trust, not to count them.
+  int64_t last_mapdiv_log_us_{0};  ///< throttle for MAPDIV
   int64_t last_solo_log_us_{0};
   int64_t map_tsf_base_us_{0};
   int64_t map_tsf_minus_server_us_{0};
