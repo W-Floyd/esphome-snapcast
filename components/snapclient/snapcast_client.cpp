@@ -2931,6 +2931,51 @@ void SnapcastClient::player_task_() {
     const bool coarse_on_tags = tags_fresh && now_us() >= st.tag_fault_until_us;
     const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
 
+    // IS THIS A TIMING ERROR AT ALL, OR AN UNANCHORED SUBTRACTION?
+    //
+    // A playout error is bounded by the audio this client holds: it can be at most as late as the
+    // pipeline is deep, and being "early" means the deadline is ahead of audio we already have.
+    // An error far outside that is not lateness, it is a deadline computed against the wrong
+    // epoch -- the local-vs-server offset leaking in where the anchored difference belongs.
+    //
+    // Measured 2026-09-02: board a re-anchored its timebase (consensus spread 428 ms) with the
+    // ring at 26 ms, computed err = -147040916007 us, and declared itself 40.8 HOURS early. That
+    // is exactly the local-vs-server epoch offset, which DELAY reports as -147039308867 us in the
+    // same window. It then inserted silence for every chunk from 13:35 onward -- audio the
+    // analyser could no longer correlate against the other board at all -- and it would not have
+    // self-healed: the figure counts down in real time, so ~40 hours to reach zero. One board out
+    // of service for a day and a half, from a subtraction against an anchor that was not set.
+    //
+    // The bound is derived, not chosen: the pipeline's own depth, times a factor for the server
+    // buffer and re-anchor transients. Floored, so an empty ring cannot make every real error
+    // implausible -- that is the state the failure happens in.
+    // The ring's CAPACITY, not its current fill: fill is near zero in exactly the state this
+    // failure happens in, and a bound that collapses when the buffer empties would reject the real
+    // errors too. Capacity is a config quantity, so this carries no time of its own -- change
+    // buffer_size or the sample rate and the bound follows.
+    const uint32_t fb_plaus = rec.params.frame_bytes();
+    const int64_t ring_capacity_us =
+        (fb_plaus > 0 && rec.params.sample_rate > 0)
+            ? static_cast<int64_t>(this->config_.buffer_size) * 1000000 /
+                  (static_cast<int64_t>(fb_plaus) * rec.params.sample_rate)
+            : 0;
+    const int64_t pipeline_us =
+        ring_capacity_us + this->pipe_depth_us_.load(std::memory_order_relaxed);
+    const int64_t plausible_us = 4 * pipeline_us;
+    // plausible_us == 0 means we cannot judge yet (no stream params), so do not block on it.
+    const bool coarse_plausible =
+        plausible_us <= 0 || std::llabs(coarse_err_us) <= plausible_us;
+    if (!coarse_plausible) {
+      st.implausible_err_count++;
+      if (now_us() - st.implausible_log_us >= 2000000) {
+        st.implausible_log_us = now_us();
+        ESP_LOGW(TAG,
+                 "IMPLAUSIBLE err=%" PRId64 " us exceeds %" PRId64 " us (pipeline %" PRId64
+                 " us); deadline unanchored, refusing to resync; n=%" PRIu32,
+                 coarse_err_us, plausible_us, pipeline_us, st.implausible_err_count);
+      }
+    }
+
     // One engine decision per chunk, from the measured error when tags are live. Computed here
     // because this is where the error is known; applied at the two seams below.
     const timing::Command engine_cmd =
@@ -3060,7 +3105,7 @@ void SnapcastClient::player_task_() {
     // far outside the server's buffer is meaningless -- so anything past bufferMs
     // mutes on the spot, and the bailout above reconnects if it persists.
     bool mute_now = false;
-    if (std::abs(coarse_err_us) > hard_us && coarse_ok) {
+    if (std::abs(coarse_err_us) > hard_us && coarse_ok && coarse_plausible) {
       if (now_us() - st.storm_window_us > RESYNC_STORM_WINDOW_US) {
         st.storm_window_us = now_us();
         st.storm_resyncs = 0;
@@ -3170,7 +3215,7 @@ void SnapcastClient::player_task_() {
     // log traffic competes with the audio stream on the already-congested link — a
     // feedback loop that prolongs the outage. The periodic sync report carries the
     // full per-window count either way.
-    if (coarse_err_us > hard_us && coarse_ok) {
+    if (coarse_err_us > hard_us && coarse_ok && coarse_plausible) {
       if (coarse_on_tags) {
         st.coarse_act_us = now_us();
         st.coarse_act_err_us = coarse_err_us;
@@ -3205,7 +3250,7 @@ void SnapcastClient::player_task_() {
     }
 
     uint32_t drop_frames = 0;
-    if (coarse_err_us < -hard_us && coarse_ok) {
+    if (coarse_err_us < -hard_us && coarse_ok && coarse_plausible) {
       if (coarse_on_tags) {
         st.coarse_act_us = now_us();
         st.coarse_act_err_us = coarse_err_us;

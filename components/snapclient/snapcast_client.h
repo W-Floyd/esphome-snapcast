@@ -976,6 +976,8 @@ class SnapcastClient {
     int64_t resync_last_block_us{0};    // dl_err_at_us of the block the last in-window step used (one block, one step)
     int64_t rskip_log_at_us{0};         // block the last RSKIP line described (one line per block)
     int64_t resync_step_at_us{0};       // last in-window position step of ANY source (ledger steps wait out the blank too)
+    uint32_t implausible_err_count{0};  // errors rejected as unanchored (see IMPLAUSIBLE)
+    int64_t implausible_log_us{0};
     int64_t phase_transient_until_us{0};  // my render phase does not describe my audio until then (steps, hard resyncs, deadline source changes)
     int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
     uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
