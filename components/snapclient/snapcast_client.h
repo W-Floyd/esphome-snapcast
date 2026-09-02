@@ -1230,6 +1230,11 @@ class SnapcastClient {
   }
   /// St7 ablation mask; 0 = every guard active. See GuardBit.
   std::atomic<uint32_t> tune_guard_mask_{0};
+  /// St8: noise floor (us) subtracted from the differential evidence before it earns the gd
+  /// boost. 0 = today's behaviour. See the comment at the boost_err computation for why: the
+  /// boost was paying up to 12.5x gain for an estimate whose noise (80 us sd) exceeds the true
+  /// differential it is estimating (~15 us sd on the wire).
+  std::atomic<int32_t> tune_boost_floor_us_{0};
 
   /// St4. One position arbiter: given ErrorView + gates + pending-motion ledger, returns the
   /// frames to move this chunk. Hard resync / window step / splice / bang-bang become four

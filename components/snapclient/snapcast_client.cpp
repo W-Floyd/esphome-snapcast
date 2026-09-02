@@ -4873,13 +4873,35 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // differential residual recovers at tracking gain while gd is briefly unknown. That is the trade
   // the old fallback was buying, and it is the wrong side of it at a 2.7 % dropout rate.
   float boost_err = std::abs(e);
+  // NOISE FLOOR ON THE DIFFERENTIAL EVIDENCE (`boost_floor_us`, default 0 = off).
+  //
+  // The boost multiplies kp by up to 12.5 on the DIFFERENTIAL portion of the error, which is the
+  // right thing to boost -- common wander must stay at tracking gain or the pair moves apart. But
+  // `gd` carries its own measurement noise, and the loop cannot tell a real differential residual
+  // from noise on the estimate of one, so it pays boosted gain for both.
+  //
+  // Measured 2026-09-02 over 232 co-timed seconds: the boards' differential error signal has
+  // sd 80.3 us while the WIRE says the true differential wander is ~15 us sd -- so most of what
+  // is being boosted is the estimate's own noise. kp * sd(err_diff) predicts 1.12 ppm of
+  // differential rate command; measured 4.77 ppm, i.e. an effective 4.2x. Position is the
+  // integral of rate, so 4.77 ppm held between updates integrates to ~15 us of position wander
+  // over the offset's ~3 s correlation time -- which is the sawtooth visible in the live plot,
+  // and it accounts for essentially all of it (13.8 us predicted against 15.1 us observed).
+  //
+  // So: subtract the floor from the differential evidence before it earns any boost. Above the
+  // floor the boost is unchanged, so a real step still converges at full speed; below it the loop
+  // reverts to tracking gain and stops amplifying its own noise into the wire.
+  const float boost_floor =
+      static_cast<float>(this->tune_boost_floor_us_.load(std::memory_order_relaxed));
   if (this->tsf_sync_ != nullptr) {
     const int32_t gd_boost = this->tsf_sync_->render_group_delta_us();
     const int32_t n_phase = this->tsf_sync_->group_delta_n();
     if (gd_boost != INT32_MIN && n_phase > 1) {
       boost_err = std::min(boost_err,
-                           std::abs(static_cast<float>(gd_boost)) * static_cast<float>(n_phase) /
-                               static_cast<float>(n_phase - 1));
+                           std::max(0.0f, std::abs(static_cast<float>(gd_boost)) *
+                                                  static_cast<float>(n_phase) /
+                                                  static_cast<float>(n_phase - 1) -
+                                              boost_floor));
     } else if (n_phase > 1) {
       // PEERS EXIST BUT gd IS PAST ITS 10 s FRESHNESS GATE. Two stages, because the boost needs a
       // MAGNITUDE BOUND and not a value to steer on -- a delta tens of seconds old still answers
@@ -4892,8 +4914,10 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
       const int32_t gd_held = this->tsf_sync_->render_group_delta_held_us(now, &gd_age);
       if (gd_held != INT32_MIN && gd_age <= BOOST_GD_HOLD_US) {
         boost_err = std::min(boost_err,
-                             std::abs(static_cast<float>(gd_held)) * static_cast<float>(n_phase) /
-                                 static_cast<float>(n_phase - 1));
+                             std::max(0.0f, std::abs(static_cast<float>(gd_held)) *
+                                                    static_cast<float>(n_phase) /
+                                                    static_cast<float>(n_phase - 1) -
+                                                boost_floor));
         if (!st.boost_blind) {
           st.boost_blind = true;
           ESP_LOGD(TAG, "BOOSTHOLD gd stale %.1f s, bound from held %+" PRId32 " us (err %+.0f) t=%" PRId64,
@@ -5372,6 +5396,11 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "splice_us") {
     if (!(value == -1.0f || (value >= 0.0f && value <= 10000.0f))) return false;
     this->tune_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+  } else if (name == "boost_floor_us") {
+    // Differential-evidence noise floor for the gd boost. 0 = today's behaviour exactly.
+    this->tune_boost_floor_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+    ESP_LOGI(TAG, "boost_floor_us = %" PRId32 " (0 = boost on any gd, as before) t=%" PRId64,
+             this->tune_boost_floor_us_.load(std::memory_order_relaxed), now_us());
   } else if (name == "guards") {
     // St7 ABLATION. Bitmask, set = guard disabled; 0 restores today's behaviour. Logged at INFO
     // on every change because a window graded without knowing which guards were live is
