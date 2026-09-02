@@ -16,8 +16,10 @@ constexpr int CREDIT_BASELINE_HORIZONS = 10;
 constexpr float CRYSTAL_TAU_S = 300.0f;
 /// A crystal is tens of ppm; hundreds means the estimate is tracking something else.
 constexpr float CRYSTAL_LIMIT_PPM = 200.0f;
-/// Error-filter weight. Dimensionless, so it carries no rate or codec dependence.
-constexpr float ERR_ALPHA = 0.02f;
+/// Error-filter time constant. A TIME, not a weight: a fixed weight makes the filter's timescale
+/// depend on how often observations arrive, so changing the observation cadence would silently
+/// retune the loop. alpha is derived from dt per step.
+constexpr float ERR_TAU_S = 2.0f;
 }  // namespace
 
 void Engine::set_crystal_ppm(float ppm) {
@@ -38,6 +40,8 @@ void Engine::reset() {
   last_obs_us_ = 0;
   suppressed_ = 0;
 }
+
+int64_t Engine::filter_lag_us() { return static_cast<int64_t>(ERR_TAU_S * 1e6f); }
 
 float Engine::sigma_e_us() const {
   // 1.25 * MAD approximates sigma for a Gaussian. Floored at a quarter frame so a briefly quiet
@@ -108,19 +112,22 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   const int64_t e = obs.error_us;
   cmd.decision.error_us = e;
 
-  // Track the error's own noise, on the visibility horizon: that is the timescale the gain is
-  // priced over.
+  // Track the error and its own noise. alpha comes from the elapsed time, so the filter has the
+  // same timescale whether observations arrive per chunk or per tag arrival.
   {
     const float x = static_cast<float>(e);
     if (!err_seeded_) {
       err_mean_us_ = x;
-      // Seed pessimistic (one frame). Seeding at 0 makes the gain maximal exactly when nothing
+      // Seed pessimistic (one frame): seeding at 0 makes the gain maximal exactly when nothing
       // is known about the signal's resolution.
       err_mad_us_ = static_cast<float>(profile_.frame_us());
       err_seeded_ = true;
     } else {
-      err_mean_us_ += ERR_ALPHA * (x - err_mean_us_);
-      err_mad_us_ += ERR_ALPHA * (std::fabs(x - err_mean_us_) - err_mad_us_);
+      const int64_t dt = last_obs_us_ > 0 ? now_us - last_obs_us_ : 0;
+      const float dt_s = dt > 0 ? static_cast<float>(dt) / 1e6f : 0.0f;
+      const float alpha = dt_s > 0.0f ? 1.0f - std::exp(-dt_s / ERR_TAU_S) : 0.0f;
+      err_mean_us_ += alpha * (x - err_mean_us_);
+      err_mad_us_ += alpha * (std::fabs(x - err_mean_us_) - err_mad_us_);
     }
   }
 
@@ -150,7 +157,14 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // The filter has its own uncertainty: for an EMA, sd_out ~ sd_in * sqrt(alpha/2). Require the
   // filtered error to clear one frame by 2 of those before spending an irreversible correction,
   // so noise alone cannot trigger one. No magic margin -- it is derived from the measured noise.
-  const float sigma_filtered = sigma_e_us() * std::sqrt(ERR_ALPHA / 2.0f);
+  // The filter's residual noise: sd_out ~ sd_in * sqrt(alpha/2) for an EMA, with alpha the
+  // effective per-observation weight implied by the current interval and ERR_TAU_S.
+  const float obs_dt_s =
+      last_obs_us_ > 0 && now_us > last_obs_us_
+          ? static_cast<float>(now_us - last_obs_us_) / 1e6f
+          : ERR_TAU_S;
+  const float alpha_eff = std::min(1.0f, 1.0f - std::exp(-obs_dt_s / ERR_TAU_S));
+  const float sigma_filtered = sigma_e_us() * std::sqrt(std::max(1e-6f, alpha_eff) / 2.0f);
   const int64_t coarse_gate_us =
       frame_us + static_cast<int64_t>(std::llround(2.0f * sigma_filtered));
   const int32_t frames = (frame_us > 0 && std::llabs(e_filtered) >= coarse_gate_us)

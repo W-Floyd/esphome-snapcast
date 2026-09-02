@@ -109,6 +109,10 @@ class Engine {
   /// budget/sigma_e, so a noisier measurement earns less gain.
   float sigma_e_us() const;
 
+  /// Lag the error filter adds, us. The caller's visibility horizon is the pipeline it can
+  /// measure plus this: a correction is not visible until the filter has caught up with it.
+  static int64_t filter_lag_us();
+
   void reset();
 
  private:

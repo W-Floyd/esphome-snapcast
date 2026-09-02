@@ -2851,7 +2851,7 @@ void SnapcastClient::player_task_() {
       // a full block has elapsed after the landing.
       const int64_t horizon_now =
           ring_us_now + st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate) +
-          2 * static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
+          timing::Engine::filter_lag_us();
       blank_us = std::max(blank_us, horizon_now);
     }
     // JUDGE ONLY AFTER THE MEASUREMENT CAN SHOW THE EFFECT. The action cadence (blank_us, 200 ms in
@@ -4030,8 +4030,10 @@ int64_t SnapcastClient::travel_horizon_us_() const {
   if (ring <= 0 && pipe <= 0) {
     return PHASE_TRANSIENT_US;
   }
-  const int64_t blocks = 2 * static_cast<int64_t>(this->tune_block_n_.load(std::memory_order_relaxed)) * DL_ARRIVAL_US;
-  return std::clamp<int64_t>(ring + pipe + blocks, 1000000, 5000000);
+  // ring and pipe are measured; the third term is the error filter's own lag, since a correction
+  // is not visible until the filter has caught up with it. It used to be 2 * block_n arrivals,
+  // which modelled the lag of averaging 64 arrivals -- an average that no longer exists.
+  return std::clamp<int64_t>(ring + pipe + timing::Engine::filter_lag_us(), 1000000, 5000000);
 }
 
 void SnapcastClient::publish_render_phase_(bool steady) {
@@ -4175,32 +4177,30 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
 // phase. The control that used to live here -- PI, boost, knee, holds, align kick, trim clamp --
 // is timing::Engine's now.
 //
-// block_n is the last chunk-derived constant in the timing path. It can go once the ladder does:
-// the engine filters internally, so a block average ahead of it is redundant, and publishing per
-// arrival would remove the dependency entirely. Left alone here so this pass changes one thing.
+// No block count: the accumulator is drained on every call, so the observation is "the mean of
+// the tag errors since the last one" and nothing here depends on a chunk being 1152 frames or a
+// block being 64 arrivals. The engine's error filter is time-based, so a change in how often
+// this runs does not retune the loop (tests/timing, case 9).
 void SnapcastClient::delay_measure_(ServoState &st) {
   const int64_t tag_stale_us =
       static_cast<int64_t>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed)) * 1000;
-  const uint32_t block_n = static_cast<uint32_t>(this->tune_block_n_.load(std::memory_order_relaxed));
 
   this->playout_mutex_.lock();
   const int64_t last = this->dl_acc_last_us_;
   const int64_t now = now_us();
   const bool tags_live = last > 0 && now - last < tag_stale_us;
-  const bool ready = tags_live && this->dl_acc_n_ >= block_n;
   const uint32_t n = this->dl_acc_n_;
   const double sum = this->dl_acc_sum_us_;
-  if (ready || !tags_live) {
-    this->dl_acc_n_ = 0;
-    this->dl_acc_sum_us_ = 0.0;
-  }
+  const bool ready = tags_live && n > 0;
+  this->dl_acc_n_ = 0;
+  this->dl_acc_sum_us_ = 0.0;
   this->playout_mutex_.unlock();
 
   if (!tags_live) {
     st.dl_have_err = false;   // absent, not zero: the engine holds on an invalid observation
     return;
   }
-  if (!ready || n == 0) {
+  if (!ready) {
     return;
   }
 
@@ -4437,9 +4437,6 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "ti_s") {
     if (!(value >= 10.0f && value <= 1200.0f)) return false;
     this->tune_ti_s_.store(value, std::memory_order_relaxed);
-  } else if (name == "block_n") {
-    if (!(value >= 8.0f && value <= 64.0f)) return false;
-    this->tune_block_n_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "splice_us") {
     if (!(value == -1.0f || (value >= 0.0f && value <= 10000.0f))) return false;
     this->tune_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);

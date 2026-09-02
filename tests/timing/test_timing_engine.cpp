@@ -244,6 +244,28 @@ int main() {
           r48.final_crystal_ppm, r44.final_crystal_ppm);
   }
 
+  printf("\n9. observation cadence must not retune the loop\n");
+  {
+    // Same plant, same duration, observations 25x apart in cadence. A fixed filter weight would
+    // make these differ; a time-based one must not. This is the property that lets block_n go.
+    auto run_at = [&](int64_t tick_us) {
+      Engine eng(p);
+      Plant plant;
+      plant.plant_ppm = 3.35;
+      plant.frame_us = p.frame_us();
+      for (int64_t t = 0; t < 600000000; t += tick_us) {
+        Observation obs{t, static_cast<int64_t>(std::llround(plant.error_us)), true};
+        Command c = eng.step(t, obs, GroupEvidence{});
+        plant.advance(tick_us, c.rate_ppm);
+      }
+      return eng.crystal_ppm();
+    };
+    const float fast = run_at(25000);     // 40 Hz, per tag arrival
+    const float slow = run_at(650000);    // ~1.5 Hz, per 64-arrival block
+    printf("        crystal at 40 Hz %.2f ppm, at 1.5 Hz %.2f ppm\n", fast, slow);
+    check(std::fabs(fast - slow) < 1.0, "crystal learned equally at both cadences", slow, fast);
+  }
+
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all properties hold", failures,
          failures == 1 ? "" : "s");
   return failures ? 1 : 0;
