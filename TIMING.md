@@ -3,30 +3,19 @@
 How a chunk gets from a snapserver timestamp to a speaker cone at the same instant on every
 device, and which quantities are measurable.
 
-**This document describes the code as built at `d9224e4` (2026-08-31).** Where a claim is
+**This document describes the code as built at `4f792e0` (2026-09-02).** Where a claim is
 checkable in the source it is cited; where it rests on a bench measurement it says so, with the
 date. `PLAN-timing-v2.md` proposes how to reduce what is described here; this file does not
-propose anything.
+propose anything, and it carries no history — git does that.
 
-The short version, and it is no longer the sentence this document used to open with:
+The short version:
 
 > The loop is closed on a **measured** render error (`err_tag`), not on a prediction. The
 > prediction survives as a *scheduling* comparison — hard resync, stale bailout, the splice
 > fallback when tags are absent — and the two coexist, which is where most of the remaining
 > complexity lives.
 
----
-
-## 0. What changed since the previous revision of this file
-
-Four statements in the old text are now wrong, and each mattered:
-
-| Old text | Now |
-|---|---|
-| "one control loop, closed on a **prediction**" | the rate loop closes on the measured tag error; the prediction is a demoted second signal ([L4426](components/snapclient/snapcast_client.cpp#L4426)) |
-| "`Kp = 0.5 ppm/µs`, `Ki = Kp²/4`" | `Kp = 1/τ_eff` with τ ≥ 5 s, `Ki = Kp/Ti`, `Ti = 600 s`. `Ki = Kp²` was tried and **rejected** — 57 ppm p-p integral swing ([L4766](components/snapclient/snapcast_client.cpp#L4766)) |
-| "the adopted mapping is **slewed, never stepped**" | the adoption slew was **removed**: it made the consensus path-dependent and cost 2.7× on sd (9.72 vs 3.6). Adoption is a deterministic step ([tsf_sync.cpp:237](components/clock_sync/tsf_sync.cpp#L237)). The *publish* slew stays |
-| "one control loop … three tiers" | three actuators (rate, position, deadline), six error signals, eleven time-gates |
+Three actuators (rate, position, deadline), six error signals, eleven time-gates.
 
 ---
 
@@ -60,7 +49,7 @@ the mean slightly instead of collapsing the timebase. Leadership had been changi
 seventeen minutes on a two-device group. Measured 2026-08-28, three devices: median −3.75 µs,
 sd 4.32, MAD 2.19, zero churn.
 
-**Two invariants, and the second one is the opposite of what this document used to say:**
+**Two invariants:**
 
 1. A member publishes only its **own raw** estimate, never the consensus. Feeding the adopted
    mean back is positive feedback — the whole group can walk while every device agrees
@@ -109,20 +98,35 @@ The observer publishes no phase at all (`publish_render_phase_` returns early wh
 `tsf_observer` is set, [L4378](components/snapclient/snapcast_client.cpp#L4378)), so the phase
 group on the bench is `n = 2` always.
 
-> **[C] `consensus_n()` is not that `n`.** It counts contributors with a valid, fresh **mapping**
+> **`consensus_n()` is not that `n`, and the boost bound must not use it.** `consensus_n` counts
+> contributors with a valid, fresh **mapping**
 > ([tsf_sync.cpp:876-888](components/clock_sync/tsf_sync.cpp#L876-L888)), and the observer beacons
-> a mapping — `observer-supermini.yaml` inherits `tsf_sync: true` from the base package. So on the
-> bench `consensus_n = 3` while the phase group is 2. The PI's boost bound un-halves `gd` with
-> `n_cons/(n_cons−1)` ([L4646](components/snapclient/snapcast_client.cpp#L4646)), which gives
-> 1.5 where 2 is correct: the bound is 25 % too tight, silently, and only on groups containing a
-> mapping-only member.
+> a mapping — `observer-supermini.yaml` inherits `tsf_sync: true` from the base package — so on the
+> bench `consensus_n = 3` while the phase group is 2. The boost bound un-halves `gd` with the
+> **phase** count from `group_delta_n()`; using `consensus_n` gives 1.5 where 2 is correct, a
+> silent 25 % over-tight bound on any group containing a mapping-only member.
 
-**Known defect, blocking the tight-sync goal.** Measured 2026-08-30 (builds 84–86): the exchanged
-phase values **under-measure a real differential by ~8×** — a matched window read −1.5 ms on the
-rival-clean wire against ≤0.2 ms in pairwise beacon phases. Pairing and consensus were exonerated
-at the time, and `HANDOFF.md` names the tag/feedback stamping as the suspect. **That suspect is
-now excluded by source reading (§2), and a factor of 2 is the self-inclusion above** — so ~4×
-remains genuinely unexplained. Any conclusion drawn from the group delta's *magnitude* inherits it.
+**The reference is honest, measured 2026-09-02.** `GDIN` logs the pairing inputs — `raw`, the
+un-halved pairwise difference before self-inclusion — and `scripts/bench/gdin-wire.py` regresses it
+against the rival-clean wire. Over a clean 30-minute window, both probed boards, non-steady samples
+gated out by `GDIN`'s `steady=` flag:
+
+    median |raw| / median |wire|            1.03   1.08   (two windows)
+    median |gd|  / median |wire|            0.51   0.51
+    raw − wire: median / MAD          +2.2 / 6.8   +4.5 / 7.6  us
+    slope, per 5-min block            6/6 consistent with 1.0 ± 0.15, both boards
+
+So `raw` tracks the wire 1:1 in slope and magnitude, and `gd` is half of it — the correct value for
+two phase contributors. Read the `steady=` flag before believing any of it: a board in transient
+keeps measuring its phase locally on purpose ([L4468](components/snapclient/snapcast_client.cpp#L4468)),
+and ungated those samples inflate the residual `sd` from ~54 µs to ~130 µs while leaving the MAD
+unchanged.
+
+**One live discrepancy at this scale:** the `raw − wire` medians are equal and opposite between
+boards (`+4.5` / `−4.4` µs, and `+2.2` / `−2.2` in an earlier window). Each board reads the other
+as ~4.5 µs later. Paired, signed and stable across windows, so it is a differential bias rather
+than scatter; candidates are the analyser's own zero error (`scripts/probe-cal.py` measures it) and
+a real pairing asymmetry.
 
 ### Reading TSF: the sandwich
 
@@ -300,13 +304,11 @@ two actuators. The sign was established **by measurement, not derivation**: a po
 this board play earlier, so `bias -= delta × gain`; an earlier build flipped it from a polluted
 run and made early boards earlier.
 
-> **[C] Live discrepancy worth knowing about.** `example/snapclient-base.yaml` sets
-> `render_align_max: 0ms` and `HANDOFF.md` records render_align as disabled — but
-> [L919](components/snapclient/snapcast_client.cpp#L919) only copies the YAML value into
-> `tune_align_max_us_` **when it is > 0**, and the member's default is 500. A YAML value of 0
-> therefore leaves render_align running at a 500 µs cap. The comment at
-> [L6254](components/snapclient/snapcast_client.cpp#L6254) claims "0 = off". Either the seeding
-> or the comment is wrong; the bench has been running the loop it believed was off.
+> **`render_align_max: 0ms` does disable it**, but only since the seeding was fixed to store
+> unconditionally ([L919](components/snapclient/snapcast_client.cpp#L919), `>= 0`). Before that the
+> YAML value was copied only when `> 0` and the member default of 500 stood, so a config asking for
+> "off" ran render_align at a 500 µs cap. **Any measurement taken before that fix was taken with a
+> third controller live and is not a baseline.**
 
 ---
 
@@ -336,10 +338,32 @@ trim     += align_kick                      (≤ 1.5 ppm)
 **The boost clamps on the differential, not the magnitude.** Boosting on `|e|` is symmetric and
 still moves a pair apart: common timeline wander ramps both boards' `e` together, each board's
 slightly different local reading gets multiplied by the gain, and `Kp·(e_A − e_B)` becomes 2–5 ppm
-of differential trim — the ±30–50 µs steady-state sawtooth measured 2026-08-30 21:01. The
-differential evidence is the group delta (`|gd|` is the same number on both boards, so the
-schedule stays symmetric), so the boost runs on `min(|e|, |gd|·n/(n−1))`
+of differential trim. The differential evidence is the group delta (`|gd|` is the same number on
+both boards, so the schedule stays symmetric), so the boost runs on `min(|e|, |gd|·n/(n−1))`
 ([L4646](components/snapclient/snapcast_client.cpp#L4646)).
+
+**But the boost amplifies its own input noise, and that sets the steady-state floor.** Measured
+2026-09-02 over 232 co-timed seconds:
+
+    err signal, each board              sd 251 us,  corr(A,B) = +0.949   (95 % common-mode)
+    differential part (err_A − err_B)   sd 80.3 us
+    kp · sd(err_diff)                   1.12 ppm    predicted differential rate command
+    measured sd(trim_A − trim_B)        4.77 ppm    -> effective 4.2x
+    true differential wander, wire      ~15 us sd
+
+The boards' estimate of their differential is ~5× noisier than the differential it estimates, and
+the loop cannot tell a real residual from noise on the estimate of one, so it pays boosted gain for
+both. **Position is the integral of rate and the rate is held constant between updates**, so
+4.77 ppm draws straight ramps whose slope changes each update: 13.8 µs predicted against 15.1 µs of
+observed position wander over the offset's ~3 s correlation time. That is the sawtooth visible in
+the live plot — structural to a rate actuator doing position work, not a plotting artefact and not
+a fault.
+
+`boost_floor_us` (default 0 = off) subtracts a floor from the differential evidence before it earns
+any boost: above the floor the boost is unchanged so a real step still converges at full speed,
+below it the loop reverts to tracking gain. The deadband is on the **evidence**, not the error —
+position error is still corrected at tracking gain always. `guards` bit `0x10` ablates the boost
+entirely, for the arm that says what it is buying.
 
 **Unknown `gd` is not the same as being alone** (`d9224e4`). The old fallback boosted on `|e|`
 whenever `gd == INT32_MIN`, regardless of peer count — so a board with a healthy pair that merely
@@ -439,8 +463,15 @@ Plus the booleans: `converged`, `dl_active`, `dl_oor`, `tags_fresh`, `coarse_on_
 five ways**: `blank_ms` (500 ms), `resync_blank_ms` (1200 ms), the per-chunk computed
 `ring + pipeline + 2·block`, `travel_horizon_us_` (`ring + pipe + 2·block_n`, clamped 1–5 s), and
 the flat `PHASE_TRANSIENT_US` (4 s). Four of the five are the same physical quantity from the same
-inputs with different clamps. This is `TIMING.md` §11's "constants that encode a relationship"
-failure, one level up.
+inputs with different clamps — §11's "constants that encode a relationship" failure, one level up.
+
+`visibility_horizon_us(clamp)` is the single source the `travel_horizon` sites now derive from
+(`clamp > 0 ? max(clamp, travel) : travel`, identical by construction to the inline max each site
+applied). The rest is not consolidated, and one inconsistency is worth knowing: `dl_blank_until_us_`
+is set travel-aware at [L1297](components/snapclient/snapcast_client.cpp#L1297) and **flat** at
+[L1608](components/snapclient/snapcast_client.cpp#L1608) and
+[L3213](components/snapclient/snapcast_client.cpp#L3213) — same field, same purpose, two formulas.
+Unifying them lengthens two blanks, so it is a control change needing a measurement, not a tidy-up.
 
 ---
 
@@ -451,15 +482,15 @@ steers real audio to the wrong time and reports zero error.** Measured consequen
 and 52 ms out of alignment, plainly audible, while every on-device metric read clean.
 
 Closing the rate loop on `err_tag` removes that blind spot *for the rate loop*. It does not remove
-it from the paths still reading the prediction, and it introduces a second one: the render phase
-is derived from the same tag stamping, and that stamping is currently suspect (§1, ~8×
-under-measurement).
+it from the paths still reading the prediction. The render phase is derived from the same tag
+stamping, so a fault there would be common to both — which is why §1's wire regression matters:
+it is the one check the on-device signals cannot perform on themselves.
 
 | Instrument | Sees | Blind to |
 |---|---|---|
 | `median` in the sync report | tracking error against *this device's* prediction | any error in the prediction itself |
 | `dl_err` / `err_tag` | measured render error of tagged audio | anything untagged; a fault in the tag stamping |
-| `render_group_delta` | this device's phase vs the peer mean | a fault shared by the whole group; currently under-reads ~8× |
+| `render_group_delta` | this device's phase vs the peer mean | a fault shared by the whole group. Tracks the wire 1:1 (§1); `gd` is half the pairwise difference by construction |
 | `pipeline` / `fill` / `drift` | accumulator vs observed pipeline content | anything downstream of the reported stages |
 | **`raw-sync.py`** | inter-device rendering from raw observations | anything past the I2S pin |
 | **logic analyser** (`scripts/i2s-skew.py`) | **the actual wire**, ~26 ns per-capture precision | nothing that matters; this is the referee |
@@ -500,23 +531,36 @@ Measured at 44.1 kHz on the two-speaker bench:
 |---|---|---|
 | TSF read noise | ~±3.5 µs per device | variation within a ~42 µs deterministic bracket |
 | Published mapping error | ~0 | common-mode by construction — what TSF buys |
-| **Differential rate noise** | **~0.33 ppm** | ~150× the 0.017 ppm crystal budget; at 0.33 ppm a 1 µs error accrues in ~3 ms |
+| **Differential rate noise** | **3.7 ppm achieved, 4.8 ppm commanded** | measured 2026-09-02, 6.0 h, p2p gate 60 µs. 1 µs accrues in 0.27 ms. `kp · sd(err_diff)` alone predicts 1.1 ppm; the boost multiplies it ~4.2× (§5) |
 | Frame quantisation | ~0 with rate lock | 22.7 µs per frame on the splice fallback |
 | DAC/amp/driver | fixed | identical hardware, cancels between devices |
 | **Speaker placement** | **29 µs per cm** | dominates everything below ~100 µs; trim with `static_delay` |
 
-Current wire behaviour (build 88, quiet window): median −1.5 µs, MAD 5.1 µs; structure function
-1.3–1.5 µs at τ = 1 s, 5.6–5.8 at τ = 10 s, plateau 11–14 µs with a 60–120 s correlation time.
+Current wire behaviour (quiet window, 2026-09-02): detrended position sd ~15 µs, residual MAD
+7.4–7.6 µs against the boards' own reference. Post-reboot convergence to < 10 µs takes ~3.5 min.
 
 **The residual is variance, not lag.** Consecutive-difference σ divided by σ came out 1.32–1.43
 against √2 ≈ 1.41 for white noise. So raising gain makes it worse and averaging harder makes it
-better at no tracking cost. `MEDIAN_WINDOW` went 15 → 31 for exactly this reason, reversing an
-earlier shortening made on the assumption the residual was lag.
+better at no tracking cost. `MEDIAN_WINDOW` is 31 for that reason.
 
-**The 0.33 ppm plateau is the open question.** At τ = 120 s the loop cannot correct every 3 ms;
-no gain increase closes a 40000× bandwidth gap. Whether the loop *generates* it (in which case
-tuning helps) or it is downstream (in which case only feed-forward or a better reference helps)
-is decided by the structure function of `d = fs_diff − trim_diff`, which has not been run.
+**SF_d, run 2026-09-02 (6.0 h, 147 937 rows, 7473 bins, p2p gate 60 µs — quote the gate, the same
+quantity spans 3× across gate choices):**
+
+     tau     SF(d_wire)   SF(trim_diff)   SF(achieved)   ratio d/trim
+      5s         6.280         5.317          4.381         1.18
+     30s         8.357         7.833          5.382         1.07
+     60s         8.594         8.000          5.626         1.07
+
+`SF(d)` moves +3 % between τ = 30 s and 60 s, i.e. it has saturated: the disturbance is **broadband
+and enters downstream of the command**, outside the fine loop's τ of 120 s. `SF(achieved)` 5.38
+against `SF(d)` 8.36 says the loop already removes ~35 % and no more is available by gain. So a
+τ/Ti sweep reads null, and feed-forward cannot help either — it cancels predictable terms and
+broadband noise is not one.
+
+**What is left is the source, and §5 identifies it:** the commanded 4.8 ppm is the boost paying
+gain for noise on its own input. Read `SF(d)` growing as "slow, the loop can see it" and flat as
+"broadband, it cannot" — the structure function grows with τ for a correlated signal and saturates
+for white noise.
 
 ---
 
@@ -599,9 +643,24 @@ config) · `tag_stale_ms` 1000 · `blank_ms` 500 · `gap_blank_ms` 50 · `align_
 `align_gain` 0.3 · `align_deadband_us` 1 · `align_reject_us` 500 · `align_step_us` 20 ·
 `align_recentre_us` 2 · `align_apply` true · `resync_win_s` 60 · `resync_gain` 1.0 ·
 `resync_reopen_us` 400 · `resync_splice_us` 100 · `resync_close_s` 5 · `resync_local_us` 2000 ·
-`resync_blank_ms` 1200 · `phase_tx_hz` · `autotune` false · `persist` true.
+`resync_blank_ms` 1200 · `phase_tx_hz` · `autotune` false · `persist` true ·
+`boost_floor_us` 0 (§5: noise floor on the differential evidence that earns the gd boost) ·
+`guards` 0 (ablation mask; bits disable one mechanism each — `0x01` tag blank, `0x02` gap blank,
+`0x04` the two-consistent-readings wait, `0x08` the pending-trim splice hold, `0x10` the gd boost.
+Every change logs a `GUARDS` line, because a window graded without knowing which mechanisms were
+live is ungradeable).
 
 Bench hooks: `inject_split`, `inject_starvation`, `align_bias_us` / `align_bias_kick_us`.
+
+### Diagnostic lines
+
+| Line | Carries | Read it for |
+|---|---|---|
+| `DECIDE` | one per chunk: `src`/`gate`/`act`/`frames`/`pend`/`gd`/`sk` | the servo ladder's resolution. `sk=` counts chunks the idle throttle suppressed, so the census still accounts for every chunk while the line rate stays ~3/s |
+| `GDIN` | `raw`/`gd`/`n`/`gap`/`drift`/`extrap`/`steady` | the group delta's *inputs*. `steady=0` means the board was in transient and the sample is not comparable to the wire |
+| `ERRSEL` | `n`/`srcdiff`/`valdiff`/`live`/`new`/`worst` | `active_error()` running as a shadow beside the live selector; zero mismatches over ~96 k chunks per board including a starvation-driven tag→ledger transition |
+| `PHASEIN` | the consensus inputs, naming which peer moved | observer only — the group delta's output cannot diagnose itself |
+| `Sync:` | error summary, `corrected -D/+I frames`, `hard resyncs`, `err samples` | the aggregate. The last field is `err_count`, which fires the report *at* 128 and is therefore always 128 — it is not a chunk census |
 
 ---
 
