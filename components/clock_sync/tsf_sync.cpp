@@ -1011,6 +1011,10 @@ void TsfSync::record_peer_phase_(Peer &peer, int64_t phase_us, int64_t local_now
 
 void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   const int64_t mine = this->render_phase_us_.load(std::memory_order_relaxed);
+  // A board with no render phase of its own computes no delta and therefore emits NO GDIN. That
+  // is the observer's normal state, not a missing signal: it drives no DAC, so it has no playout
+  // phase to difference against -- which is precisely why it publishes PHASEIN (the consensus
+  // INPUTS) instead. Do not go looking for observer GDIN lines.
   if (mine == RENDER_PHASE_UNKNOWN) {
     this->render_group_delta_us_.store(INT32_MIN, std::memory_order_relaxed);
     this->group_delta_n_.store(0, std::memory_order_relaxed);
@@ -1053,7 +1057,10 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
     // common-mode bias the re-centring absorbed but that inflated every delta.
     vals[n] = static_cast<double>(this->peer_[i].phase_us - mine) -
               static_cast<double>(this->map_drift_ppm_) * 1e-6 * static_cast<double>(pair_gap);
-    // Keep the freshest pairing's inputs for GDIN (the last scanned peer that paired).
+    // GDIN describes the LAST SCANNED peer that paired -- peer_[] order, which is arrival
+    // order, not recency. With one phase-contributing peer (the bench pair, since an observer
+    // publishes no phase) that is the only peer and the distinction is empty; with two it is an
+    // arbitrary choice among them, so do not read this line as "the closest" or "the newest".
     gdin_raw = this->peer_[i].phase_us - mine;
     gdin_gap = pair_gap;
     gdin_drift = this->map_drift_ppm_;

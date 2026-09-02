@@ -26,6 +26,7 @@ import re
 import statistics
 import subprocess
 
+STAMP = re.compile(r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\]")
 ERR = re.compile(r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*DLLOOP err=([+-]\d+)")
 RND = re.compile(r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*render ([+-]?\d+) us")
 EVENTS = ("Hard resync", "Fast splice engaged", "OUT OF RANGE", "tags stale", "Muting",
@@ -82,6 +83,36 @@ def summarize(vals):
     mad = statistics.median(abs(x - med) for x in vals)
     s = sorted(vals)
     return med, mad, s[int(len(s) * 0.05)], s[int(len(s) * 0.95)]
+
+
+# Wall-clock discontinuities in a log segment. A gap is LOST CAPTURE, not a quiet bench: the
+# firmware's aggregate counters keep counting through it while the per-chunk lines do not, so any
+# reconciliation across a gap under-reports one side and reads as a firmware fault. That exact
+# false MISMATCH cost a debugging round on 2026-09-01 -- 109 s of gaps plus a reboot on board A,
+# while board B, gap-free, reconciled exactly. A reboot is worse than a gap: the counters restart.
+def capture_breaks(data: str, gap_s: float = 2.0):
+    """(gaps, reboots) as (timestamp, seconds) and (timestamp,) lists."""
+    gaps, reboots, prev = [], [], None
+    for line in data.splitlines():
+        m = STAMP.match(line)
+        if not m:
+            continue
+        t = _ts(m)
+        # Logs carry no date, so midnight looks like a 24 h jump backwards; treat any negative
+        # step as a day rollover rather than as a gap.
+        if prev is not None and 0 < t - prev > gap_s:
+            gaps.append((m.group(0), round(t - prev, 1)))
+        prev = t
+        if "ESPHome version" in line or "Boot seems" in line:
+            reboots.append(m.group(0))
+    return gaps, reboots
+
+
+def _hms_to_s(stamp: str) -> float:
+    """'[HH:MM:SS.mmm]' -> seconds. Same clock as _ts, for filtering break lists by window."""
+    h, m, rest = stamp.strip("[]").split(":")
+    sec, ms = rest.split(".")
+    return int(h) * 3600 + int(m) * 60 + int(sec) + int(ms) / 1000.0
 
 
 def _ts(m):
@@ -195,7 +226,9 @@ def main() -> None:
     if args.self_test:
         self_test()
         return
-    if not (args.a_off and args.b_off):
+    # `is None`, not falsiness: 0 is a legal byte offset (the start of a fresh or rotated log)
+    # and was being rejected as "missing".
+    if args.a_off is None or args.b_off is None:
         ap.error("--a-off and --b-off are required unless --self-test is given")
 
     segs = {}
@@ -221,6 +254,19 @@ def main() -> None:
         census = collections.Counter({k: data.count(k) for k in EVENTS})
         print(f"        events: {dict(census)}")
 
+        # Is this window even gradeable? Ask BEFORE reporting numbers derived from it.
+        gaps, reboots = capture_breaks(data)
+        gaps = [g for g in gaps if _hms_to_s(g[0]) >= t0]
+        reboots = [r for r in reboots if _hms_to_s(r) >= t0]
+        gradeable = not gaps and not reboots
+        if gaps:
+            lost = sum(g[1] for g in gaps)
+            print(f"        !! {len(gaps)} CAPTURE GAP(S) totalling {lost:.0f}s "
+                  f"({', '.join(f'{g[1]:.0f}s at {g[0]}' for g in gaps[:4])})")
+        if reboots:
+            print(f"        !! {len(reboots)} REBOOT(S) in window ({', '.join(reboots[:4])}) "
+                  f"-- the aggregate counters restart at each one")
+
         # STAGE 2 DECIDE census over the SAME settled window, reconciled to the Sync aggregate.
         decide = decide_rows(data)
         # t0..t1 is a quiet 30-min window if the settled span reaches that far.
@@ -243,9 +289,18 @@ def main() -> None:
                 print(f"        reconcile: DECIDE drops={rep['drops']} inserts={rep['inserts']} "
                       f"resyncs={rep['resyncs']} vs Sync -{sd}/+{si}, {sh} -> "
                       f"{'OK' if ok else 'MISMATCH'}")
-                if not ok:
-                    print("        !! mismatch: either a DECIDE line lost its frames to truncation, or"
-                          "        the ladder description in PLAN-timing-v2 is wrong. See CLAUDE.md.")
+                if not ok and not gradeable:
+                    # Lost lines and restarted counters produce a mismatch on their own. Saying
+                    # "the plan is built on a wrong map" here would be an instrument reading its
+                    # own damage as a finding -- which is exactly what happened on 2026-09-01.
+                    print("        -> NOT A FINDING: this window has a gap or a reboot, which "
+                          "breaks the reconciliation by itself.")
+                    print("           Re-run over a clean span before reading anything into it.")
+                elif not ok:
+                    print("        !! mismatch on a CLEAN window (no gaps, no reboots): either a "
+                          "DECIDE line lost its frames to truncation,")
+                    print("           or the ladder description in PLAN-timing-v2 is wrong. "
+                          "See CLAUDE.md.")
         # STAGE 1 GDIN: the un-halved pairwise delta beside the halved control-path delta.
         gd = gdin_rows(data)
         gd_in = [r for r in gd if t0 <= r[0] <= t_end] if ev else []

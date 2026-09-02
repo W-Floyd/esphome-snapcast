@@ -180,10 +180,25 @@ if [[ "${DOCKER}" -eq 1 ]]; then
         fi
     fi
 
-    # The image tag DEFAULTS TO THE MOUNTED FORK'S OWN esphome version, read from its const.py,
-    # so the two cannot drift apart silently -- a hardcoded constant here would just relocate the
-    # problem to the day someone updates the fork. Falls back to a known-good tag if the fork is
-    # absent or unreadable; override either with ESPHOME_IMAGE_TAG.
+    # The image tag DEFAULTS TO THE MOUNTED FORK'S OWN esphome version, read from its const.py.
+    #
+    # BUT UNDERSTAND WHAT THE TAG DOES AND DOES NOT DO. The esphome image installs esphome AT
+    # /esphome (verified: `docker run --entrypoint python <image> -c "import esphome; print(...)"`
+    # -> /esphome/esphome), which is exactly where the fork is mounted below. So a mounted fork
+    # REPLACES THE WHOLE CORE, not just the six components the config names, and the built
+    # firmware reports the FORK's version whatever tag is pulled:
+    #
+    #   image :2026.8.2, fork mounted   -> esphome 2026.8.1   (the fork's)
+    #   image :2026.8.2, no fork        -> esphome 2026.8.2
+    #
+    # Matching the tag to the fork therefore keeps the TOOLCHAIN consistent with the core that
+    # will actually run; it does not select the core. Chasing a different esphome version by
+    # setting ESPHOME_IMAGE_TAG here cannot work, and cost four flashes on 2026-09-02 before
+    # anyone read the mechanism. To build against a different core, use an unshadowed one --
+    # a host/venv esphome at that version, with the fork supplying components via the relative
+    # path -- which is what the bench host was doing all along.
+    #
+    # Falls back to a known-good tag if the fork is absent or unreadable.
     ESPHOME_TAG="2026.8.1"
     if [[ -n "${FORK:-}" && -r "${FORK}/esphome/const.py" ]]; then
         _fork_ver="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "${FORK}/esphome/const.py" | head -1)"
@@ -201,6 +216,19 @@ if [[ "${DOCKER}" -eq 1 ]]; then
 else
     esphome compile "${CONFIG}"
 fi
+
+# WHICH esphome built this, stated at build time. The version is otherwise only discoverable
+# afterwards from device_info over the API -- i.e. after it is already on the boards, which is
+# how a whole fleet ended up on a core nobody chose.
+echo "==> built by esphome $(
+    if [[ "${DOCKER}" -eq 1 ]]; then
+        docker run --rm "${MOUNTS[@]}" --entrypoint esphome \
+            "ghcr.io/esphome/esphome:${ESPHOME_IMAGE_TAG:-${ESPHOME_TAG}}" version 2>/dev/null |
+            sed -n 's/^Version: //p'
+    else
+        esphome version 2>/dev/null | sed -n 's/^Version: //p'
+    fi
+)"
 
 # ── Resolve the firmware binary ───────────────────────────────────────────────
 
