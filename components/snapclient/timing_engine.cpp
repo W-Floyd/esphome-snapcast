@@ -234,6 +234,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       cmd.rate_ppm = crystal_ppm_;
       cmd.decision.act = Decision::Act::Hold;
       cmd.decision.why = Decision::Why::InFlight;
+      cmd.decision.rate_ppm = cmd.rate_ppm;  // else the log reads 0 while the command holds
       suppressed_++;
       return cmd;
     }
