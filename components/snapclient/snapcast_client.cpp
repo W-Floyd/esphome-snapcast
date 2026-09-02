@@ -3555,7 +3555,7 @@ void SnapcastClient::player_task_() {
         // and through everything that suppresses tags, the demand is left exactly where it was --
         // which is what "hold the last trim, never the last error" means concretely. The gain
         // schedule, bumpless transfer, conditional integration and the clamp all live inside.
-        this->delay_loop_update_(st);
+        this->delay_measure_(st);
         decide_act = 1;  // trim (rate lock steering this chunk); frame paths below override
         // THE SPLIT-PENDING TRIM HOLD IS DELETED, not improved: it existed because the rate loop
         // steered on a prediction the split detector was about to declare wrong, and the loop no
@@ -4591,20 +4591,18 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   return cmd;
 }
 
-void SnapcastClient::delay_loop_update_(ServoState &st) {
-  // WS3.1 GATE, SET AT A SINGLE POINT THAT ALWAYS EXECUTES. dl_oor means "the loop is NOT in clean
-  // in-range steady state", and it is asserted here on entry and cleared only on the one path that
-  // reaches a good in-range block. Setting it in the out-of-range branch alone left it latched
-  // through every OTHER early return in this function -- tags stale, deadline on the local
-  // fallback, not ready -- so a stale-tag period would have frozen it true and conv_ops_q would
-  // never increment again. That is CLAUDE.md's rule verbatim: a reset must not be conditional on
-  // an unrelated success; reset at a single point that always executes.
-  st.dl_oor = true;
-  // Pull the accumulator state. A completed block is drained; a partial one is left to fill --
-  // unless the stream has gone stale, in which case the partial block spans a gap and is discarded
-  // (samples from before an outage folded into a mean with samples after it describe nothing).
-  const int64_t tag_stale_us = static_cast<int64_t>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed)) * 1000;
+// Measurement only: drain the tag accumulator into a block-mean error, and publish the render
+// phase. The control that used to live here -- PI, boost, knee, holds, align kick, trim clamp --
+// is timing::Engine's now.
+//
+// block_n is the last chunk-derived constant in the timing path. It can go once the ladder does:
+// the engine filters internally, so a block average ahead of it is redundant, and publishing per
+// arrival would remove the dependency entirely. Left alone here so this pass changes one thing.
+void SnapcastClient::delay_measure_(ServoState &st) {
+  const int64_t tag_stale_us =
+      static_cast<int64_t>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed)) * 1000;
   const uint32_t block_n = static_cast<uint32_t>(this->tune_block_n_.load(std::memory_order_relaxed));
+
   this->playout_mutex_.lock();
   const int64_t last = this->dl_acc_last_us_;
   const int64_t now = now_us();
@@ -4612,480 +4610,30 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   const bool ready = tags_live && this->dl_acc_n_ >= block_n;
   const uint32_t n = this->dl_acc_n_;
   const double sum = this->dl_acc_sum_us_;
-  const int64_t first = this->dl_acc_first_us_;
   if (ready || !tags_live) {
     this->dl_acc_n_ = 0;
     this->dl_acc_sum_us_ = 0.0;
   }
   this->playout_mutex_.unlock();
 
-  // IN-RANGE HOLD (tag loss, mapping flap): keep the P term and DECAY it toward the integral over
-  // tau. Holding the integral alone dropped P instantly -- with P ~ 25 ppm of legitimate response
-  // to the common-mode wander that the peer kept applying, every ~1 s mapping flap became a
-  // differential rate step and ~130 us of wire skew (measured build 10). A long outage still ends
-  // at the crystal offset, which is what the integral-only hold was for. Out-of-range keeps the
-  // integral-only rule: that P is mid-transient and untrusted.
-  const float clamp_hold = trim_clamp_ppm(this->config_.converge_fine_us);
-  auto enter_hold = [&](const char *why) {
-    st.dl_active = false;
-    // A deadline-source change moves my audio relative to my measured phase without a step: hold
-    // the beacon quiet for the horizon (build 68; see phase_transient_until_us).
-    st.phase_transient_until_us = std::max(st.phase_transient_until_us, now + PHASE_TRANSIENT_US);
-    st.dl_hold_p_ppm = st.trim_applied_ppm - st.trim_integral_ppm;
-    st.dl_hold_since_us = now;
-    ESP_LOGD(TAG, "Delay loop: %s, holding integral %+.2f ppm + P %+.2f decaying over tau t=%" PRId64, why,
-             st.trim_integral_ppm, st.dl_hold_p_ppm, now);
-  };
-  auto apply_hold = [&]() {
-    const float tau_s = this->tune_tau_s_.load(std::memory_order_relaxed);
-    const float age_s = static_cast<float>(now - st.dl_hold_since_us) / 1000000.0f;
-    const float p = st.dl_hold_since_us != 0 ? st.dl_hold_p_ppm * std::exp(-age_s / tau_s) : 0.0f;
-    st.trim_applied_ppm = std::clamp(st.trim_integral_ppm + p, -clamp_hold, clamp_hold);
-  };
-
   if (!tags_live) {
-    // HOLD, not revert: st.trim_applied_ppm keeps being programmed by the caller, so the learned
-    // crystal offset keeps cancelling. There is no ledger servo to fall back to -- that is the
-    // design, not an omission. dl_active drops so the next fresh block resumes from the integral,
-    // and dl_have_err drops so fast_splice_ hands back to the demoted prediction (where the
-    // split-pending guard applies again).
-    if (st.dl_active) {
-      enter_hold("tags stale");
-    }
-    apply_hold();
-    st.dl_have_err = false;
+    st.dl_have_err = false;   // absent, not zero: the engine holds on an invalid observation
+    return;
+  }
+  if (!ready || n == 0) {
     return;
   }
 
-#ifdef CLOCK_SYNC_TSF_ACTIVE
-  // PRECONDITION: the shared TSF mapping. deadline() sits inside err_tag, so the clock-offset
-  // estimator is inside this loop; on the shared mapping its wander is common-mode across the
-  // group and harmless to alignment, on the local-Kalman fallback it is per-device and steering
-  // on it misaligns. Hold trim until the mapping returns (chosen over widening tau: it matches
-  // the tag-loss behaviour and needs no second tuning). A device consensing alone has no group
-  // to misalign against and is not made to wait.
-  const bool mapping_shared = this->tsf_sync_ == nullptr || this->tsf_sync_->consensus_n() < 2 ||
-                              this->deadline_on_shared_tsf_;
-  if (!mapping_shared) {
-    if (st.dl_active) {
-      enter_hold("deadline on local fallback");
-    }
-    apply_hold();
-    st.dl_have_err = false;
-    return;
-  }
-#endif
-
-  if (!ready) {
-    return;
-  }
-
-  const float e = static_cast<float>(sum / static_cast<double>(n));
-  st.dl_err_us = static_cast<int64_t>(llroundf(e));
+  st.dl_err_us = static_cast<int64_t>(llroundf(static_cast<float>(sum / static_cast<double>(n))));
   st.dl_err_at_us = now;
   st.dl_have_err = true;
   st.dl_updates++;
-  // PUBLISH THE RENDER PHASE PER BLOCK, NOT PER REPORT. The group delta pairs my phase with a
-  // peer's only if the two were sampled within PHASE_PAIR_WINDOW_US (300 ms) of each other; with
-  // both boards publishing once per ~3.3 s report that was a coincidence -- delta known on 62 % of
-  // reports, unknown for the first 20-40 s after a boot, and the resync gate refusing for want of
-  // evidence (build 48 boot, 00:43: RSTEP gd=unknown). Every ~0.65 s block on each board puts ~5
-  // samples inside each 3.3 s and a pairing inside every beacon interval.
-  // "In transient" = a position step or hard resync landed within the last PHASE_TRANSIENT_US -- the
-  // interval in which my measured phase does not yet describe where my audio will be. NOT "window
-  // open" and NOT "unconverged": build 63 used those and at boot neither board broadcast anything,
-  // so there was no group delta for the gate or the group-agreement unmute, and both crawled in on
-  // the PI (+528 us on the wire for a minute, 09:08).
-  // Build 68: one field, set wherever my audio is about to move relative to my measured phase --
-  // window steps, hard resyncs (mark_kp_event_), and deadline source changes (fallback / re-engage:
-  // 10:46, B's fallback read as +203 to A and B stepped +100 chasing it).
+
+  // Per block, not per report: a peer pairing needs both phases sampled inside
+  // PHASE_PAIR_WINDOW_US, and once per report made that a coincidence. In transient the phase
+  // does not describe where the audio will be, so publish unknown instead of a stale value.
   const bool in_transient = now < st.phase_transient_until_us;
   this->publish_render_phase_(!in_transient);
-
-  // ABOVE THE SPLICE THRESHOLD, SPLICE; BELOW IT, TRIM -- the plan's rule, and the trim half of
-  // it: position errors at the millisecond scale belong to the fast path, and a rate loop asked
-  // to chase them converts every coarse correction into a rail-to-rail trim excursion. Measured
-  // on the first flash without this guard: engaged at err +15081 us and slammed to the +1000 ppm
-  // rail at boot, and wound the integral to -994 ppm chasing a delivery stall's displaced audio.
-  // Hold the trim (the integral is still the learned crystal offset), keep publishing dl_err so
-  // fast_splice_ acts on the measured error, and do not SEED while out of range -- acquisition
-  // splices down to the threshold first, and the loop takes over from there.
-  const int32_t splice_override = this->tune_splice_us_.load(std::memory_order_relaxed);
-  const int64_t splice_threshold =
-      splice_override >= 0 ? static_cast<int64_t>(splice_override)
-      : this->config_.fast_splice_threshold_us > 0
-          ? static_cast<int64_t>(this->config_.fast_splice_threshold_us)
-          : static_cast<int64_t>(this->config_.converge_fine_us);
-  if (std::abs(st.dl_err_us) >= splice_threshold) {
-    if (st.dl_integral_ema_valid && std::abs(st.trim_integral_ppm - st.dl_integral_ema_ppm) > DL_INTEGRAL_SNAP_PPM) {
-      ESP_LOGW(TAG, "Delay loop: out of range with integral %+.2f far from its average %+.2f -- snapping to the average",
-               st.trim_integral_ppm, st.dl_integral_ema_ppm);
-      st.trim_integral_ppm = st.dl_integral_ema_ppm;
-    }
-    // HOLD THE INTEGRAL, NOT THE WHOLE TRIM -- the split-hold's lesson, verbatim. Out of range is
-    // by definition mid-transient, so the last demanded trim carries a P term computed against an
-    // error the fast path is about to remove; the integral is the learned crystal offset and is
-    // the only part worth holding. Measured without this: boards held arbitrary transient trims
-    // (+96, +121 ppm) through 1 ms sawtooth cycles while the error GREW under them.
-    st.trim_applied_ppm = std::clamp(st.trim_integral_ppm, -trim_clamp_ppm(this->config_.converge_fine_us),
-                                     trim_clamp_ppm(this->config_.converge_fine_us));
-    if (now - st.dl_log_us >= DL_LOG_INTERVAL_US) {
-      st.dl_log_us = now;
-      ESP_LOGD(TAG, "DLLOOP err=%+" PRId64 " us OUT OF RANGE (>=%" PRId64 "), holding integral %+.2f ppm t=%" PRId64,
-               st.dl_err_us, splice_threshold, st.trim_applied_ppm, now);
-    }
-    return;
-  }
-
-  const float clamp_ppm = trim_clamp_ppm(this->config_.converge_fine_us);
-  // The gain schedule survives, scaled to the loop's own run gain: trim_kp_ still reads a timer
-  // since a discrete event (hard resync, timebase re-anchor), never the error, and those events
-  // also blank the tag stream -- so by the time a block completes under the elevated gain, the
-  // audio it measured is genuinely post-event.
-  // Error-proportional gain: the tunables are the floor, |err| raises them (knee_us / tau_min_s).
-  const float tau_tuned = this->tune_tau_s_.load(std::memory_order_relaxed);
-  const float ti_tuned = this->tune_ti_s_.load(std::memory_order_relaxed);
-  const float knee_us = this->tune_knee_us_.load(std::memory_order_relaxed);
-  const float tau_min = this->tune_tau_min_s_.load(std::memory_order_relaxed);
-  // WILD DESYNC RE-OPENS THE WINDOW. B's error stepped -66 -> -545 us in ten seconds at 22:56:57
-  // (a per-board timebase step under a 1-2 ms consensus spread; A flat) thirteen seconds after the
-  // boot window had closed, and recovery then ran at steady-state gains: 450 -> 224 us in 35 s. A
-  // jump past resync_reopen_us (400 -- the common wander stays under it) is a known displacement
-  // whatever caused it, and gets the step-and-verify treatment.
-  if (std::abs(e) > this->tune_resync_reopen_us_.load(std::memory_order_relaxed) && now >= st.post_event_until_us) {
-    st.post_event_until_us =
-        now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
-    st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
-    std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
-    std::fill(std::begin(st.win_step_land_frame), std::end(st.win_step_land_frame), 0);
-    st.resync_inside_since_us = 0;
-    ESP_LOGI(TAG, "Delay loop: resync window re-opened on a %+.0f us step t=%" PRId64, e, now);
-  }
-  // ... AND CLOSES ON CONVERGENCE, not on the timer. Left open for the full 60 s, the in-window
-  // coarse steps kept firing on the +-60..150 us post-event noise and the common wander after the
-  // wire had already crossed zero (22:59:04 -> -145 us by 22:59:34): each 80 % step over-corrects
-  // against the other board. Inside the arm threshold for resync_close_s -> the window is done.
-  if (now < st.post_event_until_us) {
-    if (std::abs(e) <= this->tune_resync_splice_us_.load(std::memory_order_relaxed)) {
-      if (st.resync_inside_since_us == 0) st.resync_inside_since_us = now;
-      else if (now - st.resync_inside_since_us >= static_cast<int64_t>(this->tune_resync_close_s_.load(std::memory_order_relaxed) * 1000000.0f)) {
-        st.post_event_until_us = now;
-        st.resync_inside_since_us = 0;
-        ESP_LOGD(TAG, "Delay loop: resync window closed, converged t=%" PRId64, now);
-      }
-    } else {
-      st.resync_inside_since_us = 0;
-    }
-  }
-  // NO PER-BOARD RATE-GAIN BOOST IN THE RESYNC WINDOW. Measured 2026-08-29 22:58-22:59 (300 ms
-  // injection on A): with A at kp 0.05 inside its window and B at 0.008 outside, the SAME common
-  // deadline wander (+30..+130 us on both) became a 2-4 ppm differential trim -- (0.05-0.008) x 80 us
-  // -- and the wire walked away from zero at 2-3 us/s for 30 s in block-sized stairs. Any gain
-  // that only one board has turns common-mode error into differential motion; the rate loop's
-  // gain must be the same function of the error on every board. Position corrections (the coarse
-  // step-and-verify) do the resync: a bounded one-off, not a sustained rate.
-  // BOOST ON THE DIFFERENTIAL PORTION OF THE ERROR, NOT ITS MAGNITUDE. 21:01 (build 86, knee 25):
-  // common timeline wander ramped BOTH boards' e to ~-220 us together; kp scaled to ~0.07-0.08 on
-  // each, and the boost multiplied their slightly-different local readings into kp*(e_A - e_B) ~
-  // 2-5 ppm of differential trim -- the +-30-50 us steady-state sawtooth, reset at each wander
-  // zero-crossing. Same lesson as the 08-29 window boost, arriving through a symmetric function:
-  // gain responding to a COMMON error still moves the pair apart. The differential evidence is the
-  // group delta (|gd| is the same number on both boards, so the schedule stays symmetric): boost on
-  // min(|e|, |gd|*n/(n-1)) -- the gap to the others -- so common wander runs at tracking gain on
-  // both boards while a genuinely differential residual (the post-window tails, where gd agreed
-  // with e) keeps the fast decay.
-  //
-  // GD UNKNOWN IS NOT THE SAME AS BEING ALONE (fixed 2026-08-31, measured). The fallback used to be
-  // "gd unknown -> boost on |e|", justified as "recovery needs the boost and a lone board has no
-  // pair to disturb". But it was taken whenever gd == INT32_MIN REGARDLESS OF n_cons, so a board
-  // with a perfectly healthy pair that merely lost gd for one decision got full boost on a COMMON
-  // error -- which is precisely the differential motion the whole paragraph above exists to
-  // prevent, arriving through the one branch that skips it.
-  //
-  // MEASURED, 09:58:57. A common-mode step took both boards (A e +224 -> +322, B +84 -> +170). A's
-  // gd was unknown for that decision (6 gd=unknown in the window against B's 0), so A boosted on
-  // |e|: boost 12.5, kp 0.104, trim +57.10 -> +88.31 ppm in ONE block. B's gd was valid and clamped
-  // it to tracking gain, kp 0.008. The ~6 ppm differential over ~20 s put ~120 us on the wire and
-  // the pair then spent 40 s ramping back with an overshoot. gd goes unknown on ~2.7 % of decisions
-  // on BOTH boards and it is BURSTY, so this fires whenever a burst lands on one board of the pair
-  // during common wander -- which is most of the time, since the dropouts are independent.
-  //
-  // So: unknown gd with peers present means NO differential evidence, and the correct response to
-  // no evidence is tracking gain, not maximum gain. Full boost survives only where its rationale
-  // actually holds -- n_cons <= 1, genuinely alone, nothing to disturb. Cost, stated: a real
-  // differential residual recovers at tracking gain while gd is briefly unknown. That is the trade
-  // the old fallback was buying, and it is the wrong side of it at a 2.7 % dropout rate.
-  float boost_err = std::abs(e);
-  if (this->tsf_sync_ != nullptr) {
-    const int32_t gd_boost = this->tsf_sync_->render_group_delta_us();
-    const int32_t n_phase = this->tsf_sync_->group_delta_n();
-    if (gd_boost != INT32_MIN && n_phase > 1) {
-      boost_err = std::min(boost_err,
-                           std::abs(static_cast<float>(gd_boost)) * static_cast<float>(n_phase) /
-                               static_cast<float>(n_phase - 1));
-    } else if (n_phase > 1) {
-      // PEERS EXIST BUT gd IS PAST ITS 10 s FRESHNESS GATE. Two stages, because the boost needs a
-      // MAGNITUDE BOUND and not a value to steer on -- a delta tens of seconds old still answers
-      // "is this error differential or common", which is the only question asked of it here.
-      //   age <= BOOST_GD_HOLD_US : keep using the held delta as the bound. Cheap and it covers the
-      //                             bursty dropouts (~2.7 % of decisions) that caused the damage.
-      //   older, or never computed: tracking gain. No differential evidence at all, and the correct
-      //                             response to no evidence is not maximum gain.
-      int64_t gd_age = INT64_MAX;
-      const int32_t gd_held = this->tsf_sync_->render_group_delta_held_us(now, &gd_age);
-      if (gd_held != INT32_MIN && gd_age <= BOOST_GD_HOLD_US) {
-        boost_err = std::min(boost_err,
-                             std::abs(static_cast<float>(gd_held)) * static_cast<float>(n_phase) /
-                                 static_cast<float>(n_phase - 1));
-        if (!st.boost_blind) {
-          st.boost_blind = true;
-          ESP_LOGD(TAG, "BOOSTHOLD gd stale %.1f s, bound from held %+" PRId32 " us (err %+.0f) t=%" PRId64,
-                   static_cast<double>(gd_age) / 1e6, gd_held, e, now);
-        }
-      } else {
-        boost_err = 0.0f;  // tracking gain: boost clamps to 1
-        if (!st.boost_blind) {
-          st.boost_blind = true;
-          ESP_LOGD(TAG, "BOOSTBLIND no gd within %.0f s with n=%" PRId32 " peers: tracking gain "
-                        "(err %+.0f us) t=%" PRId64,
-                   static_cast<double>(BOOST_GD_HOLD_US) / 1e6, n_phase, e, now);
-        }
-      }
-    }
-    if (gd_boost != INT32_MIN || n_phase <= 1) {
-      st.boost_blind = false;
-    }
-  }
-  const float boost = std::clamp(boost_err / knee_us, 1.0f, std::max(1.0f, tau_tuned / tau_min));
-  const float tau_eff = tau_tuned / boost;
-  // Ti is NOT boosted: Ki = kp/Ti already rises with kp. Dividing Ti too made Ki scale with boost^2
-  // and wound the (already correct, NVS-restored) integral during the position catch-up -- the
-  // -150 us undershoot and the minutes-long tail on A's 13:35 boot. A boot error is position, not
-  // rate; P should close it and the integral should barely move.
-  const float ti_eff = ti_tuned;
-  const float kp_run = 1.0f / tau_eff;
-  // FLAT GAIN: Kp = 1/tau, no acquire->run schedule. The schedule bought fast nulling after a
-  // hard resync when the rate loop was the only corrector; here anything past the splice
-  // threshold belongs to the fast path and anything inside it does not need 2x gain -- while
-  // Ki = Kp^2 meant every re-arm wound the integral 4x faster. Measured (build 7 boot): source
-  // flaps re-arming every ~25 s drove A's integral to +134 ppm against a ~+60 ppm crystal.
-  // kp still changes when tau is retuned over the API; the bumpless transfer below covers that.
-  const float kp = kp_run;
-  st.kp_active = kp;
-
-  if (!st.dl_active) {
-    // ENGAGE WITH THE INTEGRAL AS IT STANDS -- never re-seed it from the applied trim. The
-    // integral is the learned crystal offset and survives in RAM across every disengage; the
-    // applied trim does not survive the actors that write it (the muted out-of-band branch
-    // programs 0). Seeding from applied_ppm() was measured 2026-08-28 19:06 re-engaging at
-    // "+0.00 ppm" after a mute cycle: the board then ran ~crystal slow, accrued 1 ms in ~18 s,
-    // and sawtoothed through splice/resync cycles -- the audible flutter. At a genuine cold boot
-    // the integral is 0 anyway, and that wind-up is the closed-loop PI response to a ~40 ppm rate
-    // step: peak ~0.5*crystal/Kp ~ 200 us at tau = 10 s, under the splice threshold.
-    st.dl_kp_last = 1.0f / tau_tuned;
-#ifdef CLOCK_SYNC_TSF_ACTIVE
-    // COLD START SEED. A fresh board has no NVS integral and would wind ~56 ppm through Ki --
-    // 10+ minutes at Ti 600, spent near the splice/out-of-range thresholds. The TSF crystal
-    // estimate is the same hardware property measured against the radio within seconds of boot;
-    // it sits ~14 ppm from the trim the DAC actually needs (int +56 vs crystal +42, measured all
-    // day), which the fast boot Ti then absorbs in tens of seconds instead of tens of minutes.
-    if (st.dl_cold_start && st.trim_integral_ppm == 0.0f && this->tsf_sync_ != nullptr) {
-      const float seed = this->tsf_sync_->own_crystal_ppm();
-      if (std::isfinite(seed) && std::abs(seed) <= TRIM_CLAMP_MAX_PPM) {
-        st.trim_integral_ppm = seed;
-        ESP_LOGI(TAG, "Delay loop: cold start, integral seeded %+.2f ppm from the TSF crystal estimate", seed);
-      }
-    }
-#endif
-    st.dl_active = true;
-    st.dl_engaged_since_us = now;
-    st.post_event_until_us =
-        now + static_cast<int64_t>(this->tune_resync_win_s_.load(std::memory_order_relaxed) * 1000000.0f);
-    st.resync_step_at_us = 0;  // a fresh window: the ledger may take its first step
-    std::fill(std::begin(st.win_step_at_us), std::end(st.win_step_at_us), 0);
-    std::fill(std::begin(st.win_step_land_frame), std::end(st.win_step_land_frame), 0);
-    st.phase_transient_until_us = std::max(st.phase_transient_until_us, now + PHASE_TRANSIENT_US);  // re-engage = deadline source change
-    ESP_LOGD(TAG, "Delay loop: engaged, integral %+.2f ppm (err %+" PRId64 " us) t=%" PRId64,
-             st.trim_integral_ppm, st.dl_err_us, now);
-  }
-
-  // Bumpless transfer for TUNABLE changes only (tau_s over the API): move the output step
-  // (kp_old - kp_new) * e into the integrator so the commanded trim is continuous. Keyed on the
-  // tuned 1/tau, NOT on the error-proportional kp: that one changes every block, and folding its
-  // change into the integral made a hidden integrator of (dkp * e) -- measured build 20, B at
-  // 13:45:49-53: integral 54.2 -> 61.5 ppm in four blocks as err crossed +232 -> -189 us, then the
-  // wire diverged from zero as the loop chased its own integral. The proportional boost is meant
-  // to step the output; that step IS the acquisition.
-  const float kp_tuned = 1.0f / tau_tuned;
-  if (st.dl_kp_last != kp_tuned) {
-    st.trim_integral_ppm = std::clamp(st.trim_integral_ppm + (st.dl_kp_last - kp_tuned) * e, -clamp_ppm, clamp_ppm);
-    st.dl_kp_last = kp_tuned;
-  }
-
-  // dt is the block's real span, not an assumed cadence -- arrivals pause whenever tagged audio
-  // does. Bounded, so a pathological pair of stamps cannot wind the integral by a large step.
-  const float dt_s = std::clamp(static_cast<float>(last - first) / 1000000.0f, 0.05f, 2.0f);
-  const float p_term = kp * e;
-  // Conditional integration (anti-windup): freeze the integral whenever the output is saturated
-  // in the error's own direction -- the +164.9 ppm runaway from the realised-slope experiment is
-  // what its absence looks like. Ki = Kp / Ti with Ti a separate tunable (default 120 s): Ti = tau
-  // (Ki = Kp^2) let the integral swing ~57 ppm p-p chasing the common-mode wander -- see
-  // tune_ti_s_. The integral models the crystal, which moves over minutes, and the NVS restore
-  // removed the cold-boot reason for a fast one.
-  const float unclamped = p_term + st.trim_integral_ppm;
-  if (std::abs(unclamped) < clamp_ppm || (unclamped > 0.0f) != (e > 0.0f)) {
-    st.trim_integral_ppm =
-        std::clamp(st.trim_integral_ppm +
-                       (kp / ((st.dl_cold_start && now < DL_TI_BOOT_WINDOW_US) ? DL_TI_BOOT_S : ti_eff)) *
-                           e * dt_s,
-                   -clamp_ppm, clamp_ppm);
-  }
-  st.trim_applied_ppm = std::clamp(p_term + st.trim_integral_ppm, -clamp_ppm, clamp_ppm);
-  // ALIGN KICK: deliver a render_align bias change as position NOW, by rate, instead of letting the PI
-  // walk the audio to the moved deadline over tau = 120 s. That lag is what forced align's gain to
-  // 0.03 (0.1 hunted at +-100 us on 2026-08-29; +-10 us "5-minute sawtooth" on 2026-08-30) and made
-  // the wire's mean crawl at ~3 us/min. A +D us bias (deadline later) means the audio must play D us
-  // later: err_tag reads -D, the PI would slow by kp*D; here the rate is lowered by up to
-  // ALIGN_KICK_MAX_PPM until D has been delivered (5 us in ~0.5 s at 10 ppm), and the P-term's
-  // contribution at a 5 us error (0.04 ppm) is noise beside it. With the lag gone, align's loop is the
-  // ~3.5 s tag visibility and a gain of ~0.3 per 10-s cycle is stable.
-  st.align_kick_us += this->bias_kick_request_us_.exchange(0.0f, std::memory_order_relaxed);  // bench hook
-  if (st.align_kick_us != 0.0f) {
-    const float want_ppm = -st.align_kick_us / dt_s;  // deliver it all this block if allowed
-    const float kick_ppm = std::clamp(want_ppm, -ALIGN_KICK_MAX_PPM, ALIGN_KICK_MAX_PPM);
-    st.align_kick_us += kick_ppm * dt_s;  // delivered part: -kick_ppm*dt_s us of audio movement
-    if (std::abs(st.align_kick_us) < 0.05f) {
-      st.align_kick_us = 0.0f;
-    }
-    st.trim_applied_ppm = std::clamp(st.trim_applied_ppm + kick_ppm, -clamp_ppm, clamp_ppm);
-  }
-
-  // Slow average of the integral, for persistence (see dl_integral_ema_ppm).
-  if (!st.dl_integral_ema_valid) {
-    st.dl_integral_ema_ppm = st.trim_integral_ppm;
-    st.dl_integral_ema_valid = true;
-  } else {
-    const float alpha = std::min(1.0f, dt_s / DL_PERSIST_EMA_S);
-    st.dl_integral_ema_ppm += alpha * (st.trim_integral_ppm - st.dl_integral_ema_ppm);
-  }
-  this->dl_integral_ema_mirror_.store(st.dl_integral_ema_ppm, std::memory_order_relaxed);
-
-  // Persist the learned crystal offset, slowly and only on real change; see DL_PERSIST_DELTA_PPM.
-  // dl_saved_at_us == 0 means never saved this boot: the first write is allowed at once, or a
-  // board rebooted inside the interval never persists anything (measured: 90 s after engage with
-  // the integral at +134 ppm and nothing written, because uptime < 10 min).
-  if (this->tune_persist_.load(std::memory_order_relaxed) &&
-      std::abs(st.dl_integral_ema_ppm - st.dl_saved_integral_ppm) > DL_PERSIST_DELTA_PPM &&
-      st.dl_engaged_since_us != 0 && now - st.dl_engaged_since_us > DL_PERSIST_SETTLE_US &&
-      (st.dl_saved_at_us == 0 || now - st.dl_saved_at_us > DL_PERSIST_MIN_INTERVAL_US)) {
-    float v = st.dl_integral_ema_ppm;
-    if (this->dl_integral_pref_.save(&v)) {
-      global_preferences->sync();
-      st.dl_saved_integral_ppm = v;
-      st.dl_saved_at_us = now;
-      ESP_LOGD(TAG, "Delay loop: integral %+.2f ppm persisted t=%" PRId64, v, now);
-    }
-  }
-
-  // Persist the align bias on the same slow cadence and the same conditions as the integral above
-  // -- it is a position offset that took minutes to earn, and NVS wear is the reason both are rate
-  // limited. Saved only when it has actually moved, so a settled board writes nothing.
-  if (this->tune_persist_.load(std::memory_order_relaxed) && this->tune_align_max_us_.load(std::memory_order_relaxed) > 0) {
-    const int32_t bias_now = this->render_bias_us_.load(std::memory_order_relaxed);
-    if (std::abs(bias_now - st.align_saved_bias_us) > ALIGN_PERSIST_DELTA_US &&
-        (st.align_saved_at_us == 0 || now - st.align_saved_at_us > DL_PERSIST_MIN_INTERVAL_US)) {
-      int32_t v = bias_now;
-      if (this->align_bias_pref_.save(&v)) {
-        global_preferences->sync();
-        st.align_saved_bias_us = v;
-        st.align_saved_at_us = now;
-        ESP_LOGD(TAG, "Render align: bias %+" PRId32 " us persisted t=%" PRId64, v, now);
-      }
-    }
-  }
-
-  // AUTOTUNE (master toggle, default off): adapt tau from the lag-1 autocorrelation of the
-  // block-error series, one decision per 64-block (~21 s) window -- a decade slower than the
-  // loop, which is what keeps an adapter wrapped around a controller from becoming a second
-  // oscillator. Ringing (r1 strongly negative: successive block means alternating) means the
-  // loop is too fast for the current lag/noise -> slow 25%. A standing mean with r1 near +1
-  // (error walks, loop not keeping up) -> speed 15%. Hard bounds, WARN-logged, never persisted.
-  if (this->tune_autotune_.load(std::memory_order_relaxed)) {
-    st.at_win[st.at_n++] = e;
-    if (st.at_n >= ServoState::AT_WINDOW) {
-      const double dn = static_cast<double>(st.at_n);
-      double mean = 0.0;
-      for (uint32_t i = 0; i < st.at_n; i++) mean += st.at_win[i];
-      mean /= dn;
-      // Proper lag-1 autocorrelation of the demeaned window: one denominator, |r1| <= 1.
-      double num = 0.0, den = 0.0;
-      for (uint32_t i = 0; i < st.at_n; i++) {
-        const double d = st.at_win[i] - mean;
-        den += d * d;
-        if (i > 0) num += d * (st.at_win[i - 1] - mean);
-      }
-      const double var = den / dn;
-      const double r1 = den > 1.0 ? num / den : 0.0;
-      const double sem = std::sqrt(var / dn);
-      const float tau = this->tune_tau_s_.load(std::memory_order_relaxed);
-      float new_tau = tau;
-      // ONE-SIDED: slow down on ringing only. The speed-up rule ("standing mean with r1 near +1")
-      // was measured 2026-08-28 20:27 firing identically on both boards within a second -- it was
-      // reading the COMMON-MODE timebase wander as sluggish tracking, and would have ratcheted
-      // both to the floor. Loop lag and a moving target are indistinguishable on one device; the
-      // wander is common-mode and cancels between devices, so chasing it faster buys nothing and
-      // costs noise gain. The starting tau is the operator's; autotune only backs off from it.
-      if (r1 < -0.25) {
-        new_tau = std::min(tau * 1.25f, 60.0f);
-      } else if (r1 > 0.7 && std::abs(mean) > 3.0 * sem) {
-        ESP_LOGD(TAG, "SERVOTUNE sluggish-looking window (r1=%+.2f mean=%+.0f) -- not acted on, likely common-mode wander",
-                 r1, mean);
-      }
-      if (new_tau != tau) {
-        this->tune_tau_s_.store(new_tau, std::memory_order_relaxed);
-        ESP_LOGW(TAG, "SERVOTUNE tau %.1f -> %.1f s (r1=%+.2f mean=%+.0f sd=%.0f us over %" PRIu32 " blocks) t=%" PRId64,
-                 tau, new_tau, r1, mean, std::sqrt(std::max(var, 0.0)), st.at_n, now);
-      } else {
-        ESP_LOGD(TAG, "SERVOTUNE hold tau=%.1f s (r1=%+.2f mean=%+.0f sd=%.0f) t=%" PRId64, tau, r1, mean,
-                 std::sqrt(std::max(var, 0.0)), now);
-      }
-      st.at_n = 0;
-    }
-  } else if (st.at_n != 0) {
-    st.at_n = 0;
-  }
-
-  // THE one clean exit: an in-range block on a shared mapping with fresh tags. Only here does the
-  // WS3.1 invariant apply, so only here is the gate released.
-  st.dl_oor = false;
-
-  // Own short line, throttled by time -- never a tail on a report line (the 256-byte ceiling).
-  if (now - st.dl_log_us >= DL_LOG_INTERVAL_US) {
-    st.dl_log_us = now;
-    ESP_LOGD(TAG, "DLLOOP err=%+" PRId64 " us trim=%+.2f int=%+.2f ppm kp=%.3f n=%" PRIu32 " dt=%.2f t=%" PRId64,
-             st.dl_err_us, st.trim_applied_ppm, st.trim_integral_ppm, kp, n, dt_s, now);
-  }
-
-  // WS3.1 INVARIANT LINE. Own short line, fixed field count, no variable-length tail -- the
-  // 256-byte ceiling rule, and this one is meant to be COUNTED from, which is exactly the use
-  // that the truncated `Sync:` line silently corrupted (three retracted findings). `thr` is the
-  // splice threshold IN FORCE, not the compiled default: `splice_us` is a runtime override
-  // (set_servo_param) that can defeat the invariant, so a zero-ops report is only meaningful
-  // beside the threshold that produced it. `d` is the delta since the last line, so a reader
-  // never has to difference two absolute counters across a reboot.
-  if (now - st.conv_inv_log_us >= DL_LOG_INTERVAL_US) {
-    st.conv_inv_log_us = now;
-    const int32_t thr_now = this->tune_splice_us_.load(std::memory_order_relaxed);
-    // qops/qframes ARE THE INVARIANT (converged AND no reference step outstanding); ops/frames are
-    // the ungated totals, which include correct step-tracking and must not be read as breaches.
-    ESP_LOGD(TAG,
-             "FRAMEINV qops=%" PRIu32 " qframes=%" PRIu32 " ops=%" PRIu32 " d=%" PRIu32
-             " frames=%" PRIu32 " conv=%d oor=%d thr=%" PRId32 " us",
-             st.conv_ops_q, st.conv_frames_q, st.conv_ops, st.conv_ops - st.conv_ops_last_log,
-             st.conv_frames, st.converged ? 1 : 0, st.dl_oor ? 1 : 0,
-             thr_now >= 0 ? thr_now : static_cast<int32_t>(this->config_.fast_splice_threshold_us));
-    st.conv_ops_last_log = st.conv_ops;
-  }
 }
 #endif  // USE_I2S_RATE_LOCK
 
