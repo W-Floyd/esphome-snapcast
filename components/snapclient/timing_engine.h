@@ -258,6 +258,10 @@ class Engine {
   int32_t in_flight_frames_ = 0;
   int64_t in_flight_since_us_ = 0;
 
+  /// Last commanded rate and whether one has been issued: a continuous actuator's command must
+  /// not step, so each new command is slew-limited from the previous one.
+  float last_rate_cmd_ = 0.0f;
+  bool rate_cmd_seeded_ = false;
   int64_t last_obs_us_ = 0;
   uint32_t suppressed_ = 0;
 };

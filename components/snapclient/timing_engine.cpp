@@ -618,7 +618,35 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // -- tracking the server is then the only meaning "in sync" has.
   const float p_raw = proportional_gain_ppm_per_us() * static_cast<float>(e_position);
   const float p_term = std::clamp(p_raw, -profile_.rate_authority_ppm, profile_.rate_authority_ppm);
-  cmd.rate_ppm = crystal_ppm_ + p_term;
+
+  // SLEW-LIMIT THE COMMAND. A continuous actuator's command should be continuous -- that is the
+  // whole reason to prefer rate over position -- and a command that steps forfeits it.
+  //
+  // P is proportional, so whatever steps the FILTER steps the command with it. The jump detector
+  // does precisely that by design: on a confirmed step it snaps the mean to the observation, and
+  // P then slams by Kp * step, about 100 ppm for a 200 us jump. Measured on the bench after the
+  // boolean gate was removed: the trim is smooth at 3-5 ppm per report most of the time, with
+  // occasional excursions of 49-117 ppm -- board b's applied trim read
+  // +115 +58 +56 +55 +47 +56 +73 +66 across consecutive reports. Removing the boolean
+  // discontinuity had left a snap discontinuity in its place.
+  //
+  // A jump in the differential is a DISPLACEMENT, which is what the position actuator is for: it
+  // exceeds the coarse gate and is corrected there. Rate owns the continuous part, so its command
+  // may traverse the full authority over one horizon and no faster. Derived from the authority
+  // and the horizon, so it carries no time of its own.
+  const float horizon_s = std::max(1e-3f, static_cast<float>(profile_.rate_horizon_us()) / 1e6f);
+  // dt bounded by the horizon for the same reason the integral's is: a long gap means
+  // observability was lost, not that the command earned the right to jump.
+  const float dt_cmd_s =
+      dt_us > 0 ? std::min(static_cast<float>(dt_us) / 1e6f, horizon_s) : 0.0f;
+  const float max_slew_ppm = profile_.rate_authority_ppm * (dt_cmd_s / horizon_s);
+  const float want = crystal_ppm_ + p_term;
+  cmd.rate_ppm =
+      rate_cmd_seeded_
+          ? last_rate_cmd_ + std::clamp(want - last_rate_cmd_, -max_slew_ppm, max_slew_ppm)
+          : want;
+  rate_cmd_seeded_ = true;
+  last_rate_cmd_ = cmd.rate_ppm;
   cmd.decision.act = differential ? Decision::Act::Rate : Decision::Act::Hold;
   cmd.decision.why =
       differential ? (frames == 0 ? Decision::Why::WithinFrame : Decision::Why::RateOnly)
