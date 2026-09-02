@@ -2818,6 +2818,12 @@ void SnapcastClient::player_task_() {
     // The first block after the guard interval judges the last tag-driven correction: |err_tag|
     // still >= 75% of what it was = a miss. Three in a row fault the tag path for TAG_FAULT_US,
     // during which every consumer of "tags live" falls back to the ledger.
+    // MEASURE FIRST, ONCE PER CHUNK. This call used to live inside the ladder's median-window
+    // branch, so deleting that branch left the measurement uncalled: no observation ever reached
+    // the engine (why=NoEvidence on every decision), st.dl_err_us never updated, and
+    // publish_render_phase_ never ran, which killed the group phase exchange as well. Nothing
+    // gates it -- an unconditional measurement is the point.
+    this->delay_measure_(st);
     const bool tags_fresh = st.dl_have_err && now_us() - st.dl_err_at_us < DL_ERR_STALE_US;
     // In the resync window (see ServoState::post_event_until_us) the coarse path may act again as
     // soon as tags post-date the previous action by resync_blank_ms, and with a 4x step: a 300 ms
