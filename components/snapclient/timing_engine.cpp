@@ -207,7 +207,8 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // on the bench: ring 1724 ms -> 26 ms, then err climbing 3 ms per report while the loop dropped
   // 5584 frames a time. Rate holds the learned offset; nothing is integrated, because the error is
   // not telling us about the clock.
-  if (obs.buffer_us > 0 && obs.buffer_us < profile_.measurement_lag_us) {
+  if (obs.buffer_us > 0 && profile_.buffer_floor_us > 0 &&
+      obs.buffer_us < profile_.buffer_floor_us) {
     cmd.rate_ppm = crystal_ppm_;
     cmd.decision.act = Decision::Act::Hold;
     cmd.decision.why = Decision::Why::NoEvidence;
@@ -235,7 +236,25 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       const float dt_s = dt > 0 ? static_cast<float>(dt) / 1e6f : 0.0f;
       const float tau_s = std::max(1e-3f, static_cast<float>(profile_.filter_lag_us()) / 1e6f);
       const float alpha = dt_s > 0.0f ? 1.0f - std::exp(-dt_s / tau_s) : 0.0f;
-      err_mean_us_ += alpha * (x - err_mean_us_);
+      // RATE-LIMIT THE INNOVATION. Between two observations dt apart, the true error can only
+      // move by what the plant can do: the rate range times dt, plus one frame for a correction
+      // that may have landed. A 30 ms jump between samples 25 ms apart is 1.2 MILLION ppm -- the
+      // plant cannot do that, so such a sample is a measurement fault (tag mis-identity, a resync
+      // that moved audio without telling us, an epoch step), not a displacement.
+      //
+      // Unfiltered, one such spike moves err_mean by alpha * 30 ms = 495 us at this cadence --
+      // ten times the coarse gate -- and buys a ~22 frame step. In the two-board simulator with
+      // transients at the rate the bench delivers, that produced 240 corrections and 44 ms of p90
+      // skew REGARDLESS of authority, which is why raising authority did nothing.
+      //
+      // Clamping rather than discarding: a genuinely large move is still tracked, just over
+      // several samples instead of one, and a spike contributes only its bounded share.
+      const float plant_ppm_span = profile_.rate_authority_ppm + CRYSTAL_LIMIT_PPM;
+      const float max_move_us =
+          plant_ppm_span * dt_s + static_cast<float>(profile_.frame_us());
+      const float innovation =
+          std::clamp(x - err_mean_us_, -max_move_us, max_move_us);
+      err_mean_us_ += alpha * innovation;
       // Noise from CONSECUTIVE DIFFERENCES, not from the spread about the mean. |x - mean|
       // counts the loop's own slow excursion as measurement noise, and since Kp = budget/sigma_e
       // that feeds back: a wider excursion lowers the gain, which widens the excursion. Measured
@@ -280,8 +299,32 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   bool differential = true;
   int64_t e_diff = 0;
   bool have_diff = false;
+  float gd_sigma_us = 0.0f;
   if (group.present && group.contributors > 1) {
-    e_diff = group.delta_us;
+    // FILTERED, with the same discipline as the deadline error: same time constant from the
+    // measured transport delay, same consecutive-difference noise estimate, same innovation
+    // rate-limit. Acting on the raw delta is what made single measurement spikes into whole-frame
+    // steps -- the filter existed but only covered a signal position had stopped using.
+    const float gx = static_cast<float>(group.delta_us);
+    if (!gd_seeded_) {
+      gd_mean_us_ = gx;
+      gd_last_us_ = gx;
+      gd_diff_us_ = static_cast<float>(profile_.frame_us());
+      gd_seeded_ = true;
+    } else {
+      const int64_t gdt = gd_last_at_us_ > 0 ? now_us - gd_last_at_us_ : 0;
+      const float gdt_s = gdt > 0 ? static_cast<float>(gdt) / 1e6f : 0.0f;
+      const float gtau_s = std::max(1e-3f, static_cast<float>(profile_.filter_lag_us()) / 1e6f);
+      const float galpha = gdt_s > 0.0f ? 1.0f - std::exp(-gdt_s / gtau_s) : 0.0f;
+      const float gspan = profile_.rate_authority_ppm + CRYSTAL_LIMIT_PPM;
+      const float gmax = gspan * gdt_s + static_cast<float>(profile_.frame_us());
+      gd_mean_us_ += galpha * std::clamp(gx - gd_mean_us_, -gmax, gmax);
+      gd_diff_us_ += galpha * (std::fabs(gx - gd_last_us_) - gd_diff_us_);
+      gd_last_us_ = gx;
+    }
+    gd_last_at_us_ = now_us;
+    gd_sigma_us = std::max(0.8862f * gd_diff_us_, 0.25f * static_cast<float>(profile_.frame_us()));
+    e_diff = static_cast<int64_t>(std::llround(gd_mean_us_));
     have_diff = true;
     differential = std::llabs(e_diff) >= profile_.target_position_us;
   }
@@ -303,8 +346,12 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
           : tau_gate_s;
   const float alpha_eff = std::min(1.0f, 1.0f - std::exp(-obs_dt_s / tau_gate_s));
   const float sigma_filtered = sigma_e_us() * std::sqrt(std::max(1e-6f, alpha_eff) / 2.0f);
+  // Gate on the noise of the signal position TESTS. With position on the differential error, a
+  // gate sized from the deadline error's noise is measuring the wrong distribution.
+  const float gate_sigma =
+      have_diff ? gd_sigma_us * std::sqrt(std::max(1e-6f, alpha_eff) / 2.0f) : sigma_filtered;
   const int64_t coarse_gate_us =
-      frame_us + static_cast<int64_t>(std::llround(2.0f * sigma_filtered));
+      frame_us + static_cast<int64_t>(std::llround(2.0f * gate_sigma));
   // Rate owns anything it can still reach. needed_ppm is what would remove the filtered error
   // within one horizon; while that is inside the loop's authority, a frame correction is not a
   // last resort but a shortcut -- and an irreversible one, quantised to 22.68 us, against an

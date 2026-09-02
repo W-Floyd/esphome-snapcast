@@ -3597,6 +3597,11 @@ void SnapcastClient::player_task_() {
         this->ring_depth_us_.store(static_cast<int64_t>(this->pcm_ring_->available()) * 1000000 /
                                        (static_cast<int64_t>(fb_h) * rec.params.sample_rate),
                                    std::memory_order_relaxed);
+        // Capacity, not fill: the starvation floor and the implausibility bound are both derived
+        // from it, and both need a value that does not collapse when the buffer empties.
+        this->ring_capacity_us_.store(static_cast<int64_t>(this->config_.buffer_size) * 1000000 /
+                                          (static_cast<int64_t>(fb_h) * rec.params.sample_rate),
+                                      std::memory_order_relaxed);
       }
     }
     this->playout_mutex_.unlock();
@@ -4240,6 +4245,12 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // The clamp was doing stability duty as well as noise duty, and only the noise part was
   // documented.
   prof.rate_authority_ppm = 100.0f;
+  // Starvation floor: an eighth of the ring's CAPACITY, from the mirror updated where the frame
+  // size is known. Dimensionless and config-derived, so it moves with buffer_size and the sample
+  // rate and carries no time of its own -- and, unlike the measurement lag it used to be keyed
+  // to, it cannot drift out from under the guard when an unrelated quantity is redefined. At the
+  // bench's 2972 ms capacity this is ~371 ms, above the 500 ms "ring low" band a keeps entering.
+  prof.buffer_floor_us = this->ring_capacity_us_.load(std::memory_order_relaxed) / 8;
   prof.target_position_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
 
@@ -5154,9 +5165,15 @@ void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, ui
       if (st.rate_lock_ok) {
         ESP_LOGD(TAG,
                  "TRIMDBG applied=%+.2f ppm samples=%" PRIu32 " railed=%" PRIu32 " span=%+.0f..%+.0f "
-                 "dl=%d dlups=%" PRIu32 " gate=%d lock=%d conv=%d err=%" PRId32,
+                 "dith=%.3f ppm dl=%d dlups=%" PRIu32 " gate=%d lock=%d conv=%d err=%" PRId32,
                  this->rate_lock_->applied_ppm(), st.trim_samples, st.trim_railed,
                  st.trim_samples > 0 ? st.trim_min_ppm : 0.0f, st.trim_samples > 0 ? st.trim_max_ppm : 0.0f,
+                 // Dither bracket width, ppm. 0.000 means the requested ratio is EXACTLY
+                 // representable and there is nothing to dither between -- which is the normal
+                 // state at trim 0, since 160 MHz / (44100 * 256) is 14 + 76/441 and 441 <= 511.
+                 // It was invisible until now: "does it dither?" could only be answered from the
+                 // wire, and a signal that exists but is never logged looks like it never happened.
+                 this->rate_lock_->dither_gap_ppm(),
                  st.dl_active ? 1 : 0, st.dl_updates, st.gate_seen ? 1 : 0, st.gate_rate_lock_ok ? 1 : 0,
                  st.gate_converged ? 1 : 0, st.gate_median_err_us);
       } else {

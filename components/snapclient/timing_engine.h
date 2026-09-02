@@ -52,6 +52,14 @@ struct Profile {
   int64_t position_delay_us = 1250000;
   /// Position accuracy aimed at; sets the rate-command noise budget.
   int64_t target_position_us = 20;
+  /// Buffer level below which the board is treated as STARVED and the loop holds. Supplied by
+  /// the transport, because only it knows the ring's capacity.
+  ///
+  /// This was keyed to measurement_lag_us when that meant the pipeline (~250 ms). measurement_lag
+  /// then became the measured observation cadence (~47 ms), and the threshold silently fell 5x
+  /// with it -- so the guard stopped firing while the ring drained to 500 ms and below, 65 times
+  /// in one session. Two quantities that happened to be close, and then one of them moved.
+  int64_t buffer_floor_us = 0;
   /// How much rate the loop may command on top of the crystal, from the transport that owns the
   /// actuator. AUTHORITY, not noise: Kp = budget/sigma_e already bounds the injected noise, so
   /// clamping the output to the budget as well capped correction at one sigma and made position
@@ -190,6 +198,16 @@ class Engine {
   float err_mean_us_ = 0.0f;
   float err_diff_us_ = 0.0f;   ///< EWMA of |e_k - e_(k-1)|: noise, immune to slow drift
   float err_last_us_ = 0.0f;
+
+  // The DIFFERENTIAL error gets its own filter and its own noise estimate. Position acts on this
+  // signal, not on the deadline error, so smoothing only the latter left the position path acting
+  // on a raw one: gd is 8-42 us of noise on this bench before any transient, against a 47 us gate,
+  // so single spikes bought whole-frame steps.
+  float gd_mean_us_ = 0.0f;
+  float gd_diff_us_ = 0.0f;
+  float gd_last_us_ = 0.0f;
+  bool gd_seeded_ = false;
+  int64_t gd_last_at_us_ = 0;
   bool err_seeded_ = false;
 
   // Net position movement, for the rate credit. A single correction is not a rate measurement;
