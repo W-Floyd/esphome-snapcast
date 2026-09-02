@@ -4893,7 +4893,12 @@ void SnapcastClient::delay_loop_update_(ServoState &st) {
   // reverts to tracking gain and stops amplifying its own noise into the wire.
   const float boost_floor =
       static_cast<float>(this->tune_boost_floor_us_.load(std::memory_order_relaxed));
-  if (this->tsf_sync_ != nullptr) {
+  if (this->guard_off(GUARD_GD_BOOST)) {
+    // Boost ablated: the differential residual runs at tracking gain like everything else. The
+    // cheapest possible model of this term -- no term at all -- and the arm that says what the
+    // boost is actually buying.
+    boost_err = 0.0f;
+  } else if (this->tsf_sync_ != nullptr) {
     const int32_t gd_boost = this->tsf_sync_->render_group_delta_us();
     const int32_t n_phase = this->tsf_sync_->group_delta_n();
     if (gd_boost != INT32_MIN && n_phase > 1) {
@@ -5408,9 +5413,11 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     const uint32_t mask = static_cast<uint32_t>(value);
     this->tune_guard_mask_.store(mask, std::memory_order_relaxed);
     ESP_LOGI(TAG,
-             "GUARDS mask=0x%02" PRIx32 " tag_blank=%d gap_blank=%d ledger_stable=%d trim_hold=%d t=%" PRId64,
+             "GUARDS mask=0x%02" PRIx32 " tag_blank=%d gap_blank=%d ledger_stable=%d trim_hold=%d "
+             "gd_boost=%d t=%" PRId64,
              mask, (mask & GUARD_TAG_BLANK) ? 0 : 1, (mask & GUARD_GAP_BLANK) ? 0 : 1,
-             (mask & GUARD_LEDGER_STABLE) ? 0 : 1, (mask & GUARD_TRIM_HOLD) ? 0 : 1, now_us());
+             (mask & GUARD_LEDGER_STABLE) ? 0 : 1, (mask & GUARD_TRIM_HOLD) ? 0 : 1,
+             (mask & GUARD_GD_BOOST) ? 0 : 1, now_us());
   } else if (name == "tag_stale_ms") {
     if (!(value >= 200.0f && value <= 10000.0f)) return false;
     this->tune_tag_stale_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);

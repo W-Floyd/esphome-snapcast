@@ -101,6 +101,17 @@ enum GuardBit : uint32_t {
   /// results mean nothing. Run it first, expect a regression, and only trust the rest if you see
   /// one.
   GUARD_TRIM_HOLD = 1u << 3,
+  /// The gd boost is off entirely: the differential residual runs at tracking gain like
+  /// everything else. Fires on: any differential error at all, so it is exercised continuously
+  /// -- unlike the bits above, this one needs no injection to be under test.
+  ///
+  /// THIS BIT ABLATES A GAIN, NOT A GUARD, and it is in this mask because the mask is the one
+  /// runtime surface for "make the model smaller". The boost exists to converge a genuinely
+  /// differential residual quickly, so switching it off should COST convergence speed after a
+  /// real differential step while removing the 4.2x amplification of gd's own noise. That
+  /// trade is the measurement; with floor/off/on all reachable at runtime it is three arms of
+  /// one build rather than three flashes.
+  GUARD_GD_BOOST = 1u << 4,
 };
 
 // NOT WIRED, and deliberately absent from the enum rather than present and inert:
