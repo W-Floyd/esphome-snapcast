@@ -24,6 +24,15 @@
 
 using namespace esphome::snapclient::timing;
 
+// The real intervals, from clock_sync/tsf_sync: beacons at 1 Hz, phases paired only within
+// 300 ms, a kept delta expiring at 15 s.
+constexpr int64_t BEACON_INTERVAL_US = 1000000;
+constexpr int64_t PHASE_PAIR_WINDOW_US = 300000;
+constexpr int64_t PHASE_STALE_US = 15000000;
+constexpr int64_t GROUP_DELTA_STALE_US = 15000000;
+static long gd_ticks = 0, gd_present_ticks = 0, gd_fresh_ticks = 0;
+static double gd_age_sum_us = 0.0;
+
 namespace {
 
 int failures = 0;
@@ -44,6 +53,13 @@ struct Board {
   int corrections = 0;
   long gross_frames = 0;
   double phase_us = 0.0;    // what it publishes
+  int64_t phase_at_us = 0;  // and when it sampled it -- pairing needs both
+  int64_t last_beacon_us = -1000000;
+  double heard_phase_us[4] = {};
+  int64_t heard_at_us[4] = {};
+  bool heard_valid[4] = {};
+  int64_t last_gd_us = 0;
+  int64_t last_gd_at_us = 0;
   double own_deadline_us = 0.0;   // this board's own deadline steps (re-anchors)
   explicit Board(const Profile &p) : eng(p) {}
 };
@@ -109,16 +125,30 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
   std::normal_distribution<double> nd(0.0, noise_us);
   const int64_t tick = 25000;
   std::vector<double> skews, errs;
+  gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
 
   for (int64_t t = 0; t < static_cast<int64_t>(seconds * 1e6); t += tick) {
     deadline_shift += common_ppm * 1e-6 * static_cast<double>(tick);
 
-    // group delta as tsf_sync computes it: mean of all phases INCLUDING self, so a two-board
-    // group reports half the true pairwise difference and the engine unhalves it.
-    double mean_phase = 0.0;
-    for (auto &x : b) mean_phase += x.phase_us;
-    mean_phase /= static_cast<double>(b.size());
+    // BEACONS, not telepathy. Every board learns its peers' phases only from beacons, and this
+    // simulator previously read them out of the other objects instantly, every 25 ms tick, with
+    // the set always complete. The real path is 1 Hz beacons, a 300 us... 300 MS pairing window
+    // that the code's own comment says "leaves 0-2 contributors 94% of the time", and INT32_MIN
+    // when nothing pairs. Both actuators now steer on the differential, so its cadence and
+    // availability are load-bearing -- and were the one thing here that was free.
+    for (size_t i = 0; i < b.size(); i++) {
+      if (t - b[i].last_beacon_us >= BEACON_INTERVAL_US) {
+        b[i].last_beacon_us = t;
+        // What the beacon carries: this board's phase AND the instant it was sampled.
+        for (size_t j = 0; j < b.size(); j++) {
+          if (j == i) continue;
+          b[j].heard_phase_us[i] = b[i].phase_us;
+          b[j].heard_at_us[i] = t;
+          b[j].heard_valid[i] = true;
+        }
+      }
+    }
 
     for (size_t i = 0; i < b.size(); i++) {
       Board &x = b[i];
@@ -164,6 +194,7 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
       // declares a purely common error "differential". Publishing it noiseless makes the gate
       // look perfect.
       x.phase_us = measured + nd(rng) * 0.25;
+      x.phase_at_us = t;
       x.obs.emplace_back(t, measured + nd(rng));
       double seen = x.obs.front().second;
       while (x.obs.size() > 1 && x.obs.front().first <= t - p.measurement_lag_us) {
@@ -171,10 +202,39 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         x.obs.pop_front();
       }
 
+      // PAIR ONLY PHASES SAMPLED AT ROUGHLY THE SAME INSTANT, as recompute_group_delta_ does:
+      // these are absolute offsets drifting continuously, so differencing a fresh peer phase
+      // against a stale local one measures drift, not skew.
       GroupEvidence g{};
-      g.present = true;
-      g.contributors = static_cast<uint8_t>(b.size());
-      g.delta_us = static_cast<int64_t>(std::llround(x.phase_us - mean_phase));
+      double sum = 0.0;
+      size_t n_contrib = 1;              // self is in the group, hence the halving
+      for (size_t j = 0; j < b.size(); j++) {
+        if (j == i || !x.heard_valid[j]) continue;
+        const int64_t pair_gap = x.heard_at_us[j] - x.phase_at_us;
+        if (pair_gap > PHASE_PAIR_WINDOW_US || pair_gap < -PHASE_PAIR_WINDOW_US) continue;
+        if (t - x.heard_at_us[j] > PHASE_STALE_US) continue;
+        sum += x.heard_phase_us[j] - x.phase_us;
+        n_contrib++;
+      }
+      if (n_contrib >= 2) {
+        const double mean_rel = sum / static_cast<double>(n_contrib);
+        g.present = true;
+        g.contributors = static_cast<uint8_t>(n_contrib);
+        g.delta_us = static_cast<int64_t>(std::llround(-mean_rel));
+        x.last_gd_us = g.delta_us;
+        x.last_gd_at_us = t;
+        gd_fresh_ticks++;
+      } else if (x.last_gd_at_us != 0 && t - x.last_gd_at_us <= GROUP_DELTA_STALE_US) {
+        // Keep the last valid delta rather than reporting unknown, as tsf_sync does.
+        g.present = true;
+        g.contributors = 2;
+        g.delta_us = x.last_gd_us;
+      }
+      if (g.present) {
+        gd_present_ticks++;
+        gd_age_sum_us += static_cast<double>(t - x.last_gd_at_us);
+      }
+      gd_ticks++;
 
       // UNANNOUNCED move: the resync path shifts the audio and the engine is never told.
       // A HARD RESYNC, as the client actually performs one: it fires when the board is already
@@ -214,6 +274,18 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
       skews.push_back(std::fabs(b[1].err_us - b[0].err_us));
       errs.push_back(std::fabs(b[0].err_us + deadline_shift));
     }
+  }
+  // How often the differential was AVAILABLE at all. The code's own comment says the 300 ms
+  // pairing window "leaves 0-2 contributors 94% of the time", and both actuators now steer on
+  // this signal -- so its availability is a property worth reporting, not assuming.
+  // Present is not the same as fresh: tsf_sync KEEPS the last valid delta for up to 15 s rather
+  // than reporting unknown, so "present" is ~always true once one pairing has happened. What
+  // matters to an actuator steering on it is how OLD the number is.
+  if (gd_ticks > 0 && gd_present_ticks > 0) {
+    printf("        [gd present %.0f%% of decisions, FRESHLY PAIRED on %.1f%%, mean age %.0f ms]\n",
+           100.0 * gd_present_ticks / static_cast<double>(gd_ticks),
+           100.0 * gd_fresh_ticks / static_cast<double>(gd_ticks),
+           gd_age_sum_us / static_cast<double>(gd_present_ticks) / 1000.0);
   }
   std::sort(skews.begin(), skews.end());
   std::sort(errs.begin(), errs.end());
