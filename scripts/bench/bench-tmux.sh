@@ -46,6 +46,7 @@ ROLES="a b observer"
 WANT_ANALYZER=1
 DRY_RUN=0
 FLASH_ROLES=""
+FLASH_FORCE=0
 
 # The analyser invocation, from HANDOFF.md. --samples 200000 is load-bearing: a run that
 # dropped it came back with rival = 0.942 on every row, i.e. whole-frame errors masquerading
@@ -593,6 +594,19 @@ cmd_flash() {
         case " ${configs} " in *" ${cfg} "*) continue ;; esac
         configs="${configs} ${cfg}"
     done
+    # DO NOT BUILD ON THE CAPTURE HOST WHILE IT IS MEASURING. A PlatformIO build is the
+    # heaviest thing that runs on this bench: CLAUDE.md records captures stalling 10-12 s at
+    # load 5.0, and doing it here with the analyser plus three serial loggers live took the
+    # machine off the network entirely -- ping answered, sshd could not complete a banner
+    # exchange, and it needed a reboot, which ended the capture and the tmux session with it.
+    # Build somewhere else and OTA from there, or stop the analyser first.
+    if [ -n "$(pane_id_for analyzer analyzer)" ] && ! pane_dead "$(pane_id_for analyzer analyzer)" \
+       && [ "${FLASH_FORCE}" != 1 ]; then
+        die "the analyser is running on this host -- a build here starves the capture (it has
+  already cost a reboot). Either flash from another machine on the LAN:
+      ./scripts/flash.sh -c <config> --docker --no-log -p <hosts>
+  or stop the capture first ('$0 stop'), or pass --force-build-here if you mean it."
+    fi
     for cfg in ${configs}; do
         hosts=""
         for role in ${FLASH_ROLES}; do
@@ -653,6 +667,7 @@ while [ $# -gt 0 ]; do
         start|status|stop|attach|discover|pins) CMD="$1"; shift ;;
         flash) CMD=flash; shift ;;
         --all) FLASH_ROLES="${ROLES}"; shift ;;
+        --force-build-here) FLASH_FORCE=1; shift ;;
         a|b|observer) FLASH_ROLES="${FLASH_ROLES} $1"; shift ;;
         --no-analyzer) WANT_ANALYZER=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
