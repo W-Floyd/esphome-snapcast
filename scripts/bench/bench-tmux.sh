@@ -26,6 +26,7 @@
 #   scripts/bench/bench-tmux.sh start        # start/repair everything, idempotent
 #   scripts/bench/bench-tmux.sh status       # is it actually capturing?
 #   scripts/bench/bench-tmux.sh pins         # probe pins <-> board roles, the sign of B−A
+#   scripts/bench/bench-tmux.sh flash a b    # OTA those boards, batched, capture left running
 #   scripts/bench/bench-tmux.sh attach
 #   scripts/bench/bench-tmux.sh stop
 #
@@ -44,6 +45,7 @@ MIN_FREE_GB="${BENCH_MIN_FREE_GB:-20}"
 ROLES="a b observer"
 WANT_ANALYZER=1
 DRY_RUN=0
+FLASH_ROLES=""
 
 # The analyser invocation, from HANDOFF.md. --samples 200000 is load-bearing: a run that
 # dropped it came back with rival = 0.942 on every row, i.e. whole-frame errors masquerading
@@ -132,8 +134,8 @@ set_() { eval "$1_$2=\$3"; }                      # set_ SUF a e985e8
 
 load_conf() {
     [ -f "${CONF}" ] || return 0
-    local suffix role log rest ok
-    while read -r suffix role log rest; do
+    local suffix role log cfg rest ok
+    while read -r suffix role log cfg rest; do
         case "${suffix}" in ''|\#*) continue ;; esac
         [ -n "${role}" ] && [ -n "${log}" ] || die "${CONF}: bad line near '${suffix}'"
         ok=0
@@ -141,7 +143,24 @@ load_conf() {
         [ "${ok}" = 1 ] || die "${CONF}: unknown role '${role}' (want one of: ${ROLES})"
         set_ SUF "${role}" "$(printf '%s' "${suffix}" | lower)"
         set_ LOG "${role}" "${log}"
+        # Optional 4th field: the config THIS board runs. Named per board and never inferred
+        # -- flashing the observer with a speaker config puts I2S back on its live DAC and
+        # renames it, which is the documented way to destroy the observer. A board with no
+        # config here simply cannot be flashed by this script.
+        set_ CFG "${role}" "${cfg:-}"
     done < "${CONF}"
+}
+
+# ESPHome's name_add_mac_suffix appends the last three MAC bytes, which is exactly the suffix
+# this script keys on -- so the OTA hostname is derivable from the config rather than being a
+# fifth thing to keep in sync by hand.
+ota_host() {   # <role> -> hostname, or empty
+    local role="$1" cfg name
+    cfg="$(get CFG "${role}")"
+    [ -n "${cfg}" ] && [ -f "${cfg}" ] || return 0
+    name="$(sed -n 's/^  name:[[:space:]]*\([A-Za-z0-9_-]\{1,\}\).*/\1/p' "${cfg}" | head -1)"
+    [ -n "${name}" ] || return 0
+    echo "${name}-$(get SUF "${role}").local"
 }
 
 # Fills PORT_<role> for every attached board named in boards.conf, and reports the rest.
@@ -505,6 +524,102 @@ cmd_pins() {
 EOF
 }
 
+# OTA the named boards, in ONE batch, without disturbing the capture.
+#
+# OTA rather than USB even though every board is on a tty here: serial flashing needs the port,
+# so the logger holding it would have to be killed, and esptool drives DTR/RTS to force ROM
+# download mode. Over OTA the serial loggers stay attached and ride the reboot as a
+# detach/attach, so the logs keep their continuity across the flash -- which matters, because a
+# capture gap is indistinguishable from a firmware that stopped emitting, and it has already
+# turned a clean DECIDE reconciliation into a false MISMATCH on this bench.
+#
+# Roles must be named explicitly, or --all given. A bench flash costs ~5 consensus membership
+# changes per board (|median error| 154 us within 15 s of one, against 93 us elsewhere), so
+# flashing the fleet must be something you asked for, never a default.
+cmd_flash() {
+    local role host cfg configs="" hosts before after rc=0 any=0
+    load_conf
+    [ -n "${FLASH_ROLES}" ] || die "name the roles to flash (e.g. '$0 flash a b') or pass --all"
+
+    # Resolve and check everything BEFORE flashing anything: a batch that dies half way leaves
+    # the bench running two firmware eras, which looks like an inter-board difference.
+    for role in ${FLASH_ROLES}; do
+        cfg="$(get CFG "${role}")"
+        [ -n "${cfg}" ] || die "${role}: no config in ${CONF} (4th field) — refusing to guess which firmware this board runs"
+        [ -f "${cfg}" ] || die "${role}: config not found: ${cfg}"
+        host="$(ota_host "${role}")"
+        [ -n "${host}" ] || die "${role}: cannot derive a hostname from ${cfg} (no 'name:' substitution)"
+        host_up "${host}" || die "${role}: ${host} does not answer — flash it over USB or fix the network first"
+        set_ HOST "${role}" "${host}"
+        any=1
+    done
+    [ "${any}" = 1 ] || die "nothing to flash"
+
+    # The witness, before. compilation_time is what proves which build answered afterwards --
+    # an OTA log saying "successful" does not, since a replug inside the first minute rolls
+    # both halves back and the log still reads clean.
+    for role in ${FLASH_ROLES}; do
+        before="$("$(pyexe)" scripts/bench/device-info.py "$(get HOST "${role}")" 2>/dev/null | cut -f2)"
+        set_ WAS "${role}" "${before:-unknown}"
+        printf '    %-9s %-34s running build %s\n' "${role}" "$(get HOST "${role}")" "${before:-UNREACHABLE (API)}"
+    done
+    if [ "${DRY_RUN}" = 1 ]; then
+        for role in ${FLASH_ROLES}; do
+            echo "    would flash ${role}: $(get CFG "${role}") -> $(get HOST "${role}")"
+        done
+        return 0
+    fi
+
+    # One build per distinct config, all of that config's boards in a single parallel run.
+    for role in ${FLASH_ROLES}; do
+        cfg="$(get CFG "${role}")"
+        case " ${configs} " in *" ${cfg} "*) continue ;; esac
+        configs="${configs} ${cfg}"
+    done
+    for cfg in ${configs}; do
+        hosts=""
+        for role in ${FLASH_ROLES}; do
+            [ "$(get CFG "${role}")" = "${cfg}" ] && hosts="${hosts} $(get HOST "${role}")"
+        done
+        note "flashing${hosts} with ${cfg}"
+        # --no-log: the serial loggers are already capturing, and a second log stream over the
+        # API is airtime spent on the thing under measurement.
+        ./scripts/flash.sh -c "${cfg}" --docker --no-log -p ${hosts} || rc=$?
+        [ "${rc}" = 0 ] || die "flash.sh failed for ${cfg} (exit ${rc}); the bench may now be running two firmware eras"
+    done
+
+    # The witness, after. Wait for each board to answer again rather than sleeping blind.
+    echo
+    note "verifying the running build (device_info compilation_time)"
+    for role in ${FLASH_ROLES}; do
+        host="$(get HOST "${role}")"
+        after=""
+        local i=0
+        while [ "${i}" -lt 30 ]; do
+            after="$("$(pyexe)" scripts/bench/device-info.py "${host}" 2>/dev/null | cut -f2)"
+            [ -n "${after}" ] && break
+            i=$((i + 1)); sleep 2
+        done
+        if [ -z "${after}" ]; then
+            printf '    %-9s %-34s NO ANSWER — verify by hand before trusting any measurement\n' "${role}" "${host}"
+            rc=1
+        elif [ "${after}" = "$(get WAS "${role}")" ]; then
+            printf '    %-9s %-34s UNCHANGED (%s) — the OTA did not take\n' "${role}" "${host}" "${after}"
+            rc=1
+        else
+            printf '    %-9s %-34s now %s\n' "${role}" "${host}" "${after}"
+        fi
+    done
+    cat >&2 <<'EOF'
+
+    Do NOT replug a board for the next minute: a replug that soon after the OTA reboot rolls
+    both halves back to the previous firmware while the OTA log still says "successful".
+    Every board just rebooted, which is ~5 consensus membership changes each -- expect
+    elevated error for ~15 s and do not grade a window that overlaps it.
+EOF
+    return "${rc}"
+}
+
 cmd_stop() {
     have_session || { echo "session '${SESSION}' is not running"; return 0; }
     tmux kill-session -t "${SESSION}"
@@ -519,6 +634,9 @@ CMD=start
 while [ $# -gt 0 ]; do
     case "$1" in
         start|status|stop|attach|discover|pins) CMD="$1"; shift ;;
+        flash) CMD=flash; shift ;;
+        --all) FLASH_ROLES="${ROLES}"; shift ;;
+        a|b|observer) FLASH_ROLES="${FLASH_ROLES} $1"; shift ;;
         --no-analyzer) WANT_ANALYZER=0; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --session) SESSION="${2:?--session requires an argument}"; shift 2 ;;
