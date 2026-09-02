@@ -311,6 +311,25 @@ number:
     type: server_latency          # server-persisted; stays in sync with snapweb
     snapclient_id: snap
     name: Server Latency
+  # Timing tunables, in the frontend and restored across reboots. timing_target_us is the one
+  # that matters: it is the position accuracy the loop aims at, and it prices the rate gain
+  # (sigma_rate <= target / visibility), so lowering it makes the loop quieter and slower.
+  - platform: snapclient
+    type: timing_target_us
+    snapclient_id: snap
+    name: Timing Target
+  - platform: snapclient
+    type: tag_stale_ms
+    snapclient_id: snap
+    name: Tag Stale
+  - platform: snapclient
+    type: blank_ms
+    snapclient_id: snap
+    name: Blank
+  - platform: snapclient
+    type: gap_blank_ms
+    snapclient_id: snap
+    name: Gap Blank
   # SuperMini antennas distort at high power, so LOWER often connects better. The driver
   # quantizes and clamps the request, so only the readback set_max_tx_power logs is real.
   - platform: template

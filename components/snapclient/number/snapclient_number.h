@@ -25,6 +25,24 @@ class SnapclientServerLatencyNumber final : public SnapclientChild, public numbe
   void control(float value) override;
 };
 
+/// @brief Number entity backed by set_servo_param(), one class for every tunable.
+///
+/// The parameter name is set at codegen time, so adding a knob to the frontend is a schema entry
+/// rather than a new class. Values are restored from NVS on boot and re-applied, since a knob the
+/// user moved should survive a reboot.
+class SnapclientServoParamNumber final : public SnapclientChild, public number::Number {
+ public:
+  void setup() override;
+  void dump_config() override;
+  void set_param(const std::string &name) { this->param_ = name; }
+
+ protected:
+  void control(float value) override;
+
+  std::string param_;
+  ESPPreferenceObject pref_;
+};
+
 }  // namespace esphome::snapclient
 
 #endif  // USE_ESP32 && USE_NUMBER

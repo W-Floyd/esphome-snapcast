@@ -977,9 +977,6 @@ class SnapcastClient {
     int64_t rskip_log_at_us{0};         // block the last RSKIP line described (one line per block)
     int64_t resync_step_at_us{0};       // last in-window position step of ANY source (ledger steps wait out the blank too)
     int64_t phase_transient_until_us{0};  // my render phase does not describe my audio until then (steps, hard resyncs, deadline source changes)
-    int64_t decide_log_us{0};            // last Stage 2 DECIDE emit (idle throttle, <= 2 Hz)
-    uint32_t decide_skipped{0};          // chunks the throttle suppressed since the last emit; reported as sk=
-                                         // so the census still accounts for every chunk (see decide_log)
     int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
     uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
     float align_kick_us{0.0f};  // render_align bias change not yet delivered as position (ALIGN KICK)
@@ -1168,6 +1165,9 @@ class SnapcastClient {
   /// Position accuracy the engine aims at (us); sets its rate-command noise budget.
   std::atomic<int32_t> tune_timing_target_us_{20};
   timing::Engine timing_engine_{timing::Profile{}};
+  /// Last crystal value written to NVS, and when: the save is gated on 2 ppm or 10 minutes.
+  float crystal_saved_ppm_{0.0f};
+  int64_t crystal_saved_at_us_{0};
   int64_t timing_log_us_{0};
   /// St8: noise floor (us) subtracted from the differential evidence before it earns the gd
   /// boost. 0 = today's behaviour. See the comment at the boost_err computation for why: the

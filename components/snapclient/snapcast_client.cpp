@@ -2461,12 +2461,10 @@ void SnapcastClient::player_task_() {
   {
     float saved = 0.0f;
     if (this->dl_integral_pref_.load(&saved) && std::isfinite(saved) && std::abs(saved) <= TRIM_CLAMP_MAX_PPM) {
-      st.trim_integral_ppm = saved;
-      st.dl_saved_integral_ppm = saved;
-      st.dl_integral_ema_ppm = saved;
-      st.dl_integral_ema_valid = true;
+      this->timing_engine_.set_crystal_ppm(saved);
+      this->crystal_saved_ppm_ = saved;
       st.dl_cold_start = false;
-      ESP_LOGI(TAG, "Delay loop: integral restored %+.2f ppm from NVS", saved);
+      ESP_LOGI(TAG, "Crystal offset restored %+.2f ppm from NVS", saved);
     }
   }
   // ALIGN BIAS across reboots. Guarded the same way the integral is: a value inside the cap is
@@ -2810,10 +2808,6 @@ void SnapcastClient::player_task_() {
     // and logged from a single point per chunk (see the decide_log lambda below). frames is
     // signed: + = dropped, - = inserted, and reconciles against soft_dropped_frames /
     // soft_inserted_frames / hard_resyncs in the sync report -- the census's pass condition.
-    int32_t decide_frames = 0;
-    int64_t decide_pend_us = 0;
-    int decide_act = 0;                // 0 none, 1 trim, 2 splice, 3 step, 4 resync
-    const char *decide_gate = nullptr;  // first refusing gate, or null for an acted decision
     // COARSE DECISIONS ON THE MEASURED ERROR WHILE TAGS ARE LIVE. The prediction is built from the
     // ledger; repaired, the repair moves real audio (-29/+29 ms pairs, 21:37), unrepaired, its bias
     // rides the common wander into the 50 ms hard-resync threshold (three 50-53 ms resyncs on A in
@@ -2939,57 +2933,6 @@ void SnapcastClient::player_task_() {
     // because this is where the error is known; applied at the two seams below.
     const timing::Command engine_cmd =
         this->timing_step_(st, rec.params.sample_rate, tags_fresh, coarse_err_us);
-
-    // ONE DECIDE PER CHUNK, FROM A SINGLE POINT, FIXED FIELDS, NO VARIABLE-LENGTH TAIL.
-    // Throttled to <= 2 Hz for idle (act=none) chunks -- those dominate steady state and a
-    // per-chunk line is the documented ~38 lines/s that stalls an OTA -- every non-idle decision
-    // always logs. Names first, numeric tail last, so a truncation hits t= and never a name.
-    auto decide_log = [&]() {
-      const int64_t decide_t = now_us();
-      // A TRIM THAT MOVED NO FRAMES IS IDLE FOR THROTTLING PURPOSES. Measured on the bench:
-      // 93 % of all DECIDE lines were act=trim, and in a clean 7-minute window 16,600 of them
-      // moved 350 frames between them -- so the throttle almost never engaged and the census
-      // cost 34 lines/s, ~580 MB per board per day. The trim itself still happens; what is
-      // suppressed is the LINE saying nothing changed.
-      //
-      // Suppressed chunks are COUNTED, not forgotten: sk= carries how many were skipped since
-      // the last emit, so "every chunk accounted for" -- the Stage 2 pass condition -- still
-      // holds exactly, and the frame sums are untouched because a skipped chunk contributes
-      // zero frames by construction.
-      const bool decide_idle = (decide_act == 0) || (decide_act == 1 && decide_frames == 0);
-      if (decide_idle && decide_t - st.decide_log_us < 500000) {
-        st.decide_skipped++;
-        return;  // throttle: at most one such line per 500 ms
-      }
-      st.decide_log_us = decide_t;
-      const char *act_name = "none";
-      switch (decide_act) {
-        case 1: act_name = "trim"; break;
-        case 2: act_name = "splice"; break;
-        case 3: act_name = "step"; break;
-        case 4: act_name = "resync"; break;
-        default: break;
-      }
-      char gd_buf[16];
-      const char *gd_str = "unknown";
-      if (this->tsf_sync_ != nullptr) {
-        const int32_t gd = this->tsf_sync_->render_group_delta_us();
-        if (gd != INT32_MIN) {
-          snprintf(gd_buf, sizeof(gd_buf), "%+" PRId32, gd);
-          gd_str = gd_buf;
-        }
-      }
-      const uint32_t decide_sk = st.decide_skipped;
-      st.decide_skipped = 0;
-      // sk goes AFTER gd and before t: t stays the last field, so a truncation at the 256-byte
-      // ceiling still hits t= and never a name, and a parser that predates sk simply does not
-      // match the optional group.
-      ESP_LOGD(TAG,
-               "DECIDE src=%s cls=none gate=%s act=%s frames=%+d pend=%+" PRId64
-               " gd=%s sk=%" PRIu32 " t=%" PRId64,
-               coarse_on_tags ? "tag" : "ledger", decide_gate != nullptr ? decide_gate : "none", act_name,
-               decide_frames, decide_pend_us, gd_str, decide_sk, decide_t);
-    };
     // Is the LEDGER reading stable enough to step on? During a refill burst it bounces tens of ms
     // chunk to chunk (17:41:53: +41.8, +27.7, +36.4, +42.2 ms on consecutive chunks) and a first step
     // taken then left 1-14 ms for extra correction rounds (build 77 injections: 20/15/10/32 s, the
@@ -3255,9 +3198,6 @@ void SnapcastClient::player_task_() {
       }
       st.converged = st.converged && !mute_now;
       st.resync_drops++;
-      decide_act = 4;                             // resync
-      decide_frames = static_cast<int32_t>(frames);  // whole chunk dropped
-      decide_log();                                // emit here: the branch continues
       this->discard_ring_bytes_(rec.bytes);
       continue;
     }
@@ -3287,8 +3227,6 @@ void SnapcastClient::player_task_() {
                  -error_us / 1000, st.storm_resyncs, RESYNC_STORM_WINDOW_US / 1000000);
       }
       st.converged = st.converged && !mute_now;
-      decide_act = 4;                                     // resync
-      decide_frames = -static_cast<int32_t>(fill);         // silence inserted
       this->push_silence_(fill, rec.params);
     }
 
@@ -3330,7 +3268,6 @@ void SnapcastClient::player_task_() {
           std::max(st.phase_transient_until_us, now_us() + this->visibility_horizon_us());
     }
 
-    decide_log();  // one DECIDE per chunk; the late-resync branch emitted its own above
 
 #ifdef USE_I2S_RATE_LOCK
     // Integrate the REALISED trim over this chunk's audio time. Placed after the whole servo
@@ -4203,6 +4140,23 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
 
   const timing::Command cmd = this->timing_engine_.step(obs.at_us, obs, grp);
 
+  // Persist the learned crystal on the old gate: 10 minutes or 2 ppm of movement, whichever
+  // comes first, so a reboot restores a value that is minutes old at worst rather than zero.
+  // The shutdown hook catches the rest.
+  if (this->tune_persist_.load(std::memory_order_relaxed)) {
+    const float x = this->timing_engine_.crystal_ppm();
+    const bool moved = std::abs(x - this->crystal_saved_ppm_) >= 2.0f;
+    const bool overdue = obs.at_us - this->crystal_saved_at_us_ >= 600000000;
+    if (std::isfinite(x) && x != 0.0f && (moved || overdue) &&
+        this->crystal_saved_at_us_ != obs.at_us) {
+      if (this->dl_integral_pref_.save(&x)) {
+        this->crystal_saved_ppm_ = x;
+        this->crystal_saved_at_us_ = obs.at_us;
+        ESP_LOGD(TAG, "Crystal offset %+.2f ppm persisted t=%" PRId64, x, obs.at_us);
+      }
+    }
+  }
+
   const int64_t tnow = obs.at_us;
   if (cmd.frames != 0 || tnow - this->timing_log_us_ >= 2000000) {
     this->timing_log_us_ = tnow;
@@ -4462,10 +4416,10 @@ void SnapcastClient::mark_kp_event_(ServoState &st, const char *why) {
 // 10 min / 2 ppm, so the value on flash could be minutes to hours old at the moment of reboot.
 void SnapcastClient::persist_now() {
 #ifdef USE_I2S_RATE_LOCK
-  float v = this->dl_integral_ema_mirror_.load(std::memory_order_relaxed);
+  const float v = this->timing_engine_.crystal_ppm();
   if (std::isfinite(v) && v != 0.0f && std::abs(v) <= TRIM_CLAMP_MAX_PPM && this->dl_integral_pref_.save(&v)) {
     global_preferences->sync();
-    ESP_LOGI(TAG, "Delay loop: integral %+.2f ppm persisted at shutdown", v);
+    ESP_LOGI(TAG, "Crystal offset %+.2f ppm persisted at shutdown", v);
   }
 #endif
 }

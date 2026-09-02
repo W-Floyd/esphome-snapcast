@@ -101,6 +101,10 @@ class Engine {
   /// Learned per-board plant rate offset, ppm.
   float crystal_ppm() const { return crystal_ppm_; }
 
+  /// Seed it from NVS at boot. The offset is a property of the hardware, not the session, so
+  /// relearning it every boot costs the whole wind-up transient for nothing.
+  void set_crystal_ppm(float ppm);
+
   /// Current estimate of the error signal's own noise (us, 1-sigma). The proportional gain is
   /// budget/sigma_e, so a noisier measurement earns less gain.
   float sigma_e_us() const;

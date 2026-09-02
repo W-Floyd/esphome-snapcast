@@ -27,6 +27,34 @@ void SnapclientServerLatencyNumber::control(float value) {
   this->publish_state(value);
 }
 
+void SnapclientServoParamNumber::setup() {
+  // Restore and re-apply: a knob moved in the frontend should survive a reboot, and the servo
+  // only learns about it by being told.
+  this->pref_ = global_preferences->make_preference<float>(this->get_object_id_hash());
+  float restored = NAN;
+  if (this->pref_.load(&restored) && std::isfinite(restored)) {
+    this->publish_state(restored);
+    if (this->parent_ != nullptr) {
+      this->parent_->set_servo_param(this->param_, restored);
+    }
+  } else {
+    this->publish_state(this->traits.get_min_value());
+  }
+}
+
+void SnapclientServoParamNumber::control(float value) {
+  if (this->parent_ != nullptr) {
+    this->parent_->set_servo_param(this->param_, value);
+  }
+  this->pref_.save(&value);
+  this->publish_state(value);
+}
+
+void SnapclientServoParamNumber::dump_config() {
+  LOG_NUMBER("", "Snapclient servo parameter", this);
+  ESP_LOGCONFIG(TAG, "  Parameter: %s", this->param_.c_str());
+}
+
 }  // namespace esphome::snapclient
 
 #endif  // USE_ESP32 && USE_NUMBER

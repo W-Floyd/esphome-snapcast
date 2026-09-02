@@ -20,6 +20,11 @@ constexpr float CRYSTAL_LIMIT_PPM = 200.0f;
 constexpr float ERR_ALPHA = 0.02f;
 }  // namespace
 
+void Engine::set_crystal_ppm(float ppm) {
+  if (!std::isfinite(ppm)) return;
+  crystal_ppm_ = std::clamp(ppm, -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
+}
+
 void Engine::reset() {
   crystal_ppm_ = 0.0f;
   crystal_at_us_ = 0;
