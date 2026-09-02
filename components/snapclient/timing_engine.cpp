@@ -19,8 +19,12 @@ constexpr uint32_t CREDIT_MIN_CORRECTIONS = 3;
 /// in one 69-frame step implied 156 ppm of "rate", which wound the estimate to its clamp. A
 /// sustained offset still converges, over several windows.
 constexpr float CREDIT_MAX_PPM_PER_WINDOW = 5.0f;
-/// A crystal moves with temperature over minutes, so learn it slowly.
-constexpr float CRYSTAL_TAU_S = 300.0f;
+/// Phase margin for the crystal integral, in visibility horizons: wn = 1/(this * visibility).
+/// K=3 measured at median |error| 7-15 us with <=14 ppm overshoot at horizons up to 3 s; K=1.5
+/// overshot 80 ppm at a 1 s horizon and K=5 was needlessly slow. Not a time constant -- the
+/// horizon supplies the timescale, so this stays dimensionless and no constant here is tied to
+/// rate, chunk size or sample depth.
+constexpr float CRYSTAL_DELAY_MARGIN = 3.0f;
 /// A crystal is tens of ppm; hundreds means the estimate is tracking something else.
 constexpr float CRYSTAL_LIMIT_PPM = 200.0f;
 /// Error-filter time constant. A TIME, not a weight: a fixed weight makes the filter's timescale
@@ -54,10 +58,18 @@ void Engine::reset() {
 int64_t Engine::filter_lag_us() { return static_cast<int64_t>(ERR_TAU_S * 1e6f); }
 
 float Engine::sigma_e_us() const {
-  // 1.25 * MAD approximates sigma for a Gaussian. Floored at a quarter frame so a briefly quiet
-  // measurement cannot produce unbounded gain.
-  const float floor_us = 0.25f * static_cast<float>(profile_.frame_us());
-  return std::max(1.25f * err_mad_us_, floor_us);
+  // Floored at ONE FRAME, which is what caps Kp at budget/frame_us -- the gain at which the P
+  // term stays LINEAR across the whole range position cannot cover. Below that floor Kp is larger
+  // and the clamp to +-budget turns P into a relay for any error past sigma_e: with the floor at
+  // a quarter frame, Kp was 4x the cap, P saturated beyond 5.5 us, and the loop bang-banged
+  // against the transport delay at +-10-20 us on a 20-40 s period with ZERO frame corrections --
+  // a pure rate-loop limit cycle. Measured: at a 0.25-frame floor the crystal swung 2.1-4.6 ppm
+  // for ever against a 3.35 ppm plant; at 0.5 frame it still swung; at one frame it converged to
+  // 3.347 ppm with the error inside 0.4 us. The floor only binds when the measurement is quiet --
+  // at the bench's ~80 us of noise sigma_e is measured and this never applies.
+  const float floor_us = static_cast<float>(profile_.frame_us());
+  // E|dx| = 2 sigma / sqrt(pi) for Gaussian white noise, so sigma = E|dx| * sqrt(pi)/2.
+  return std::max(0.8862f * err_diff_us_, floor_us);
 }
 
 float Engine::proportional_gain_ppm_per_us() const {
@@ -152,16 +164,25 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     const float x = static_cast<float>(e);
     if (!err_seeded_) {
       err_mean_us_ = x;
+      err_last_us_ = x;
       // Seed pessimistic (one frame): seeding at 0 makes the gain maximal exactly when nothing
       // is known about the signal's resolution.
-      err_mad_us_ = static_cast<float>(profile_.frame_us());
+      err_diff_us_ = static_cast<float>(profile_.frame_us());
       err_seeded_ = true;
     } else {
       const int64_t dt = last_obs_us_ > 0 ? now_us - last_obs_us_ : 0;
       const float dt_s = dt > 0 ? static_cast<float>(dt) / 1e6f : 0.0f;
       const float alpha = dt_s > 0.0f ? 1.0f - std::exp(-dt_s / ERR_TAU_S) : 0.0f;
       err_mean_us_ += alpha * (x - err_mean_us_);
-      err_mad_us_ += alpha * (std::fabs(x - err_mean_us_) - err_mad_us_);
+      // Noise from CONSECUTIVE DIFFERENCES, not from the spread about the mean. |x - mean|
+      // counts the loop's own slow excursion as measurement noise, and since Kp = budget/sigma_e
+      // that feeds back: a wider excursion lowers the gain, which widens the excursion. Measured
+      // as a ~1200 s oscillation, crystal swinging 2.4-4.3 ppm with sigma_e swinging 9.8-12.0 in
+      // phase with it, once the integral was fast enough for the amplitude to matter.
+      // Differencing high-passes the signal, so drift cancels and only sample-to-sample noise is
+      // left. E|dx| = 2 sigma / sqrt(pi) for Gaussian white noise, hence the 1.128.
+      err_diff_us_ += alpha * (std::fabs(x - err_last_us_) - err_diff_us_);
+      err_last_us_ = x;
     }
   }
 
@@ -247,11 +268,24 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   const int64_t dt_us = last_obs_us_ > 0 ? now_us - last_obs_us_ : 0;
   if (dt_us > 0 && differential) {
     const float dt_s = static_cast<float>(dt_us) / 1e6f;
-    const float ki = 1.0f / CRYSTAL_TAU_S;
-    const float contrib = std::clamp(proportional_gain_ppm_per_us() * static_cast<float>(e),
-                                     -profile_.rate_noise_budget_ppm(),
-                                     profile_.rate_noise_budget_ppm());
-    crystal_ppm_ = std::clamp(crystal_ppm_ + ki * contrib * dt_s,
+    // The integral's bandwidth is set by the TRANSPORT DELAY, not by a fixed time constant and
+    // not by damping. A correction is invisible for a whole visibility horizon, so wn must sit
+    // well below 1/visibility; above that the loop integrates error it has already answered.
+    //
+    //     wn = 1 / (CRYSTAL_DELAY_MARGIN * visibility),  Ki = wn^2
+    //
+    // Measured across the whole [1 s, 5 s] horizon range, at 0 and 80 us of noise. Two other
+    // laws were tried and both rail the estimate to its clamp at long horizons:
+    //   * ki * clamp(Kp e) with a fixed tau -- slew is ki * budget = ki * target/visibility, so
+    //     loop speed scales as 1/visibility^2. Unwinding 60 ppm took 45 min at tau = 300 s; fast
+    //     enough to be useful at 3 s, it railed at 5 s.
+    //   * Ki = (Kp/2)^2, critical damping. Ignores the delay, which is the dominant dynamic here:
+    //     with no measurement noise sigma_e sits on its 0.25-frame floor, Kp is large, and at a
+    //     5 s horizon wn ~ 0.35 rad/s wiped out the phase margin (xtal railed to 183-199 ppm).
+    // The delay-limited law showed no instability at any K or horizon tested.
+    const float vis_s = static_cast<float>(profile_.visibility_us) / 1e6f;
+    const float wn = vis_s > 0.0f ? 1.0f / (CRYSTAL_DELAY_MARGIN * vis_s) : 0.0f;
+    crystal_ppm_ = std::clamp(crystal_ppm_ + wn * wn * static_cast<float>(e) * dt_s,
                               -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
   }
   last_obs_us_ = now_us;

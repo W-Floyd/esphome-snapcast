@@ -127,7 +127,8 @@ class Engine {
   // Online noise estimate of e. Gain follows measured resolution: assuming a value and then
   // claiming a budget does not respect the budget.
   float err_mean_us_ = 0.0f;
-  float err_mad_us_ = 0.0f;
+  float err_diff_us_ = 0.0f;   ///< EWMA of |e_k - e_(k-1)|: noise, immune to slow drift
+  float err_last_us_ = 0.0f;
   bool err_seeded_ = false;
 
   // Net position movement, for the rate credit. A single correction is not a rate measurement;

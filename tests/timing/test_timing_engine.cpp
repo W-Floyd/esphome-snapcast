@@ -385,7 +385,49 @@ int main() {
     // plant error on its own. Board a booted at +112 ppm for exactly this reason. Compensation
     // scores 100 us here against the blind hold's 482 us, which is the 4.8x that matches the
     // bench's 25 us vs 224 us -- but neither is 20 us, and closing that is the next change.
-    check(med < 150.0, "position error stays bounded while it unwinds", med, 150.0);
+    check(med < 30.0, "position error stays bounded while it unwinds", med, 30.0);
+  }
+
+  printf("\n11. the rate loop must not limit-cycle on a quiet measurement\n");
+  {
+    // The P term is clamped to the budget, so if Kp is large enough that the clamp is reached
+    // inside the error range position cannot cover, P stops being proportional and becomes a
+    // relay -- and a relay against a transport delay oscillates. This fired with sigma_e floored
+    // at a quarter frame: rate swung -17..+24 ppm on a 20-40 s period with ZERO frame corrections
+    // and the crystal never converged. Nothing else in this file caught it, because every other
+    // property is satisfied by a loop that oscillates about the right answer.
+    Profile pq = p;
+    pq.visibility_us = 1000000;
+    Engine eng(pq);
+    Plant plant;
+    plant.plant_ppm = 3.35;
+    plant.frame_us = pq.frame_us();
+    std::deque<std::pair<int64_t, double>> history;
+    uint64_t pid = 0; int32_t pf = 0; bool live = false; int64_t land = 0;
+    std::vector<double> rates, errs;
+    const int64_t tick = 25000;
+    for (int64_t t = 0; t < 900000000; t += tick) {
+      if (live && t >= land) { plant.apply_frames(pf); eng.confirm_position_landed(pid, t); live = false; }
+      history.emplace_back(t, plant.error_us);
+      double seen = history.front().second;
+      while (history.size() > 1 && history.front().first <= t - pq.visibility_us) {
+        seen = history.front().second;
+        history.pop_front();
+      }
+      Command c = eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), true},
+                           GroupEvidence{});
+      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + 350000; live = true; }
+      plant.advance(tick, c.rate_ppm);
+      if (t > 600000000) { rates.push_back(c.rate_ppm); errs.push_back(std::fabs(plant.error_us)); }
+    }
+    double m = 0.0; for (double v : rates) m += v; m /= static_cast<double>(rates.size());
+    double var = 0.0; for (double v : rates) var += (v - m) * (v - m);
+    const double sd = std::sqrt(var / static_cast<double>(rates.size()));
+    std::sort(errs.begin(), errs.end());
+    printf("        settled: rate mean %+.2f ppm sd %.2f ppm, |error| median %.1f us\n",
+           m, sd, errs[errs.size() / 2]);
+    check(sd < 1.0, "the rate command settles instead of swinging", sd, 1.0);
+    check(errs[errs.size() / 2] < 5.0, "and the error settles with it", errs[errs.size() / 2], 5.0);
   }
 
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all properties hold", failures,
