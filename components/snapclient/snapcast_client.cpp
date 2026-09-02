@@ -4202,6 +4202,9 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   obs.at_us = now_us();
   obs.error_us = err_us;
   obs.valid = err_valid;
+  // Buffer depth, so the engine can refuse to spend audio it does not have. Measured, not
+  // assumed -- available() is the ring's own item count.
+  obs.buffer_us = this->ring_depth_us_.load(std::memory_order_relaxed);
 
   timing::GroupEvidence grp;
   if (this->tsf_sync_ != nullptr) {

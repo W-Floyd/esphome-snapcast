@@ -593,6 +593,67 @@ int main() {
     }
   }
 
+  printf("\n14. a frame drop is SPENT FROM THE BUFFER, and must not drain it\n");
+  {
+    // The bench's worst failure, and entirely self-inflicted. Dropping frames removes audio from
+    // the ring, so a loop that drops to fix a late error drains the thing that lets it play
+    // continuously. Board a dropped 54951 frames -- 1.25 s of audio -- from a 1724 ms buffer,
+    // took the ring to 26 ms, and starved. A starved board falls further behind, which reads as a
+    // LATER error, which buys more drops: err climbed 3 ms per report while the loop commanded
+    // 5584 frames at a time. Nothing in this file modelled a buffer, so nothing could see it.
+    //
+    // Persistent late bias, which is what keeps the drops coming.
+    Profile pn = p;
+    pn.position_delay_us = 1250000;
+    Engine eng(pn);
+    const double frame_us = static_cast<double>(pn.frame_us());
+    double err = 0.0, buffer_us = 1724000.0;
+    const double deadline_ppm = 150.0;   // deadline receding: the board is persistently late
+    std::mt19937 rng(3);
+    std::normal_distribution<double> nd(0.0, 80.0);
+    std::deque<std::pair<int64_t, double>> obs;
+    std::vector<std::pair<int64_t, int32_t>> inflight;
+    uint64_t pid = 0; bool live = false;
+    const int64_t tick = 25000;
+    double min_buffer = buffer_us, max_abs_err = 0.0;
+    long gross = 0;
+    for (int64_t t = 0; t < 900000000; t += tick) {
+      for (auto it = inflight.begin(); it != inflight.end();) {
+        if (t >= it->first) { err -= static_cast<double>(it->second) * frame_us; it = inflight.erase(it); }
+        else ++it;
+      }
+      if (live && inflight.empty()) { eng.confirm_position_landed(pid, t); live = false; }
+      const bool starved = buffer_us <= 0.0;
+      // Starved: playout stalls while the deadline keeps advancing, so the error grows 1:1.
+      err += starved ? static_cast<double>(tick) : deadline_ppm * 1e-6 * static_cast<double>(tick);
+      obs.emplace_back(t, err + nd(rng));
+      double seen = obs.front().second;
+      while (obs.size() > 1 && obs.front().first <= t - pn.measurement_lag_us) {
+        seen = obs.front().second;
+        obs.pop_front();
+      }
+      Observation o{t, static_cast<int64_t>(std::llround(seen)), true,
+                    static_cast<int64_t>(std::max(0.0, buffer_us))};
+      Command c = eng.step(t, o, GroupEvidence{});
+      if (c.frames != 0 && !live) {
+        pid = c.correction_id;
+        inflight.push_back({t + pn.position_delay_us, c.frames});
+        live = true;
+        gross += std::abs(c.frames);
+        buffer_us -= static_cast<double>(c.frames) * frame_us;   // drops SPEND the buffer
+      }
+      buffer_us = std::min(buffer_us, 1724000.0);
+      min_buffer = std::min(min_buffer, buffer_us);
+      if (t > 120000000) max_abs_err = std::max(max_abs_err, std::fabs(err));
+    }
+    printf("        buffer low-water %.0f ms (started 1724); %ld frames spent; "
+           "worst |error| %.0f us; crystal %+.1f ppm\n",
+           min_buffer / 1000.0, gross, max_abs_err, eng.crystal_ppm());
+    check(min_buffer > static_cast<double>(pn.measurement_lag_us),
+          "the buffer never starves", min_buffer, static_cast<double>(pn.measurement_lag_us));
+    check(max_abs_err < 100000.0, "and the error does not run away", max_abs_err, 100000.0);
+  }
+
   printf("\n%s (%d failure%s)\n", failures ? "FAILED" : "all properties hold", failures,
          failures == 1 ? "" : "s");
   return failures ? 1 : 0;

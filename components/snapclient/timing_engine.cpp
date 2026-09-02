@@ -200,6 +200,22 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       pending_ref_us_ = 0;
     }
   }
+  // STARVED: hold everything. When the buffer is below one measurement lag there is not enough
+  // audio queued for the render instant to be deadline-driven at all -- the board is playing
+  // whatever it has and falling behind, so the growing "error" is a data shortage reported in
+  // microseconds. Correcting it with position removes yet more audio, which is the spiral measured
+  // on the bench: ring 1724 ms -> 26 ms, then err climbing 3 ms per report while the loop dropped
+  // 5584 frames a time. Rate holds the learned offset; nothing is integrated, because the error is
+  // not telling us about the clock.
+  if (obs.buffer_us > 0 && obs.buffer_us < profile_.measurement_lag_us) {
+    cmd.rate_ppm = crystal_ppm_;
+    cmd.decision.act = Decision::Act::Hold;
+    cmd.decision.why = Decision::Why::NoEvidence;
+    cmd.decision.rate_ppm = cmd.rate_ppm;
+    suppressed_++;
+    return cmd;
+  }
+
   const int64_t e = obs.error_us - pending_disp_us_;
   cmd.decision.error_us = e;
 
@@ -306,10 +322,18 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   const float needed_ppm =
       reach_s > 0.0f ? static_cast<float>(e_position) / reach_s : 0.0f;
   const bool rate_can_fix = std::fabs(needed_ppm) <= profile_.rate_authority_ppm;
-  const int32_t frames =
-      (frame_us > 0 && std::llabs(e_position) >= coarse_gate_us && !rate_can_fix)
-          ? static_cast<int32_t>(e_position / frame_us)
-          : 0;
+  int32_t frames = (frame_us > 0 && std::llabs(e_position) >= coarse_gate_us && !rate_can_fix)
+                       ? static_cast<int32_t>(e_position / frame_us)
+                       : 0;
+  // A DROP IS SPENT FROM THE BUFFER. Never spend more than half of it on one correction: the
+  // buffer is what makes continuous playout possible, and a correction that empties it trades a
+  // timing error for a dropout -- then reports the dropout as a bigger timing error. Half, so
+  // that no single correction can ever bring the buffer below the level it needs to deliver that
+  // correction. Inserts add audio and need no such bound.
+  if (frames > 0 && obs.buffer_us > 0 && frame_us > 0) {
+    const int32_t affordable = static_cast<int32_t>((obs.buffer_us / 2) / frame_us);
+    if (frames > affordable) frames = affordable;
+  }
   cmd.decision.filtered_us = e_position;
   cmd.decision.gate_us = coarse_gate_us;
   cmd.decision.needed_ppm = needed_ppm;

@@ -94,6 +94,14 @@ struct Observation {
   int64_t at_us = 0;
   int64_t error_us = 0;   ///< e
   bool valid = false;     ///< false: no measurement, engine holds
+  /// Audio queued ahead of the DAC. Position corrections are SPENT FROM THIS: dropping frames
+  /// removes audio from the buffer, so a loop that drops to fix a late error drains the very
+  /// thing that lets it play continuously. Measured on the bench: board a dropped 54951 frames
+  /// (1.25 s of audio) from a 1724 ms buffer, drained the ring to 26 ms, then starved -- and a
+  /// starved board falls further behind, which reads as a LATER error, which buys more drops.
+  /// 122 ms of "error" growing 3 ms per report, entirely self-inflicted.
+  /// 0 means unknown, and the engine then applies no buffer reasoning.
+  int64_t buffer_us = 0;
 };
 
 /// Differential evidence. Absent on a transport without a shared clock; the engine then runs
