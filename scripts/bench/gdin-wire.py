@@ -233,7 +233,12 @@ def grade(pairs, block_s, min_n):
         pts = blocks[b]
         span = (hms(t0 + b * block_s), hms(t0 + (b + 1) * block_s))
         if len(pts) < min_n:
-            out.append((b, len(pts), float("nan"), float("nan"), span))
+            # SAME ARITY AS THE FULL ROW. This branch returned 5 fields where the other returns
+            # 8, so the first thin block crashed the report with "expected 8, got 5" -- and the
+            # self-test never hit it, because every synthetic block is full. A row shape that
+            # depends on which branch produced it is a trap for exactly that reason.
+            nan = float("nan")
+            out.append((b, len(pts), nan, nan, nan, nan, nan, span))
             continue
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
         lo, hi, r = bracket(xs, ys)
@@ -325,6 +330,17 @@ def self_test():
     unin = sum(1 for lo, hi in b if verdict(lo, hi) == "uninformative")
     assert unin >= 4, f"expected most no-leverage blocks to be called uninformative, got {unin}"
     print(f"  no leverage (4 us sweep): {unin}/{len(b)} blocks reported uninformative")
+
+    # A THIN BLOCK MUST NOT CRASH THE REPORT. Every synthetic block above is full, so the
+    # under-min_n branch was unexercised and shipped with the wrong arity.
+    gdin, wire = synth(n=310)          # 300 + 10: the trailing block is genuinely under min_n
+    rows = grade(pair(gdin, wire, 0.5)[0], 300, 20)
+    thin = [r for r in rows if r[1] < 20]
+    assert thin, f"expected a thin block, got sizes {[r[1] for r in rows]}"
+    assert all(len(r) == 8 for r in rows), [len(r) for r in rows]
+    assert all(verdict(r[2], r[3]) == "no data" for r in thin), [verdict(r[2], r[3]) for r in thin]
+    print(f"  thin block: {len(thin)} of {len(rows)} rows under min_n, all 8 fields, "
+          f"verdict 'no data'")
 
     # Orientation: an inverted wire must read as inverted, not as |slope|.
     gdin, wire = synth()
