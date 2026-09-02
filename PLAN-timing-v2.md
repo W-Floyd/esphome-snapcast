@@ -309,11 +309,33 @@ int64_t visibility_horizon_us(Horizon purpose) const;   // ring + pipe + k·bloc
 All five encodings become one function differing only in `k` and clamp, each documented with what
 it is waiting for.
 
-**Verification: shadow first.** Log old and new side by side for one session and change nothing.
-Bar: the new function reproduces each old value within that value's own clamp on ≥ 99 % of chunks,
-and every divergence is explained before any consumer is swapped. `PHASE_TRANSIENT_US` is the one
-likely to *not* reproduce — it is a flat 4 s and the others are live — so decide deliberately
-whether it becomes live or stays flat, and write down which.
+**Status:** `visibility_horizon_us(clamp)` exists and three `travel_horizon_us_()` sites already
+use it. That much is identical by construction — it is `clamp > 0 ? max(clamp, travel) : travel`
+and those sites applied the same max inline — so it needs no shadow bar. `enum class Horizon` is
+declared and unused; the rest of the collapse is outstanding.
+
+**What reading the remaining sites turned up (2026-09-02): the tag blank is computed two different
+ways, and nothing said so.**
+
+    L1297   dl_blank_until_us_ = timestamp + visibility_horizon_us(blank_ms)   -> max(travel, blank)
+    L1608   dl_blank_until_us_ = now + blank_ms                                -> flat, travel-blind
+    L3213   dl_blank_until_us_ = now + blank_ms                                -> flat, travel-blind
+
+Same field, same purpose, one site travel-aware and two not. **Unifying them lengthens two blanks,
+which is a behaviour change and not the pure refactor this stage claims to be** — so it needs a
+measurement, not a tidy-up, and it must not ride along with the enum.
+
+**Two decisions to take deliberately, before any consumer moves:**
+
+1. Do L1608/L3213 become travel-aware? If yes it is a control change and belongs in a build of its
+   own with a before/after on the tag-blank behaviour, not in Stage 3.
+2. Does `PHASE_TRANSIENT_US` become live or stay a flat 4 s? It is armed at five sites as
+   `max(existing, now + PHASE_TRANSIENT_US)` and is the one encoding that cannot reproduce a live
+   value by construction. **Write down which, and why, when it is decided.**
+
+**Verification for whatever does move: shadow first.** Log old and new side by side for one session
+and change nothing. Bar: the new function reproduces each old value within that value's own clamp
+on ≥ 99 % of chunks, and every divergence is explained before any consumer is swapped.
 
 ---
 
