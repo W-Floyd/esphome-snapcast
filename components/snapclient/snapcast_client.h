@@ -1139,6 +1139,7 @@ class SnapcastClient {
   /// afford it.
   std::atomic<int64_t> ring_depth_slow_us_{0};
   std::atomic<int64_t> ring_capacity_us_{0};  ///< ring capacity in us; see buffer_floor_us
+  int64_t est_stale_log_us_{0};   ///< throttle for the stale-estimate warning
   int64_t last_timing_obs_us_{0};
   int64_t timing_obs_interval_us_{0};  // ring + pipeline + two blocks: how long a position change takes to reach the tags
 #endif

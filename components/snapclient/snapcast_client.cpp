@@ -416,6 +416,18 @@ static constexpr float TRIM_KP_PPM_PER_US = TRIM_KP_ACQUIRE_PPM_PER_US;
 static constexpr float TRIM_CLAMP_MIN_PPM = 500.0f;
 static constexpr float TRIM_CLAMP_MAX_PPM = 2000.0f;
 
+// How old a clock estimate may be and still be PUBLISHED as a mapping. DERIVED from the window a
+// receiver applies to our beacons, not written beside it: TsfSync drops a peer mapping older than
+// PEER_MAP_STALE_US, so we stop advertising at exactly the point anyone would stop believing us.
+// I first wrote 15000 here against a 5000 ms receiver window and claimed in the comment that they
+// matched -- the same "two constants that must agree" mistake that had already cost the starvation
+// floor and the jump threshold today.
+//
+// Deliberately NOT a judgement about how long an estimate stays ACCURATE: it coasts on drift, so
+// that depends on the crystal. This is the point past which publishing is a claim we cannot
+// support.
+static constexpr int64_t EST_STALE_MS = TsfSync::PEER_MAP_STALE_US / 1000;
+
 // --- THE DELAY LOOP (PLAN-delay-controlled-servo.md) ---
 //
 // PI rate steering on the MEASURED tag error (err_tag), setpoint zero. The plant is the pipeline
@@ -1953,6 +1965,34 @@ void SnapcastClient::service_tx_() {
       TsfSync::Estimate est;
       this->filter_mutex_.lock();
       est.valid = this->time_filter_.has_estimate();
+      if (est.valid) {
+        // FRESHNESS, not just maturity. has_estimate() and is_settled() are latching -- they count
+        // samples and samples are never un-counted -- so a node that settled hours ago and has
+        // heard nothing since still reports both as true, and its offset coasts on drift alone.
+        //
+        // Measured 2026-09-02: the bench observer's player stalled at 11:28 and its server traffic
+        // stopped with it. Its estimate coasted 3.9 hours to 735 ms away from two boards that
+        // agreed with each other to 1.5 ms, was published as valid && mature throughout, and was
+        // pooled into both boards' timebase -- stepping it ~197 ms. Nothing in the publish gate
+        // asked how old the estimate was, because nothing could: the filter exposed no such
+        // question.
+        //
+        // The horizon is the peer-mapping staleness the receiver already applies to OUR beacons.
+        // Publishing an estimate older than the window in which anyone would still use it is
+        // advertising something we know to be expired.
+        const double age_ms = now / 1000.0 - this->time_filter_.last_update_ms();
+        const bool fresh = age_ms >= 0.0 && age_ms <= static_cast<double>(EST_STALE_MS);
+        if (!fresh) {
+          est.valid = false;
+          if (now - this->est_stale_log_us_ >= 10000000) {
+            this->est_stale_log_us_ = now;
+            ESP_LOGW(TAG,
+                     "Clock estimate stale: %.0f ms since the last measurement (limit %d) -- "
+                     "publishing phase only, not a mapping",
+                     age_ms, static_cast<int>(EST_STALE_MS));
+          }
+        }
+      }
       if (est.valid) {
         est.mature = this->time_filter_.is_settled() && this->time_sync_burst_remaining_ == 0;
         est.offset_ms = this->time_filter_.get_offset(now / 1000.0);

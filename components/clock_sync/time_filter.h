@@ -126,6 +126,20 @@ class KalmanTimeFilter {
   /// be off by 100+ ms under congestion).
   bool is_settled() const { return this->count_ >= MIN_SAMPLES; }
 
+  /// @brief Client time (ms) of the last absorbed measurement, so a consumer can ask how OLD the
+  /// estimate is rather than only whether one exists.
+  ///
+  /// has_estimate() and is_settled() are both latching: once true they stay true, because they
+  /// count samples and samples are never un-counted. Neither can express "settled four hours ago
+  /// and not updated since", which is the state a node in that condition still advertises as
+  /// current -- its offset then coasts on drift alone, and the error grows without bound.
+  ///
+  /// Measured 2026-09-02: the bench observer's player stalled at 11:28 (PLAYER STALLED, no chunk
+  /// for 14036 s), its server traffic stopped, and its estimate coasted for 3.9 hours to 735 ms
+  /// away from two boards that agreed with each other to 1.5 ms -- while still published as
+  /// valid && mature, and pooled into both boards' timebase.
+  double last_update_ms() const { return this->last_update_; }
+
   /// @brief Drift estimate (offset ms per client ms, dimensionless — equivalently
   /// ppm×1e-6); 0.0 until statistically significant, matching get_offset()'s gating.
   double get_drift() const { return this->use_drift_ ? this->drift_ : 0.0; }

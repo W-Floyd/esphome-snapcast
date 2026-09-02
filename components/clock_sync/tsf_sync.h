@@ -81,6 +81,17 @@ class TsfSync {
   explicit TsfSync(int64_t plausibility_us) : plausibility_us_(plausibility_us) {}
   ~TsfSync();
 
+  /// A raw estimate older than this is dropped from the consensus. Tighter than PHASE_STALE_US
+  /// because this one steers the timebase rather than reporting on it: beacons come once a
+  /// second, so this tolerates four consecutive losses before a peer stops counting. A departing
+  /// device therefore leaves the mean gradually-ish, and the adoption slew smooths the rest.
+  ///
+  /// PUBLIC because it is a contract, not an implementation detail: a sender must not advertise a
+  /// mapping older than the window in which a receiver would still use it. The caller derives its
+  /// own publish gate from this value rather than writing a second number beside it -- two
+  /// constants that must agree have drifted apart three times on this bench in one day.
+  static constexpr int64_t PEER_MAP_STALE_US = 5000000;
+
   /// @brief Runs receive/publish/consensus. Call periodically (~every message / idle tick)
   /// from the network task while a session is active.
   /// @param local_now_us esp_timer time of the sampled @p est.
@@ -368,11 +379,6 @@ class TsfSync {
   static constexpr size_t MAX_PEERS = 8;
   /// A phase older than this says nothing about where that device is now.
   static constexpr int64_t PHASE_STALE_US = 15000000;
-  /// A raw estimate older than this is dropped from the consensus. Tighter than PHASE_STALE_US
-  /// because this one steers the timebase rather than reporting on it: beacons come once a
-  /// second, so this tolerates four consecutive losses before a peer stops counting. A departing
-  /// device therefore leaves the mean gradually-ish, and the adoption slew smooths the rest.
-  static constexpr int64_t PEER_MAP_STALE_US = 5000000;
   /// How far apart two phases may have been sampled and still be worth differencing. They are
   /// absolute offsets drifting at ~50 ppm between devices, so the pairing error is
   /// window x drift: 300 ms bounds it at ~15 us, against a signal of order 100 us. Anything
