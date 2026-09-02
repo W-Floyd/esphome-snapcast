@@ -25,10 +25,13 @@ Run this ON the bench host (it reads a.log/b.log and needs aioesphomeapi for the
 
 import argparse
 import asyncio
+import os
 import re
 import subprocess
 import sys
 import time
+
+LOGS = {}          # name -> path, set in main(); report() needs it to count events by offset
 
 ERRSEL = re.compile(
     r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*?\bERRSEL n=(\d+) srcdiff=(\d+) valdiff=(\d+) "
@@ -51,9 +54,20 @@ def last_errsel(path, tail_mb=8):
             "live": m.group(8), "new": m.group(9), "worst": int(m.group(10))}
 
 
-def event_counts(path, tail_mb=8):
-    out = subprocess.run(["tail", "-c", str(tail_mb << 20), path],
-                         capture_output=True).stdout.decode(errors="replace")
+def log_size(path):
+    return os.path.getsize(path)
+
+
+def event_counts_since(path, offset):
+    """Events in the bytes appended after `offset`. BYTE-ANCHORED, not a fixed tail.
+
+    Counting in a `tail -c 8M` window and differencing gives NEGATIVE deltas as the log grows and
+    old occurrences slide out of the window -- which is exactly what the first run of this script
+    printed ("Hard resync: -1", "OUT OF RANGE: -4"). A count whose window moves is not a count.
+    """
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        out = fh.read().decode(errors="replace")
     return {e: out.count(e) for e in EVENTS}
 
 
@@ -78,7 +92,18 @@ async def call(host, action, arg_name, value, timeout=10.0):
 
 
 def sample(logs):
-    return {name: (last_errsel(path), event_counts(path)) for name, path in logs.items()}
+    """Counters plus the byte offset each phase's event count will be measured from."""
+    return {name: (last_errsel(path), log_size(path)) for name, path in logs.items()}
+
+
+def arms_seen(path, offset):
+    """Which selector arms the log shows after `offset`. A phase in which the live selector never
+    left the tag path did not exercise the difference between the two selectors, so zero mismatches
+    there is a weak result -- say so rather than counting it as a pass."""
+    with open(path, "rb") as fh:
+        fh.seek(offset)
+        out = fh.read().decode(errors="replace")
+    return {m.group(8) for m in ERRSEL.finditer(out)}
 
 
 def report(before, after, label):
@@ -86,8 +111,8 @@ def report(before, after, label):
     print(f"  {'board':<8} {'chunks':>8} {'srcdiff':>8} {'valdiff':>8} {'worst us':>9}  events")
     ok = True
     for name in before:
-        b, be = before[name]
-        a, ae = after[name]
+        b, boff = before[name]
+        a, _ = after[name]
         if b is None or a is None:
             print(f"  {name:<8} no ERRSEL line (build predates the shadow?)")
             ok = False
@@ -95,8 +120,13 @@ def report(before, after, label):
         dn = a["n"] - b["n"]
         ds = a["srcdiff"] - b["srcdiff"]
         dv = a["valdiff"] - b["valdiff"]
-        ev = {k: ae[k] - be[k] for k in ae if ae[k] - be[k]}
-        print(f"  {name:<8} {dn:>8} {ds:>8} {dv:>8} {a['worst']:>+9}  {ev if ev else '-'}")
+        ev = {k: v for k, v in event_counts_since(LOGS[name], boff).items() if v}
+        arms = arms_seen(LOGS[name], boff)
+        print(f"  {name:<8} {dn:>8} {ds:>8} {dv:>8} {a['worst']:>+9}  "
+              f"arms={'+'.join(sorted(arms)) or '?'}  {ev if ev else '-'}")
+        if arms and arms == {"tag"}:
+            print(f"           (live selector stayed on tags throughout -- this phase did not "
+                  f"exercise the ledger arm)")
         if dn <= 0:
             print(f"           !! no chunks advanced -- the board was not playing, so this phase "
                   f"tested nothing")
@@ -122,6 +152,7 @@ def main():
     args = ap.parse_args()
 
     logs = {"a": args.log_a, "b": args.log_b}
+    LOGS.update(logs)
     hosts = {"a": args.host_a, "b": args.host_b}
     passed = True
 
