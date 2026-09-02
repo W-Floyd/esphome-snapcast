@@ -91,6 +91,9 @@ struct Faults {
   /// 428637 us" around exactly the events that precede a storm.
   double reanchor_period_s = 0.0;
   double reanchor_us = 0.0;
+  /// How far apart two devices adopt the SAME step. Beacons are 1 Hz, so a second is the natural
+  /// scale; this is the whole disturbance, because the step itself is common.
+  double reanchor_stagger_s = 1.0;
 };
 
 /// `common_ppm` drifts every board's deadline together -- a server/timebase offset, which is what
@@ -134,11 +137,23 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         starved = ph < f.starve_secs;
         if (starved) x.err_us += static_cast<double>(tick);   // 1:1 with the clock
       }
-      // ROOT DISTURBANCE 2: the timebase re-anchors and this board's deadline steps.
-      if (f.reanchor_period_s > 0.0 && t > 0 &&
-          static_cast<int64_t>(t / 1000000) % static_cast<int64_t>(f.reanchor_period_s) == 0 &&
-          t % 1000000 < tick) {
-        x.own_deadline_us += f.reanchor_us * (i == 0 ? 1.0 : -0.6);
+      // ROOT DISTURBANCE 2: the timebase re-anchors. COMMON-MODE, as the firmware states outright
+      // ("every device holding this set steps identically") -- but the devices do not adopt it at
+      // the same INSTANT. Beacons arrive once a second and a device steps when its own consensus
+      // recomputes, so for up to a beacon interval one board has stepped and the other has not,
+      // and during that window they disagree by the FULL step.
+      //
+      // My first model applied a permanent, per-board-DIFFERENT offset, which injected an
+      // ever-growing differential and reported 384 ms of skew for ever. That was the model, not
+      // the system -- the same mistake as modelling a resync as opposite shoves.
+      if (f.reanchor_period_s > 0.0) {
+        const double period = f.reanchor_period_s;
+        const double phase = std::fmod(static_cast<double>(t) / 1e6, period);
+        // Board i adopts the step stagger_i into the event; before that it holds the old timebase.
+        const double stagger = (i == 0) ? 0.0 : f.reanchor_stagger_s;
+        const double epoch = std::floor(static_cast<double>(t) / 1e6 / period);
+        const double adopted = (phase >= stagger) ? epoch + 1.0 : epoch;
+        x.own_deadline_us = adopted * f.reanchor_us;
       }
 
       // measured against its OWN deadline, which the common-mode term has moved
