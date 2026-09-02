@@ -1345,7 +1345,15 @@ def parse_sync_events(path, board, trim_ppm, start_offset=0, span=None, state=No
             tod_p = (int(rp.group(1)) * 3600 + int(rp.group(2)) * 60 + int(rp.group(3))
                      + int(rp.group(4)) / (10 ** len(rp.group(4))))
             first_seq, t0 = int(rp.group(5)), int(rp.group(7))
-            cols = [[int(v) for v in rp.group(g).split(",")] for g in (8, 9, 10, 11, 12)]
+            # THE SHAPE GUARD BELOW CANNOT RUN IF THE PARSE THROWS FIRST. A line truncated
+            # mid-number leaves an empty or partial element, int() raises ValueError, and the
+            # exception escapes parse_sync_events and kills the whole analyser -- which it did
+            # on 2026-09-02, taking the run down with test.csv frozen. The comment below always
+            # said truncation was expected here; only the length mismatch was being handled.
+            try:
+                cols = [[int(v) for v in rp.group(g).split(",")] for g in (8, 9, 10, 11, 12)]
+            except ValueError:
+                continue          # truncated mid-number: refuse the line, as the shape guard does
             # A truncated line (the formatting ceiling is 256 bytes and six saturated samples
             # can approach it) would zip short and silently drop the tail; refuse it instead.
             if len({len(c) for c in cols}) == 1:
