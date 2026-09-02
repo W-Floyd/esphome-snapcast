@@ -166,6 +166,20 @@ class Engine {
   /// then: two in flight cannot be distinguished from one that failed.
   void confirm_position_landed(uint64_t correction_id, int64_t now_us);
 
+  /// SOMEONE ELSE MOVED THE AUDIO. The hard-resync path drops chunks and inserts silence on its
+  /// own authority, and until this existed it did so without telling the engine -- so the engine's
+  /// position model was wrong by however far the resync went, and it read the jump as a plant
+  /// movement to be chased. Two controllers on one actuator, one of them silent.
+  ///
+  /// Measured in tests/group with the fault modelled: 19 us of skew and zero corrections became
+  /// 63 ms and 521 corrections. Missing HALF the observations, by comparison, cost 1 us. This was
+  /// the dominant reason the simulator disagreed with the bench.
+  ///
+  /// Treated exactly like a correction the engine issued -- filter shifted, compensation window
+  /// armed, position serialised -- except that it is NOT credited to the crystal: someone else's
+  /// displacement says nothing about this board's rate.
+  void note_external_move(int64_t applied_us, int64_t now_us);
+
 
   /// Learned per-board plant rate offset, ppm.
   float crystal_ppm() const { return crystal_ppm_; }
@@ -196,6 +210,15 @@ class Engine {
   // Online noise estimate of e. Gain follows measured resolution: assuming a value and then
   // claiming a budget does not respect the budget.
   float err_mean_us_ = 0.0f;
+  /// Jump detection: a spike and a step are indistinguishable in one sample and differ in
+  /// persistence. Counting consecutive same-sign over-limit innovations separates them.
+  int jump_run_ = 0;
+  int jump_dir_ = 0;
+  int gd_jump_run_ = 0;
+  int gd_jump_dir_ = 0;
+  /// Last sigma of the differential, for the jump test: the current one is not known until after
+  /// the filter has been updated with this sample.
+  float gd_sigma_prev_us_ = 0.0f;
   float err_diff_us_ = 0.0f;   ///< EWMA of |e_k - e_(k-1)|: noise, immune to slow drift
   float err_last_us_ = 0.0f;
 

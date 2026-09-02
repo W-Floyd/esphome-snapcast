@@ -48,6 +48,10 @@ constexpr float CRYSTAL_LIMIT_PPM = 200.0f;
 /// scale. A hardcoded 2.0 s happened to be right for a 1724 ms ring; it would have been wrong for
 /// any other buffer size, sample rate or network condition, and nothing would have said so.
 constexpr float ERR_TAU_HORIZONS = 1.0f;
+/// Consecutive over-limit innovations of the same sign before a jump is believed. A measurement
+/// spike does not survive its own sample; a deadline re-anchor or an unannounced resync does.
+/// Three, so a single fault and a coincidental pair are both still rejected.
+constexpr int JUMP_CONFIRM_SAMPLES = 3;
 }  // namespace
 
 void Engine::set_crystal_ppm(float ppm) {
@@ -143,6 +147,18 @@ void Engine::confirm_position_landed(uint64_t correction_id, int64_t now_us) {
   in_flight_ = false;
   in_flight_id_ = 0;
   in_flight_frames_ = 0;
+}
+
+void Engine::note_external_move(int64_t applied_us, int64_t now_us) {
+  if (applied_us == 0) return;
+  // The same coordinate change an issued correction makes: the filter's state moves with its
+  // inputs, and observations are compensated until the move is observable. No credit -- this is
+  // not evidence about our rate.
+  err_mean_us_ -= static_cast<float>(applied_us);
+  pending_disp_us_ = applied_us;
+  pending_ref_us_ = static_cast<int64_t>(std::llround(err_mean_us_)) + applied_us;
+  pending_comp_until_us_ = now_us + profile_.compensation_us();
+  serialise_until_us_ = now_us + profile_.settle_us();
 }
 
 Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence &group) {
@@ -252,9 +268,42 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       const float plant_ppm_span = profile_.rate_authority_ppm + CRYSTAL_LIMIT_PPM;
       const float max_move_us =
           plant_ppm_span * dt_s + static_cast<float>(profile_.frame_us());
-      const float innovation =
-          std::clamp(x - err_mean_us_, -max_move_us, max_move_us);
-      err_mean_us_ += alpha * innovation;
+      const float raw_innov = x - err_mean_us_;
+      // A SPIKE AND A STEP LOOK THE SAME FOR ONE SAMPLE. They differ in PERSISTENCE: a
+      // measurement fault is gone next sample, a real step -- a deadline re-anchor, an
+      // unannounced resync -- is still there. Clamping alone treats both as noise, and that
+      // limits tracking to (span * dt + frame) per sample: ~30 us at this cadence, so 1.2 ms/s.
+      // A 120 ms deadline step then takes 100 s to track, and the loop is BLIND to a real
+      // differential the whole time -- measured in tests/group as 384 ms of skew with ZERO
+      // corrections, which is the shape of today's bench regression.
+      //
+      // So: clamp, but count consecutive over-limit innovations of the same sign, and once they
+      // persist, accept the observation outright. Spikes never reach the count.
+      // The jump test is scaled to the NOISE, not to plant motion. max_move_us is ~30 us at this
+      // cadence while the measurement carries 80 us of noise, so ordinary samples exceed it
+      // constantly and three same-sign ones arrive by chance -- the filter then snapped to a noisy
+      // sample and amplified it (rate sd 13.31 ppm against an 11.43 ppm budget, and 24 corrections
+      // where none were needed). A real step clears several sigma; noise does not.
+      const float jump_us = std::max(max_move_us, 4.0f * sigma_e_us());
+      if (std::fabs(raw_innov) > jump_us) {
+        const int dir = raw_innov > 0.0f ? 1 : -1;
+        if (dir == jump_dir_) {
+          jump_run_++;
+        } else {
+          jump_dir_ = dir;
+          jump_run_ = 1;
+        }
+      } else {
+        jump_run_ = 0;
+        jump_dir_ = 0;
+      }
+      if (jump_run_ >= JUMP_CONFIRM_SAMPLES) {
+        err_mean_us_ = x;          // a real step: stop pretending it is noise
+        jump_run_ = 0;
+        jump_dir_ = 0;
+      } else {
+        err_mean_us_ += alpha * std::clamp(raw_innov, -max_move_us, max_move_us);
+      }
       // Noise from CONSECUTIVE DIFFERENCES, not from the spread about the mean. |x - mean|
       // counts the loop's own slow excursion as measurement noise, and since Kp = budget/sigma_e
       // that feeds back: a wider excursion lowers the gain, which widens the excursion. Measured
@@ -318,12 +367,34 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       const float galpha = gdt_s > 0.0f ? 1.0f - std::exp(-gdt_s / gtau_s) : 0.0f;
       const float gspan = profile_.rate_authority_ppm + CRYSTAL_LIMIT_PPM;
       const float gmax = gspan * gdt_s + static_cast<float>(profile_.frame_us());
-      gd_mean_us_ += galpha * std::clamp(gx - gd_mean_us_, -gmax, gmax);
+      const float g_innov = gx - gd_mean_us_;
+      // Same spike-versus-step distinction, on the signal position actually acts on.
+      const float g_jump_us = std::max(gmax, 4.0f * gd_sigma_prev_us_);
+      if (std::fabs(g_innov) > g_jump_us) {
+        const int gdir = g_innov > 0.0f ? 1 : -1;
+        if (gdir == gd_jump_dir_) {
+          gd_jump_run_++;
+        } else {
+          gd_jump_dir_ = gdir;
+          gd_jump_run_ = 1;
+        }
+      } else {
+        gd_jump_run_ = 0;
+        gd_jump_dir_ = 0;
+      }
+      if (gd_jump_run_ >= JUMP_CONFIRM_SAMPLES) {
+        gd_mean_us_ = gx;
+        gd_jump_run_ = 0;
+        gd_jump_dir_ = 0;
+      } else {
+        gd_mean_us_ += galpha * std::clamp(g_innov, -gmax, gmax);
+      }
       gd_diff_us_ += galpha * (std::fabs(gx - gd_last_us_) - gd_diff_us_);
       gd_last_us_ = gx;
     }
     gd_last_at_us_ = now_us;
     gd_sigma_us = std::max(0.8862f * gd_diff_us_, 0.25f * static_cast<float>(profile_.frame_us()));
+    gd_sigma_prev_us_ = gd_sigma_us;
     e_diff = static_cast<int64_t>(std::llround(gd_mean_us_));
     have_diff = true;
     differential = std::llabs(e_diff) >= profile_.target_position_us;
@@ -501,6 +572,12 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   //     budget -- and to sigma_filtered * Kp here, which is smaller still. Clamping the output to
   //     the budget as well conflated "how much noise may I add" with "how much error may I
   //     correct", and cost a frame correction every horizon.
+  // TRIED AND REVERTED: P on the differential error instead of the deadline error. The reasoning
+  // was that rate steering to this board's OWN deadline fights position steering to the group
+  // when the two deadlines disagree. That reasoning may still be right, but it did NOT fix the
+  // re-anchor case (384 ms of skew either way, because the RESYNC path is what yanks each board
+  // to its own re-anchored deadline) and it cost group test 3 -- skew 77 us against a 44 us
+  // bound -- so it is not carried on an argument the numbers do not support.
   const float p_raw = differential ? proportional_gain_ppm_per_us() * err_mean_us_ : 0.0f;
   const float p_term = std::clamp(p_raw, -profile_.rate_authority_ppm, profile_.rate_authority_ppm);
   cmd.rate_ppm = crystal_ppm_ + p_term;
