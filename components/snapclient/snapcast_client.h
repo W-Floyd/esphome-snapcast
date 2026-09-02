@@ -52,84 +52,15 @@ using clock_sync::TsfSync;
 /// Rate — frequency drift between the two DACs (~0.33 ppm differential)
 /// Step — a displacement: join, refill, hard resync, timebase adoption
 /// Bias — my idea of the group's timeline is biased relative to the wire
-enum class ErrClass { Rate, Step, Bias, None };
 
 /// @brief The three error sources: Tag (tag-derived render phase), Ledger (deadline loop error),
 /// or None (no differential evidence). One owner per row.
-enum class ErrSource { Tag, Ledger, None };
 
 /// @brief A view of the currently active error, classified by source and class.
-/// Emitted by active_error() — one selector, one place.
-struct ErrorView {
-  int64_t us;
-  ErrSource src;
-  int64_t age_us;
-  bool trusted;
-  ErrClass cls;
-};
-
 /// @brief How long until a correction shows up in the measurement". See the cpp for the single
 /// horizon function that replaces the five independent encodings.
-/// St7 ABLATION MASK. One bit per guard, set = that guard is DISABLED. Default 0 = every guard
-/// active, i.e. today's behaviour exactly.
-///
-/// WHY A RUNTIME MASK AND NOT #if / commented-out code: an ablation per build costs a flash, a
-/// capture gap and ~5 consensus membership changes per board, so a dozen guards would cost a
-/// dozen windows and could only ever be compared against a remembered baseline. One build with a
-/// mask can A/B a guard against itself inside a single session.
-///
-/// HOW TO READ AN ABLATION, because the obvious reading is wrong: **"guard off changed nothing
-/// over a quiet window" is NOT evidence the guard is unneeded.** Almost every one of these exists
-/// for a rare event -- a storm, a starvation, a split repair, a reboot -- which a quiet window
-/// does not contain. Ablating there measures nothing while looking like a pass, which is the
-/// CLAUDE.md "search narrow enough to confirm an expectation" failure applied to a control law.
-/// Each guard below names WHAT FIRES IT; ablate it together with that trigger or not at all.
-enum GuardBit : uint32_t {
-  /// Tag samples arriving inside dl_blank_until_us_ are accepted. Fires on: any action that sets
-  /// the blank (window step, hard resync, splice), i.e. inject_split / inject_starvation.
-  GUARD_TAG_BLANK = 1u << 0,
-  /// No blank after a feedback gap. Fires on: a render gap / late-stamped catch-up burst, i.e.
-  /// inject_starvation.
-  GUARD_GAP_BLANK = 1u << 1,
-  /// A window step no longer waits for two consistent ledger readings (L3350). Fires on: a
-  /// refill burst, i.e. inject_starvation.
-  GUARD_LEDGER_STABLE = 1u << 2,
-  /// The splice may act while the rate lock is holding a pending trim (L3640). Fires on:
-  /// inject_split.
-  ///
-  /// THIS ONE IS THE POSITIVE CONTROL FOR THE WHOLE EXERCISE. Its value is already measured:
-  /// PLAN-delay-controlled-servo.md records -101.5 us for the version without the hold. So if an
-  /// ablation of this bit shows "no difference", the ablation protocol is blind and its other
-  /// results mean nothing. Run it first, expect a regression, and only trust the rest if you see
-  /// one.
-  GUARD_TRIM_HOLD = 1u << 3,
-  /// The gd boost is off entirely: the differential residual runs at tracking gain like
-  /// everything else. Fires on: any differential error at all, so it is exercised continuously
-  /// -- unlike the bits above, this one needs no injection to be under test.
-  ///
-  /// THIS BIT ABLATES A GAIN, NOT A GUARD, and it is in this mask because the mask is the one
-  /// runtime surface for "make the model smaller". The boost exists to converge a genuinely
-  /// differential residual quickly, so switching it off should COST convergence speed after a
-  /// real differential step while removing the 4.2x amplification of gd's own noise. That
-  /// trade is the measurement; with floor/off/on all reachable at runtime it is three arms of
-  /// one build rather than three flashes.
-  GUARD_GD_BOOST = 1u << 4,
-};
 
-// NOT WIRED, and deliberately absent from the enum rather than present and inert:
-//   * the tag-fault judge -- the block at L2920 RE-TRUSTS tags (sets tag_fault_until_us to now);
-//     the setter that opens the distrust window is elsewhere and needs finding first.
-//   * in-flight step serialisation -- it lives in position_arbiter_, which is Stage 4 shadow code
-//     that nothing calls, so a bit for it would toggle nothing.
-//   * the ~10 `st.converged` conjuncts (the WS3.1 invariant). One bit cannot express them; they
-//     need to be enumerated site by site, and the invariant is documented as load-bearing.
 
-enum class Horizon {
-  TagBlank,
-  CoarseBlank,
-  PhaseTransient,
-  SpliceInFlight
-};
 
 /// @brief Compile-time configuration for SnapcastClient, built by the hub's codegen setters.
 struct SnapcastClientConfig {
@@ -1049,17 +980,6 @@ class SnapcastClient {
     int64_t decide_log_us{0};            // last Stage 2 DECIDE emit (idle throttle, <= 2 Hz)
     uint32_t decide_skipped{0};          // chunks the throttle suppressed since the last emit; reported as sk=
                                          // so the census still accounts for every chunk (see decide_log)
-    // St3a SHADOW. active_error() run beside the live composite, acting on nothing. The live test
-    // is `tags_fresh && now >= tag_fault_until_us`; active_error() additionally requires
-    // dl_err_at_us != 0 and a fresh accumulator (tune_tag_stale_ms_), so a disagreement is
-    // expected and its RATE is the thing being measured. The plan's bar is zero mismatches
-    // before any consumer is swapped, over a session including an injected starvation and an
-    // inject_split.
-    uint32_t errsel_n{0};                // chunks compared
-    uint32_t errsel_src_diff{0};         // ... where the two disagree on tag-vs-ledger
-    uint32_t errsel_val_diff{0};         // ... where both say tag but the value differs
-    int64_t errsel_worst_us{0};          // largest |new - live| seen while both said tag
-    int64_t errsel_log_us{0};            // last ERRSEL emit
     int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
     uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
     float align_kick_us{0.0f};  // render_align bias change not yet delivered as position (ALIGN KICK)
@@ -1230,7 +1150,6 @@ class SnapcastClient {
 
   /// St3a. One error selector: classifies the currently active error. The single point every
   /// consumer of error signals goes through; see the definition for the tag/ledger arbitration.
-  ErrorView active_error(const ServoState &st) const;
   /// St3b. One visibility horizon: how long until a correction shows up in the measurement.
   /// Replaces the five independent encodings (blank_ms / resync_blank_ms / travel_horizon /
   /// PHASE_TRANSIENT_US). @p clamp_us is the caller's per-use floor (0 = the unclamped live
@@ -1242,12 +1161,6 @@ class SnapcastClient {
   timing::Command timing_step_(ServoState &st, uint32_t sample_rate, bool err_valid,
                                int64_t err_us);
   /// True when this guard has been ablated via servo_param("guards", mask). Reads one relaxed
-  /// atomic; safe from any task.
-  bool guard_off(uint32_t bit) const {
-    return (this->tune_guard_mask_.load(std::memory_order_relaxed) & bit) != 0;
-  }
-  /// St7 ablation mask; 0 = every guard active. See GuardBit.
-  std::atomic<uint32_t> tune_guard_mask_{0};
   /// The new engine owns both actuators. 0 falls back to the old ladder + PI, for one flash's
   /// worth of comparison; the old paths go once this holds.
   std::atomic<uint32_t> tune_timing_engine_{1};
@@ -1258,28 +1171,13 @@ class SnapcastClient {
   /// St8: noise floor (us) subtracted from the differential evidence before it earns the gd
   /// boost. 0 = today's behaviour. See the comment at the boost_err computation for why: the
   /// boost was paying up to 12.5x gain for an estimate whose noise (80 us sd) exceeds the true
-  /// differential it is estimating (~15 us sd on the wire).
-  std::atomic<int32_t> tune_boost_floor_us_{0};
 
-  /// St4. One position arbiter: given ErrorView + gates + pending-motion ledger, returns the
-  /// frames to move this chunk. Hard resync / window step / splice / bang-bang become four
-  /// policies inside it, not four sites.
-  int32_t position_arbiter_(ServoState &st, const ErrorView &ev, int64_t now_us);
   /// St4. The one in-flight ledger, frame-exact, shared by every position policy. Serial
   /// step-and-verify: never step while a step is in flight.
-  struct InFlightLedger {
-    int32_t target_frames{0};
-    int32_t landed_frames{0};
-    int64_t step_at_us{0};
-    bool in_flight{false};
-  };
-  InFlightLedger in_flight_;
 
   /// St5a. Pending timebase step (us) fed forward from a consensus adoption or deadline-source
   /// switch. The size of the move is known at the instant it happens; the arbiter starts from it
   /// instead of rediscovering it as error over the next several blocks.
-  int64_t pending_timebase_step_us_{0};
-  int64_t timebase_step_at_us_{0};
   /// Forces one repair cycle after a re-lock, if configured; a no-op otherwise. Called once per
   /// chunk from the player loop, after the convergence gate.
   void reanchor_after_relock_(ServoState &st);
