@@ -425,7 +425,19 @@ cmd_status() {
         echo "    restart it to pick up the default: ${0##*/} stop && ${0##*/} start" >&2
         return 0
     fi
+    # The analyser binds the port a few seconds into startup (it primes log baselines
+    # first), so a single check right after `start` reports a bind failure that is really a
+    # race. Give it a moment before saying so -- a wrong alarm here sends you to read the
+    # pane for a fault that does not exist.
     rc=0; port_listening "${port}" || rc=$?
+    if [ "${rc}" = 1 ]; then
+        local i=0
+        while [ "${i}" -lt 6 ]; do
+            sleep 1; i=$((i + 1))
+            rc=0; port_listening "${port}" || rc=$?
+            [ "${rc}" = 1 ] || break
+        done
+    fi
     case "${rc}" in
         0) note "web plotter: http://127.0.0.1:${port}/  (listening)" ;;
         2) note "web plotter: --serve ${port} (no ss/lsof here — could not confirm it bound)" ;;
@@ -433,8 +445,10 @@ cmd_status() {
            echo "    the analyser warns and continues when the port is busy; check its pane" >&2 ;;
     esac
     # The server binds 127.0.0.1 only, so it is not reachable across the network by design.
+    # Address taken from SSH_CONNECTION's server field (the address you actually reached
+    # this box on), not from `hostname -f`, which returned "debian-work.debian-work" here.
     [ "${rc}" = 0 ] && [ -n "${SSH_CONNECTION:-}" ] && \
-        echo "    from your workstation: ssh -N -L ${port}:127.0.0.1:${port} $(id -un)@$(hostname -f 2>/dev/null || hostname)"
+        echo "    from your workstation: ssh -N -L ${port}:127.0.0.1:${port} $(id -un)@$(echo "${SSH_CONNECTION}" | awk '{print $3}')"
     return 0
 }
 
