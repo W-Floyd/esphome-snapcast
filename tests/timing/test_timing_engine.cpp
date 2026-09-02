@@ -98,7 +98,8 @@ Run simulate(Profile p, double plant_ppm, double seconds, double noise_us = 0.0,
   plant.noise_us = noise_us;
 
   const int64_t tick_us = 25000;  // ~40 Hz observations; the engine assumes no cadence
-  const int64_t pipe_us = 350000;  // when the dropped frames actually leave the pipeline
+  // no fixed pipe constant: the correction reaches the DAC at position_delay_us, and is then
+  // measured measurement_lag_us later. Their sum is exactly compensation_us().
   Run r{};
   double sum = 0.0, sumsq = 0.0;
   int n = 0;
@@ -127,7 +128,7 @@ Run simulate(Profile p, double plant_ppm, double seconds, double noise_us = 0.0,
     // at the same instant compensation stopped.
     history.emplace_back(t, plant.observe());
     double seen = history.front().second;
-    while (history.size() > 1 && history.front().first <= t - p.observation_delay_us) {
+    while (history.size() > 1 && history.front().first <= t - p.measurement_lag_us) {
       seen = history.front().second;
       history.pop_front();
     }
@@ -140,7 +141,7 @@ Run simulate(Profile p, double plant_ppm, double seconds, double noise_us = 0.0,
     Command cmd = eng.step(t, obs, g);
     if (cmd.frames != 0) {
       r.position_corrections++;
-      pend = {cmd.correction_id, cmd.frames, t + pipe_us, true};
+      pend = {cmd.correction_id, cmd.frames, t + p.position_delay_us, true};
     }
     plant.advance(tick_us, cmd.rate_ppm);
 
@@ -168,8 +169,8 @@ int main() {
   // The bench's own shape: transport (ring + pipe) is what an observation waits for, and
   // visibility adds the filter's lag on top. Keeping the relationship explicit here means a
   // profile in a test cannot accidentally make the two equal again.
-  p.observation_delay_us = 1000000;
-  p.visibility_us = p.observation_delay_us + Engine::filter_lag_us(p.observation_delay_us);
+  p.measurement_lag_us = 250000;    // pipeline: rate's dead time
+  p.position_delay_us = 1250000;    // ring + pipe: position's, measured on the wire
   // Swept: 88-100 ppm is where frame corrections stop, set by the plant's own +-30-40 ppm
   // wander rather than by the actuator's range. The actuator accepts +-2000, but authority
   // that large lets rate accept errors it then overshoots by A*T through the transport delay.
@@ -225,8 +226,7 @@ int main() {
   // filter (tau 2 s) cannot climb back over the coarse gate. At 3 s it can.
   for (int64_t vis_us : {1000000, 2000000, 3000000, 4000000, 5000000}) {
     Profile pv = p;
-    pv.observation_delay_us = vis_us;
-    pv.visibility_us = vis_us + Engine::filter_lag_us(vis_us);
+    pv.position_delay_us = vis_us;
     Engine eng(pv);
     Plant plant;
     plant.frame_us = pv.frame_us();
@@ -245,7 +245,11 @@ int main() {
     // measurement follows a visibility horizon later. Landing and visibility were one time here
     // too, which is why this property passed while the bench re-issued.
     std::deque<std::pair<int64_t, double>> history;
-    for (int64_t t = 0; t < 20000000; t += 25000) {
+    // Run for a multiple of the profile's own settling time, not a fixed 20 s: with the position
+    // delay swept to 5 s, a fixed window measures the residual before rate has finished cleaning
+    // up after the step and reports 1-2 frames of "failure" that is just impatience.
+    const int64_t run_us = std::max<int64_t>(20000000, 12 * pv.settle_us());
+    for (int64_t t = 0; t < run_us; t += 25000) {
       if (live && t >= land) {
         plant.apply_frames(pend_frames);
         eng.confirm_position_landed(pend_id, t);
@@ -253,7 +257,7 @@ int main() {
       }
       history.emplace_back(t, plant.error_us);
       double seen = history.front().second;
-      while (history.size() > 1 && history.front().first <= t - pv.observation_delay_us) {
+      while (history.size() > 1 && history.front().first <= t - pv.measurement_lag_us) {
         seen = history.front().second;
         history.pop_front();
       }
@@ -263,12 +267,12 @@ int main() {
         corrections++;
         pend_id = cmd.correction_id;
         pend_frames = cmd.frames;
-        land = t + 350000;  // pipeline depth, NOT the visibility horizon
+        land = t + pv.position_delay_us;
         live = true;
       }
       plant.advance(25000, cmd.rate_ppm);
     }
-    printf("        visibility %lld ms: %d corrections, residual %+.1f us\n",
+    printf("        position delay %lld ms: %d corrections, residual %+.1f us\n",
            static_cast<long long>(vis_us / 1000), corrections, plant.error_us);
     check(corrections >= 1, "a step out of rate's reach IS delivered", corrections, 1);
     check(corrections <= 2, "and costs at most 2 corrections", corrections, 2);
@@ -282,8 +286,7 @@ int main() {
     // of error is rate's job. Measured there as a correction every 4.0 s -- the entire
     // serialisation window -- at 8-9 frames each, while P contributed 0.4 ppm.
     Profile ps = p;
-    ps.observation_delay_us = 2000000;
-    ps.visibility_us = ps.observation_delay_us + Engine::filter_lag_us(ps.observation_delay_us);
+    ps.position_delay_us = 2000000;
     Run r = simulate(ps, 0.0, 600.0, 80.0);
     printf("        3-frame-scale error, 80 us noise: %d corrections over 600 s\n",
            r.position_corrections);
@@ -353,7 +356,7 @@ int main() {
       if (live && t >= land) { plant.apply_frames(pf); eng.confirm_position_landed(pid, t); live = false; }
       Observation obs{t, static_cast<int64_t>(std::llround(plant.error_us)), true};
       Command c = eng.step(t, obs, GroupEvidence{});
-      if (c.frames != 0) { pid = c.correction_id; pf = c.frames; land = t + p.visibility_us; live = true; }
+      if (c.frames != 0) { pid = c.correction_id; pf = c.frames; land = t + p.settle_us(); live = true; }
       plant.advance(25000, c.rate_ppm);
     }
     printf("        crystal after a pure 1.5 ms displacement: %.2f ppm\n", eng.crystal_ppm());
@@ -391,9 +394,7 @@ int main() {
     // pays for it in skew. Blind-holding for the visibility horizon passed every other property
     // here and still regressed the bench 9x (median |offset| 25 us -> 224 us), because this case
     // was not tested: with the crystal already correct, coasting costs nothing.
-    Profile pw = p;
-    pw.observation_delay_us = 2000000;   // bench: ring 1724 ms + pipe 247 ms
-    pw.visibility_us = pw.observation_delay_us + Engine::filter_lag_us(pw.observation_delay_us);
+    Profile pw = p;   // bench: ring 1724 ms + pipe 247 ms
     Engine eng(pw);
     eng.set_crystal_ppm(60.0f);   // wrong by 60 ppm: nothing in the plant asks for it
     Plant plant;
@@ -411,13 +412,13 @@ int main() {
       }
       history.emplace_back(t, plant.error_us);
       double seen = history.front().second;
-      while (history.size() > 1 && history.front().first <= t - pw.observation_delay_us) {
+      while (history.size() > 1 && history.front().first <= t - pw.measurement_lag_us) {
         seen = history.front().second;
         history.pop_front();
       }
       Command c = eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), true},
                            GroupEvidence{});
-      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + 350000; live = true; }
+      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + pw.position_delay_us; live = true; }
       plant.advance(tick, c.rate_ppm);
       // WHILE it unwinds, not after: measure from 30 s (past the initial acquisition) to 400 s,
       // which is where the crystal is still wrong and corrections are still firing. Sampling the
@@ -466,8 +467,7 @@ int main() {
     // and the crystal never converged. Nothing else in this file caught it, because every other
     // property is satisfied by a loop that oscillates about the right answer.
     Profile pq = p;
-    pq.observation_delay_us = 1000000;
-    pq.visibility_us = pq.observation_delay_us + Engine::filter_lag_us(pq.observation_delay_us);
+    pq.position_delay_us = 1000000;
     Engine eng(pq);
     Plant plant;
     plant.plant_ppm = 3.35;
@@ -480,13 +480,13 @@ int main() {
       if (live && t >= land) { plant.apply_frames(pf); eng.confirm_position_landed(pid, t); live = false; }
       history.emplace_back(t, plant.error_us);
       double seen = history.front().second;
-      while (history.size() > 1 && history.front().first <= t - pq.observation_delay_us) {
+      while (history.size() > 1 && history.front().first <= t - pq.measurement_lag_us) {
         seen = history.front().second;
         history.pop_front();
       }
       Command c = eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), true},
                            GroupEvidence{});
-      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + 350000; live = true; }
+      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + pq.position_delay_us; live = true; }
       plant.advance(tick, c.rate_ppm);
       if (t > 600000000) { rates.push_back(c.rate_ppm); errs.push_back(std::fabs(plant.error_us)); }
     }
@@ -507,8 +507,7 @@ int main() {
     // the CRYSTAL_LIMIT_PPM clamp means it is tracking something else. Measured on hardware
     // railing both boards to 200 ppm inside one boot, while the host suite was green.
     Profile pt = p;
-    pt.observation_delay_us = 2000000;
-    pt.visibility_us = pt.observation_delay_us + Engine::filter_lag_us(pt.observation_delay_us);
+    pt.position_delay_us = 2000000;
     Engine eng(pt);
     Plant plant;
     plant.plant_ppm = 3.35;
@@ -524,13 +523,13 @@ int main() {
       if (live && t >= land) { plant.apply_frames(pf); eng.confirm_position_landed(pid, t); live = false; }
       history.emplace_back(t, plant.observe());
       double seen = history.front().second;
-      while (history.size() > 1 && history.front().first <= t - pt.observation_delay_us) {
+      while (history.size() > 1 && history.front().first <= t - pt.measurement_lag_us) {
         seen = history.front().second;
         history.pop_front();
       }
       Command c = eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), true},
                            GroupEvidence{});
-      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + 350000; live = true; }
+      if (c.frames != 0 && !live) { pid = c.correction_id; pf = c.frames; land = t + pt.position_delay_us; live = true; }
       plant.advance(tick, c.rate_ppm);
       peak_abs_xtal = std::max(peak_abs_xtal, std::fabs((double) eng.crystal_ppm()));
     }

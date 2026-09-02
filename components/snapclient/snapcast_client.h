@@ -1129,7 +1129,11 @@ class SnapcastClient {
   void publish_render_phase_(bool steady);  // per-block render phase to the group; UNKNOWN while in transient
   void publish_render_phase_sample_();      // measure + store one phase sample (no broadcast-flag change)
   int64_t travel_horizon_us_() const;
-  int64_t observation_delay_us_() const;  // ring + pipeline + two blocks: how long a position change takes to reach the tags
+  int64_t observation_delay_us_() const;
+  /// Measured observation cadence: how often the engine is told the error. Supplies
+  /// Profile::measurement_lag_us, which is rate's dead time.
+  int64_t last_timing_obs_us_{0};
+  int64_t timing_obs_interval_us_{0};  // ring + pipeline + two blocks: how long a position change takes to reach the tags
 #endif
 
   /// St3a. One error selector: classifies the currently active error. The single point every

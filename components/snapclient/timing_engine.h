@@ -16,7 +16,7 @@
 //
 // Budget. Position is the integral of rate, so rate-command noise is a position noise budget:
 //
-//     sigma_rate <= sigma_position / visibility_us
+//     sigma_rate <= sigma_position / rate_horizon_us   (rate's own delay, not the buffer's)
 //
 // Rate is also the only continuous actuator, so it owns sub-frame position by necessity;
 // position actuators are quantised to one frame.
@@ -30,30 +30,62 @@
 namespace esphome::snapclient::timing {
 
 /// Rate- and codec-dependent values, supplied by the transport.
+///
+/// TWO measured delays, because the two actuators do not share one.
+///
+///   RATE acts at the DAC. Changing the I2S clock shifts the render instant of everything already
+///   buffered, immediately, so rate's dead time is only how long the error takes to be MEASURED
+///   and reported -- the pipeline, ~250 ms. The ring is not in its loop at all.
+///
+///   POSITION acts at the ring INPUT. A dropped frame has to drain the whole ring before the DAC
+///   or the measurement can see it, so its dead time carries the buffer: ring + pipe, ~1.25 s
+///   measured on the wire (93% of corrections produce a wire step at that lag).
+///
+/// Sizing rate from position's delay costs a factor of 6 in position error -- measured at median
+/// |e| 60 us against 9 us -- because it throttles a loop that has no reason to be slow. It also
+/// makes a bigger network buffer degrade clock sync, which it has no business doing.
 struct Profile {
   uint32_t frame_rate_hz = 44100;
-  /// Time for a correction to become visible in the FILTERED error: the transport delay plus the
-  /// error filter's own lag. Sets the noise budget, the credit baseline and position serialisation.
-  int64_t visibility_us = 3000000;
-  /// Time for a correction to appear in a RAW observation: the transport delay alone (ring +
-  /// pipe), with no filter lag in it. This is the only correct window for compensating stale
-  /// observations, and it is much shorter than visibility_us -- measured on the bench at 1971 ms
-  /// against 3971 ms, so compensating over the latter subtracts a displacement the measurement
-  /// has already accounted for, for two whole seconds, and the loop corrects the phantom back.
-  int64_t observation_delay_us = 1000000;
+  /// Render instant -> reported error. RATE's dead time.
+  int64_t measurement_lag_us = 250000;
+  /// Ring + pipe: a delivered frame correction -> the DAC. POSITION's dead time.
+  int64_t position_delay_us = 1250000;
   /// Position accuracy aimed at; sets the rate-command noise budget.
   int64_t target_position_us = 20;
   /// How much rate the loop may command on top of the crystal, from the transport that owns the
   /// actuator. AUTHORITY, not noise: Kp = budget/sigma_e already bounds the injected noise, so
   /// clamping the output to the budget as well capped correction at one sigma and made position
-  /// pay for every plant wander. Not a constant in this file -- it is a property of the hardware.
+  /// pay for every plant wander. Sized by the plant's ppm wander, so it does not scale with rate,
+  /// buffer or codec. Not a constant in this file -- it is a property of the hardware.
   float rate_authority_ppm = 100.0f;
 
   int64_t frame_us() const { return 1000000 / static_cast<int64_t>(frame_rate_hz); }
 
+  /// Lag the error filter adds. A multiple of the TRANSPORT delay (compensation_us), not of the
+  /// measurement lag: the filter's job is rejecting measurement noise and the tens-of-ms
+  /// transients this bench delivers, and a filter as short as the pipeline passes them straight
+  /// into the crystal -- measured railing the estimate to its 200 ppm clamp. So the filter stays
+  /// slow, and rate's horizon carries that lag honestly rather than pretending to be faster.
+  int64_t filter_lag_us() const;
+
+  /// RATE's loop delay: measure it, then filter it. Sets Kp, the integral's bandwidth, and how
+  /// far rate can reach before position has to act.
+  int64_t rate_horizon_us() const { return measurement_lag_us + filter_lag_us(); }
+
+  /// Window over which a delivered correction is still absent from a RAW observation: it must
+  /// reach the DAC and then be measured. No filter lag -- compensation applies to raw samples.
+  int64_t compensation_us() const { return position_delay_us + measurement_lag_us; }
+
+  /// When the FILTERED error contains a delivered correction. Serialises position, and sets the
+  /// credit baseline and the in-flight expiry.
+  int64_t settle_us() const { return compensation_us() + filter_lag_us(); }
+
+  /// sigma_rate <= sigma_position / horizon, over RATE's horizon: the command noise integrates
+  /// into position over the time rate takes to respond, which the ring does not lengthen.
   float rate_noise_budget_ppm() const {
-    if (visibility_us <= 0) return 0.0f;
-    return 1e6f * static_cast<float>(target_position_us) / static_cast<float>(visibility_us);
+    const int64_t h = rate_horizon_us();
+    if (h <= 0) return 0.0f;
+    return 1e6f * static_cast<float>(target_position_us) / static_cast<float>(h);
   }
 };
 
@@ -130,11 +162,9 @@ class Engine {
   /// budget/sigma_e, so a noisier measurement earns less gain.
   float sigma_e_us() const;
 
-  /// Lag the error filter adds, us, for a given transport delay. The caller's visibility horizon
-  /// is the transport it can measure plus this: a correction is not visible until the filter has
-  /// caught up with it. Takes the delay as an argument rather than owning a time of its own, so
-  /// the filter's timescale follows the buffer and the rate instead of this file.
-  static int64_t filter_lag_us(int64_t observation_delay_us);
+  /// Lag the error filter adds for a given measurement lag. Free function form, for callers that
+  /// need the horizon arithmetic before they have a Profile.
+  static int64_t filter_lag_for(int64_t measurement_lag_us);
 
   void reset();
 

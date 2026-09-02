@@ -2853,7 +2853,7 @@ void SnapcastClient::player_task_() {
       const int64_t transport_now =
           ring_us_now + st.pipe_depth_frames * 1000000 / static_cast<int64_t>(rec.params.sample_rate);
       const int64_t horizon_now =
-          transport_now + timing::Engine::filter_lag_us(transport_now);
+          transport_now + timing::Engine::filter_lag_for(transport_now);
       blank_us = std::max(blank_us, horizon_now);
     }
     // JUDGE ONLY AFTER THE MEASUREMENT CAN SHOW THE EFFECT. The action cadence (blank_us, 200 ms in
@@ -4052,7 +4052,7 @@ int64_t SnapcastClient::travel_horizon_us_() const {
   // is not visible until the filter has caught up with it. It used to be 2 * block_n arrivals,
   // which modelled the lag of averaging 64 arrivals -- an average that no longer exists.
   const int64_t transport = ring + pipe;
-  return std::clamp<int64_t>(transport + timing::Engine::filter_lag_us(transport), 1000000,
+  return std::clamp<int64_t>(transport + timing::Engine::filter_lag_for(transport), 1000000,
                              5000000);
 }
 
@@ -4162,8 +4162,28 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
                                             bool err_valid, int64_t err_us) {
   timing::Profile prof;
   prof.frame_rate_hz = sample_rate ? sample_rate : 44100;
-  prof.visibility_us = this->visibility_horizon_us();
-  prof.observation_delay_us = this->observation_delay_us_();
+  // TWO delays, because the two actuators do not share one.
+  //
+  // position_delay: ring + pipe. A frame dropped at the ring input drains the whole buffer before
+  // the DAC sees it. Cross-checked on the wire: 93% of corrections produce a frame-sized step in
+  // the analyser's offset 1.25 s later.
+  prof.position_delay_us = this->observation_delay_us_();
+  // measurement_lag: render instant -> reported error. NOT the pipeline, which is push -> render:
+  // the error describes audio that has ALREADY rendered, so what remains is how long until we are
+  // told. That is the observation cadence, so it is measured rather than assumed -- a chunk period
+  // is a function of codec and rate and would be wrong as a constant here.
+  const int64_t obs_now = now_us();
+  if (this->last_timing_obs_us_ != 0) {
+    const int64_t gap = obs_now - this->last_timing_obs_us_;
+    if (gap > 0 && gap < 1000000) {
+      this->timing_obs_interval_us_ =
+          this->timing_obs_interval_us_ == 0
+              ? gap
+              : this->timing_obs_interval_us_ + (gap - this->timing_obs_interval_us_) / 8;
+    }
+  }
+  this->last_timing_obs_us_ = obs_now;
+  prof.measurement_lag_us = std::max<int64_t>(this->timing_obs_interval_us_, 10000);
   // Authority is sized by the PLANT'S WANDER, which is a ppm quantity and so independent of rate,
   // buffer size and codec -- measured on this bench at |de/dt| median 16 ppm, p90 30 ppm. Swept in
   // the host harness: frame corrections stop at 88-100 ppm and the saturation point is the same at

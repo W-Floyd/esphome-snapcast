@@ -73,9 +73,11 @@ void Engine::reset() {
   suppressed_ = 0;
 }
 
-int64_t Engine::filter_lag_us(int64_t observation_delay_us) {
-  return static_cast<int64_t>(ERR_TAU_HORIZONS * static_cast<float>(observation_delay_us));
+int64_t Engine::filter_lag_for(int64_t measurement_lag_us) {
+  return static_cast<int64_t>(ERR_TAU_HORIZONS * static_cast<float>(measurement_lag_us));
 }
+
+int64_t Profile::filter_lag_us() const { return Engine::filter_lag_for(compensation_us()); }
 
 float Engine::sigma_e_us() const {
   // Floored at ONE FRAME, which is what caps Kp at budget/frame_us -- the gain at which the P
@@ -111,7 +113,7 @@ void Engine::credit_position_correction(int32_t frames, int64_t now_us) {
   credit_count_++;
 
   const int64_t baseline_us =
-      static_cast<int64_t>(CREDIT_BASELINE_HORIZONS) * profile_.visibility_us;
+      static_cast<int64_t>(CREDIT_BASELINE_HORIZONS) * profile_.settle_us();
   const int64_t dt_us = now_us - credit_since_us_;
   if (dt_us < baseline_us) return;
 
@@ -196,8 +198,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     } else {
       const int64_t dt = last_obs_us_ > 0 ? now_us - last_obs_us_ : 0;
       const float dt_s = dt > 0 ? static_cast<float>(dt) / 1e6f : 0.0f;
-      const float tau_s =
-          std::max(1e-3f, static_cast<float>(filter_lag_us(profile_.observation_delay_us)) / 1e6f);
+      const float tau_s = std::max(1e-3f, static_cast<float>(profile_.filter_lag_us()) / 1e6f);
       const float alpha = dt_s > 0.0f ? 1.0f - std::exp(-dt_s / tau_s) : 0.0f;
       err_mean_us_ += alpha * (x - err_mean_us_);
       // Noise from CONSECUTIVE DIFFERENCES, not from the spread about the mean. |x - mean|
@@ -214,7 +215,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
 
   // Expire an unconfirmed correction, or the position path freezes if a landing is never reported.
   if (in_flight_ && now_us - in_flight_since_us_ >
-                        static_cast<int64_t>(MAX_IN_FLIGHT_HORIZONS) * profile_.visibility_us) {
+                        static_cast<int64_t>(MAX_IN_FLIGHT_HORIZONS) * profile_.settle_us()) {
     in_flight_ = false;
     in_flight_frames_ = 0;
   }
@@ -240,8 +241,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // so noise alone cannot trigger one. No magic margin -- it is derived from the measured noise.
   // The filter's residual noise: sd_out ~ sd_in * sqrt(alpha/2) for an EMA, with alpha the
   // effective per-observation weight implied by the current interval and ERR_TAU_S.
-  const float tau_gate_s =
-      std::max(1e-3f, static_cast<float>(filter_lag_us(profile_.observation_delay_us)) / 1e6f);
+  const float tau_gate_s = std::max(1e-3f, static_cast<float>(profile_.filter_lag_us()) / 1e6f);
   const float obs_dt_s =
       last_obs_us_ > 0 && now_us > last_obs_us_
           ? static_cast<float>(now_us - last_obs_us_) / 1e6f
@@ -254,13 +254,11 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // within one horizon; while that is inside the loop's authority, a frame correction is not a
   // last resort but a shortcut -- and an irreversible one, quantised to 22.68 us, against an
   // actuator that is continuous. Position is for what rate CANNOT do.
-  // Judged over the OBSERVATION delay, not visibility. visibility carries the position delay and
-  // the filter lag on top, and a horizon that long claims rate can absorb an error it will in fact
-  // overshoot: at a 10 s visibility a 907 us step needs only 91 ppm, passes as "within reach", and
-  // settles 290 us the other side. INTERIM -- the honest quantity is rate's own dead time (the
-  // measurement lag, ~pipe), which needs the three-horizon split; measured at median |e| 9 us
-  // against 60 us for the horizon we ship.
-  const float reach_s = static_cast<float>(profile_.observation_delay_us) / 1e6f;
+  // Judged over RATE'S OWN horizon: measure, then filter. Not over the position delay, which
+  // carries the ring and would claim rate can absorb an error it will in fact overshoot (at a 10 s
+  // horizon a 907 us step needs only 91 ppm, passes as "within reach", and settles 290 us the
+  // other side).
+  const float reach_s = static_cast<float>(profile_.rate_horizon_us()) / 1e6f;
   const float needed_ppm =
       reach_s > 0.0f ? static_cast<float>(e_filtered) / reach_s : 0.0f;
   const bool rate_can_fix = std::fabs(needed_ppm) <= profile_.rate_authority_ppm;
@@ -291,8 +289,8 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     in_flight_frames_ = frames;
     in_flight_since_us_ = now_us;
     pending_disp_us_ = static_cast<int64_t>(frames) * frame_us;
-    pending_comp_until_us_ = now_us + profile_.observation_delay_us;
-    serialise_until_us_ = now_us + profile_.visibility_us;
+    pending_comp_until_us_ = now_us + profile_.compensation_us();
+    serialise_until_us_ = now_us + profile_.settle_us();
     // Compensation is a change of coordinates, so the filter's STATE moves with its inputs, at
     // the same instant. Shifting only the inputs leaves err_mean_us_ holding the pre-correction
     // value and decaying toward the compensated stream over ERR_TAU_S, which crosses the coarse
@@ -333,8 +331,10 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     //     with no measurement noise sigma_e sits on its 0.25-frame floor, Kp is large, and at a
     //     5 s horizon wn ~ 0.35 rad/s wiped out the phase margin (xtal railed to 183-199 ppm).
     // The delay-limited law showed no instability at any K or horizon tested.
-    const float vis_s = static_cast<float>(profile_.visibility_us) / 1e6f;
-    const float wn = vis_s > 0.0f ? 1.0f / (CRYSTAL_DELAY_MARGIN * vis_s) : 0.0f;
+    // RATE's horizon. Sized from the position delay this was 6x slower than it needed to be, for
+    // no reason: the ring is not in the rate loop.
+    const float rate_h_s = static_cast<float>(profile_.rate_horizon_us()) / 1e6f;
+    const float wn = rate_h_s > 0.0f ? 1.0f / (CRYSTAL_DELAY_MARGIN * rate_h_s) : 0.0f;
     // BOUNDED input. The error carries transients of tens of milliseconds -- the bench census
     // shows min -26 ms, max +50 ms on a quiet run -- and an integrator fed raw error winds them
     // straight into the estimate: measured railing both boards to the 200 ppm clamp within one
