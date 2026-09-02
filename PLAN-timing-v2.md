@@ -316,6 +316,36 @@ handling. **[C]**
 mismatches over a session including an injected starvation and an `inject_split`. Only then swap
 the consumers.
 
+**Measured 2026-09-02 (`scripts/bench/errsel-bar.py`, shadow in `cee71d1`).** Bar met in letter:
+`srcdiff = 0`, `valdiff = 0` across ~96 k cumulative chunks per board and through every phase.
+Read the sharpness before believing it:
+
+    phase                     arms exercised     srcdiff   events
+    quiet, both boards        tag only                 0   -
+    starvation 300 ms on A    ledger + tag             0   2 hard resyncs, 1 OOR
+    split +1000 us on A       tag only                 0   -
+    board B, every phase      tag only                 0   -
+
+The two selectors can only differ OFF the tag path, so a phase that never leaves `live=tag`
+proves nothing. Exactly one phase — the starvation on A — produced a real tag→ledger transition,
+and the selectors agreed through it. That is a genuine pass over one board and ~882 chunks, and it
+is thinner than "zero over a session" sounds.
+
+**Two findings for the plan itself:**
+
+1. **`inject_split` does not exercise the selector.** Tags stayed live on both boards throughout,
+   so this half of the bar tested nothing about tag-vs-ledger. It perturbs the ledger, which is a
+   different thing from making the tag path untrustworthy. To exercise the extra conditions
+   directly, shrink `tag_stale_ms` via `servo_param` or starve for longer than
+   `DL_ERR_STALE_US`; a 300 ms starvation only just reaches the transition.
+2. **`active_error()`'s two extra conditions have never bound.** `dl_err_at_us != 0` and the
+   `tune_tag_stale_ms_` accumulator gate changed no outcome, including across the one real
+   transition. They are stricter than the live test and fail toward the ledger, so they are safe —
+   but they are also **untested code in a load-bearing path**, which is the thing to decide about
+   before Stage 4 consumes `ErrorView`. Keep them and record that they have never fired (so nobody
+   later "simplifies" them believing they carry weight), or drop them and lose nothing measurable.
+   **Do not swap the consumers while that is undecided.**
+
 ### 3b. One visibility horizon
 
 "How long until a correction shows up in the measurement" is encoded **five ways**, four of which
