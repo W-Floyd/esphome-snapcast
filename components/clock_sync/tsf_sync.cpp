@@ -862,25 +862,50 @@ void TsfSync::update_consensus_(int64_t local_now_us) {
   double dr[MAX_PEERS + 1];
   size_t n = 0;
   int64_t base_tms = 0;
-  const auto add = [&](int64_t tsf_base, int64_t tms_base, float drift_ppm) {
+  // WHO CONTRIBUTED WHAT. dv[] and dr[] alone cannot answer that, and without it a timebase step
+  // can only be reasoned about from its magnitude -- which I did, and got wrong twice: first
+  // blaming a zero-valued mapping (no such value is reachable: BSSID and server_id are checked on
+  // receive, a BSSID change resets, broadcast_ is gated on est.valid && est.mature, and
+  // no_mapping continues before map_valid is set), then blaming the anchor (the estimator is
+  // gauge-invariant, so arrival order cannot matter). Record the inputs so the next step names
+  // its cause instead of inviting another theory.
+  struct Contrib {
+    bool self;
+    uint8_t mac[6];
+    int64_t tsf_base;
+    int64_t tms_base;
+    float drift_ppm;
+    int64_t tms_at_ref;
+  };
+  Contrib contrib[MAX_PEERS + 1] = {};
+  const auto add = [&](bool self, const uint8_t *mac, int64_t tsf_base, int64_t tms_base,
+                       float drift_ppm) {
     const int64_t dt = ref_tsf - tsf_base;
     const int64_t tms = tms_base + static_cast<int64_t>(static_cast<double>(drift_ppm) * 1e-6 *
                                                         static_cast<double>(dt));
     if (n == 0) {
       base_tms = tms;
     }
+    contrib[n].self = self;
+    if (mac != nullptr) {
+      memcpy(contrib[n].mac, mac, 6);
+    }
+    contrib[n].tsf_base = tsf_base;
+    contrib[n].tms_base = tms_base;
+    contrib[n].drift_ppm = drift_ppm;
+    contrib[n].tms_at_ref = tms;
     dv[n] = static_cast<double>(tms - base_tms);
     dr[n] = static_cast<double>(drift_ppm);
     n++;
   };
   if (this->pub_valid_) {
-    add(this->pub_tsf_base_, this->pub_tms_base_, this->pub_drift_ppm_);
+    add(true, this->my_mac_, this->pub_tsf_base_, this->pub_tms_base_, this->pub_drift_ppm_);
   }
   for (const Peer &p : this->peer_) {
     if (n >= MAX_PEERS + 1 || !p.used || !p.map_valid || local_now_us - p.map_seen_us > PEER_MAP_STALE_US) {
       continue;
     }
-    add(p.tsf_base_us, p.tms_base_us, p.drift_ppm);
+    add(false, p.mac, p.tsf_base_us, p.tms_base_us, p.drift_ppm);
   }
   if (n == 0) {
     return;
@@ -936,6 +961,35 @@ void TsfSync::update_consensus_(int64_t local_now_us) {
   const int64_t held_tms_base = this->map_tsf_minus_server_us_;
   const float held_drift = this->map_drift_ppm_;
   this->mapping_mutex_.unlock();
+  // ONE SHORT LINE PER CONTRIBUTOR, fixed field count, no variable-length tail: the formatting
+  // ceiling is 256 bytes of message and a field near the end of a long line is really a record of
+  // "did the line fit". Absolute values, not deviations -- the deviations are what we already had
+  // and they cannot identify a bad input.
+  const auto dump = [&](const char *why, bool have_expected, int64_t expected) {
+    for (size_t i = 0; i < n; i++) {
+      ESP_LOGW(TAG,
+               "CONSIN %s %zu/%zu %s%02X%02X tsf_base=%" PRId64 " tms_base=%" PRId64
+               " drift=%+.3f tms@ref=%" PRId64 " dev=%+.0f",
+               why, i + 1, n, contrib[i].self ? "SELF:" : "peer:", contrib[i].mac[4],
+               contrib[i].mac[5], contrib[i].tsf_base, contrib[i].tms_base, contrib[i].drift_ppm,
+               contrib[i].tms_at_ref, dv[i]);
+    }
+    // `expected` only exists when a mapping was held. Printed as "n/a" otherwise, never as 0:
+    // a zero that reads as a measurement is how a 2^63 overflow got taken seriously on this bench
+    // once already, and the whole point of this line is that someone will subtract these fields.
+    char exp_str[24];
+    if (have_expected) {
+      snprintf(exp_str, sizeof(exp_str), "%" PRId64, expected);
+    } else {
+      snprintf(exp_str, sizeof(exp_str), "n/a");
+    }
+    ESP_LOGW(TAG,
+             "CONSIN %s ref_tsf=%" PRId64 " base_tms=%" PRId64 " adopt=%" PRId64 " held=%d"
+             " held_tms=%" PRId64 " held_tsf=%" PRId64 " held_drift=%+.3f expected=%s",
+             why, ref_tsf, base_tms, tms_adopt, held ? 1 : 0, held_tms_base, held_tsf_base,
+             held_drift, exp_str);
+  };
+
   if (held) {
     // Diagnostics only now: report how far the timebase actually moved, so a membership change or
     // a genuine re-anchor is still visible and still tells the consumer's servo. Nothing is
@@ -948,7 +1002,18 @@ void TsfSync::update_consensus_(int64_t local_now_us) {
       this->timebase_epoch_.fetch_add(1, std::memory_order_relaxed);
       ESP_LOGI(TAG, "Timebase step %+" PRId64 " us over %zu estimate(s) (common-mode: every device "
                     "holding this set steps identically)", delta, n);
+      dump("step", true, expected);
     }
+  }
+  // ADOPTION WITHOUT CORROBORATION. With one contributor there is no averaging and no dilution:
+  // base_tms IS that contributor's value, dv = {0}, robust_mean returns 0, and tms_adopt is its
+  // mapping verbatim. It is also the state in which the per-peer plausibility gate is off, since
+  // that gate requires our own estimate to be mature and n==1 usually means it is not. Measured
+  // 199 such adoptions on board b in one session. Throttled, because n==1 is common and this is
+  // for seeing WHICH mapping was taken on trust, not for counting them.
+  if (n == 1 && local_now_us - this->last_solo_log_us_ >= 10000000) {
+    this->last_solo_log_us_ = local_now_us;
+    dump("solo", false, 0);
   }
   this->adopt_(ref_tsf, tms_adopt, drift_c, local_now_us);
 
