@@ -57,14 +57,28 @@ note() { echo "==> $*"; }
 lower() { tr '[:upper:]' '[:lower:]'; }
 
 # ── BSD/GNU wrappers ──────────────────────────────────────────────────────────
-file_size() { stat -f %z "$1" 2>/dev/null || stat -c %s "$1" 2>/dev/null || echo 0; }
+# Decided ONCE by probing, not by try-BSD-then-GNU. `stat -f` exists in both and means
+# different things: BSD reads it as a format string, GNU as --file-system. Given a file, GNU
+# `stat -f %z a.log` PRINTS THE FILESYSTEM BLOCK to stdout and only then exits nonzero, so a
+# `||` fallback still emits that text -- it reached `$(( ))` as "File: \"a.log\" ID: ..." and
+# came back as `File: unbound variable`. A fallback whose wrong branch half-succeeds is worse
+# than having none: it corrupts the output instead of failing over.
+if stat --version >/dev/null 2>&1; then STAT=gnu; else STAT=bsd; fi
 
-file_time() {  # mtime as HH:MM:SS
-    stat -f '%Sm' -t '%H:%M:%S' "$1" 2>/dev/null && return
-    stat -c '%y' "$1" 2>/dev/null | cut -c12-19
+file_size() {
+    if [ "${STAT}" = gnu ]; then stat -c %s "$1" 2>/dev/null || echo 0
+    else stat -f %z "$1" 2>/dev/null || echo 0; fi
 }
 
-file_mtime() { stat -f %m "$1" 2>/dev/null || stat -c %Y "$1" 2>/dev/null || echo 0; }
+file_mtime() {
+    if [ "${STAT}" = gnu ]; then stat -c %Y "$1" 2>/dev/null || echo 0
+    else stat -f %m "$1" 2>/dev/null || echo 0; fi
+}
+
+file_time() {  # mtime as HH:MM:SS
+    if [ "${STAT}" = gnu ]; then stat -c '%y' "$1" 2>/dev/null | cut -c12-19
+    else stat -f '%Sm' -t '%H:%M:%S' "$1" 2>/dev/null; fi
+}
 
 # These logs span DAYS and carry no date, so a bare HH:MM:SS is not evidence of freshness --
 # reading one as current when it was a previous day's build has already cost a session here.
@@ -158,7 +172,6 @@ ensure_session() {
     # remain-on-exit keeps a dead pane and its last words on screen instead of collapsing the
     # window -- the difference between diagnosing a crash and finding an empty session.
     tmux new-session -d -s "${SESSION}" -n scratch -c "${REPO_ROOT}"
-    tmux set-option -t "${SESSION}" remain-on-exit on >/dev/null
     tmux set-option -t "${SESSION}" history-limit 200000 >/dev/null
     tmux set-option -t "${SESSION}" -g pane-border-status top >/dev/null 2>&1 || true
     tmux set-option -t "${SESSION}" -g pane-border-format ' #{pane_title} ' >/dev/null 2>&1 || true
@@ -183,6 +196,10 @@ ensure_pane() {
     if ! tmux list-windows -t "${SESSION}" -F '#{window_name}' | grep -qx "${win}"; then
         tmux new-window -d -t "${SESSION}" -n "${win}" -c "${REPO_ROOT}" "${cmd}"
         tmux select-pane -t "${SESSION}:${win}" -T "${title}"
+        # remain-on-exit is a WINDOW option: setting it on the session target does not reach
+        # windows made later, and a pane that died was then destroyed rather than held with
+        # its last words on screen -- which is the whole reason for wanting it.
+        tmux set-option -w -t "${SESSION}:${win}" remain-on-exit on >/dev/null
         note "started ${win}/${title}"
         return
     fi
@@ -246,9 +263,16 @@ start_analyzer() {
     fi
     # ORDER IS LOAD-BEARING: --annotate takes the first two logs as board A and board B, in
     # that order; anything after is parsed for events only. observer.log goes THIRD.
+    # Every CONFIGURED log is annotated, whether or not it exists yet -- on a fresh host the
+    # serial loggers have not written a byte at this point, and filtering on -f silently
+    # handed the analyser `--annotate a.log` alone. It would then have run a whole session
+    # with board B and the observer unparsed, which looks exactly like two boards that never
+    # logged an event. Create the files instead (append-open, never truncating).
     for role in ${ROLES}; do
         log="$(get LOG "${role}")"
-        [ -n "${log}" ] && [ -f "${log}" ] && annotate="${annotate} ${log}"
+        [ -n "${log}" ] || continue
+        [ "${DRY_RUN}" = 1 ] || [ -f "${log}" ] || : >> "${log}"
+        annotate="${annotate} ${log}"
     done
     analyzer_preflight
 
@@ -341,9 +365,9 @@ cmd_status() {
     local win id title dead cmd role log f
     while IFS="$(printf '\t')" read -r win id title dead cmd; do
         printf '    %-9s %-10s %-8s %s\n' "${win}" "${title}" \
-            "$([ "${dead}" = 1 ] && echo DEAD || echo live)" "${cmd}"
+            "$([ "${dead}" = 1 ] && echo DEAD || echo live)" "$(printf '%.72s' "${cmd}")"
     done < <(tmux list-panes -s -t "${SESSION}" -F \
-        "#{window_name}$(printf '\t')#{pane_id}$(printf '\t')#{pane_title}$(printf '\t')#{pane_dead}$(printf '\t')#{pane_current_command}")
+        "#{window_name}$(printf '\t')#{pane_id}$(printf '\t')#{pane_title}$(printf '\t')#{pane_dead}$(printf '\t')#{pane_start_command}")
 
     # Panes can be live while nothing is being captured -- a detached USB device, or an
     # analyser gone quiet on LIBUSB_ERROR_NO_DEVICE. Freshness is the real signal, so print
