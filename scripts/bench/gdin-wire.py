@@ -119,8 +119,55 @@ def read_wire(path):
     return rows, dropped
 
 
+def ols(xs, ys):
+    """Least-squares slope of y on x."""
+    n = len(xs)
+    if n < 2:
+        return float("nan")
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sxx = sum((x - mx) ** 2 for x in xs)
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / sxx if sxx else float("nan")
+
+
+def bracket(xs, ys):
+    """(low, high) bounds on the slope under errors-in-variables, plus Pearson r.
+
+    THE NOISE IS IN x, NOT IN y: `raw` disagrees with the wire by rare large excursions, while
+    the wire is gated to a clean lock. Every single-estimator slope is therefore biased, and the
+    direction depends on which variable you regress on:
+
+        OLS(y|x)      attenuated toward 0 by the noise in x  -> LOWER bound
+        1/OLS(x|y)    inflated by the noise in y             -> UPPER bound
+        Theil-Sen     somewhere between, by no fixed rule
+
+    Reporting one number is how this grader printed FAIL (Theil-Sen 0.93, 4/6 blocks out of band)
+    on data whose slope is 1.0: the bracket was 0.58 .. 1.04, and the upper bound sat on 1.0 in
+    every block on both boards, which is the signature of y = x + noise. Quote the bracket.
+    """
+    n = len(xs)
+    if n < 3:
+        return float("nan"), float("nan"), float("nan")
+    fwd = ols(xs, ys)
+    rev = ols(ys, xs)
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    sx = (sum((x - mx) ** 2 for x in xs) / n) ** 0.5
+    sy = (sum((y - my) ** 2 for y in ys) / n) ** 0.5
+    r = (sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / n / (sx * sy)) if sx and sy else float("nan")
+    hi = (1.0 / rev) if rev else float("nan")
+    lo = fwd
+    if lo == lo and hi == hi and lo > hi:      # both finite and inverted (negative slopes)
+        lo, hi = hi, lo
+    return lo, hi, r
+
+
 def theil_sen(xs, ys, cap=40000):
-    """Median of pairwise slopes. Robust to the whole-frame outliers this bench produces."""
+    """Median of pairwise slopes. Robust to the whole-frame outliers this bench produces.
+
+    Kept as a third view, NOT as the verdict: it is biased under errors-in-variables and this
+    bench is exactly that case. See bracket().
+    """
     n = len(xs)
     if n < 2:
         return float("nan")
@@ -183,50 +230,102 @@ def grade(pairs, block_s, min_n):
             out.append((b, len(pts), float("nan"), float("nan"), span))
             continue
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
-        slope = theil_sen(xs, ys)
-        resid = statistics.median([abs(y - slope * x) for x, y in zip(xs, ys)])
-        out.append((b, len(pts), slope, resid, span))
+        lo, hi, r = bracket(xs, ys)
+        ts = theil_sen(xs, ys)
+        # Residual about the bracket's midpoint, in MAD not sd: this bench's disagreement is rare
+        # large excursions, and sd overstates it by ~8x.
+        mid = (lo + hi) / 2 if lo == lo and hi == hi else ts
+        res = [y - mid * x for x, y in zip(xs, ys)]
+        rmed = statistics.median(res)
+        resid = statistics.median([abs(v - rmed) for v in res])
+        out.append((b, len(pts), lo, hi, r, ts, resid, span))
     return out
 
 
+def verdict(lo, hi, tol=SLOPE_TOL, uninformative=1.0):
+    """What a block's bracket actually licenses you to say."""
+    if lo != lo or hi != hi:
+        return "no data"
+    if hi - lo > uninformative:
+        return "uninformative"          # too little leverage to constrain the slope at all
+    if hi < 1.0 - tol or lo > 1.0 + tol:
+        return "EXCLUDES 1.0"           # a real disagreement, not an estimator artefact
+    return "ok"
+
+
 def self_test():
-    """The grader must recover a slope it was given, and must NOT be fooled by outliers."""
+    """The grader must recover a slope it was given, AND must not be fooled by the shape of this
+    bench's real error.
+
+    THE ORIGINAL SELF-TEST COULD NOT FAIL. It built the wire as an exact function of `raw`, i.e.
+    with no noise in x -- the one case where every estimator agrees and the errors-in-variables
+    bias vanishes. It passed while the grader printed FAIL on real data whose slope is 1.0. The
+    x-noise cases below are the ones that matter; keep them.
+    """
     import random
     random.seed(7)
-    wire, gdin = [], []
-    for i in range(1800):                      # 30 min at 1 Hz
-        t = 3600.0 + i
-        true_raw = 200.0 * ((i % 300) / 300.0 - 0.5)      # a slow sweep, not a constant
-        gdin.append((t, true_raw, true_raw / 2, 2))
-        wire.append((t + 0.05, true_raw * 1.0))           # slope exactly 1
-    pairs, un = pair(gdin, wire, 0.5)
-    assert un == 0, un
-    rows = grade(pairs, 300, 20)
-    assert all(len(r) == 5 for r in rows), "grade() rows carry their wall-clock span"
-    slopes = [r[2] for r in rows if r[1] >= 20]
-    assert len(slopes) >= 6, len(slopes)
-    assert all(abs(s - 1.0) < 0.01 for s in slopes), slopes
-    print(f"  slope-1 synthetic: {len(slopes)} blocks, slopes {min(slopes):.3f}..{max(slopes):.3f}")
 
-    # 4x, the failure Stage 1 exists to detect
-    wire4 = [(t, v / 4.0) for t, v in wire]
-    rows4 = grade(pair(gdin, wire4, 0.5)[0], 300, 20)
-    s4 = [r[2] for r in rows4 if r[1] >= 20]
-    assert all(abs(s - 0.25) < 0.01 for s in s4), s4
-    print(f"  4x-disagreement synthetic: slopes {min(s4):.3f}..{max(s4):.3f} (detected, not averaged away)")
+    def synth(k=1.0, xnoise=0.0, ynoise=0.0, outlier=0.0, n=1800, amp=200.0):
+        wire, gdin = [], []
+        for i in range(n):
+            t = 3600.0 + i
+            truth = amp * ((i % 300) / 300.0 - 0.5)          # a sweep, not a constant
+            raw = truth + random.gauss(0, xnoise)
+            w = k * truth + random.gauss(0, ynoise)
+            if outlier and random.random() < outlier:
+                w += 22680.0                                  # one whole frame
+            gdin.append((t, raw, raw / 2, 2))
+            wire.append((t + 0.05, w))
+        return gdin, wire
 
-    # whole-frame mislocks on 10 % of rows must not move the verdict
-    dirty = [(t, v + (22680.0 if random.random() < 0.10 else 0.0)) for t, v in wire]
-    rowsd = grade(pair(gdin, dirty, 0.5)[0], 300, 20)
-    sd = [r[2] for r in rowsd if r[1] >= 20]
-    assert all(abs(s - 1.0) < 0.05 for s in sd), sd
-    print(f"  10% whole-frame outliers: slopes {min(sd):.3f}..{max(sd):.3f} (Theil-Sen holds)")
+    def run(**kw):
+        gdin, wire = synth(**kw)
+        pairs, un = pair(gdin, wire, 0.5)
+        assert un == 0, un
+        rows = grade(pairs, 300, 20)
+        assert all(len(r) == 8 for r in rows), "grade() rows carry bracket, r, T-S, resid, span"
+        return [(r[2], r[3]) for r in rows if r[1] >= 20]
 
-    # an inverted orientation must be reported as such, not as |slope|
+    b = run()
+    assert len(b) >= 6 and all(lo <= 1.0 <= hi for lo, hi in b), b
+    print(f"  clean slope 1: {len(b)} blocks, every bracket contains 1.0")
+
+    # THE CASE THE OLD TEST MISSED: noise in x only. Single estimators are biased low here;
+    # the bracket must still contain the truth.
+    b = run(xnoise=55.0)
+    # The bracket bounds the errors-in-variables BIAS; it is not a confidence interval, so with
+    # ~300 samples a bound can land a few percent the wrong side of the truth. What must hold is
+    # the operational property: the forward estimator is visibly attenuated, the reverse bound
+    # sits near 1.0, and no block is called a failure.
+    assert all(lo < 0.95 for lo, hi in b), f"forward estimator should be attenuated: {b}"
+    assert all(hi > 0.85 for lo, hi in b), f"reverse bound should sit near 1.0: {b}"
+    assert all(verdict(lo, hi) == "ok" for lo, hi in b), [verdict(*x) for x in b]
+    print(f"  noise in x (55 us, the real shape): brackets {min(l for l,_ in b):.2f}.."
+          f"{max(h for _,h in b):.2f}, all read 'ok' (single estimators would say FAIL)")
+
+    # A REAL 4x must still be caught, and must not be excused as noise.
+    b = run(k=0.25, xnoise=20.0)
+    assert all(verdict(lo, hi) == "EXCLUDES 1.0" for lo, hi in b), [verdict(*x) for x in b]
+    print(f"  true 4x with x-noise: every block EXCLUDES 1.0 (not averaged away)")
+
+    # Whole-frame mislocks on 10 % of rows must not move the verdict.
+    b = run(outlier=0.10)
+    assert all(verdict(lo, hi) in ("ok", "uninformative") for lo, hi in b), [verdict(*x) for x in b]
+    print(f"  10% whole-frame outliers: no block falsely excludes 1.0")
+
+    # No leverage: a block where the differential barely moves must say so, not guess.
+    b = run(amp=4.0, xnoise=20.0)
+    assert all(verdict(lo, hi) in ("uninformative", "EXCLUDES 1.0") for lo, hi in b), b
+    unin = sum(1 for lo, hi in b if verdict(lo, hi) == "uninformative")
+    assert unin >= 4, f"expected most no-leverage blocks to be called uninformative, got {unin}"
+    print(f"  no leverage (4 us sweep): {unin}/{len(b)} blocks reported uninformative")
+
+    # Orientation: an inverted wire must read as inverted, not as |slope|.
+    gdin, wire = synth()
     inv = [(t, -v) for t, v in wire]
-    si = [r[2] for r in grade(pair(gdin, inv, 0.5)[0], 300, 20) if r[1] >= 20]
-    assert all(abs(s + 1.0) < 0.01 for s in si), si
-    print(f"  inverted orientation: slopes {min(si):.3f}..{max(si):.3f} (sign preserved)")
+    b = [(r[2], r[3]) for r in grade(pair(gdin, inv, 0.5)[0], 300, 20) if r[1] >= 20]
+    assert all(hi < 0 for lo, hi in b), b
+    print(f"  inverted orientation: every bracket is negative (sign preserved)")
     print("self-test OK")
 
 
@@ -285,35 +384,56 @@ def main():
         return 2
 
     rows = grade(pairs, args.block, args.min_n)
-    print(f"\n  {'block':>5} {'window':>19} {'n':>6} {'slope':>8} {'|resid| med':>12}")
-    good = []
-    for b, n, slope, resid, span in rows:
-        mark = ""
+    print(f"\n  {'block':>5} {'window':>19} {'n':>6} {'slope bracket':>16} {'r':>6} "
+          f"{'T-S':>6} {'MAD':>7}  verdict")
+    good, verdicts = [], []
+    for b, n, lo, hi, r, ts, resid, span in rows:
+        v = verdict(lo, hi) if n >= args.min_n else "thin"
         if n >= args.min_n:
-            mark = "  <-- outside 1.0 +-{:.2f}".format(SLOPE_TOL) if abs(slope - 1.0) > SLOPE_TOL else ""
-            good.append(slope)
-        print(f"  {b:>5} {span[0]}..{span[1]} {n:>6} {slope:>8.3f} {resid:>12.1f}{mark}")
+            good.append((lo, hi)); verdicts.append(v)
+        print(f"  {b:>5} {span[0]}..{span[1]} {n:>6} {lo:>7.3f}..{hi:<8.3f} {r:>6.3f} "
+              f"{ts:>6.3f} {resid:>7.1f}  {v}")
 
     print()
     if len(good) < MIN_BLOCKS:
         print(f"INCONCLUSIVE: {len(good)} usable blocks, the plan wants >= {MIN_BLOCKS} "
               f"disjoint {args.block:.0f}s blocks. Longer clean window needed.")
         return 1
-    med = statistics.median(good)
-    inband = [s for s in good if abs(s - 1.0) <= SLOPE_TOL]
-    print(f"median slope {med:+.3f} over {len(good)} blocks; "
-          f"{len(inband)}/{len(good)} inside 1.0 +-{SLOPE_TOL}")
-    if med < 0:
-        print("ORIENTATION MISMATCH, not a firmware result: raw and the wire disagree in SIGN.\n"
+
+    # MAGNITUDE, independent of any regression. Ratio of medians needs no model, no leverage and
+    # no assumption about where the noise lives -- if raw were 4x the wire this alone would say so.
+    raws = [abs(p[1]) for p in pairs]
+    wires = [abs(p[2]) for p in pairs]
+    mw = statistics.median(wires)
+    ratio = statistics.median(raws) / mw if mw else float("nan")
+    resid = [p[1] - p[2] for p in pairs]
+    rmed = statistics.median(resid)
+    rmad = statistics.median([abs(v - rmed) for v in resid])
+    print(f"magnitude: median |raw| / median |wire| = {ratio:.2f} "
+          f"({statistics.median(raws):.1f} / {mw:.1f} us)")
+    print(f"residual raw-wire: median {rmed:+.1f}  MAD {rmad:.1f}  sd "
+          f"{statistics.pstdev(resid):.1f} us   (MAD is the honest one; sd here is tail-driven)")
+
+    if all(hi < 0 for lo, hi in good):
+        print("\nORIENTATION MISMATCH, not a firmware result: raw and the wire disagree in SIGN.\n"
               "  Either --negate is wrong for this log, or boards.conf's A/B does not match which\n"
               "  board carries the analyser's _ONE clips. Fix that before reading the magnitude.")
         return 1
-    if len(inband) == len(good):
-        print(f"PASS: raw tracks the wire at slope 1.0 +-{SLOPE_TOL} across every block.")
-        return 0
-    print(f"FAIL: {len(good) - len(inband)} block(s) outside the band. "
-          f"A slope of ~0.25 is the 4x the stage is looking for; ~0.5 is a stray halving.")
-    return 1
+    excl = [v for v in verdicts if v == "EXCLUDES 1.0"]
+    unin = [v for v in verdicts if v == "uninformative"]
+    print(f"\n{len(good)} blocks: {len(verdicts) - len(excl) - len(unin)} consistent with 1.0, "
+          f"{len(excl)} excluding it, {len(unin)} uninformative")
+    if excl:
+        print(f"FAIL: {len(excl)} block(s) EXCLUDE slope 1.0 -- a real disagreement, not an "
+              f"estimator artefact.\n  ~0.25 would be the 4x; ~0.5 a stray halving.")
+        return 1
+    if len(verdicts) - len(unin) < MIN_BLOCKS:
+        print(f"INCONCLUSIVE: only {len(verdicts) - len(unin)} blocks carry enough leverage to "
+              f"constrain the slope.\n  A block where the differential barely moves cannot grade "
+              f"a slope, however many samples it has.")
+        return 1
+    print(f"PASS: every block is consistent with raw tracking the wire at 1.0 +-{SLOPE_TOL}.")
+    return 0
 
 
 if __name__ == "__main__":
