@@ -37,7 +37,12 @@ EVENTS = ("Hard resync", "Fast splice engaged", "OUT OF RANGE", "tags stale", "M
 # dropping the whole line would lose its frames count (CLAUDE.md: never require a trailing field).
 DECIDE = re.compile(
     r"\[(\d\d):(\d\d):(\d\d)\.(\d\d\d)\].*?\bDECIDE src=(\w+) cls=(\w+) gate=(\w+) act=(\w+) "
-    r"frames=([+-]\d+) pend=([+-]\d+)(?: gd=(\S+))?(?: t=(\d+))?"
+    # gd is matched as a VALUE, not as \S+. Two boards' log tasks occasionally interleave
+    # mid-line on the UART (measured 17 lines in 51,606, 0.03%), and \S+ happily captured the
+    # ANSI prefix of the intruding line -- int() then raised and the whole run died. A pattern
+    # loose enough to swallow corruption turns a 0.03% nuisance into a total loss; matching the
+    # shape means such a line simply reads as gd absent, which it is.
+    r"frames=([+-]\d+) pend=([+-]\d+)(?: gd=([+-]\d+|unknown))?(?: t=(\d+))?"
 )
 # --- PLAN-timing-v2 Stage 1 GDIN pairing-input shadow ---
 # raw = un-halved pairwise phase difference (pre-mean, what the analyser can grade);
