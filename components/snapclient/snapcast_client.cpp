@@ -416,11 +416,6 @@ static constexpr float TRIM_KP_PPM_PER_US = TRIM_KP_ACQUIRE_PPM_PER_US;
 static constexpr float TRIM_CLAMP_MIN_PPM = 500.0f;
 static constexpr float TRIM_CLAMP_MAX_PPM = 2000.0f;
 
-static float trim_clamp_ppm(int64_t converge_fine_us) {
-  return std::clamp(TRIM_KP_PPM_PER_US * static_cast<float>(converge_fine_us), TRIM_CLAMP_MIN_PPM,
-                    TRIM_CLAMP_MAX_PPM);
-}
-
 // --- THE DELAY LOOP (PLAN-delay-controlled-servo.md) ---
 //
 // PI rate steering on the MEASURED tag error (err_tag), setpoint zero. The plant is the pipeline
@@ -4217,93 +4212,6 @@ void SnapcastClient::delay_measure_(ServoState &st) {
 }
 #endif  // USE_I2S_RATE_LOCK
 
-// THREAD CONTEXT: player task. See FAST_SPLICE_RELEASE_US for the argument.
-int32_t SnapcastClient::fast_splice_(ServoState &st, int64_t err_us, uint32_t sample_rate,
-                                     bool hold, uint32_t horizon_chunks, bool measured) {
-  // RESYNC WINDOW (ServoState::post_event_until_us): right after an event the error is a known
-  // displacement, not wander, so the splice arms at resync_splice_us and immediately; in steady
-  // state the configured threshold and the persistence wait keep it off the common wander.
-  // Inside the resync window the continuous splice is off so the two never act on the same block error (build 33 thrash).
-  const bool post_event = now_us() < st.post_event_until_us;
-  const int64_t cfg_threshold = static_cast<int64_t>(this->config_.fast_splice_threshold_us);
-  const int64_t threshold = post_event ? 0 : cfg_threshold;  // 0 = disabled below
-  const int64_t persist_us = FAST_SPLICE_PERSIST_US;
-  const int64_t frame_us = sample_rate > 0 ? 1000000 / static_cast<int64_t>(sample_rate) : 0;
-  int32_t applied = 0;
-
-  const bool repair_settling =
-      st.last_repair_us != 0 && now_us() - st.last_repair_us < FAST_SPLICE_REPAIR_HOLDOFF_US;
-  // The converged gate exists so this path does not fight muted coarse convergence, which acts
-  // on the same PREDICTED error. A MEASURED error carries no such conflict, and gating it created
-  // a dead zone: unconverged, rate lock holding, err between the splice threshold and
-  // converge_fine, nothing corrected at all -- measured 2026-08-28 19:47-19:51, board A creeping
-  // at +20 us/s from +1.0 to +2.0 ms for 4.5 minutes under Never-Mute. Position correction on a
-  // measured error is safe at any convergence state; the prediction keeps the gate.
-  if (threshold > 0 && frame_us > 0 && (st.converged || measured) && !hold && !repair_settling) {
-    // What the SIGNAL has not yet seen: splices applied within its measurement lag. The window is
-    // the caller's horizon -- half the median window on the prediction, one pipeline depth plus
-    // half the averaging block on err_tag -- summed over the newest entries of the ring, BEFORE
-    // this chunk's own contribution is recorded below. Without the subtraction the loop keeps
-    // correcting an error it has already fixed and overshoots: the limit cycle this path is on
-    // record for.
-    const uint32_t win = std::min<uint32_t>(horizon_chunks, ServoState::SPLICE_HIST);
-    int32_t in_flight = 0;
-    for (uint32_t i = 1; i <= win; i++) {
-      in_flight += st.splice_hist[(st.splice_hist_idx + ServoState::SPLICE_HIST - i) % ServoState::SPLICE_HIST];
-    }
-    const int64_t in_flight_us = static_cast<int64_t>(in_flight) * frame_us;
-    const int64_t effective_us = err_us - in_flight_us;
-    if (st.fast_splice_active) {
-      // Splicing every chunk: my phase does not describe my audio until a horizon after the LAST
-      // spliced frame, so keep the transient rolling (the engage-site mark alone expired mid-splice).
-      st.phase_transient_until_us = std::max(st.phase_transient_until_us, now_us() + PHASE_TRANSIENT_US);
-      // Release inside half the ARM threshold: with the resync window arming at 100 us, a fixed
-      // 300 us release sat ABOVE the arm point and the splice re-engaged every release (build 31
-      // boot: engaged at -102, -104, -104 us in a row). Steady state keeps its 300 us.
-      const int64_t release_us = std::min<int64_t>(FAST_SPLICE_RELEASE_US, threshold / 2);
-      if (std::abs(effective_us) <= release_us || st.fast_splice_frames >= FAST_SPLICE_MAX_FRAMES) {
-        if (st.fast_splice_frames >= FAST_SPLICE_MAX_FRAMES) {
-          ESP_LOGW(TAG, "Fast splice hit its %" PRIu32 "-frame bound with %" PRId64
-                        " us still standing -- treating as a measurement fault, handing back to the PI",
-                   FAST_SPLICE_MAX_FRAMES, effective_us);
-        } else {
-          ESP_LOGD(TAG, "Fast splice done: %" PRIu32 " frames, %" PRId64 " us left for the PI t=%" PRId64,
-                   st.fast_splice_frames, effective_us, now_us());
-        }
-        st.fast_splice_active = false;
-      } else {
-        applied = effective_us > 0 ? 1 : -1;
-        st.fast_splice_seen_us = 0;  // an episode owns the timer; the next arm starts fresh
-      }
-    } else if (std::abs(effective_us) >= threshold) {
-      // Above the threshold, but only ARM once it has stayed there. The timer is cleared the
-      // moment the error drops back, so a transient never accumulates credit toward engaging.
-      if (st.fast_splice_seen_us == 0) {
-        st.fast_splice_seen_us = now_us();
-      } else if (now_us() - st.fast_splice_seen_us >= persist_us) {
-        st.fast_splice_active = true;
-        st.phase_transient_until_us = std::max(st.phase_transient_until_us, now_us() + PHASE_TRANSIENT_US);
-        st.fast_splice_frames = 0;
-        applied = effective_us > 0 ? 1 : -1;
-        ESP_LOGI(TAG, "Fast splice engaged: %" PRId64 " us standing for %" PRId64
-                      " s, correcting by position at one frame (%" PRId64 " us) per chunk t=%" PRId64,
-                 effective_us, persist_us / 1000000, frame_us, now_us());
-      }
-    } else {
-      st.fast_splice_seen_us = 0;
-    }
-  } else {
-    st.fast_splice_active = false;
-    st.fast_splice_seen_us = 0;
-  }
-
-  st.splice_hist[st.splice_hist_idx] = static_cast<int8_t>(applied);
-  st.splice_hist_idx = (st.splice_hist_idx + 1) % ServoState::SPLICE_HIST;
-  if (applied != 0) {
-    st.fast_splice_frames++;
-  }
-  return applied;
-}
 
 // THREAD CONTEXT: player task. See REANCHOR_BIAS_US for what this is for and what is unproven
 // about it.
@@ -4434,12 +4342,6 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
       ESP_LOGW(TAG, "SERVOPARAM tau_s set manually while autotune is ON; the next adaptation will move it");
     }
     this->tune_tau_s_.store(value, std::memory_order_relaxed);
-  } else if (name == "ti_s") {
-    if (!(value >= 10.0f && value <= 1200.0f)) return false;
-    this->tune_ti_s_.store(value, std::memory_order_relaxed);
-  } else if (name == "splice_us") {
-    if (!(value == -1.0f || (value >= 0.0f && value <= 10000.0f))) return false;
-    this->tune_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "timing_engine") {
     this->tune_timing_engine_.store(value != 0.0f ? 1u : 0u, std::memory_order_relaxed);
     ESP_LOGI(TAG, "timing_engine = %u (0 = old ladder + PI) t=%" PRId64,
@@ -4457,12 +4359,6 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "gap_blank_ms") {
     if (!(value >= 10.0f && value <= 500.0f)) return false;
     this->tune_gap_blank_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
-  } else if (name == "knee_us") {
-    if (!(value >= 5.0f && value <= 1000.0f)) return false;
-    this->tune_knee_us_.store(value, std::memory_order_relaxed);
-  } else if (name == "tau_min_s") {
-    if (!(value >= 2.0f && value <= 600.0f)) return false;
-    this->tune_tau_min_s_.store(value, std::memory_order_relaxed);
   } else if (name == "align_max_us") {
     if (!(value >= 0.0f && value <= 20000.0f)) return false;
     this->tune_align_max_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
@@ -4536,36 +4432,12 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_win_s") {
     if (!(value >= 0.0f && value <= 600.0f)) return false;
     this->tune_resync_win_s_.store(value, std::memory_order_relaxed);
-  } else if (name == "resync_local_us") {
-    if (!(value >= 100.0f && value <= 5000.0f)) return false;
-    this->tune_resync_local_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
-  } else if (name == "resync_close_s") {
-    if (!(value >= 1.0f && value <= 60.0f)) return false;
-    this->tune_resync_close_s_.store(value, std::memory_order_relaxed);
-  } else if (name == "resync_reopen_us") {
-    if (!(value >= 100.0f && value <= 5000.0f)) return false;
-    this->tune_resync_reopen_us_.store(value, std::memory_order_relaxed);
-  } else if (name == "resync_gain") {
-    if (!(value >= 0.1f && value <= 1.0f)) return false;
-    this->tune_resync_gain_.store(value, std::memory_order_relaxed);
   } else if (name == "resync_blank_ms") {
     if (!(value >= 50.0f && value <= 2000.0f)) return false;
     this->tune_resync_blank_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
   } else if (name == "resync_splice_us") {
     if (!(value >= 20.0f && value <= 5000.0f)) return false;
     this->tune_resync_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
-  } else if (name == "phase_tx_hz") {
-    // WS2.0 (R3.5/R12.2): sweep the phase-TX rate and read delivery from the EXISTING `GDAVG n=`
-    // line -- own samples arrive at ~94 Hz so essentially every arriving peer sample pairs, which
-    // makes n a delivered-packet counter, and it is the same series R2.1's 1.1/s-vs-16/s table was
-    // built from. Sent rate is this parameter. Flat n vs rate => a packet-rate cap => batching
-    // wins ~10x and WS2.1 is worth building; linear => per-packet loss => batching wins nothing
-    // and the unicast question is the only path. One tunable, five minutes, one workstream decided.
-    if (!(value >= 1.0f && value <= 50.0f)) return false;
-    if (this->tsf_sync_ == nullptr) return false;
-    this->tsf_sync_->set_phase_tx_interval_us(static_cast<int64_t>(1000000.0f / value));
-    ESP_LOGW(TAG, "SERVOPARAM phase_tx_hz=%.1f (interval %lld us)", value,
-             static_cast<long long>(this->tsf_sync_->phase_tx_interval_us()));
   } else if (name == "autotune") {
     this->tune_autotune_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "persist") {
@@ -5903,34 +5775,6 @@ void SnapcastClient::apply_channel_mode_(uint8_t *data, size_t len, const Stream
   }
 }
 
-// THREAD CONTEXT: Player task
-void SnapcastClient::push_repeat_frame_(const StreamParams &params) {
-  const uint32_t frame_bytes = params.frame_bytes();
-  if (this->audio_listener_ == nullptr || frame_bytes == 0 || frame_bytes > sizeof(this->last_frame_)) {
-    return;
-  }
-  if (this->last_frame_bytes_ != frame_bytes) {
-    // No cached frame in this format yet
-    this->push_silence_(1, params);
-    return;
-  }
-  size_t offset = 0;
-  while (offset < frame_bytes && this->output_active_.load(std::memory_order_relaxed) &&
-         !this->shutdown_.load(std::memory_order_relaxed)) {
-    // Untagged for the same reason as inserted silence: a repeated frame is the servo's, not the
-    // server's, and giving it the neighbouring chunk's identity would hide the very splice it is.
-    this->audio_listener_->on_set_render_tag(audio::RenderTag{});
-    const size_t written =
-        this->audio_listener_->on_audio_write(this->last_frame_ + offset, frame_bytes - offset, 100, params);
-    if (written == 0) {
-      return;
-    }
-    offset += written;
-  }
-  this->playout_mutex_.lock();
-  this->pushed_frames_total_ += 1;
-  this->playout_mutex_.unlock();
-}
 
 void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, bool silent) {
   const uint32_t frame_bytes = rec.params.frame_bytes();

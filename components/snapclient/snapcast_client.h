@@ -1113,21 +1113,6 @@ class SnapcastClient {
   /// THREAD CONTEXT: player task.
   void accumulate_achieved_rate_(ServoState &st, const ChunkRecord &rec);
 
-  /// Fast POSITION correction while converged: one frame per chunk against a standing offset the
-  /// rate loop would take too long to integrate away. Returns the frames to splice this chunk
-  /// (>0 drop, <0 insert, 0 none). See fast_splice_threshold_us.
-  ///
-  /// @p err_us is whichever error signal is live -- the measured tag error when fresh, the demoted
-  /// prediction otherwise. @p hold gates the whole path (the split-pending guard, applied by the
-  /// caller ONLY on the prediction: a ledger bias is invisible to err_tag, so guarding it there
-  /// would disarm the mechanism against exactly the errors it can safely correct).
-  /// @p horizon_chunks is the signal's measurement lag in chunks -- how far back a splice is still
-  /// invisible to @p err_us -- over which in-flight splices are subtracted before the threshold
-  /// test. @p measured lifts the converged gate: a measured error cannot fight the muted coarse
-  /// convergence (which acts on the prediction), and gating it left an unconverged 1-2 ms dead
-  /// zone nothing corrected.
-  int32_t fast_splice_(ServoState &st, int64_t err_us, uint32_t sample_rate, bool hold,
-                       uint32_t horizon_chunks, bool measured);
 
 #ifdef USE_I2S_RATE_LOCK
   /// @brief THE DELAY LOOP: PI rate steering on the measured tag error, the ledger nowhere in it.
@@ -1235,10 +1220,6 @@ class SnapcastClient {
   bool accounted_at_(int64_t as_of_us, int64_t &frames) const;
   /// Pushes silence downstream. @return frames actually pushed.
   uint32_t push_silence_(uint32_t frames, const StreamParams &params);
-  /// Pushes one copy of the most recently pushed frame (sample stuffing, like the
-  /// reference); a repeated frame is nearly click-free where an inserted silence
-  /// frame is a hard amplitude step. Falls back to silence when no frame is cached.
-  void push_repeat_frame_(const StreamParams &params);
   /// Pushes @p bytes from the ring downstream, dropping @p drop_frames from the front.
   /// @p silent replaces the audio with zeros (timing preserved): played during sync
   /// convergence so correction splices are inaudible, like the reference's mute-
@@ -1677,19 +1658,12 @@ class SnapcastClient {
   /// a reboot returns to the flashed values, which keeps a bad experiment one power-cycle from
   /// gone. Every set is logged at WARN so the analyser's annotations carry it.
   std::atomic<float> tune_tau_s_{120.0f};  // floor; error-proportional gain stiffens it (DL_GAIN_KNEE_US)
-  /// Integral time (s): Ki = Kp / Ti. Decoupled from tau -- Ti = tau (Ki = Kp^2) made the integral
-  /// swing ~57 ppm p-p chasing the +-600 us / ~60 s common-mode wander (measured 21:08: +103->+114
-  /// in 2 s), so a hold froze a wrong 'crystal offset'. With the integral restored from NVS the
-  /// fast wind-up Ti = tau bought is moot; Ti belongs to the crystal's drift timescale (minutes).
-  std::atomic<float> tune_ti_s_{600.0f};
   /// Error-proportional gain: Kp = (1/tau) * max(1, |err| / knee), effective tau floored at tau_min.
   /// Knee 25 us: tau 120 only inside the per-block noise, tau ~30 s at 100 us, tau_min beyond 120 us.
   // KNEE OFF (1e6 us): the error-proportional boost is a per-board gain, and 22:13-22:59 one board
   // was above knee 150 while the other was below 21 % of the time (median asymmetry 0.004 ppm/us =
   // 0.4 ppm of differential trim per 100 us of common wander). The rate gain must be the same
-  // function of the error on every board; acquisition is the coarse path's job (position).
-  std::atomic<float> tune_knee_us_{25.0f};   // A/B 2026-08-30 18:42: tails 30-50 s at flat tau died in ~4 s
-  std::atomic<float> tune_tau_min_s_{5.0f};  // floor of the error-proportional boost (same A/B)
+  // function of the error on every board; acquisition is the coarse path's job (position).   // A/B 2026-08-30 18:42: tails 30-50 s at flat tau died in ~4 s  // floor of the error-proportional boost (same A/B)
   /// render_align channel (inter-device, on the exchanged tag-derived render phase): cap in us
   /// (0 = off; seeded from YAML render_align_max), gain per due report, deadband in us.
   // Defaults = the 2026-08-29 18:00-18:45 operating point: 45 min, wire median +2.7 us, robust sd
@@ -1705,16 +1679,9 @@ class SnapcastClient {
   std::atomic<bool> tune_align_apply_{true};        // false = shadow: log the step, move nothing
   /// Resync window (s) after an event, and the splice threshold (us) inside it. Target: |A-B| < 100 us
   /// within 5 s of a disturbance.
-  std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)
-  std::atomic<float> tune_resync_gain_{1.0f};    // fraction of the measured error corrected per step (clean block)
-  std::atomic<float> tune_resync_reopen_us_{400.0f};  // a block error past this re-opens the window
-  std::atomic<int32_t> tune_resync_splice_us_{100};  // in-window coarse arm, one step per block (build 42); 150 left 50-115 us residuals to tau 120
-  std::atomic<float> tune_resync_close_s_{5.0f};     // inside the arm threshold this long -> window closes
-  std::atomic<int32_t> tune_resync_local_us_{2000};  // below this an in-window step needs the group delta to agree: common TIMEBASE STEPS reach +400 us (23:22:03, both boards), only starvation-class errors are local by construction
+  std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)    // fraction of the measured error corrected per step (clean block)  // a block error past this re-opens the window
+  std::atomic<int32_t> tune_resync_splice_us_{100};  // in-window coarse arm, one step per block (build 42); 150 left 50-115 us residuals to tau 120     // inside the arm threshold this long -> window closes  // below this an in-window step needs the group delta to agree: common TIMEBASE STEPS reach +400 us (23:22:03, both boards), only starvation-class errors are local by construction
   std::atomic<int32_t> tune_resync_blank_ms_{1200}; // step-and-verify cadence: the judging block must START after the step (block 0.65 s + pipeline 0.28 s)
-  std::atomic<int32_t> tune_block_n_{64};
-  /// -1 = use config_.fast_splice_threshold_us.
-  std::atomic<int32_t> tune_splice_us_{-1};
   std::atomic<int32_t> tune_tag_stale_ms_{1000};
   std::atomic<int32_t> tune_blank_ms_{500};
   std::atomic<int32_t> tune_gap_blank_ms_{50};
