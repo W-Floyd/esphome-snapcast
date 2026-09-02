@@ -48,9 +48,10 @@ DRY_RUN=0
 # The analyser invocation, from HANDOFF.md. --samples 200000 is load-bearing: a run that
 # dropped it came back with rival = 0.942 on every row, i.e. whole-frame errors masquerading
 # as findings. --plot-every/--plot-window are cosmetic; the rest is not.
+SERVE_PORT="${BENCH_SERVE_PORT:-8000}"
 ANALYZER_CMD="python3 scripts/i2s-skew.py --stream --interval 0 --count 0 \
 --samplerate 12M --samples 200000 --plot-every 0.0167 --plot-window 45 \
---out test.csv --plot test.svg"
+--serve ${SERVE_PORT} --out test.csv --plot test.svg"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
@@ -92,6 +93,20 @@ age_of() {
 }
 
 free_gb() { df -Pk . | awk 'NR==2 {printf "%d", $4/1048576}'; }  # -Pk is the portable form
+
+# Is anything actually listening on this port? --serve failing to bind is deliberately
+# non-fatal in the analyser (a busy port is no reason to lose a capture), so the flag being
+# on the command line is NOT evidence that the plot is being served. Check the socket.
+port_listening() {
+    local port="$1"
+    if command -v ss >/dev/null 2>&1; then
+        ss -ltnH 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"
+    elif command -v lsof >/dev/null 2>&1; then
+        lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    else
+        return 2        # unknown, and say so rather than implying "no"
+    fi
+}
 
 host_up() {  # BSD ping: -t <seconds>. GNU ping: -W <seconds>, and -t is a TTL.
     if [ "$(uname)" = Darwin ]; then ping -c 1 -t 2 "$1" >/dev/null 2>&1
@@ -392,6 +407,35 @@ cmd_status() {
             "$(wc -l < "${f}" | tr -d ' ')" "$(file_time "${f}")" "$(age_of "${f}")"
     done
     printf '    %-12s %s GB free\n' disk "$(free_gb)"
+
+    # The live plot, reported from the RUNNING command rather than from this script's
+    # defaults -- an analyser started before --serve existed, or with a different port, must
+    # not be described by what we would launch today.
+    local started port rc
+    started="$(tmux list-panes -s -t "${SESSION}" -F '#{pane_title} #{pane_start_command}' \
+               2>/dev/null | grep '^analyzer ' || true)"
+    echo
+    if [ -z "${started}" ]; then
+        note "web plotter: no analyser pane"
+        return 0
+    fi
+    port="$(printf '%s' "${started}" | sed -n 's/.*--serve[= ]\{1,\}\([0-9]\{1,\}\).*/\1/p')"
+    if [ -z "${port}" ]; then
+        note "web plotter: NOT served — the running analyser has no --serve"
+        echo "    restart it to pick up the default: ${0##*/} stop && ${0##*/} start" >&2
+        return 0
+    fi
+    rc=0; port_listening "${port}" || rc=$?
+    case "${rc}" in
+        0) note "web plotter: http://127.0.0.1:${port}/  (listening)" ;;
+        2) note "web plotter: --serve ${port} (no ss/lsof here — could not confirm it bound)" ;;
+        *) note "web plotter: --serve ${port} but NOTHING IS LISTENING"
+           echo "    the analyser warns and continues when the port is busy; check its pane" >&2 ;;
+    esac
+    # The server binds 127.0.0.1 only, so it is not reachable across the network by design.
+    [ "${rc}" = 0 ] && [ -n "${SSH_CONNECTION:-}" ] && \
+        echo "    from your workstation: ssh -N -L ${port}:127.0.0.1:${port} $(id -un)@$(hostname -f 2>/dev/null || hostname)"
+    return 0
 }
 
 # The two bindings that decide the sign of every wire number, printed side by side because

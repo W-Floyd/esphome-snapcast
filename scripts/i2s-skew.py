@@ -261,6 +261,68 @@ def stream_reader(args, depth=16):
     return take, state
 
 
+class CaptureFailures:
+    """Bound what a capture that keeps failing is allowed to cost.
+
+    The dangerous failure is not one bad capture, it is a STUCK one. With --stream the loop
+    runs at --interval 0, so a device this process cannot claim -- PulseView holding the USB
+    interface, LIBUSB_ERROR_ACCESS -- produced an unthrottled print loop rather than an exit.
+    Redirected to a file (2026-08-28) that wrote 143 GB and filled the disk, which killed both
+    live analyser instances mid-window and froze test.csv. Nothing warned: the boards kept
+    logging normally and the CSV simply stopped.
+
+    So a repeated failure is made cheap in both directions:
+
+      * OUTPUT is bounded. An identical message is printed on a doubling schedule (1st, 2nd,
+        4th, 8th ...) carrying its own tally, so a wedge costs a few dozen lines however long
+        it lasts, and a genuinely varying failure still shows every distinct message.
+      * TIME is bounded. Retries back off to MAX_BACKOFF regardless of --interval, so the
+        loop cannot spin, and after HARD_LIMIT consecutive failures the process EXITS
+        nonzero. A wedged analyser that exits is visible -- a dead tmux pane, a non-zero
+        status -- where one that retries for ever looks exactly like a quiet bench.
+
+    The tally is the point of the summary line: "gave up after N consecutive failures" says
+    the run ended, which "capture failed" repeated for six hours does not.
+    """
+
+    HARD_LIMIT = 40          # consecutive failures before giving up entirely
+    MAX_BACKOFF = 30.0       # seconds; the floor on retry spacing, ignoring --interval
+
+    def __init__(self, limit=None):
+        self.limit = limit or self.HARD_LIMIT
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        self.last = None
+        self.first_at = None
+
+    ok = reset          # a successful capture clears the run
+
+    def failed(self, msg, elapsed):
+        """Report one failure. Returns the seconds to wait; exits if it has gone on too long."""
+        now = time.time()
+        if msg != self.last:
+            self.last, self.n, self.first_at = msg, 0, now
+        self.n += 1
+        if self.first_at is None:
+            self.first_at = now
+        # Doubling schedule: 1, 2, 4, 8, ... Bounded output for an unbounded wedge.
+        if self.n & (self.n - 1) == 0:
+            tail = f" [{self.n} consecutive, {now - self.first_at:.0f}s]" if self.n > 1 else ""
+            print(f"{elapsed:9.1f}   capture failed: {msg}{tail}", file=sys.stderr, flush=True)
+        if self.n >= self.limit:
+            print(f"\nGIVING UP: {self.n} consecutive capture failures over "
+                  f"{now - self.first_at:.0f}s, last was: {msg}\n"
+                  f"  Nothing has been measured since. Fix the analyser and restart; the "
+                  f"CSV written so far is intact.", file=sys.stderr, flush=True)
+            sys.exit(3)
+        return min(2.0 ** min(self.n - 1, 16), self.MAX_BACKOFF)
+
+
+FAILURES = CaptureFailures()
+
+
 def bit(buf, ch):
     return ((buf >> ch) & 1).astype(bool)
 
@@ -4338,6 +4400,7 @@ def main():
                     pending = pool.submit(capture) if more else None
                 off, ppm, coef, info = measure_capture(buf, chan, args, prefer,
                                                       dumpf, elapsed)
+                FAILURES.ok()      # a capture got through; the failure run is over
                 # Remove the analyser's own zero error. It is a property of the RIG -- probe
                 # delay, channel skew, threshold asymmetry -- not of the boards, and it is the
                 # same size as the offsets being chased: measured at ~-25 us on 2026-08-27, when a
@@ -4361,13 +4424,16 @@ def main():
                 # What IS happening is a genuine slow drift: ~23 us over 120 s, about 0.19 ppm of
                 # differential rate. Do not re-add an unwrap; fix the rate.
             except RuntimeError as e:
-                print(f"{elapsed:9.1f}   capture failed: {e}", file=sys.stderr)
+                # Backoff, bounded output, and an eventual exit -- see CaptureFailures. The
+                # wait is a FLOOR over --interval, which is 0 in --stream: without it a stuck
+                # device spins the loop as fast as it can print.
+                delay = FAILURES.failed(str(e), elapsed)
                 pending = None
                 n += 1
                 if args.count and n >= args.count:
                     break
                 if not args.simulate:
-                    time.sleep(args.interval)
+                    time.sleep(max(delay, args.interval))
                 continue
 
             if not shown_cfg:
