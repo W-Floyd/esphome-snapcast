@@ -993,6 +993,17 @@ class SnapcastClient {
     int64_t decide_log_us{0};            // last Stage 2 DECIDE emit (idle throttle, <= 2 Hz)
     uint32_t decide_skipped{0};          // chunks the throttle suppressed since the last emit; reported as sk=
                                          // so the census still accounts for every chunk (see decide_log)
+    // St3a SHADOW. active_error() run beside the live composite, acting on nothing. The live test
+    // is `tags_fresh && now >= tag_fault_until_us`; active_error() additionally requires
+    // dl_err_at_us != 0 and a fresh accumulator (tune_tag_stale_ms_), so a disagreement is
+    // expected and its RATE is the thing being measured. The plan's bar is zero mismatches
+    // before any consumer is swapped, over a session including an injected starvation and an
+    // inject_split.
+    uint32_t errsel_n{0};                // chunks compared
+    uint32_t errsel_src_diff{0};         // ... where the two disagree on tag-vs-ledger
+    uint32_t errsel_val_diff{0};         // ... where both say tag but the value differs
+    int64_t errsel_worst_us{0};          // largest |new - live| seen while both said tag
+    int64_t errsel_log_us{0};            // last ERRSEL emit
     int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
     uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
     float align_kick_us{0.0f};  // render_align bias change not yet delivered as position (ALIGN KICK)

@@ -2933,6 +2933,42 @@ void SnapcastClient::player_task_() {
     }
     const bool coarse_on_tags = tags_fresh && now_us() >= st.tag_fault_until_us;
     const int64_t coarse_err_us = coarse_on_tags ? st.dl_err_us : error_us;
+
+    // ── St3a SHADOW: active_error() beside the live selector, ACTING ON NOTHING ──────────────
+    // Counters only. The two differ by construction -- active_error() also demands
+    // dl_err_at_us != 0 and an accumulator fresher than tune_tag_stale_ms_ -- so what this
+    // measures is how often that matters, which is the number the plan gates the swap on. Note
+    // the ledger arms differ deliberately: the live path uses THIS chunk's error_us, the new one
+    // the median of err_window, so only the tag arm's values are compared for equality.
+    {
+      const ErrorView ev = this->active_error(st);
+      const bool new_on_tags = (ev.src == ErrSource::Tag);
+      st.errsel_n++;
+      if (new_on_tags != coarse_on_tags) {
+        st.errsel_src_diff++;
+      } else if (new_on_tags) {
+        const int64_t d = ev.us - coarse_err_us;
+        if (d != 0) {
+          st.errsel_val_diff++;
+          if (std::abs(d) > std::abs(st.errsel_worst_us)) {
+            st.errsel_worst_us = d;
+          }
+        }
+      }
+      // Own short line, fixed fields, numeric tail last (the 256-byte rule). 1/5 s is enough to
+      // carry a rate; every count is cumulative since the last emit is not needed here because
+      // the ratios are what matter.
+      const int64_t esnow = now_us();
+      if (esnow - st.errsel_log_us >= 5000000) {
+        st.errsel_log_us = esnow;
+        ESP_LOGD(TAG,
+                 "ERRSEL n=%" PRIu32 " srcdiff=%" PRIu32 " valdiff=%" PRIu32 " live=%s new=%s "
+                 "worst=%+" PRId64 " t=%" PRId64,
+                 st.errsel_n, st.errsel_src_diff, st.errsel_val_diff,
+                 coarse_on_tags ? "tag" : "ledger", new_on_tags ? "tag" : "ledger",
+                 st.errsel_worst_us, esnow);
+      }
+    }
     // ONE DECIDE PER CHUNK, FROM A SINGLE POINT, FIXED FIELDS, NO VARIABLE-LENGTH TAIL.
     // Throttled to <= 2 Hz for idle (act=none) chunks -- those dominate steady state and a
     // per-chunk line is the documented ~38 lines/s that stalls an OTA -- every non-idle decision
