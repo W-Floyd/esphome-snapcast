@@ -353,8 +353,11 @@ cmd_discover() {
     # Existing lines are never rewritten -- the roles you already confirmed are the one thing
     # in here that was checked against physical reality.
     [ -f "${CONF}" ] || printf '%s\n%s\n' \
-        "# <mac-suffix>  <role: a|b|observer>  <logfile>" \
+        "# <mac-suffix>  <role: a|b|observer>  <logfile>  [config.yaml]" \
         "# role a is logic-analyser channel A; observer drives no DAC and emits PHASEIN." \
+        "# config.yaml is per board and never inferred -- flashing the observer with a speaker" \
+        "# config puts I2S back on its live DAC and renames it. A board without one cannot be" \
+        "# flashed by 'bench-tmux.sh flash'." \
         > "${CONF}"
 
     local added=0 host
@@ -363,16 +366,16 @@ cmd_discover() {
         grep -qiE "^[[:space:]]*#?[[:space:]]*${suffix}[[:space:]]" "${CONF}" && continue
         if host_up "snapclient-observer-${suffix}.local"; then
             if grep -qE '^[[:space:]]*[0-9a-fA-F]+[[:space:]]+observer[[:space:]]' "${CONF}"; then
-                echo "# ${suffix}  observer  observer.log   # a second observer? one is already assigned" >> "${CONF}"
+                echo "# ${suffix}  observer  observer.log  example/observer-supermini.yaml   # a second observer? one is already assigned" >> "${CONF}"
                 echo "    ${suffix}: answers as an observer, but ${CONF} already has one — added commented" >&2
             else
-                echo "${suffix}  observer  observer.log" >> "${CONF}"
+                echo "${suffix}  observer  observer.log  example/observer-supermini.yaml" >> "${CONF}"
                 echo "    ${suffix}: observer (confirmed by mDNS) — assigned" >&2
             fi
         else
             host=""
             host_up "snapclient-supermini-${suffix}.local" && host=" # answers as snapclient-supermini-${suffix}"
-            echo "# ${suffix}  a  a.log   # or b/b.log — CONFIRM against the analyser clips${host}" >> "${CONF}"
+            echo "# ${suffix}  a  a.log  <config.yaml>   # or b/b.log — CONFIRM against the analyser clips${host}" >> "${CONF}"
             echo "    ${suffix}: speaker — added COMMENTED; A vs B is a wiring fact, uncomment the right one" >&2
         fi
         added=1
