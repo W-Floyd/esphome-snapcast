@@ -2939,8 +2939,20 @@ void SnapcastClient::player_task_() {
     // always logs. Names first, numeric tail last, so a truncation hits t= and never a name.
     auto decide_log = [&]() {
       const int64_t decide_t = now_us();
-      if (decide_act == 0 && decide_t - st.decide_log_us < 500000) {
-        return;  // idle throttle: at most one act=none line per 500 ms
+      // A TRIM THAT MOVED NO FRAMES IS IDLE FOR THROTTLING PURPOSES. Measured on the bench:
+      // 93 % of all DECIDE lines were act=trim, and in a clean 7-minute window 16,600 of them
+      // moved 350 frames between them -- so the throttle almost never engaged and the census
+      // cost 34 lines/s, ~580 MB per board per day. The trim itself still happens; what is
+      // suppressed is the LINE saying nothing changed.
+      //
+      // Suppressed chunks are COUNTED, not forgotten: sk= carries how many were skipped since
+      // the last emit, so "every chunk accounted for" -- the Stage 2 pass condition -- still
+      // holds exactly, and the frame sums are untouched because a skipped chunk contributes
+      // zero frames by construction.
+      const bool decide_idle = (decide_act == 0) || (decide_act == 1 && decide_frames == 0);
+      if (decide_idle && decide_t - st.decide_log_us < 500000) {
+        st.decide_skipped++;
+        return;  // throttle: at most one such line per 500 ms
       }
       st.decide_log_us = decide_t;
       const char *act_name = "none";
@@ -2960,9 +2972,16 @@ void SnapcastClient::player_task_() {
           gd_str = gd_buf;
         }
       }
-      ESP_LOGD(TAG, "DECIDE src=%s cls=none gate=%s act=%s frames=%+d pend=%+" PRId64 " gd=%s t=%" PRId64,
+      const uint32_t decide_sk = st.decide_skipped;
+      st.decide_skipped = 0;
+      // sk goes AFTER gd and before t: t stays the last field, so a truncation at the 256-byte
+      // ceiling still hits t= and never a name, and a parser that predates sk simply does not
+      // match the optional group.
+      ESP_LOGD(TAG,
+               "DECIDE src=%s cls=none gate=%s act=%s frames=%+d pend=%+" PRId64
+               " gd=%s sk=%" PRIu32 " t=%" PRId64,
                coarse_on_tags ? "tag" : "ledger", decide_gate != nullptr ? decide_gate : "none", act_name,
-               decide_frames, decide_pend_us, gd_str, decide_t);
+               decide_frames, decide_pend_us, gd_str, decide_sk, decide_t);
     };
     // Is the LEDGER reading stable enough to step on? During a refill burst it bounces tens of ms
     // chunk to chunk (17:41:53: +41.8, +27.7, +36.4, +42.2 ms on consecutive chunks) and a first step

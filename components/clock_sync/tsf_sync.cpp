@@ -1087,7 +1087,11 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   // Short, fixed fields; names first, numeric tail last -- a truncation hits t= and not a name.
   if (gdin_n > 0 && local_now_us - this->last_gdin_log_us_ >= 1000000) {
     this->last_gdin_log_us_ = local_now_us;
-    ESP_LOGV(TAG, "GDIN raw=%+" PRId64 " gd=%+" PRId64 " n=%" PRId64 " gap=%+" PRId64 " drift=%+.2f extrap=%+.2f t=%" PRId64,
+    // ESP_LOGD, NOT ESP_LOGV: esph_log_v is compiled out below ESPHOME_LOG_LEVEL_VERBOSE and
+    // the bench builds at DEBUG, so this line did not exist in the binary at all -- zero GDIN
+    // lines in 46 MB of logs while the parser, its self-test and dl-window all reported green.
+    // Stage 1 cannot be graded on a signal that is never emitted.
+    ESP_LOGD(TAG, "GDIN raw=%+" PRId64 " gd=%+" PRId64 " n=%" PRId64 " gap=%+" PRId64 " drift=%+.2f extrap=%+.2f t=%" PRId64,
              gdin_raw, d, gdin_n, gdin_gap, gdin_drift, gdin_extrap, local_now_us);
   }
 }

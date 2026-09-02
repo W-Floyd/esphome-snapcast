@@ -991,6 +991,8 @@ class SnapcastClient {
     int64_t resync_step_at_us{0};       // last in-window position step of ANY source (ledger steps wait out the blank too)
     int64_t phase_transient_until_us{0};  // my render phase does not describe my audio until then (steps, hard resyncs, deadline source changes)
     int64_t decide_log_us{0};            // last Stage 2 DECIDE emit (idle throttle, <= 2 Hz)
+    uint32_t decide_skipped{0};          // chunks the throttle suppressed since the last emit; reported as sk=
+                                         // so the census still accounts for every chunk (see decide_log)
     int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
     uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
     float align_kick_us{0.0f};  // render_align bias change not yet delivered as position (ALIGN KICK)

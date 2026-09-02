@@ -42,7 +42,10 @@ DECIDE = re.compile(
     # ANSI prefix of the intruding line -- int() then raised and the whole run died. A pattern
     # loose enough to swallow corruption turns a 0.03% nuisance into a total loss; matching the
     # shape means such a line simply reads as gd absent, which it is.
-    r"frames=([+-]\d+) pend=([+-]\d+)(?: gd=([+-]\d+|unknown))?(?: t=(\d+))?"
+    # sk= (chunks the idle throttle suppressed since the last emit) is OPTIONAL: it postdates
+    # the first DECIDE builds, and a log from either era must parse. Like gd and t it sits at
+    # the end, so a truncated line loses it rather than losing the frames count.
+    r"frames=([+-]\d+) pend=([+-]\d+)(?: gd=([+-]\d+|unknown))?(?: sk=(\d+))?(?: t=(\d+))?"
 )
 # --- PLAN-timing-v2 Stage 1 GDIN pairing-input shadow ---
 # raw = un-halved pairwise phase difference (pre-mean, what the analyser can grade);
@@ -92,7 +95,8 @@ def decide_rows(data: str):
     for m in DECIDE.finditer(data):
         gd = m.group(11)
         out.append((_ts(m), m.group(5), m.group(7), m.group(8),
-                    int(m.group(9)), int(m.group(10)), None if gd in (None, "unknown") else int(gd)))
+                    int(m.group(9)), int(m.group(10)), None if gd in (None, "unknown") else int(gd),
+                    int(m.group(12)) if m.group(12) is not None else None))
     return out
 
 
@@ -124,8 +128,15 @@ def reconcile_decide(rows, t0: float, t1: float):
     # Only splices/steps/steps contribute to the Sync `corrected -D/+I` counters.
     drops = sum(r[4] for r in rows if r[4] > 0 and r[3] != "resync")
     inserts = -sum(r[4] for r in rows if r[4] < 0 and r[3] != "resync")
+    # CHUNKS, not lines. A throttled chunk contributes zero frames but is still a chunk, and
+    # sk= is what keeps "every chunk accounted for" true while the line rate stays low. A log
+    # predating sk reports None, which is "not counted", NOT zero -- so say unknown rather than
+    # silently claiming the emitted lines were the whole census.
+    sk = [r[7] for r in rows if r[7] is not None]
+    chunks = (len(rows) + sum(sk)) if len(sk) == len(rows) and rows else None
     return {"acts": acts, "gates": gates, "drops": drops, "inserts": inserts,
-            "resyncs": acts["resync"], "n": len(rows), "malformed": len(malformed)}
+            "resyncs": acts["resync"], "n": len(rows), "malformed": len(malformed),
+            "suppressed": sum(sk) if sk else None, "chunks": chunks}
 
 
 def self_test() -> None:
@@ -216,7 +227,9 @@ def main() -> None:
         t_end = ev[-1][0] if ev else t0
         rep = reconcile_decide(decide, t0, t_end) if ev else None
         if rep and rep["n"] > 0:
-            print(f"        DECIDE n={rep['n']} acts={dict(rep['acts'])}")
+            supp = ("" if rep["suppressed"] is None
+                    else f" +{rep['suppressed']} throttled = {rep['chunks']} chunks")
+            print(f"        DECIDE n={rep['n']} lines{supp} acts={dict(rep['acts'])}")
             print(f"               gates={dict(rep['gates'])} malformed={rep['malformed']}")
             # Cross-check frame sums against the Sync aggregates: each Sync line carries the
             # incremental -D/+I/H since the previous Sync (its counters reset after printing), so
