@@ -2751,6 +2751,38 @@ void SnapcastClient::player_task_() {
         this->discard_ring_bytes_(rec.bytes);
         continue;
       }
+      // A DEADLINE IN THE FUTURE NEEDS A BOUND TOO. The line above guards a deadline in the past;
+      // nothing guarded one absurdly far ahead, and the wait below has no cap -- so the player
+      // waits for it, however far away it is. That is a deadlock by construction on this branch:
+      // the wait needs the deadline to arrive, the deadline is wrong because the clock estimate is
+      // wrong, and since nothing is ever pushed the speaker never produces a callback, so
+      // `predicted` stays < 0 and the branch can never self-heal.
+      //
+      // Measured 2026-09-02 on the bench observer: it reconnected from idle at 11:28, waited
+      // 14746 s (4.1 h) inside this loop with iters=+0, records piling to 112, the ring full at
+      // 520704/524288 and emit_pcm_ dropping chunks, while written==completed on the speaker
+      // proved no audio had been produced since before the reconnect. Its own DELAY line reported
+      // -1.39e11 us of raw local-vs-server difference -- 38.7 hours -- which is the same
+      // unanchored-quantity class as the 40.8-hour hard resync that cost board a a day earlier
+      // the same afternoon.
+      //
+      // The bound is what the pipeline can physically absorb: waiting longer than the buffer can
+      // hold is pointless, because the ring overflows first and the chunk is dropped anyway --
+      // which is precisely what happened. Derived from the ring, so it moves with buffer_size and
+      // the sample rate rather than being a number written here.
+      const int64_t wait_cap_us = this->ring_capacity_us_.load(std::memory_order_relaxed);
+      if (wait_cap_us > 0 && deadline - now_us() > wait_cap_us) {
+        if (!st.warned_far_deadline) {
+          st.warned_far_deadline = true;
+          ESP_LOGE(TAG,
+                   "First-chunk deadline %" PRId64 " ms ahead exceeds what the pipeline can hold "
+                   "(%" PRId64 " ms): the clock estimate cannot be trusted, discarding rather than "
+                   "waiting for it t=%" PRId64,
+                   (deadline - now_us()) / 1000, wait_cap_us / 1000, now_us());
+        }
+        this->discard_ring_bytes_(rec.bytes);
+        continue;
+      }
       while (now_us() < deadline - STARTUP_LEAD_US && this->output_active_.load(std::memory_order_relaxed) &&
              !this->shutdown_.load(std::memory_order_relaxed)) {
         vTaskDelay(pdMS_TO_TICKS(10));
