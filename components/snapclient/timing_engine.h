@@ -125,6 +125,11 @@ struct Profile {
   /// board's own phase is meaningless, and zeroing would itself be a step.
   bool gate_gd_on_transient = false;
 
+  /// SIZE Kp FROM THE DIFFERENTIAL'S NOISE rather than the deadline error's, whenever the group
+  /// supplies a differential. Off by default so it can be A/B'd on hardware; see the note at its
+  /// use for why the current default is a known mis-sizing rather than a choice.
+  bool kp_from_diff_sigma = false;
+
   /// Ceiling on the shared correction, separate from rate_authority_ppm because it answers a
   /// different question: authority bounds what this board may do ALONE (and so bounds the
   /// differential it can inject), while this bounds a motion the whole group makes together and
@@ -311,6 +316,10 @@ struct Decision {
   float d_p_ppm = 0.0f;         ///< how much was the proportional term
   float p_ppm = 0.0f;           ///< P itself, so a standing P is distinguishable from a moving one
   float kp_ppm_per_us = 0.0f;   ///< the gain in force, which sigma_e moves under you
+  /// The noise estimate Kp was divided by -- the DIFFERENTIAL's when kp_from_diff_sigma is on and
+  /// the group supplies one, the deadline error's otherwise. Logged because "which distribution
+  /// was the gain sized from" is exactly the question that went unasked.
+  float p_sigma_us = 0.0f;
   bool slew_clipped = false;    ///< the command wanted to move further than authority*dt/horizon
 
   /// THE SHARED COMMON-MODE TERM, and the value it acted on. Recorded even when the correction is

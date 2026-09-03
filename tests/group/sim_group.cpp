@@ -1217,6 +1217,35 @@ int main() {
     printf("        (a repair on a lie shows as skew with resyncs on A only and none on B)\n");
   }
 
+  printf("\n3h. Kp's DENOMINATOR: sized from the deadline error, applied to the differential\n");
+  {
+    // Kp = budget / sigma is a promise that command noise integrates to no more than
+    // target_diff_us over the horizon. P multiplies e_position, which is the DIFFERENTIAL when the
+    // group supplies one -- but sigma_e is the DEADLINE error's noise. Wrong distribution.
+    //
+    // Bench 2026-09-03: sigma_e pinned at its 22 us frame floor while sigma(gd) measured 30.5 us.
+    // Halving timing_target_us (halving Kp) improved BOTH wire and rate -- offset sd 16.25 -> 12.41
+    // us, rate p2p 87.9 -> 58.6 ppm -- and reverting degraded both again. Two metrics improving
+    // together is over-gain, not a trade. But the target only compensated for the wrong
+    // denominator by coincidence, and would stop the moment gd's noise moved.
+    //
+    // Swept at two noise levels because that is the whole claim: the fix should matter MORE when
+    // the differential is noisier than the deadline error, and do nothing when it is not.
+    printf("        %-28s %9s %9s %9s %8s\n", "case", "skew med", "skew p90", "corr", "frames");
+    for (double noise : {80.0, 200.0}) {
+      for (int fix = 0; fix <= 1; fix++) {
+        Profile q = p;
+        q.kp_from_diff_sigma = (fix == 1);
+        char tag[32]; snprintf(tag, sizeof(tag), "kp-%.0f-%d", noise, fix);
+        char nm[48]; snprintf(nm, sizeof(nm), "noise %.0f us, Kp from %s", noise,
+                              fix ? "DIFF sigma" : "sigma_e");
+        Result r = simulate(tag, q, -15.0, +15.0, 40.0, noise, 600.0, TRUE_LAND);
+        printf("        %-28s %9.0f %9.0f %9d %8ld\n", nm, r.skew_med, r.skew_p90, r.corr, r.gross);
+      }
+    }
+    printf("        (the fix should help where sigma(gd) > sigma_e and be neutral otherwise)\n");
+  }
+
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
   printf("   behind the engine's back by a resync path that never tells it\n");
   {

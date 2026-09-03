@@ -4653,6 +4653,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   prof.buffer_floor_us = this->ring_capacity_us_.load(std::memory_order_relaxed) / 8;
   prof.target_diff_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
   prof.target_common_us = this->tune_common_target_us_.load(std::memory_order_relaxed);
+  prof.kp_from_diff_sigma = this->tune_kp_from_diff_sigma_.load(std::memory_order_relaxed) != 0;
   prof.common_drain_s = this->tune_common_drain_s_.load(std::memory_order_relaxed);
   prof.common_authority_ppm = this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
@@ -4800,10 +4801,11 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // is merely tracking, and well below the 20-40 ppm excursions being chased.
   if (std::fabs(cmd.decision.d_rate_ppm) >= this->tune_ratewhy_ppm_.load(std::memory_order_relaxed)) {
     ESP_LOGW(TAG,
-             "RATEWHY d=%+.2f dx=%+.2f dp=%+.2f p=%+.2f kp=%.3f com=%+" PRId32 " dif=%+" PRId32
-             " snap=%+" PRId32 " clip=%d t=%" PRId64,
+             "RATEWHY d=%+.2f dx=%+.2f dp=%+.2f p=%+.2f kp=%.3f sig=%.1f com=%+" PRId32
+             " dif=%+" PRId32 " snap=%+" PRId32 " clip=%d t=%" PRId64,
              cmd.decision.d_rate_ppm, cmd.decision.d_crystal_ppm, cmd.decision.d_p_ppm,
-             cmd.decision.p_ppm, cmd.decision.kp_ppm_per_us, cmd.decision.e_common_us,
+             cmd.decision.p_ppm, cmd.decision.kp_ppm_per_us, cmd.decision.p_sigma_us,
+             cmd.decision.e_common_us,
              cmd.decision.e_diff_us, cmd.decision.gd_snap_us, cmd.decision.slew_clipped ? 1 : 0,
              tnow);
   }
@@ -5014,6 +5016,9 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "common_drain_s") {
     return this->tune_common_drain_s_.load(std::memory_order_relaxed);
   }
+  if (name == "kp_from_diff_sigma") {
+    return static_cast<float>(this->tune_kp_from_diff_sigma_.load(std::memory_order_relaxed));
+  }
   if (name == "common_target_us") {
     return static_cast<float>(this->tune_common_target_us_.load(std::memory_order_relaxed));
   }
@@ -5097,6 +5102,15 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     if (!std::isfinite(value) || (value != 0.0f && (value < 30.0f || value > 3600.0f))) return false;
     this->tune_common_drain_s_.store(value, std::memory_order_relaxed);
     ESP_LOGI(TAG, "common_drain_s = %.1f t=%" PRId64, value, now_us());
+  } else if (name == "kp_from_diff_sigma") {
+    // 0/1. Sizes Kp from the DIFFERENTIAL's noise instead of the deadline error's whenever the
+    // group supplies a differential -- i.e. from the distribution P actually multiplies. Off by
+    // default only so it can be A/B'd against the shipped behaviour; the shipped behaviour is a
+    // known mis-sizing (sigma_e pinned at 22 us while sigma(gd) measured 30.5), not a choice.
+    if (!std::isfinite(value) || value < 0.0f || value > 1.0f) return false;
+    this->tune_kp_from_diff_sigma_.store(value >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "kp_from_diff_sigma = %d t=%" PRId64,
+             this->tune_kp_from_diff_sigma_.load(std::memory_order_relaxed), now_us());
   } else if (name == "common_target_us") {
     // THE COMMON-MODE TARGET, and deliberately three orders of magnitude looser than
     // timing_target_us. A common error shifts every device equally and is inaudible; what it costs

@@ -694,7 +694,33 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // throughout. A differential of 21 us now asks for 10 ppm, not 100. Where there is no group to
   // be differential from, it falls back to the deadline error, which is correct for a lone client
   // -- tracking the server is then the only meaning "in sync" has.
-  const float p_raw = proportional_gain_ppm_per_us() * static_cast<float>(e_position);
+  // SIZE Kp FROM THE NOISE OF THE SIGNAL P MULTIPLIES. Kp = budget / sigma is a promise that the
+  // command noise integrates to no more than target_diff_us over the horizon, and that promise is
+  // only kept if sigma describes the signal actually being multiplied. P acts on e_position, which
+  // is the DIFFERENTIAL whenever the group supplies one -- but sigma_e_us() is the DEADLINE error's
+  // noise. Two different distributions, and the budget was computed from the wrong one.
+  //
+  // The identical error was already found and fixed for the position gate ten lines up ("a gate
+  // sized from the deadline error's noise is measuring the wrong distribution"); the reasoning was
+  // simply never carried across to the gain.
+  //
+  // Measured 2026-09-03: sigma_e pinned at its 22 us frame floor while sigma(gd) was 30.5 us, so
+  // Kp ran ~1.4x the budget it claimed. Halving timing_target_us (which halves Kp) improved BOTH
+  // the wire and the rate activity -- offset sd 16.25 -> 12.41 us and rate p2p 87.9 -> 58.6 ppm,
+  // with a revert to 20 degrading both again. Two metrics improving together is over-gain, not a
+  // trade, and lowering the target only compensated for the wrong denominator by coincidence: it
+  // would stop compensating the moment gd's noise moved, and board a's gd p90 reached 333 us
+  // earlier the same night.
+  //
+  // The one-frame floor comes with it, for the reason sigma_e_us() documents: below one frame the
+  // clamp turns P into a relay and the loop bang-bangs against the transport delay. gd_sigma_us
+  // floors at a QUARTER frame, which is fine for the gate it was built for and not for a gain.
+  const float p_sigma_us =
+      (profile_.kp_from_diff_sigma && have_diff)
+          ? std::max(gd_sigma_us, static_cast<float>(profile_.frame_us()))
+          : sigma_e_us();
+  const float kp_used = p_sigma_us > 0.0f ? profile_.rate_noise_budget_ppm() / p_sigma_us : 0.0f;
+  const float p_raw = kp_used * static_cast<float>(e_position);
   const float p_term = std::clamp(p_raw, -profile_.rate_authority_ppm, profile_.rate_authority_ppm);
 
   // SLEW-LIMIT THE COMMAND. A continuous actuator's command should be continuous -- that is the
@@ -784,7 +810,12 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     cmd.decision.slew_clipped = std::fabs(want - prev_cmd) > max_slew_ppm;
   }
   cmd.decision.p_ppm = p_term;
-  cmd.decision.kp_ppm_per_us = proportional_gain_ppm_per_us();
+  // THE GAIN ACTUALLY USED, not a re-derivation. Reporting proportional_gain_ppm_per_us() here
+  // while P was computed from a different sigma would make RATEWHY's kp field describe a gain the
+  // loop never applied -- and P = kp * dif was the identity that made the excursions explicable in
+  // the first place. An instrument that reports a number the code did not use is worse than none.
+  cmd.decision.kp_ppm_per_us = kp_used;
+  cmd.decision.p_sigma_us = p_sigma_us;
   last_crystal_ppm_ = crystal_ppm_;
   last_p_ppm_ = p_term;
   rate_cmd_seeded_ = true;

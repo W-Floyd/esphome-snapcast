@@ -1249,6 +1249,10 @@ class SnapcastClient {
   /// noise that lands on the DIFFERENTIAL, which is not. Separate from timing_target_us because
   /// the two errors differ by two orders of magnitude in how much is acceptable.
   std::atomic<int32_t> tune_common_target_us_{5000};
+  /// 0/1: size Kp from the DIFFERENTIAL's noise instead of the deadline error's. Off by default
+  /// only so the shipped behaviour can be A/B'd against it; the shipped behaviour divides the
+  /// budget by the wrong distribution's sigma.
+  std::atomic<int32_t> tune_kp_from_diff_sigma_{0};
   std::atomic<float> tune_common_authority_ppm_{50.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
