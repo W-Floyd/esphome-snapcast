@@ -2811,10 +2811,23 @@ void SnapcastClient::player_task_() {
     // walked back in opposite signs (+63/-64, +64/-61, -58/+174). That is the stairstep: one
     // board's network problem propagating to a healthy peer through the group delta.
     //
-    // Armed on the SUPPLY evidence rather than on the ring depth, because arrival lateness is what
-    // actually says the audio was displaced by the network; the ring can dip for a beat without
-    // the audio having moved.
-    if (rec.arrival_us > 0 && deadline - rec.arrival_us < 0) {
+    // ARMED ON RING DEPTH, not on arrival lateness. The first version of this used SUPPLY's
+    // deadline-miss test and would have missed the very next event, 2026-09-02 22:46: board a's
+    // ring drained to 26 ms and it hard-resynced twice at err=51.8 ms -- audio moved, phase still
+    // published -- while SUPPLY reported late=0 on every window.
+    //
+    // The reason is that the deadline sits a buffer ahead. A chunk arriving 862 ms after its
+    // predecessor still has ~800 ms of margin and scores as on time, so "late" cannot fire until
+    // the buffer is ALREADY gone. ARRGAP over that episode: mean 25725-26954 us, i.e. break-even,
+    // with maxima of 261-862 ms and 4-12 gaps over 120 ms per window. Delivery was bursty, not
+    // deficient, and a bursty supply drains the ring without ever missing a deadline.
+    //
+    // The ring dipping IS the audio being displaced -- that is what a hard resync then corrects --
+    // so the depth is the trigger, and it is the same quantity the engine's own starvation guard
+    // reads. SUPPLY stays as the network-side diagnostic it is genuinely good for.
+    const int64_t ring_now_us = this->ring_depth_us_.load(std::memory_order_relaxed);
+    const int64_t ring_floor_us = this->ring_capacity_us_.load(std::memory_order_relaxed) / 8;
+    if (ring_now_us > 0 && ring_floor_us > 0 && ring_now_us < ring_floor_us) {
       st.phase_transient_until_us =
           std::max(st.phase_transient_until_us, now_us() + this->visibility_horizon_us());
     }
