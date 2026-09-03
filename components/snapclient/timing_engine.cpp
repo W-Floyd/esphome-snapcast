@@ -349,7 +349,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // error is audible, and correcting a common one moves the pair apart. Not a gain input.
   // How much of MY error is differential -- not merely whether the group delta is small.
   //
-  // The old test was `|gd| * unhalve >= target_position_us`, which asks the wrong question. On the
+  // The old test was `|gd| * unhalve >= target_diff_us`, which asks the wrong question. On the
   // bench gd reads 8-42 us between boards that agree with each other to within tens of us while
   // each sits ~600 us off its own deadline: nearly all of that error is COMMON, yet a gd of 21 us
   // crosses a 20 us threshold, the whole 600 us is declared differential, and position steps it.
@@ -436,7 +436,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     gd_sigma_prev_us_ = gd_sigma_us;
     e_diff = static_cast<int64_t>(std::llround(gd_mean_us_));
     have_diff = true;
-    differential = std::llabs(e_diff) >= profile_.target_position_us;
+    differential = std::llabs(e_diff) >= profile_.target_diff_us;
   } else if (gd_hold && gd_seeded_) {
     // HOLDING STILL SUPPLIES A DIFFERENTIAL. Dropping have_diff here would send e_position to the
     // DEADLINE error instead -- 700 us to 10 ms on the bench against a differential of tens of us
@@ -446,7 +446,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     have_diff = true;
     gd_last_at_us_ = now_us;
     gd_sigma_us = gd_sigma_prev_us_;
-    differential = std::llabs(e_diff) >= profile_.target_position_us;
+    differential = std::llabs(e_diff) >= profile_.target_diff_us;
   }
 
   // Coarse: whole frames, one at a time, verified. Decided on the FILTERED error, not the latest
@@ -685,7 +685,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // the switch was doing all the jumping.
   //
   // And the two halves disagreed about which error they were about: the gate tested the
-  // DIFFERENTIAL (>= target_position_us, 20 us) while P was computed from the DEADLINE error
+  // DIFFERENTIAL (>= target_diff_us, 20 us) while P was computed from the DEADLINE error
   // (median 102 us, p90 351 us). So 21 us of differential unlocked a 100 ppm response driven by
   // an unrelated 350 us number. With sigma_e pinned at its one-frame floor, Kp saturates P past
   // 44 us of error, which is why the rail was reached at all.
@@ -737,11 +737,33 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     cmd.decision.common_shared_us = static_cast<int32_t>(
         std::clamp<int64_t>(group.common_us, INT32_MIN, INT32_MAX));
     if (profile_.common_drain_s > 0.0f) {
-      // us / s == ppm. A sustained offset sized to drain the common error over MINUTES, which is
-      // the budget that matters (stay under the resync threshold between disturbances), not over
-      // rate's 2 s horizon, which no achievable rate can satisfy.
-      const float pc_raw = static_cast<float>(group.common_us) / profile_.common_drain_s;
-      pc_term = std::clamp(pc_raw, -profile_.common_authority_ppm, profile_.common_authority_ppm);
+      // DEADBAND AT target_common_us, working only on the EXCESS beyond it. A common error is
+      // inaudible, so correcting one inside the target spends rate-command noise -- which lands
+      // on the DIFFERENTIAL, the audible quantity -- to fix something nobody can hear. Measured
+      // 2026-09-03 with the loop healthy: +1192 and +1282 us of common error on the two boards
+      // while the wire held 18 us sd. Chasing that would have been strictly harmful.
+      //
+      // It is also what lets this coexist with the crystal integral instead of fighting it. An
+      // earlier attempt removed the common component from the integral's input so the two would
+      // not both chase it, and that was wrong: pc is PROPORTIONAL and cannot deliver zero
+      // steady-state error, so a sustained 40 ppm common drift would have demanded a permanent
+      // 12 ms error to generate the ppm it needed. With a deadband the division is clean -- the
+      // integral owns common DRIFT at all times, pc owns only the large excursions that threaten
+      // the resync threshold.
+      const int64_t dead_us = std::max<int64_t>(0, profile_.target_common_us);
+      int64_t excess_us = 0;
+      if (group.common_us > dead_us) {
+        excess_us = group.common_us - dead_us;
+      } else if (group.common_us < -dead_us) {
+        excess_us = group.common_us + dead_us;
+      }
+      if (excess_us != 0) {
+        // us / s == ppm. Sized to drain over MINUTES -- the budget that matters is staying under
+        // the resync threshold between disturbances, not rate's 2 s horizon, which no achievable
+        // rate can satisfy.
+        const float pc_raw = static_cast<float>(excess_us) / profile_.common_drain_s;
+        pc_term = std::clamp(pc_raw, -profile_.common_authority_ppm, profile_.common_authority_ppm);
+      }
     }
   }
   cmd.decision.pc_ppm = pc_term;

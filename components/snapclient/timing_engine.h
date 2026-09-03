@@ -50,8 +50,30 @@ struct Profile {
   int64_t measurement_lag_us = 250000;
   /// Ring + pipe: a delivered frame correction -> the DAC. POSITION's dead time.
   int64_t position_delay_us = 1250000;
-  /// Position accuracy aimed at; sets the rate-command noise budget.
-  int64_t target_position_us = 20;
+  /// NEIGHBOUR TARGET: how far this board may sit from its PEERS. The audible one.
+  ///
+  /// Everything sized from this acts on the DIFFERENTIAL -- the position gate tests
+  /// |e_diff| >= this, and the rate-command noise budget below feeds Kp, which multiplies e_diff.
+  /// So it is a differential-position target throughout, and naming it after position alone
+  /// invited the confusion that a single number could serve both errors.
+  ///
+  /// Tight, because a differential error is the only thing a listener can hear.
+  int64_t target_diff_us = 20;
+
+  /// COMMON-MODE TARGET: how far the WHOLE GROUP may sit from the server's deadline. The
+  /// inaudible one, and therefore a completely different number.
+  ///
+  /// A common error shifts every device equally, so no listener can detect it; what it costs is
+  /// headroom, because it grows toward the hard-resync threshold and the repair is what breaks
+  /// the pair. Measured 2026-09-03 with the loop healthy: both boards sat +1192 and +1282 us from
+  /// their deadlines TOGETHER while holding 18 us sd on the wire. That is a perfectly good state
+  /// and nothing should spend rate noise correcting it.
+  ///
+  /// So this is a DEADBAND, not a setpoint: the shared common drain does nothing while the group
+  /// is inside it, and works on the excess beyond it. One knob could not express that -- sized
+  /// for the differential it chases milliseconds of inaudible error, and sized for the common it
+  /// abandons the microseconds that matter.
+  int64_t target_common_us = 5000;
   /// Buffer level below which the board is treated as STARVED and the loop holds. Supplied by
   /// the transport, because only it knows the ring's capacity.
   ///
@@ -163,7 +185,7 @@ struct Profile {
   float rate_noise_budget_ppm() const {
     const int64_t h = rate_horizon_us();
     if (h <= 0) return 0.0f;
-    return 1e6f * static_cast<float>(target_position_us) / static_cast<float>(h);
+    return 1e6f * static_cast<float>(target_diff_us) / static_cast<float>(h);
   }
 };
 

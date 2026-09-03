@@ -175,7 +175,7 @@ int main() {
   // wander rather than by the actuator's range. The actuator accepts +-2000, but authority
   // that large lets rate accept errors it then overshoots by A*T through the transport delay.
   p.rate_authority_ppm = 100.0f;
-  p.target_position_us = 20;
+  p.target_diff_us = 20;
 
   printf("profile: frame %lld us, budget %.3f ppm, Kp cap implied %.5f ppm/us\n",
          static_cast<long long>(p.frame_us()), p.rate_noise_budget_ppm(),

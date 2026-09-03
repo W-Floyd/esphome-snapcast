@@ -423,7 +423,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       const double measured = x.err_us + deadline_shift + x.own_deadline_us;
       // The PUBLISHED phase is noisy too -- it is a measurement, not a truth. On the bench gd
       // reads +8, +21, +42 us between boards that agree, and the gate tests |gd| * unhalve
-      // against target_position_us (20 us), so that noise alone crosses the threshold and
+      // against target_diff_us (20 us), so that noise alone crosses the threshold and
       // declares a purely common error "differential". Publishing it noiseless makes the gate
       // look perfect.
       x.phase_us = measured + nd(rng) * 0.25;
@@ -822,7 +822,7 @@ int main() {
   p.frame_rate_hz = 44100;
   p.measurement_lag_us = 250000;
   p.position_delay_us = 1250000;
-  p.target_position_us = 20;
+  p.target_diff_us = 20;
   p.rate_authority_ppm = 100.0f;
   // An eighth of the ring's capacity, as snapcast_client derives it. Never set here before, so it
   // was 0 and the engine's starvation guard was disabled outright -- the guard has never once run
@@ -987,17 +987,28 @@ int main() {
            plant_a, plant_b, common, plant_a + common, plant_b + common, plant_a, plant_b);
     printf("        THE TARGET IS max|com| < 50000 us -- below the resync threshold, so the solo\n");
     printf("        repair that breaks the pair (3f) never fires at all.\n");
-    printf("        %-8s %8s %8s %8s %8s %10s %7s %8s %7s\n",
-           "drain_s", "xtal a", "xtal b", "pc a", "pc b", "max|com|", "rsync", "skew med", "p90");
-    for (double drain : {0.0, 600.0, 300.0, 120.0}) {
+    // TWO TARGETS, and the deadband is the point. A common error inside target_common_us is
+    // inaudible and must not be chased: correcting it spends rate-command noise, and that noise
+    // lands on the DIFFERENTIAL, which is the audible quantity. So the drain works on the EXCESS
+    // beyond the target, which is also what lets it coexist with the crystal integral rather than
+    // fighting it -- the integral owns common drift at all times, the drain owns only excursions.
+    printf("        target_diff=%lld us (audible, drives Kp and the position gate)\n",
+           static_cast<long long>(p.target_diff_us));
+    printf("        %-8s %8s %8s %8s %8s %8s %10s %7s %8s %7s\n",
+           "drain_s", "cmn_tgt", "xtal a", "xtal b", "pc a", "pc b", "max|com|", "rsync", "skew med", "p90");
+    struct CmnCase { double drain; int64_t target; };
+    const CmnCase ccases[] = {{0.0, 5000}, {300.0, 0}, {300.0, 5000}, {300.0, 20000}};
+    for (const CmnCase &cc : ccases) {
+      const double drain = cc.drain;
       Profile q = p;
       q.common_drain_s = static_cast<float>(drain);
+      q.target_common_us = cc.target;
       char tag[24];
-      snprintf(tag, sizeof(tag), "cmn-%.0f", drain);
+      snprintf(tag, sizeof(tag), "cmn-%.0f-%lld", drain, static_cast<long long>(cc.target));
       Result r = simulate(tag, q, plant_a, plant_b, common, 80.0, 1800.0, TRUE_LAND, hungry);
-      printf("        %-8.0f %8.1f %8.1f %8.1f %8.1f %10.0f %3d/%-3d %8.0f %7.0f\n",
-             drain, r.xtal_a, r.xtal_b, r.pc_a, r.pc_b, r.common_max,
-             r.resync_a, r.resync_b, r.skew_med, r.skew_p90);
+      printf("        %-8.0f %8lld %8.1f %8.1f %8.1f %8.1f %10.0f %3d/%-3d %8.0f %7.0f\n",
+             drain, static_cast<long long>(cc.target), r.xtal_a, r.xtal_b, r.pc_a, r.pc_b,
+             r.common_max, r.resync_a, r.resync_b, r.skew_med, r.skew_p90);
       printf("               [shared? mean |pc_a - pc_b| = %.2f ppm; consensus BOTH %.0f%%,"
              " ONE-SIDED %.0f%%]\n",
              r.pc_absdiff, 100.0 * r.common_both_frac, 100.0 * r.common_one_sided_frac);

@@ -4651,7 +4651,8 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // to, it cannot drift out from under the guard when an unrelated quantity is redefined. At the
   // bench's 2972 ms capacity this is ~371 ms, above the 500 ms "ring low" band a keeps entering.
   prof.buffer_floor_us = this->ring_capacity_us_.load(std::memory_order_relaxed) / 8;
-  prof.target_position_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
+  prof.target_diff_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
+  prof.target_common_us = this->tune_common_target_us_.load(std::memory_order_relaxed);
   prof.common_drain_s = this->tune_common_drain_s_.load(std::memory_order_relaxed);
   prof.common_authority_ppm = this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
@@ -5013,6 +5014,9 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "common_drain_s") {
     return this->tune_common_drain_s_.load(std::memory_order_relaxed);
   }
+  if (name == "common_target_us") {
+    return static_cast<float>(this->tune_common_target_us_.load(std::memory_order_relaxed));
+  }
   if (name == "common_authority_ppm") {
     return this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
   }
@@ -5093,6 +5097,20 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     if (!std::isfinite(value) || (value != 0.0f && (value < 30.0f || value > 3600.0f))) return false;
     this->tune_common_drain_s_.store(value, std::memory_order_relaxed);
     ESP_LOGI(TAG, "common_drain_s = %.1f t=%" PRId64, value, now_us());
+  } else if (name == "common_target_us") {
+    // THE COMMON-MODE TARGET, and deliberately three orders of magnitude looser than
+    // timing_target_us. A common error shifts every device equally and is inaudible; what it costs
+    // is headroom toward the hard-resync threshold. Correcting one inside this band would spend
+    // rate-command noise -- which lands on the differential, the audible quantity -- on something
+    // no listener can detect. Measured 2026-09-03: +1192/+1282 us of common error with the wire
+    // holding 18 us sd, i.e. a perfectly good state that must not be chased.
+    //
+    // Upper bound below the 50 ms resync threshold: a deadband at or above it would let the group
+    // reach the repair before the drain ever engaged, which is the failure this exists to prevent.
+    if (!std::isfinite(value) || value < 0.0f || value > 40000.0f) return false;
+    this->tune_common_target_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+    ESP_LOGI(TAG, "common_target_us = %" PRId32 " t=%" PRId64,
+             this->tune_common_target_us_.load(std::memory_order_relaxed), now_us());
   } else if (name == "common_authority_ppm") {
     // The ceiling the term actually operates at, given it saturates. This is the knob that
     // matters for an A/B, not the gain.

@@ -1244,6 +1244,11 @@ class SnapcastClient {
   /// Shared common-mode correction. 0 = shadow only (consensus formed and CMNC logged, nothing
   /// applied), which is the default and what the falsified 3c result argues for.
   std::atomic<float> tune_common_drain_s_{0.0f};
+  /// Common-mode deadband, us. The group may sit this far from the server's deadline without
+  /// anything correcting it: a common error is inaudible, and correcting it costs rate-command
+  /// noise that lands on the DIFFERENTIAL, which is not. Separate from timing_target_us because
+  /// the two errors differ by two orders of magnitude in how much is acceptable.
+  std::atomic<int32_t> tune_common_target_us_{5000};
   std::atomic<float> tune_common_authority_ppm_{50.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
