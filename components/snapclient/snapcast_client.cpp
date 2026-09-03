@@ -860,6 +860,15 @@ static constexpr int64_t UNMUTE_ANCHOR_MAX_WAIT_US = 15000000;
 // this rate the 2 ms minimum that can arm a repair (DRIFT_REPAIR_US) takes ~20 s to build, plus
 // DRIFT_REPAIR_HOLD_US to fire, which is the price of not swamping the measurement.
 static constexpr double SPLIT_RAMP_US_PER_S = 100.0;
+// The old PI's tau, kept ONLY to scale one diagnostic: the "Trim window" line falls back to the
+// gain the schedule WOULD hand it when kp_active is 0, and printing a bare 0 there reads as "the
+// loop is running at zero gain". It steers nothing -- the PI it belonged to went in dee1ddd -- so
+// it is a constant rather than a knob someone might mistake for a control.
+static constexpr float LEGACY_TRIM_TAU_S = 120.0f;
+// Threshold for the RSKIP line: in a resync window, an error above this that takes NO step is the
+// case worth explaining. A LOGGING threshold, not an actuator arm -- the coarse path's own gate is
+// frame_us + 2*sigma, derived in the engine.
+static constexpr int64_t RSKIP_REPORT_US = 100;
 
 #if defined(CLOCK_SYNC_TSF_ACTIVE) && defined(USE_SNAPCLIENT_TIMING_DIAG)
 /// @brief Renders a render-phase value for a log line, printing the UNKNOWN sentinel as a word.
@@ -3157,7 +3166,7 @@ void SnapcastClient::player_task_() {
     // (build 44, B at +600 us for 45 s). One line per block, never per chunk: ~38 lines/s crashes
     // the ESPHome logger's ring buffer.
     if (resync_window && coarse_on_tags && st.dl_err_at_us != st.rskip_log_at_us &&
-        std::abs(coarse_err_us) > this->tune_resync_splice_us_.load(std::memory_order_relaxed) &&
+        std::abs(coarse_err_us) > RSKIP_REPORT_US &&
         (!coarse_ok || st.dl_err_at_us == st.resync_last_block_us)) {
       st.rskip_log_at_us = st.dl_err_at_us;
       ESP_LOGD(TAG, "RSKIP err=%+" PRId64 " ok=%d sameblk=%d since_act=%" PRId64 " ms blank=%" PRId64 " ms",
@@ -3550,8 +3559,7 @@ void SnapcastClient::player_task_() {
                    // scaled to the DELAY LOOP's gain -- trim_kp_ returns the legacy scale.
                    st.kp_active > 0.0f
                        ? st.kp_active
-                       : (1.0f / this->tune_tau_s_.load(std::memory_order_relaxed)) *
-                             (this->trim_kp_(st) / TRIM_KP_RUN_PPM_PER_US));
+                       : (1.0f / LEGACY_TRIM_TAU_S) * (this->trim_kp_(st) / TRIM_KP_RUN_PPM_PER_US));
         } else {
           ESP_LOGD(TAG, "Trim window: no trim programmed over %.2f s audio t=%" PRId64, st.trim_window_s,
                    now_us());
@@ -3698,12 +3706,14 @@ void SnapcastClient::player_task_() {
       // Accumulate rather than replace: a second request while one is in flight should add.
       this->split_ramp_remaining_us_ += split_req;
       ESP_LOGW(TAG, "SPLITINJECT request %+" PRId32 " us, ramping at %d us/s (remaining %+" PRId64 ") t=%" PRId64,
-               split_req, static_cast<int>(SPLIT_RAMP_US_PER_S), this->split_ramp_remaining_us_, now_us());
+               split_req, static_cast<int>(this->tune_split_ramp_us_per_s_.load(std::memory_order_relaxed)),
+               this->split_ramp_remaining_us_, now_us());
     }
     this->playout_mutex_.lock();
     if (this->split_ramp_remaining_us_ != 0) {
       const double chunk_s = static_cast<double>(frames) / rec.params.sample_rate;
-      const int64_t budget = static_cast<int64_t>(SPLIT_RAMP_US_PER_S * chunk_s + 0.5);
+      const int64_t budget = static_cast<int64_t>(
+          this->tune_split_ramp_us_per_s_.load(std::memory_order_relaxed) * chunk_s + 0.5);
       const int64_t inc = std::clamp<int64_t>(this->split_ramp_remaining_us_, -budget, budget);
       // ACCUMULATE in us and spend whole frames, because the accounting has no finer unit than a
       // frame. Converting each chunk's budget straight to frames truncated to zero and the ramp
@@ -4443,6 +4453,8 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // is the one knob whose evidence came from watching the ceiling get hit, so it is also the one
   // most likely to need moving again, and a reflash to move it is five membership changes.
   prof.rate_authority_ppm = this->tune_rate_authority_ppm_.load(std::memory_order_relaxed);
+  prof.err_tau_horizons = this->tune_err_tau_horizons_.load(std::memory_order_relaxed);
+  prof.rate_filter_lag_us = this->tune_rate_filter_lag_us_.load(std::memory_order_relaxed);
   // Starvation floor: an eighth of the ring's CAPACITY, from the mirror updated where the frame
   // size is known. Dimensionless and config-derived, so it moves with buffer_size and the sample
   // rate and carries no time of its own -- and, unlike the measurement lag it used to be keyed
@@ -4704,6 +4716,15 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "rate_authority_ppm") {
     return this->tune_rate_authority_ppm_.load(std::memory_order_relaxed);
   }
+  if (name == "err_tau_horizons") {
+    return this->tune_err_tau_horizons_.load(std::memory_order_relaxed);
+  }
+  if (name == "rate_filter_lag_us") {
+    return static_cast<float>(this->tune_rate_filter_lag_us_.load(std::memory_order_relaxed));
+  }
+  if (name == "split_ramp_us_per_s") {
+    return this->tune_split_ramp_us_per_s_.load(std::memory_order_relaxed);
+  }
   if (name == "tag_stale_ms") {
     return static_cast<float>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed));
   }
@@ -4717,17 +4738,21 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
 }
 
 bool SnapcastClient::set_servo_param(const std::string &name, float value) {
-  if (name == "tau_s") {
-    if (!(value >= 2.0f && value <= 600.0f)) return false;
-    if (this->tune_autotune_.load(std::memory_order_relaxed)) {
-      ESP_LOGW(TAG, "SERVOPARAM tau_s set manually while autotune is ON; the next adaptation will move it");
-    }
-    this->tune_tau_s_.store(value, std::memory_order_relaxed);
-  } else if (name == "timing_engine") {
-    this->tune_timing_engine_.store(value != 0.0f ? 1u : 0u, std::memory_order_relaxed);
-    ESP_LOGI(TAG, "timing_engine = %u (0 = old ladder + PI) t=%" PRId64,
-             this->tune_timing_engine_.load(std::memory_order_relaxed), now_us());
-  } else if (name == "crystal_ppm") {
+  // DELETED, 2026-09-02: tau_s, timing_engine, autotune, resync_splice_us. Each survived the PI's
+  // deletion as a knob whose control had already gone:
+  //   timing_engine     stored and then read back only by its own log line. It advertised
+  //                     "0 = old ladder + PI" -- both deleted in 50b01d3 and dee1ddd -- so it
+  //                     offered a fallback that does not exist. A switch wired to nothing.
+  //   autotune          read once, inside the tau_s setter, to decide whether to print a warning.
+  //                     It adapted nothing.
+  //   tau_s             read once, as a fallback VALUE in the "Trim window" log line when
+  //                     kp_active is 0. Now LEGACY_TRIM_TAU_S, since the number it produces is a
+  //                     diagnostic and not a setting.
+  //   resync_splice_us  read once, as the threshold for emitting an RSKIP line. Now
+  //                     RSKIP_REPORT_US, for the same reason.
+  // Kept, because they still steer: resync_win_s (the post-event window) and resync_blank_ms (the
+  // tag blank inside it, which is what stops stale tags reaching the engine after a resync).
+  if (name == "crystal_ppm") {
     // Set the learned plant offset directly, and PERSIST it, so a poisoned estimate can be
     // cleared without a serial NVS erase.
     //
@@ -4744,6 +4769,29 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
       this->crystal_saved_at_us_ = now_us();
     }
     ESP_LOGI(TAG, "crystal_ppm = %+.2f ppm (set and persisted) t=%" PRId64, v, now_us());
+  } else if (name == "err_tau_horizons") {
+    // The error filter's length, in compensation horizons. Bounded well away from zero: at 0 the
+    // filter is a passthrough and Kp sees raw measurement noise, which is the regime the sigma_e
+    // floor exists to prevent (P turning into a relay, measured bang-banging at +-10-20 us).
+    if (!std::isfinite(value) || value < 0.1f || value > 4.0f) return false;
+    this->tune_err_tau_horizons_.store(value, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "err_tau_horizons = %.2f t=%" PRId64, value, now_us());
+  } else if (name == "rate_filter_lag_us") {
+    // 0 = shared filter (today). Otherwise the RATE path's own filter length; position always
+    // keeps the slow one, because it is irreversible and must not fire on noise.
+    if (!std::isfinite(value) || value < 0.0f || value > 3000000.0f) return false;
+    if (value > 0.0f && value < 20000.0f) return false;   // below 20 ms is not a filter
+    this->tune_rate_filter_lag_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
+    ESP_LOGI(TAG, "rate_filter_lag_us = %" PRId32 " (0 = shared) t=%" PRId64,
+             this->tune_rate_filter_lag_us_.load(std::memory_order_relaxed), now_us());
+  } else if (name == "split_ramp_us_per_s") {
+    // TEST HOOK rate. The default 100 us/s is deliberately "ordinary drift" (the clock-offset
+    // estimate wanders about that fast unaided), which is right for measuring a repair but wrong
+    // for stressing rate authority: 100 us/s demands exactly 100 ppm, and the integral takes it.
+    // Raising it past authority is what makes inject_split able to probe the handoff at all.
+    if (!std::isfinite(value) || value < 10.0f || value > 2000.0f) return false;
+    this->tune_split_ramp_us_per_s_.store(value, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "split_ramp_us_per_s = %.0f t=%" PRId64, value, now_us());
   } else if (name == "rate_authority_ppm") {
     // BOUNDED BELOW THE CRYSTAL CLAMP, not at it. Authority is what P may add on top of the
     // crystal integral, and the integral is what must HOLD the correction once P decays. At
@@ -4844,11 +4892,6 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
   } else if (name == "resync_blank_ms") {
     if (!(value >= 50.0f && value <= 2000.0f)) return false;
     this->tune_resync_blank_ms_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
-  } else if (name == "resync_splice_us") {
-    if (!(value >= 20.0f && value <= 5000.0f)) return false;
-    this->tune_resync_splice_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
-  } else if (name == "autotune") {
-    this->tune_autotune_.store(value != 0.0f, std::memory_order_relaxed);
   } else if (name == "persist") {
     this->tune_persist_.store(value != 0.0f, std::memory_order_relaxed);
   } else {

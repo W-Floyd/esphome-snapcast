@@ -1164,7 +1164,6 @@ class SnapcastClient {
   /// True when this guard has been ablated via servo_param("guards", mask). Reads one relaxed
   /// The new engine owns both actuators. 0 falls back to the old ladder + PI, for one flash's
   /// worth of comparison; the old paths go once this holds.
-  std::atomic<uint32_t> tune_timing_engine_{1};
   /// Position accuracy the engine aims at (us); sets its rate-command noise budget.
   std::atomic<int32_t> tune_timing_target_us_{20};
   /// Rate authority, runtime-settable so it can be A/B'd WITHOUT A REFLASH. Every bench change
@@ -1172,6 +1171,20 @@ class SnapcastClient {
   /// disturbance for most of 2026-09-02; a knob turns an hour-per-arm experiment into a write.
   /// Default matches the compiled-in value -- see the profile-build site for why it is 150.
   std::atomic<float> tune_rate_authority_ppm_{150.0f};
+  /// Error-filter length in compensation horizons (Profile::err_tau_horizons). Runtime because the
+  /// sim showed THIS, not CRYSTAL_DELAY_MARGIN, is what sets the oscillation period -- and the only
+  /// way to test that on hardware is to move it without a reflash.
+  std::atomic<float> tune_err_tau_horizons_{1.0f};
+  /// Split error filter: 0 keeps rate on the shared (position-length) filter, which is today's
+  /// behaviour. The sim found no benefit (6 -> 4 us of median skew for an 8x faster filter, single
+  /// seed), so this exists to check whether the BENCH agrees -- the sim has a known ~2x fidelity
+  /// gap and its null result is not the last word.
+  std::atomic<int32_t> tune_rate_filter_lag_us_{0};
+  /// inject_split's ramp rate. Fixed at 100 us/s it demands exactly 100 ppm to hold, which the
+  /// crystal integral absorbs before authority is ever stressed -- so the provoked authority A/B
+  /// on 2026-09-02 produced ONE diagnostic event in four trials and settled nothing. A probe that
+  /// cannot exceed the thing it is probing is not a probe.
+  std::atomic<float> tune_split_ramp_us_per_s_{100.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
   /// pushed past the frame index it was applied at. Until then the engine issues no further
@@ -1717,7 +1730,6 @@ class SnapcastClient {
   /// task and speaker callback; atomics, defaults = the flashed constants. NOT persisted:
   /// a reboot returns to the flashed values, which keeps a bad experiment one power-cycle from
   /// gone. Every set is logged at WARN so the analyser's annotations carry it.
-  std::atomic<float> tune_tau_s_{120.0f};  // floor; error-proportional gain stiffens it (DL_GAIN_KNEE_US)
   /// Error-proportional gain: Kp = (1/tau) * max(1, |err| / knee), effective tau floored at tau_min.
   /// Knee 25 us: tau 120 only inside the per-block noise, tau ~30 s at 100 us, tau_min beyond 120 us.
   // KNEE OFF (1e6 us): the error-proportional boost is a per-board gain, and 22:13-22:59 one board
@@ -1740,7 +1752,6 @@ class SnapcastClient {
   /// Resync window (s) after an event, and the splice threshold (us) inside it. Target: |A-B| < 100 us
   /// within 5 s of a disturbance.
   std::atomic<float> tune_resync_win_s_{60.0f};  // 30 closed while A still sat at -114 us (build 34)    // fraction of the measured error corrected per step (clean block)  // a block error past this re-opens the window
-  std::atomic<int32_t> tune_resync_splice_us_{100};  // in-window coarse arm, one step per block (build 42); 150 left 50-115 us residuals to tau 120     // inside the arm threshold this long -> window closes  // below this an in-window step needs the group delta to agree: common TIMEBASE STEPS reach +400 us (23:22:03, both boards), only starvation-class errors are local by construction
   std::atomic<int32_t> tune_resync_blank_ms_{1200}; // step-and-verify cadence: the judging block must START after the step (block 0.65 s + pipeline 0.28 s)
   std::atomic<int32_t> tune_tag_stale_ms_{1000};
   std::atomic<int32_t> tune_blank_ms_{500};
@@ -1748,7 +1759,6 @@ class SnapcastClient {
   /// Master toggle: adapt tau automatically from the block-error series (see the autotune block
   /// in delay_loop_update_). Off by default; a manual tau_s set while this is on will be
   /// overridden by the next adaptation and says so in the log.
-  std::atomic<bool> tune_autotune_{false};
   /// Persistence master switch (servo_param persist 0/1): off lets a suspected NVS-write side
   /// effect (A-only post-boot receive stalls, 2026-08-28) be tested without a reflash.
   std::atomic<bool> tune_persist_{true};

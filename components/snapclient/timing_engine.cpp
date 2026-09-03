@@ -87,7 +87,17 @@ int64_t Engine::filter_lag_for(int64_t measurement_lag_us) {
   return static_cast<int64_t>(ERR_TAU_HORIZONS * static_cast<float>(measurement_lag_us));
 }
 
-int64_t Profile::filter_lag_us() const { return Engine::filter_lag_for(compensation_us()); }
+int64_t Profile::filter_lag_us() const {
+  // Scaled here rather than in filter_lag_for(), which two TRANSPORT estimates also call
+  // (snapcast_client.cpp:3006, :4276). Those are travel-time estimates, not the error filter, and
+  // must not move when the filter is swept.
+  //
+  // This is the constant that sets the oscillation period. Measured in tests/group 3b: the period
+  // tracks filter lag monotonically, 23.9 -> 8.1 s as the lag goes 1500 -> 187 ms, roughly
+  // period ~ sqrt(lag). It is the first evidenced mechanism for the bench's ~11.8 s cycle after
+  // three that were proposed and killed, so it is worth being able to sweep on hardware.
+  return static_cast<int64_t>(err_tau_horizons * static_cast<float>(compensation_us()));
+}
 
 float Engine::sigma_e_us() const {
   // Floored at ONE FRAME, which is what caps Kp at budget/frame_us -- the gain at which the P

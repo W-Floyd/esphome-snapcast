@@ -74,6 +74,11 @@ struct Profile {
   /// transients this bench delivers, and a filter as short as the pipeline passes them straight
   /// into the crystal -- measured railing the estimate to its 200 ppm clamp. So the filter stays
   /// slow, and rate's horizon carries that lag honestly rather than pretending to be faster.
+  /// Error-filter length in compensation horizons: filter_lag = this * compensation_us().
+  /// Default 1.0 is the compiled ERR_TAU_HORIZONS. Sweepable because it, not the crystal integral,
+  /// is what sets the loop's oscillation period (tests/group 3b).
+  float err_tau_horizons = 1.0f;
+
   int64_t filter_lag_us() const;
 
   /// SPLIT FILTER, off by default (0 = use filter_lag_us() for everything, i.e. today's behaviour).
