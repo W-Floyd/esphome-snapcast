@@ -2,6 +2,7 @@
 
 #ifdef USE_ESP32
 
+#include "chunk_deadline.h"
 #include "esphome/core/log.h"
 
 #ifdef CLOCK_SYNC_TSF_ACTIVE
@@ -1575,6 +1576,10 @@ void SnapcastClient::connection_session_() {
   this->time_sync_burst_remaining_ = TIME_SYNC_BURST_COUNT;
   this->next_time_sync_us_ = 0;
   this->last_chunk_us_.store(0, std::memory_order_relaxed);
+  // The gap ACROSS a reconnect is not a delivery stall, and counting it as one would put a gt120
+  // in every window that contains a reconnect -- exactly the reading this instrument exists to
+  // distinguish. Clearing prev (not the counters) drops that one gap and keeps the window.
+  this->arr_prev_us_ = 0;
 
   std::string hello = build_hello_payload(this->config_.client_id.c_str(), this->config_.hostname);
   bool ok = this->send_message_(MessageType::HELLO, reinterpret_cast<const uint8_t *>(hello.data()), hello.size());
@@ -2304,7 +2309,42 @@ void SnapcastClient::handle_wire_chunk_(const uint8_t *payload, size_t len) {
     return;
   }
 
-  this->last_chunk_us_.store(now_us(), std::memory_order_relaxed);
+  const int64_t arr_now = now_us();
+  this->last_chunk_us_.store(arr_now, std::memory_order_relaxed);
+  // ARRGAP: how the audio ARRIVES, on its own short line with a fixed field count. Everything
+  // downstream measures the consequence of supply; this measures supply. A stall shows as gt120,
+  // steady delivery as le30 only. Reported from the network task, where the arrival actually is.
+  if (this->arr_prev_us_ != 0 && arr_now > this->arr_prev_us_) {
+    const int64_t gap = arr_now - this->arr_prev_us_;
+    this->arr_n_++;
+    this->arr_sum_us_ += gap;
+    if (gap > this->arr_max_us_) {
+      this->arr_max_us_ = gap;
+    }
+    if (gap <= 30000) {
+      this->arr_le30_++;
+    } else if (gap <= 60000) {
+      this->arr_le60_++;
+    } else if (gap <= 120000) {
+      this->arr_le120_++;
+    } else {
+      this->arr_gt120_++;
+    }
+  }
+  this->arr_prev_us_ = arr_now;
+  if (this->arr_report_us_ == 0) {
+    this->arr_report_us_ = arr_now;
+  } else if (arr_now - this->arr_report_us_ >= 10000000 && this->arr_n_ > 0) {
+    ESP_LOGW(TAG, "ARRGAP n=%" PRIu32 " mean=%" PRId64 " max=%" PRId64 " le30=%" PRIu32 " le60=%" PRIu32
+                  " le120=%" PRIu32 " gt120=%" PRIu32,
+             this->arr_n_, this->arr_sum_us_ / this->arr_n_, this->arr_max_us_, this->arr_le30_, this->arr_le60_,
+             this->arr_le120_, this->arr_gt120_);
+    this->arr_report_us_ = arr_now;
+    this->arr_n_ = 0;
+    this->arr_sum_us_ = 0;
+    this->arr_max_us_ = 0;
+    this->arr_le30_ = this->arr_le60_ = this->arr_le120_ = this->arr_gt120_ = 0;
+  }
   if (!this->stream_active_) {
     // A new session, which the player task cannot infer from its own state: a reconnect and a
     // mid-session excursion both clear st.converged, and only the first rebuilt the pipeline.
@@ -2721,7 +2761,26 @@ void SnapcastClient::player_task_() {
       ESP_LOGW(TAG, "Injected starvation window ended");
     }
 
-    const int64_t deadline = this->chunk_deadline_us_(rec);
+    int64_t deadline = 0;
+    if (!this->chunk_deadline_us_(rec, deadline)) {
+      // Neither the shared mapping nor a seeded Kalman: there is no timebase to place this chunk
+      // against. Discarding is what the far-deadline bound below already does for the same reason
+      // ("the clock estimate cannot be trusted"); the alternative is scheduling audio against a
+      // clock domain we have not converted out of. The time-sync burst on connect is already in
+      // flight, so this window is short unless the timebase is genuinely broken.
+      st.no_timebase_chunks++;
+      if (!st.warned_no_timebase) {
+        st.warned_no_timebase = true;
+        ESP_LOGW(TAG, "NOTB no timebase (shared+kalman absent), discarding t=%" PRId64, now_us());
+      }
+      this->discard_ring_bytes_(rec.bytes);
+      continue;
+    }
+    if (st.no_timebase_chunks != 0) {
+      ESP_LOGW(TAG, "NOTB recovered after %" PRIu32 " chunks", st.no_timebase_chunks);
+      st.no_timebase_chunks = 0;
+      st.warned_no_timebase = false;
+    }
     {
       // See dl_off_* in ServoState: isolates the timebase's contribution to the error so it can be
       // told apart from the prediction's.
@@ -5913,7 +5972,7 @@ void SnapcastClient::set_stream_identity(const std::string &stream_name) {
   }
 }
 
-int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
+bool SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec, int64_t &deadline_us) {
   // Effective playout buffer, matching the reference client (controller.cpp):
   // max(0, bufferMs - serverLatency - localLatency)
   const int64_t buffer_us =
@@ -5941,8 +6000,8 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
       // Follower-side inter-device correction; 0 unless render_align_max is configured. Applied
       // only here, on the shared-TSF path: without a shared mapping the two devices' phases are
       // not comparable and the bias would be meaningless.
-      return rec.server_ts_us + buffer_us - shared_offset_us +
-             this->render_bias_us_.load(std::memory_order_relaxed);
+      return chunk_deadline(rec.server_ts_us, buffer_us, true, shared_offset_us,
+                            this->render_bias_us_.load(std::memory_order_relaxed), deadline_us);
     }
     if (this->deadline_on_shared_tsf_) {
       this->deadline_source_switched_ = true;
@@ -5952,9 +6011,28 @@ int64_t SnapcastClient::chunk_deadline_us_(const ChunkRecord &rec) {
 #endif
 
   this->filter_mutex_.lock();
-  const double offset_ms = this->time_filter_.has_estimate() ? this->time_filter_.get_offset(now_us() / 1000.0) : 0.0;
+  const bool have_estimate = this->time_filter_.has_estimate();
+  const double offset_ms = have_estimate ? this->time_filter_.get_offset(now_us() / 1000.0) : 0.0;
   this->filter_mutex_.unlock();
-  return rec.server_ts_us + buffer_us - static_cast<int64_t>(offset_ms * 1000.0);
+  // NO TIMEBASE IS NOT AN OFFSET OF ZERO. This used to answer `: 0.0`, which does not mean "the
+  // clocks agree" -- it means the server timestamp is compared against the local clock with no
+  // domain conversion at all, so the deadline is wrong by the WHOLE difference between them.
+  //
+  // Measured 2026-09-02 on the bench observer: medians of -162083994757 us (-45 h, constant and
+  // equal to its own TSF base, i.e. server_ts - now_us()) alternating with plausible values, and
+  // 64118 frames corrected in a single report as the coarse path acted on it. The window is every
+  // reconnect: connect_socket_() calls time_filter_.reset(), so has_estimate() is false until the
+  // first Time reply lands. It is invisible on a healthy board only because the shared mapping
+  // above answers first -- board a reconnected MORE often (17 vs 12) and never saw this, which is
+  // exactly the trap: the masking fallback disappears when the timebase is already in trouble,
+  // which is when a correct deadline matters most.
+  //
+  // Absent reports itself as absent, the same trade RENDER_PHASE_UNKNOWN makes. The caller has a
+  // discard path for a deadline it cannot trust; a chunk cannot be placed without a timebase.
+  // No render bias here: it is the follower-side inter-device correction and is meaningful only on
+  // the shared-TSF path, where the two devices' phases are comparable.
+  return chunk_deadline(rec.server_ts_us, buffer_us, have_estimate, static_cast<int64_t>(offset_ms * 1000.0), 0,
+                        deadline_us);
 }
 
 void SnapcastClient::discard_ring_bytes_(size_t bytes) {

@@ -979,6 +979,8 @@ class SnapcastClient {
     uint32_t implausible_err_count{0};  // errors rejected as unanchored (see IMPLAUSIBLE)
     int64_t implausible_log_us{0};
     bool warned_far_deadline{false};  // throttle for the first-chunk deadline bound
+    bool warned_no_timebase{false};   // throttle for chunks discarded with no timebase at all
+    uint32_t no_timebase_chunks{0};   // chunks discarded since the last timebase was available
     int64_t phase_transient_until_us{0};  // my render phase does not describe my audio until then (steps, hard resyncs, deadline source changes)
     int64_t ledger_prev_err_us{0};      // previous chunk's ledger error (stability test for the first window step)
     uint8_t ledger_stable_streak{0};    // consecutive chunks with a consistent ledger reading
@@ -1079,8 +1081,10 @@ class SnapcastClient {
   /// @return the predicted DAC time (µs) of the next frame pushed downstream, or -1 if
   /// no playback feedback has arrived yet.
   int64_t predict_next_play_us_(uint32_t sample_rate);
-  /// Computes the local deadline for a chunk record.
-  int64_t chunk_deadline_us_(const ChunkRecord &rec);
+  /// Computes the local deadline for a chunk record. False when NO timebase is available --
+  /// neither the shared mapping nor a seeded Kalman -- in which case deadline_us is untouched.
+  /// Reports its own validity rather than answering with a zero offset: see the definition.
+  bool chunk_deadline_us_(const ChunkRecord &rec, int64_t &deadline_us);
 
   /// @brief Correction for the inter-device offset the servo cannot see.
   ///
@@ -1614,6 +1618,19 @@ class SnapcastClient {
   bool emit_room_wait_logged_{false};  // emit_pcm_ has already reported this ring-room episode
   // Written by the network task on every chunk, read from the main loop
   std::atomic<int64_t> last_chunk_us_{0};
+  // ARRIVAL GAPS, network task only (no atomics: nothing else touches these). `buffered` shows the
+  // RESULT of supply -- it collapsed to 26 ms and refilled to 1750 ms on board a while tbjit stayed
+  // at 2 us, so the audio supply was the fault and the timebase was not. These separate "delivered
+  // late" from "arrived on time and was mishandled", which nothing currently reports.
+  int64_t arr_prev_us_{0};
+  int64_t arr_sum_us_{0};
+  int64_t arr_max_us_{0};
+  int64_t arr_report_us_{0};
+  uint32_t arr_n_{0};
+  uint32_t arr_le30_{0};   // gap <= 30 ms: normal cadence at 44.1 kHz
+  uint32_t arr_le60_{0};
+  uint32_t arr_le120_{0};
+  uint32_t arr_gt120_{0};  // a gap this long is a stall, not jitter
   int64_t next_time_sync_us_{0};
   uint32_t time_sync_burst_remaining_{0};
   std::vector<uint8_t> rx_buffer_;
