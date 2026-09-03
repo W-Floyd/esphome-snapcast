@@ -579,6 +579,27 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     // gate again on the way down and buys 2-3 extra corrections (measured in test 4). Shifting
     // both is not the double-count that a feed-forward plus RAW observations would be.
     err_mean_us_ -= static_cast<float>(pending_disp_us_);
+    // THE DIFFERENTIAL FILTER NEEDS THE SAME CHANGE OF COORDINATES, and never had it. The comment
+    // above is about err_mean_us_, but position is driven by e_position, which is e_diff whenever
+    // the group supplies one -- so when a correction comes from the differential, gd_mean_us_ is
+    // the filter left "holding the pre-correction value and decaying toward the compensated
+    // stream", crossing the coarse gate again on the way down and buying the same correction
+    // repeatedly.
+    //
+    // Measured 2026-09-03 04:52, board a, all three corrections esrc=d: ep decayed
+    // -6049 -> -2740 -> -960 us against a raw GDIN gd of +-20, spending -274, -124 and -43 frames
+    // through a shrinking gate (48 -> 46 -> 35). tests/group 3k puts 25% of frames in the short
+    // case and 54% in the long one AFTER the fault that loaded the filter had gone.
+    //
+    // (n-1)/n, NOT the whole displacement. group.delta_us is this board's deviation from the group
+    // MEAN, so moving this board by D moves its deviation by D*(n-1)/n -- D/2 for a pair. This is
+    // the same factor the "NO unhalve" note guards, in the opposite direction: over-compensating
+    // here would drag gd_mean_ past zero and buy a correction back the other way.
+    if (have_diff && group.contributors > 1 && profile_.compensate_gd_filter) {
+      const float share = static_cast<float>(group.contributors - 1) /
+                          static_cast<float>(group.contributors);
+      gd_mean_us_ -= static_cast<float>(pending_disp_us_) * share;
+    }
     cmd.frames = frames;
     cmd.correction_id = in_flight_id_;
     // Rate holds the learned offset only; chasing the same error would deliver it twice.

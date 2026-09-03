@@ -197,6 +197,19 @@ struct Profile {
   /// error nothing has corroborated.
   bool position_needs_diff = true;
 
+  /// Shift gd_mean_us_ by the delivered displacement when a correction came from the DIFFERENTIAL,
+  /// exactly as err_mean_us_ is already shifted. Without it the differential filter decays back
+  /// through the coarse gate and buys the same correction repeatedly -- measured at 25-54% of all
+  /// frames spent (tests/group 3k, decayF).
+  /// OFF: it FAILED its own falsifiable test. decayF was predicted to collapse toward zero and
+  /// instead the 4 s case came out byte-identical (2194 frames, so the branch never engaged there)
+  /// and the 40 s case improved 12% (10431 -> 9142), inside the variance already seen in those
+  /// rows. Three possibilities remain unseparated: have_diff is false at those corrections, in
+  /// which case err_mean_ is already compensated and the decay has a third cause; the (n-1)/n
+  /// factor is wrong; or decayC is counting corrections that are not decay-driven. Kept, off, with
+  /// the numbers, rather than deleted -- the reasoning is sound and the test is what disagreed.
+  bool compensate_gd_filter = false;
+
   /// SIZE Kp FROM THE DIFFERENTIAL'S NOISE rather than the deadline error's, whenever the group
   /// supplies a differential. Off by default so it can be A/B'd on hardware; see the note at its
   /// use for why the current default is a known mis-sizing rather than a choice.
