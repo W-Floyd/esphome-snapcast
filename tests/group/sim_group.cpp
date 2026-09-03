@@ -180,6 +180,8 @@ struct Result {
   /// filter still unwinding a phantom rather than out of any error present now.
   int decay_corr = 0;
   long decay_frames = 0;
+  /// Corrections split by which signal drove them, as esrc reports on the bench.
+  int corr_from_diff = 0, corr_from_dl = 0;
   double common_valid_frac = 0.0;
   /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
   /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
@@ -309,7 +311,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
-  long decay_corr = 0, decay_frames = 0;
+  long decay_corr = 0, decay_frames = 0, corr_from_diff = 0, corr_from_dl = 0;
   long psat_n = 0, psat_hit = 0;
   double psat_max = 0.0;
   double sig_e_sum = 0.0, sig_g_sum = 0.0, sig_e_max = 0.0;
@@ -727,6 +729,11 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
           decay_corr++;
           decay_frames += std::abs(c.frames);
         }
+        // WHICH SIGNAL DROVE IT, counted the way esrc reports it on the bench. Needed to tell a
+        // fix that FAILED from one that was never EXERCISED: the gd-filter compensation applies
+        // only when have_diff is true, and if these corrections are have_diff=false then this
+        // simulator cannot test it at all -- which byte-identical output would look exactly like.
+        if (c.decision.e_from_diff) corr_from_diff++; else corr_from_dl++;
         // A DELIVERED CORRECTION ARMS THE TRANSIENT, which is what the client does at
         // snapcast_client.cpp `if (applied_frames != 0)`: "a delivered correction moves the audio,
         // so the phase does not describe it until the horizon passes". This simulator's comment
@@ -945,6 +952,8 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     r.common_max = common_max_us;
     r.decay_corr = static_cast<int>(decay_corr);
     r.decay_frames = decay_frames;
+    r.corr_from_diff = static_cast<int>(corr_from_diff);
+    r.corr_from_dl = static_cast<int>(corr_from_dl);
     r.p_sat_frac = psat_n ? static_cast<double>(psat_hit) / psat_n : 0.0;
     r.p_max_ppm = psat_max;
     if (sig_n > 0) {
@@ -1518,9 +1527,9 @@ int main() {
       f.transient_secs = c.secs;
       if (!c.fault) f.phase_fault_us = 0.0;
       Result r = simulate(c.tag, q, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, f);
-      printf("        %-30s %9.1f %8.2f %8.1f %6d %7ld %7d %7ld\n",
+      printf("        %-30s %9.1f %8.2f %8.1f %6d %7ld %7d %7ld  esrc d/l=%d/%d\n",
              c.name, r.p2p_med, r.sd_med, r.p_max_ppm, r.corr, r.gross,
-             r.decay_corr, r.decay_frames);
+             r.decay_corr, r.decay_frames, r.corr_from_diff, r.corr_from_dl);
     }
     printf("        (gate_gd_on_transient holds gd while the board's own phase is meaningless)\n");
   }

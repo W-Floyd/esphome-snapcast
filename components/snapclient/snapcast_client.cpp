@@ -4720,6 +4720,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   prof.target_common_us = this->tune_common_target_us_.load(std::memory_order_relaxed);
   prof.kp_from_diff_sigma = this->tune_kp_from_diff_sigma_.load(std::memory_order_relaxed) != 0;
   prof.position_needs_diff = this->tune_position_needs_diff_.load(std::memory_order_relaxed) != 0;
+  prof.compensate_gd_filter = this->tune_compensate_gd_filter_.load(std::memory_order_relaxed) != 0;
   prof.common_drain_s = this->tune_common_drain_s_.load(std::memory_order_relaxed);
   prof.common_authority_ppm = this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
@@ -5099,6 +5100,9 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "common_drain_s") {
     return this->tune_common_drain_s_.load(std::memory_order_relaxed);
   }
+  if (name == "compensate_gd_filter") {
+    return static_cast<float>(this->tune_compensate_gd_filter_.load(std::memory_order_relaxed));
+  }
   if (name == "position_needs_diff") {
     return static_cast<float>(this->tune_position_needs_diff_.load(std::memory_order_relaxed));
   }
@@ -5188,6 +5192,15 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     if (!std::isfinite(value) || (value != 0.0f && (value < 30.0f || value > 3600.0f))) return false;
     this->tune_common_drain_s_.store(value, std::memory_order_relaxed);
     ESP_LOGI(TAG, "common_drain_s = %.1f t=%" PRId64, value, now_us());
+  } else if (name == "compensate_gd_filter") {
+    // 0/1, default 0. Shifts gd_mean_ by the delivered displacement when a correction came from
+    // the DIFFERENTIAL, exactly as err_mean_ is already shifted. The sim could not settle it --
+    // identical decayF in one row, 12% in the other, on a path esrc confirms it takes -- so the
+    // A/B belongs on the bench, where esrc=d and ep decaying -6049 -> -2740 -> -960 were measured.
+    if (!std::isfinite(value) || value < 0.0f || value > 1.0f) return false;
+    this->tune_compensate_gd_filter_.store(value >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "compensate_gd_filter = %d t=%" PRId64,
+             this->tune_compensate_gd_filter_.load(std::memory_order_relaxed), now_us());
   } else if (name == "position_needs_diff") {
     // 0/1, DEFAULT 1. When peers exist but no delta is available, position stands down instead of
     // spending irreversible frames on an unvalidated deadline error. Runtime-settable so the old

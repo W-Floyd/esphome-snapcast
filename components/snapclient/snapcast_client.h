@@ -1275,6 +1275,10 @@ class SnapcastClient {
   /// 0/1, default 1: when peers exist but no delta is available, position stands down rather than
   /// spending irreversible frames on an unvalidated deadline error.
   std::atomic<int32_t> tune_position_needs_diff_{1};
+  /// 0/1, default 0: shift gd_mean_ by the delivered displacement when a correction came from the
+  /// differential. Off because the sim result was ambiguous (identical in one row, 12% in the
+  /// other); on the bench esrc=d is confirmed, so the A/B belongs there.
+  std::atomic<int32_t> tune_compensate_gd_filter_{0};
   std::atomic<float> tune_common_authority_ppm_{50.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
