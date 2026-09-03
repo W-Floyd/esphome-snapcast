@@ -687,10 +687,24 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       dt_us > 0 ? std::min(static_cast<float>(dt_us) / 1e6f, horizon_s) : 0.0f;
   const float max_slew_ppm = profile_.rate_authority_ppm * (dt_cmd_s / horizon_s);
   const float want = crystal_ppm_ + p_term;
+  const float prev_cmd = last_rate_cmd_;
   cmd.rate_ppm =
       rate_cmd_seeded_
           ? last_rate_cmd_ + std::clamp(want - last_rate_cmd_, -max_slew_ppm, max_slew_ppm)
           : want;
+  // ATTRIBUTION, recorded where it is unambiguous. Every term is known here; a consumer trying to
+  // reconstruct this later has to guess from timing alone, which is what defeated two attempts to
+  // explain the wire's rate excursions.
+  if (rate_cmd_seeded_) {
+    cmd.decision.d_rate_ppm = cmd.rate_ppm - prev_cmd;
+    cmd.decision.d_crystal_ppm = crystal_ppm_ - last_crystal_ppm_;
+    cmd.decision.d_p_ppm = p_term - last_p_ppm_;
+    cmd.decision.slew_clipped = std::fabs(want - prev_cmd) > max_slew_ppm;
+  }
+  cmd.decision.p_ppm = p_term;
+  cmd.decision.kp_ppm_per_us = proportional_gain_ppm_per_us();
+  last_crystal_ppm_ = crystal_ppm_;
+  last_p_ppm_ = p_term;
   rate_cmd_seeded_ = true;
   last_rate_cmd_ = cmd.rate_ppm;
   cmd.decision.act = differential ? Decision::Act::Rate : Decision::Act::Hold;

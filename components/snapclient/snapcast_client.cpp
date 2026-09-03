@@ -869,6 +869,9 @@ static constexpr float LEGACY_TRIM_TAU_S = 120.0f;
 // case worth explaining. A LOGGING threshold, not an actuator arm -- the coarse path's own gate is
 // frame_us + 2*sigma, derived in the engine.
 static constexpr int64_t RSKIP_REPORT_US = 100;
+// Rate change past which the loop explains itself (RATEWHY). Above the 3-5 ppm per report the
+// command moves while merely tracking, below the 20-40 ppm excursions under investigation.
+static constexpr float RATEWHY_PPM = 5.0f;
 
 #if defined(CLOCK_SYNC_TSF_ACTIVE) && defined(USE_SNAPCLIENT_TIMING_DIAG)
 /// @brief Renders a render-phase value for a log line, printing the UNKNOWN sentinel as a word.
@@ -4625,6 +4628,29 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
     ESP_LOGW(TAG, "GDSNAP gd=%+" PRId32 " err=%+" PRId32 " rate=%+.2f xtal=%+.2f t=%" PRId64,
              cmd.decision.gd_snap_us, cmd.decision.err_snap_us, cmd.decision.rate_ppm,
              cmd.decision.crystal_ppm, tnow);
+  }
+  // RATEWHY: for any rate change past RATEWHY_PPM, say WHY at the moment it happened.
+  //
+  // The command is crystal + P, slew-limited, so a change is exactly dx + dp and the line carries
+  // both -- plus P itself (a standing P is not a moving one), the gain in force, the error split
+  // that produced it, any filter snap on the same decision, and whether the slew clipped.
+  //
+  // This exists because attributing rate excursions AFTER THE FACT has failed twice: against gd
+  // steps and against filter snaps, both times because candidate events fire every couple of
+  // seconds on this bench and any excursion has one nearby by construction. A 200-draw null model
+  // called the first null and the second only half-confirmed. The loop knows which term it just
+  // moved; asking it is not subject to that.
+  //
+  // Threshold, not every decision: 5 ppm is well above the 3-5 ppm per report seen when the loop
+  // is merely tracking, and well below the 20-40 ppm excursions being chased.
+  if (std::fabs(cmd.decision.d_rate_ppm) >= RATEWHY_PPM) {
+    ESP_LOGW(TAG,
+             "RATEWHY d=%+.2f dx=%+.2f dp=%+.2f p=%+.2f kp=%.3f com=%+" PRId32 " dif=%+" PRId32
+             " snap=%+" PRId32 " clip=%d t=%" PRId64,
+             cmd.decision.d_rate_ppm, cmd.decision.d_crystal_ppm, cmd.decision.d_p_ppm,
+             cmd.decision.p_ppm, cmd.decision.kp_ppm_per_us, cmd.decision.e_common_us,
+             cmd.decision.e_diff_us, cmd.decision.gd_snap_us, cmd.decision.slew_clipped ? 1 : 0,
+             tnow);
   }
   return cmd;
 }

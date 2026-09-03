@@ -198,6 +198,19 @@ struct Decision {
   /// What actually reached the integrator this decision, after both clamps. The gap between this
   /// and e_common + e_diff is the clamp doing its work, and is worth seeing.
   int32_t e_bounded_us = 0;
+
+  /// WHY THE RATE MOVED, decomposed at the moment it moved. The command is crystal + P, then
+  /// slew-limited, so any change is exactly d_crystal + d_p with the slew possibly clipping it.
+  /// Correlating rate excursions against events AFTER THE FACT has now failed twice -- once
+  /// against gd steps and once against filter snaps -- because the bench fires candidate events
+  /// every couple of seconds and any excursion has one nearby by construction. Attribution at the
+  /// point of decision does not have that problem: the loop knows which term it just moved.
+  float d_rate_ppm = 0.0f;      ///< change in the issued command since the last decision
+  float d_crystal_ppm = 0.0f;   ///< how much of that was the integral
+  float d_p_ppm = 0.0f;         ///< how much was the proportional term
+  float p_ppm = 0.0f;           ///< P itself, so a standing P is distinguishable from a moving one
+  float kp_ppm_per_us = 0.0f;   ///< the gain in force, which sigma_e moves under you
+  bool slew_clipped = false;    ///< the command wanted to move further than authority*dt/horizon
 };
 
 /// The two actuators. Separate fields: doing position work through the rate field requires
@@ -318,6 +331,8 @@ class Engine {
   /// Last commanded rate and whether one has been issued: a continuous actuator's command must
   /// not step, so each new command is slew-limited from the previous one.
   float last_rate_cmd_ = 0.0f;
+  float last_crystal_ppm_ = 0.0f;
+  float last_p_ppm_ = 0.0f;
   bool rate_cmd_seeded_ = false;
   int64_t last_obs_us_ = 0;
   uint32_t suppressed_ = 0;
