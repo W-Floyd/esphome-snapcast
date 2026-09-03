@@ -597,6 +597,9 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     const float fu = static_cast<float>(frame_us);
     const float e_bounded =
         std::clamp(e_common_f, -fu, fu) + std::clamp(e_diff_f, -fu, fu);
+    cmd.decision.e_common_us = static_cast<int32_t>(std::llround(e_common_f));
+    cmd.decision.e_diff_us = static_cast<int32_t>(std::llround(e_diff_f));
+    cmd.decision.e_bounded_us = static_cast<int32_t>(std::llround(e_bounded));
     // BOUND THE STEP BY BOUNDING dt. dt_s is the time since the last observation, and during a
     // storm observations stop for seconds -- so the integral was applying wn^2 * bound * dt in
     // ONE step, as though it had been watching the whole time. With the horizon collapsed to its

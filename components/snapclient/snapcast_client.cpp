@@ -4597,6 +4597,19 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
              static_cast<int>(cmd.decision.why), cmd.decision.frames, cmd.decision.rate_ppm,
              cmd.decision.crystal_ppm, this->timing_engine_.sigma_e_us(),
              cmd.decision.suppressed, tnow);
+    // ESPLIT: the integral's input, split into the part this board SHARES with the group and the
+    // part that SEPARATES it from its peers. Only e_diff is audible; only e_common can wind the
+    // crystal without anyone hearing it, which is why a wind-up went unnoticed to +192 ppm.
+    //
+    // bnd is what survived both clamps and actually reached the integrator, so bnd != com + dif
+    // says the clamp is working rather than that a term is missing. xtal alongside, because the
+    // question this answers is which component moved it.
+    //
+    // Its own line, same 2 s throttle: ENGINE is already 167 bytes worst case and a field appended
+    // to the end of a long line is a record of whether the line fitted.
+    ESP_LOGD(TAG, "ESPLIT com=%+" PRId32 " dif=%+" PRId32 " bnd=%+" PRId32 " xtal=%+.2f t=%" PRId64,
+             cmd.decision.e_common_us, cmd.decision.e_diff_us, cmd.decision.e_bounded_us,
+             cmd.decision.crystal_ppm, tnow);
   }
   // GDSNAP: a confirmed jump ASSIGNED a filter rather than stepping it, which is a discontinuity
   // in the signal P is computed from. Its own short line, unthrottled, because these are rare and

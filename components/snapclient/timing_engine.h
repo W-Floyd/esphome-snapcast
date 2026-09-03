@@ -183,6 +183,21 @@ struct Decision {
   /// board at a time. Unverified: this is the instrument, not the finding.
   int32_t gd_snap_us = 0;     ///< signed size of a gd filter snap this decision, 0 if none
   int32_t err_snap_us = 0;    ///< the same for the deadline-error filter
+
+  /// THE INTEGRAL'S INPUT, SPLIT INTO ITS TWO PARTS. e_common is what this board shares with the
+  /// group (its own clock against the server); e_diff is what separates it from its peers. Only
+  /// the second is audible, but only the first can wind the crystal without anyone hearing it.
+  ///
+  /// Both were computed on one line inside the integral and reported NOWHERE, so a wind-up episode
+  /// showed its result and never its cause. The simulator says the common part is responsible --
+  /// crystals reaching +156/+183 ppm against targets of +25/+55 while the DIFFERENTIAL stayed
+  /// correct at +27 against +30, so the pair sounded synchronised the whole way to the rail. This
+  /// is what makes that checkable on hardware instead of inferred.
+  int32_t e_common_us = 0;
+  int32_t e_diff_us = 0;
+  /// What actually reached the integrator this decision, after both clamps. The gap between this
+  /// and e_common + e_diff is the clamp doing its work, and is worth seeing.
+  int32_t e_bounded_us = 0;
 };
 
 /// The two actuators. Separate fields: doing position work through the rate field requires
