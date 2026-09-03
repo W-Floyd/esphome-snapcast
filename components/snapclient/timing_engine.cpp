@@ -319,6 +319,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
         jump_dir_ = 0;
       }
       if (jump_run_ >= JUMP_CONFIRM_SAMPLES) {
+        cmd.decision.err_snap_us = static_cast<int32_t>(std::llround(x - err_mean_us_));
         err_mean_us_ = x;          // a real step: stop pretending it is noise
         jump_run_ = 0;
         jump_dir_ = 0;
@@ -409,6 +410,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
         gd_jump_dir_ = 0;
       }
       if (gd_jump_run_ >= JUMP_CONFIRM_SAMPLES) {
+        cmd.decision.gd_snap_us = static_cast<int32_t>(std::llround(gx - gd_mean_us_));
         gd_mean_us_ = gx;
         gd_jump_run_ = 0;
         gd_jump_dir_ = 0;

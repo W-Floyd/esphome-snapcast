@@ -168,6 +168,21 @@ struct Decision {
   int64_t gate_us = 0;        ///< the threshold it was tested against
   float needed_ppm = 0.0f;    ///< rate that would remove filtered_us within one horizon
   float authority_ppm = 0.0f; ///< rate the loop was allowed to command
+
+  /// A CONFIRMED JUMP SNAPPED A FILTER, and until now nothing could see it happen.
+  ///
+  /// On confirmation the filter is assigned outright (`gd_mean_us_ = gx`) rather than stepped
+  /// toward the new value -- deliberately, since a real re-anchor should not be averaged in. But
+  /// that assignment is a DISCONTINUITY in the signal P is computed from, so P moves by
+  /// Kp * (snap size) on the next command: at Kp ~ 0.45 ppm/us a 45 us snap is ~20 ppm.
+  ///
+  /// The suspicion this exists to test: gd refreshes at ~1 Hz and JUMP_CONFIRM_SAMPLES is 3, so a
+  /// ~3 s excursion is "confirmed" as a jump. The filter snaps out to it, P follows, gd returns,
+  /// and the return is confirmed as a jump too -- so P follows back. Out and back is a full cycle
+  /// in d(rate)/dt with no net change, which is the shape seen on the wire at >20 ppm, on one
+  /// board at a time. Unverified: this is the instrument, not the finding.
+  int32_t gd_snap_us = 0;     ///< signed size of a gd filter snap this decision, 0 if none
+  int32_t err_snap_us = 0;    ///< the same for the deadline-error filter
 };
 
 /// The two actuators. Separate fields: doing position work through the rate field requires

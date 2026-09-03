@@ -4598,6 +4598,21 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
              cmd.decision.crystal_ppm, this->timing_engine_.sigma_e_us(),
              cmd.decision.suppressed, tnow);
   }
+  // GDSNAP: a confirmed jump ASSIGNED a filter rather than stepping it, which is a discontinuity
+  // in the signal P is computed from. Its own short line, unthrottled, because these are rare and
+  // each one is a candidate cause of a rate excursion -- at Kp ~ 0.45 ppm/us a 45 us snap is
+  // ~20 ppm of commanded rate arriving in one decision.
+  //
+  // What this is for: the wire shows a full 2 pi cycle in d(rate)/dt, >20 ppm, one board at a
+  // time, sometimes with a DOUBLED top. The prediction is that a plain cycle carries one snap out
+  // and one snap back, and a doubled top carries TWO same-signed snaps out before the return --
+  // because the detector re-confirms while gd is still moving. If the snaps do not line up with
+  // the excursions, this mechanism is wrong and the line says so.
+  if (cmd.decision.gd_snap_us != 0 || cmd.decision.err_snap_us != 0) {
+    ESP_LOGW(TAG, "GDSNAP gd=%+" PRId32 " err=%+" PRId32 " rate=%+.2f xtal=%+.2f t=%" PRId64,
+             cmd.decision.gd_snap_us, cmd.decision.err_snap_us, cmd.decision.rate_ppm,
+             cmd.decision.crystal_ppm, tnow);
+  }
   return cmd;
 }
 
