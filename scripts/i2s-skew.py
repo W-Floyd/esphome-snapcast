@@ -65,6 +65,7 @@ import itertools
 import json
 import math
 import queue
+import socket
 import threading
 import os
 import re
@@ -2543,8 +2544,9 @@ class PlotServer:
     stale frames is worse than a dropped one.
     """
 
-    def __init__(self, port, svg_path):
+    def __init__(self, port, svg_path, bind="127.0.0.1"):
         self.port = port
+        self.bind = bind
         self.svg_path = svg_path
         self.cv = threading.Condition()
         self.version = 0
@@ -2685,7 +2687,11 @@ class PlotServer:
             daemon_threads = True
             allow_reuse_address = True
 
-        self.httpd = Server(("127.0.0.1", self.port), Handler)
+        # Bind address, default loopback. --serve-lan binds 0.0.0.0 so the plot can be watched
+        # from another machine on the LAN instead of needing an ssh tunnel. There is no auth and
+        # no TLS, and the control endpoint accepts width/window/hide, so this is for a trusted
+        # network only -- which is why it is opt-in rather than the default.
+        self.httpd = Server((self.bind, self.port), Handler)
         self.port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
         return self.port
@@ -4067,6 +4073,11 @@ def main():
                         "display list is streamed over one SSE connection and painted to "
                         "a canvas, so no SVG document is refetched or reparsed per frame. "
                         "The .svg file is still written")
+    p.add_argument("--serve-lan", action="store_true",
+                   help="bind --serve to 0.0.0.0 instead of loopback, so the live plot can be "
+                        "opened from another machine on the LAN rather than through an ssh "
+                        "tunnel. NO AUTH AND NO TLS, and the control endpoint accepts width/"
+                        "window/hide, so use it only on a trusted network -- hence opt-in")
     p.add_argument("--plot-every", type=float, default=2.0,
                    help="seconds between plot FRAMES -- a layout, pushed to --serve and, "
                         "subject to --svg-every, written to the .svg. The CSV is always "
@@ -4120,7 +4131,8 @@ def main():
 
     if args.serve is not None:
         global PLOT_SERVER
-        PLOT_SERVER = PlotServer(args.serve, args.plot)
+        PLOT_SERVER = PlotServer(args.serve, args.plot,
+                                 bind="0.0.0.0" if args.serve_lan else "127.0.0.1")
         try:
             port = PLOT_SERVER.start()
         except OSError as e:
@@ -4130,8 +4142,21 @@ def main():
             print(f"  WARNING: --serve failed to bind port {args.serve}: {e}\n"
                   f"           continuing without the live view")
         else:
-            print(f"  live plot: http://127.0.0.1:{port}/   "
-                  f"(canvas, streamed; {args.plot} still written)")
+            if args.serve_lan:
+                # Name an address someone can actually open. The bind is 0.0.0.0, which is not a
+                # URL anyone can type, so resolve this host's LAN address for the message.
+                try:
+                    _s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                    _s.connect(("192.0.2.1", 1))          # TEST-NET-1: routed nowhere, never sent
+                    _host = _s.getsockname()[0]
+                    _s.close()
+                except OSError:
+                    _host = "0.0.0.0"
+                print(f"  live plot: http://{_host}:{port}/   "
+                      f"(LAN-visible, no auth; {args.plot} still written)")
+            else:
+                print(f"  live plot: http://127.0.0.1:{port}/   "
+                      f"(canvas, streamed; {args.plot} still written)")
 
     def collect_events(t_start, offsets=None, host_ref=None):
         """Log events as (elapsed_seconds, kind, label), relative to the run start."""

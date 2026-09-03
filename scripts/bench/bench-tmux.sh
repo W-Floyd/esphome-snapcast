@@ -53,9 +53,14 @@ FLASH_FORCE=0
 # dropped it came back with rival = 0.942 on every row, i.e. whole-frame errors masquerading
 # as findings. --plot-every/--plot-window are cosmetic; the rest is not.
 SERVE_PORT="${BENCH_SERVE_PORT:-8000}"
+# The bench host is headless, so the live plot is watched from a workstation. Default to binding
+# the LAN rather than making every viewer set up an ssh tunnel; BENCH_SERVE_LAN=0 restores
+# loopback-only. No auth and no TLS either way -- this is a trusted-network tool.
+SERVE_LAN_FLAG=""
+[ "${BENCH_SERVE_LAN:-1}" = 1 ] && SERVE_LAN_FLAG=" --serve-lan"
 ANALYZER_CMD="python3 scripts/i2s-skew.py --stream --interval 0 --count 0 \
 --samplerate 12M --samples 200000 --plot-every 0.0167 --plot-window 45 \
---serve ${SERVE_PORT} --out test.csv --plot test.svg"
+--serve ${SERVE_PORT}${SERVE_LAN_FLAG} --out test.csv --plot test.svg"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 note() { echo "==> $*"; }
