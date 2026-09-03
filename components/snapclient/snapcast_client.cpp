@@ -975,10 +975,28 @@ bool SnapcastClient::start() {
   // string buffers in one frame and emit_pre_trace_line_ 416 as its sibling, both on this task's
   // deepest path, before the logger's own formatting.
   //
+  // MEASURED from the image, not estimated -- xtensa `entry` encodes each frame, so the deepest
+  // logging path on this task sums exactly:
+  //
+  //   player_task_                  2528   the largest single frame in the whole image
+  //   log_sync_report_              1104
+  //   esp_log_printf_                 96
+  //   log_vprintf_non_main_thread_   224
+  //   _svfprintf_r                   800   newlib's formatter, with float support
+  //   _dtoa_r                        144
+  //                                 ----
+  //                                 4896   of 6144 = 80%
+  //
+  // which left ~1.2 KB for interrupt frames and is why this fired intermittently on all three
+  // boards rather than deterministically. refresh_tsf_peers_ (816) is a second deep branch off
+  // the same task. At 10240 the same path sits at 48%.
+  //
   // The raise is not the fix, it is what keeps the bench alive long enough to measure: STACKHWM
   // reports the true high-water mark every 30 s and WARNs under 1 KB, so the margin this crash
-  // never reported is now a number. A board that reboots costs a full re-acquisition and five
-  // consensus membership changes, which is the largest disturbance this bench produces.
+  // never reported is now a number. The real fix is narrower -- player_task_'s own 2528 bytes and
+  // log_sync_report_'s 1104 are one function's worth of locals each, and the float formatting
+  // path costs 944 on top. A board that reboots costs a full re-acquisition and five consensus
+  // membership changes, which is the largest disturbance this bench produces.
   if (xTaskCreatePinnedToCore(SnapcastClient::player_task_trampoline, "snap_player", PLAYER_TASK_STACK, this, 8,
                               &this->player_task_handle_, 1) != pdPASS) {
     return false;
