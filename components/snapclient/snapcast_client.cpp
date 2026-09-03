@@ -4417,7 +4417,29 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // 907 us step was accepted and left an 85-290 us residual instead of being handed to position.
   // The clamp was doing stability duty as well as noise duty, and only the noise part was
   // documented.
-  prof.rate_authority_ppm = 100.0f;
+  // RAISED 100 -> 150, 2026-09-02, on the bench measuring the ceiling being HIT rather than the
+  // wander being estimated. The sweep above priced authority from |de/dt| (median 16 ppm, p90 30)
+  // and found corrections stopping at 88-100 ppm. The wire disagrees: three excursions in one
+  // settled 15-minute window, each board b's differential reaching 229-262 us and asking for
+  //
+  //     need=-131.0  auth=100  avoidable=0        (20:02:12, then corrected -0/+11 frames)
+  //     need=-124.6  auth=100  avoidable=0        (20:05:04, then corrected -0/+11 frames)
+  //     need=+114.3  auth=100  avoidable=0        (20:05:51, then corrected -10/+0 frames)
+  //
+  // 11 frames is 249.4 us and the analyser recorded +242.9/+252.1/-259.6 us at those instants: the
+  // step IS the excursion, since a position step on one board is a step in the pair's difference.
+  // Every one of these sat just above the old ceiling, so authority was not protecting stability --
+  // it was handing an error rate could have absorbed to an actuator that is quantised to 22.7 us
+  // and irreversible, and putting the result on the wire.
+  //
+  // Why the harness understated it: that sweep ran before the simulator modelled beacons, a second
+  // board, or phase noise, so the wander it priced was smaller than the real differential's.
+  //
+  // Why this is safer than when the ceiling was set: the A*T overshoot argument below assumed a
+  // STEP of authority. The rate command is slew-limited now, so P ramps rather than snaps, and the
+  // 907 us case that motivated 100 cannot be re-entered at full authority in one observation.
+  // 150 covers the measured 114-131 with margin and stays well inside the crystal's 200 ppm clamp.
+  prof.rate_authority_ppm = 150.0f;
   // Starvation floor: an eighth of the ring's CAPACITY, from the mirror updated where the frame
   // size is known. Dimensionless and config-derived, so it moves with buffer_size and the sample
   // rate and carries no time of its own -- and, unlike the measurement lag it used to be keyed
