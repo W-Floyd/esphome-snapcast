@@ -4742,13 +4742,24 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   const int64_t tnow = obs.at_us;
   if (cmd.frames != 0 || tnow - this->timing_log_us_ >= 2000000) {
     this->timing_log_us_ = tnow;
+    // gsig PRINTS n/a WHEN THERE IS NO DIFFERENTIAL, not 0.0. gd_sigma only exists when the group
+    // supplies a delta, and a board still acquiring has none -- printing that as a number invites
+    // exactly the averaging-in that made the first reading of this field report a mean of zero.
+    // Same defect ESPLIT had and was fixed for hours earlier; reintroduced here and caught on the
+    // first line it emitted.
+    char gsig_buf[16];
+    if (cmd.decision.e_split_valid && cmd.decision.gd_sigma_us > 0.0f) {
+      snprintf(gsig_buf, sizeof(gsig_buf), "%.1f", cmd.decision.gd_sigma_us);
+    } else {
+      snprintf(gsig_buf, sizeof(gsig_buf), "n/a");
+    }
     ESP_LOGD(TAG,
              "ENGINE err=%+" PRId64 " act=%d why=%d frames=%+" PRId32 " rate=%+.2f xtal=%+.2f "
-             "sigma=%.1f gsig=%.1f sup=%" PRIu32 " t=%" PRId64,
+             "sigma=%.1f gsig=%s sup=%" PRIu32 " t=%" PRId64,
              cmd.decision.error_us, static_cast<int>(cmd.decision.act),
              static_cast<int>(cmd.decision.why), cmd.decision.frames, cmd.decision.rate_ppm,
              cmd.decision.crystal_ppm, this->timing_engine_.sigma_e_us(),
-             cmd.decision.gd_sigma_us, cmd.decision.suppressed, tnow);
+             gsig_buf, cmd.decision.suppressed, tnow);
     // ESPLIT: the integral's input, split into the part this board SHARES with the group and the
     // part that SEPARATES it from its peers. Only e_diff is audible; only e_common can wind the
     // crystal without anyone hearing it, which is why a wind-up went unnoticed to +192 ppm.

@@ -428,24 +428,28 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       } else {
         gd_mean_us_ += galpha * std::clamp(g_innov, -gmax, gmax);
       }
-      // DIFFERENCE ONLY FRESH SAMPLES. The group delta is HELD between pairings -- present on
-      // every decision but freshly paired on ~32% of them, both here and on the bench -- so most
-      // consecutive pairs are bit-identical and contribute a zero difference. Averaging those in
-      // drags the estimate toward its floor: measured 5.5 us in tests/group where the phase noise
-      // implies ~14, i.e. understated by 2.5x.
+      // THIS ESTIMATE IS DILUTED, DELIBERATELY, AND MUST NOT BE READ AS A NOISE FIGURE.
       //
-      // That matters because gd_sigma is a candidate denominator for Kp, and an UNDERSTATED noise
-      // estimate means an OVER-stated gain -- the opposite of what sizing Kp from the differential
-      // is meant to achieve. A held value is not a measurement and must not count as one.
+      // The group delta is HELD between pairings -- present on every decision but freshly paired
+      // on ~32% of them -- so most consecutive pairs are bit-identical and contribute a zero
+      // difference. That drags gd_sigma toward its quarter-frame floor: measured 5.5 us in
+      // tests/group where the phase noise implies ~14, and mode 5.5 on the bench too.
       //
-      // Equality is the discriminator because a held delta is literally the previous number, while
-      // a fresh one is a us-quantised measurement carrying tens of us of noise. Two consecutive
-      // fresh samples can coincide by chance and be skipped; at this noise that is a few percent,
-      // against the ~68% of samples the old form counted as zero-noise evidence.
-      if (gx != gd_last_us_) {
-        gd_diff_us_ += galpha * (std::fabs(gx - gd_last_us_) - gd_diff_us_);
-        gd_last_us_ = gx;
-      }
+      // Differencing only FRESH samples was tried (2026-09-03) and REVERTED, because gd_sigma is
+      // not only an estimate -- it also sets the position gate (gate_sigma) and the jump detector
+      // (4 * gd_sigma_prev), and both were calibrated around the diluted value. Correcting the
+      // estimator widened the gate and raised the snap threshold, so position corrected less and
+      // the filter admitted more. Measured on the wire at an unchanged target of 10:
+      //
+      //     diluted (this form)   median 2-min p2p  87.7 us,  sd 14.15   (12 windows)
+      //     fresh-only           median 2-min p2p 118.7 us,  sd 17.98   ( 8 windows)
+      //
+      // 31 us of stereo image wander is not worth a more honest number in a field nothing yet
+      // consumes as a noise figure. If a future change needs a true sigma for the differential --
+      // sizing Kp from it, say -- compute that SEPARATELY and leave this one feeding the gate and
+      // the jump detector it was tuned for. Two consumers, two quantities.
+      gd_diff_us_ += galpha * (std::fabs(gx - gd_last_us_) - gd_diff_us_);
+      gd_last_us_ = gx;
     }
     gd_last_at_us_ = now_us;
     gd_sigma_us = std::max(0.8862f * gd_diff_us_, 0.25f * static_cast<float>(profile_.frame_us()));

@@ -139,6 +139,10 @@ struct Result {
   // every tick, against the real timing_engine.cpp), so a limit cycle IS simulated -- it was only
   // ever invisible, because the series was stored as |skew| and a sign is what a crossing needs.
   double period_s = 0.0;    // median interval between upward crossings of the median
+  /// Median p2p and sd within successive 120 s windows -- the SAME statistic the bench is graded
+  /// on, so a sim number and a wire number are comparable rather than merely similar.
+  double p2p_med = 0.0, sd_med = 0.0;
+  int p2p_windows = 0;
   double amp_p05 = 0.0;     // signed, so a biased ring is distinguishable from a centred one
   double amp_p95 = 0.0;
   int n_periods = 0;        // fewer than ~6 and the period is not evidence (bench: 5 was not)
@@ -781,6 +785,41 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     }
     r.amp_p05 = sorted_signed[static_cast<size_t>(0.05 * sorted_signed.size())];
     r.amp_p95 = sorted_signed[static_cast<size_t>(0.95 * sorted_signed.size())];
+
+    // PEAK-TO-PEAK, GRADED THE WAY THE BENCH IS GRADED: median of the p2p within successive 120 s
+    // windows. This is the quantity that was asked for and it is NOT skew_med -- sd is the bulk of
+    // the distribution while p2p is its tails, i.e. the ^/V excursions themselves. A change can
+    // improve sd and leave p2p untouched, and reading only sd would score that as a win.
+    //
+    // Windowed rather than whole-run so it does not simply grow with run length, and median of
+    // windows rather than the max so one disturbance does not become the headline.
+    {
+      std::vector<double> win_p2p, win_sd;
+      size_t i0 = 0;
+      while (i0 < skew_t_us.size()) {
+        size_t i1 = i0;
+        double lo = skews_signed[i0], hi = skews_signed[i0], sum = 0.0, sum2 = 0.0;
+        size_t n = 0;
+        while (i1 < skew_t_us.size() && skew_t_us[i1] - skew_t_us[i0] <= 120e6) {
+          const double v = skews_signed[i1];
+          lo = std::min(lo, v); hi = std::max(hi, v);
+          sum += v; sum2 += v * v; n++; i1++;
+        }
+        if (n >= 100) {
+          win_p2p.push_back(hi - lo);
+          const double m = sum / static_cast<double>(n);
+          win_sd.push_back(std::sqrt(std::max(0.0, sum2 / static_cast<double>(n) - m * m)));
+        }
+        i0 = i1;
+      }
+      if (!win_p2p.empty()) {
+        std::sort(win_p2p.begin(), win_p2p.end());
+        std::sort(win_sd.begin(), win_sd.end());
+        r.p2p_med = win_p2p[win_p2p.size() / 2];
+        r.sd_med = win_sd[win_sd.size() / 2];
+        r.p2p_windows = static_cast<int>(win_p2p.size());
+      }
+    }
   }
   std::sort(skews.begin(), skews.end());
   std::sort(errs.begin(), errs.end());
@@ -1265,6 +1304,34 @@ int main() {
       }
     }
     printf("        (the fix should help where sigma(gd) > sigma_e and be neutral otherwise)\n");
+  }
+
+  printf("\n3i. NEIGHBOUR TARGET SWEEP, graded on p2p (the quantity actually wanted)\n");
+  {
+    // Kp scales with target_diff_us (budget = 1e6 * target / rate_horizon), so this sweeps the
+    // gain. Graded on median 2-minute p2p, matching how the wire is graded -- sd is the bulk and
+    // p2p is the tails, and the tails ARE the ^/V excursions. Reading sd alone would have scored
+    // a change that left p2p untouched as a win.
+    //
+    // BENCH REFERENCE for the same statistic: test.csv at target=10 gives p2p 94.0 us / sd 16.8
+    // over 33 windows -- the smallest sustained figure in any archive on that host.
+    //
+    // Two reasons the sim's optimum need not be the bench's, both measured: its observation noise
+    // is 80 us where the bench's sigma_e sits at its 22 us floor, and sigma(gd)/sigma_e is 0.13
+    // here against 0.34 there. So treat the SHAPE of the curve as the finding, not the argmin.
+    printf("        %-10s %10s %9s %8s %8s %8s %8s\n",
+           "target_us", "p2p/2min", "sd", "windows", "corr", "frames", "period");
+    for (int64_t tgt : {5, 10, 20, 40, 80}) {
+      Profile q = p;
+      q.target_diff_us = tgt;
+      char tag[24];
+      snprintf(tag, sizeof(tag), "tgt-%lld", static_cast<long long>(tgt));
+      Result r = simulate(tag, q, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND);
+      printf("        %-10lld %10.1f %9.2f %8d %8d %8ld %8.1f\n",
+             static_cast<long long>(tgt), r.p2p_med, r.sd_med, r.p2p_windows,
+             r.corr, r.gross, r.period_s);
+    }
+    printf("        (lower target = lower Kp; watch for corr/frames rising as rate gives up authority)\n");
   }
 
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
