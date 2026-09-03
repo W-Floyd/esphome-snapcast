@@ -77,6 +77,13 @@ struct Board {
   /// could not be represented, let alone tested.
   int64_t phase_transient_until_us = 0;
   bool phase_publishing = true;
+  /// The last decision, retained so the per-tick CSV row can carry BOTH boards. The wire's
+  /// d(rate)/dt is what shows the ^/V excursions, and a skew-only dump cannot express it.
+  double last_rate_ppm = 0.0;
+  double last_xtal_ppm = 0.0;
+  int32_t last_gd_snap_us = 0;
+  int32_t last_e_common_us = 0;
+  int32_t last_e_diff_us = 0;
   explicit Board(const Profile &p) : eng(p) {}
 };
 
@@ -104,6 +111,14 @@ struct Result {
   // starved board wound a hand-zeroed crystal to +192 ppm in twelve minutes against a true +46.
   // Reported per board because the whole point is that it should stay near the PLANT rate.
   double xtal_a = 0.0, xtal_b = 0.0;
+  /// FILTER SNAPS. A confirmed jump ASSIGNS the filter rather than stepping it, which is a
+  /// discontinuity in the signal P is computed from -- at Kp ~ 0.45 ppm/us a 45 us snap is ~20 ppm
+  /// of commanded rate arriving in one decision. The bench shows full 2 pi cycles in d(rate)/dt at
+  /// >20 ppm, one board at a time, sometimes with a doubled top; the suspicion is that these are
+  /// snaps out and back. Counted here to see whether the simulator produces them at all.
+  int gd_snaps = 0;
+  double gd_snap_abs_sum = 0.0;
+  int gd_snap_max = 0;
 };
 
 /// Everything below `noise_us` models something the bench does that this simulator did not, and
@@ -172,6 +187,8 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
   const int64_t tick = 25000;
   std::vector<double> skews, errs;
   std::vector<double> skews_signed, skew_t_us;
+  int snap_n = 0, snap_max = 0;
+  double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
 
@@ -346,6 +363,12 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
       }
       Command c = x.eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), valid,
                                             static_cast<int64_t>(std::llround(x.buffer_us))}, g);
+      if (c.decision.gd_snap_us != 0) {
+        snap_n++;
+        const int mag = c.decision.gd_snap_us < 0 ? -c.decision.gd_snap_us : c.decision.gd_snap_us;
+        snap_sum += mag;
+        if (mag > snap_max) snap_max = mag;
+      }
       if (c.frames != 0 && !x.live) {
         x.pid = c.correction_id;
         x.inflight.push_back({t + true_land_us, c.frames});
@@ -359,6 +382,11 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
           x.buffer_us = std::max(0.0, x.buffer_us - static_cast<double>(c.frames) * p.frame_us());
         }
       }
+      x.last_rate_ppm = c.rate_ppm;
+      x.last_xtal_ppm = c.decision.crystal_ppm;
+      x.last_gd_snap_us = c.decision.gd_snap_us;
+      x.last_e_common_us = c.decision.e_common_us;
+      x.last_e_diff_us = c.decision.e_diff_us;
       x.err_us += (x.plant_ppm - c.rate_ppm) * 1e-6 * double(tick);
     }
     if (t > 120000000) {
@@ -372,7 +400,16 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
       // about the sim and a claim about the wire are comparable rather than merely similar.
       //   SIM_SKEW_CSV=/tmp/sim.csv ./tests/group/run.sh
       if (g_skew_csv != nullptr) {
-        fprintf(g_skew_csv, "%s,%.6f,%.3f\n", g_scenario, static_cast<double>(t) / 1e6, skew_signed);
+        // Everything needed to test the ^/V hypothesis offline, per board: the COMMANDED rate
+        // (whose derivative is what the wire plots), the crystal under it, the snap that fired on
+        // this decision, and the two error components the integral saw. A snap is a step in P, so
+        // a cycle in d(rate)/dt should sit against a snap out and a snap back -- and that claim is
+        // checkable from this file rather than from a shape.
+        fprintf(g_skew_csv, "%s,%.6f,%.3f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d\n", g_scenario,
+                static_cast<double>(t) / 1e6, skew_signed, b[0].last_rate_ppm, b[1].last_rate_ppm,
+                b[0].last_xtal_ppm, b[1].last_xtal_ppm, b[0].last_gd_snap_us, b[1].last_gd_snap_us,
+                b[0].last_e_common_us, b[1].last_e_common_us, b[0].last_e_diff_us,
+                b[1].last_e_diff_us);
       }
       errs.push_back(std::fabs(b[0].err_us + deadline_shift));
     }
@@ -423,6 +460,9 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
   r.err_med = errs[errs.size()/2];
   r.corr = b[0].corrections + b[1].corrections;
   r.gross = b[0].gross_frames + b[1].gross_frames;
+  r.gd_snaps = snap_n;
+  r.gd_snap_abs_sum = snap_sum;
+  r.gd_snap_max = snap_max;
   r.xtal_a = b[0].eng.crystal_ppm();
   r.xtal_b = b[1].eng.crystal_ppm();
   return r;
@@ -434,7 +474,9 @@ int main() {
   if (const char *path = getenv("SIM_SKEW_CSV")) {
     g_skew_csv = fopen(path, "w");
     if (g_skew_csv != nullptr) {
-      fprintf(g_skew_csv, "scenario,t_s,skew_us\n");
+      fprintf(g_skew_csv,
+              "scenario,t_s,skew_us,rate_a_ppm,rate_b_ppm,xtal_a_ppm,xtal_b_ppm,"
+              "snap_a_us,snap_b_us,ecom_a_us,ecom_b_us,ediff_a_us,ediff_b_us\n");
       fprintf(stderr, "dumping per-tick skew to %s\n", path);
     } else {
       fprintf(stderr, "could not open %s -- continuing without the dump\n", path);
@@ -485,6 +527,15 @@ int main() {
     check(r.skew_med < 2.0 * static_cast<double>(p.frame_us()),
           "the differential is corrected without chasing the common part",
           r.skew_med, 2.0 * p.frame_us());
+    // THE QUIET CASE, which is where the bench sees the >20 ppm d(rate)/dt cycles. The jump
+    // detector's threshold is max(gmax, 4*sigma) and BOTH terms shrink when the loop is calm:
+    // gmax = (authority + 200) * gdt + frame, with gdt the OBSERVATION interval because
+    // gd_last_at_us_ is refreshed every decision rather than every gd change, and sigma floors at
+    // a quarter frame. So the threshold collapses to ~26 us exactly when gd is quietest -- and
+    // gd's own beacon staircase has a p90 step of 61 us on the bench.
+    printf("        QUIET: gd filter SNAPS %d, mean |snap| %.0f us, max %d us -> Kp*max ~ %.0f ppm\n",
+           r.gd_snaps, r.gd_snaps ? r.gd_snap_abs_sum / r.gd_snaps : 0.0, r.gd_snap_max,
+           0.45 * r.gd_snap_max);
   }
 
   printf("\n3a. CRYSTAL UNDER STARVATION (characterisation; the guard that tried to fix it was reverted)\n");
@@ -535,6 +586,9 @@ int main() {
     check(std::fabs(r.xtal_a) < 200.0f && std::fabs(r.xtal_b) < 200.0f,
           "neither has RAILED yet (documented gap: the wind-up itself is unaddressed)",
           std::max(std::fabs(r.xtal_a), std::fabs(r.xtal_b)), 200.0);
+    printf("        gd filter SNAPS: %d, mean |snap| %.0f us, max %d us  -> Kp*snap ~ %.0f ppm at the max\n",
+           r.gd_snaps, r.gd_snaps ? r.gd_snap_abs_sum / r.gd_snaps : 0.0, r.gd_snap_max,
+           0.45 * r.gd_snap_max);
   }
 
   printf("\n3b. SPLIT FILTER: does rate benefit from a faster error filter than position?\n");
