@@ -10,6 +10,8 @@
 #endif
 
 #include <esp_timer.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 #ifdef USE_SNAPCLIENT_OPUS
 #include <esp_heap_caps.h>
 #include <esp_system.h>
@@ -34,6 +36,10 @@ static const char *const TAG = "snapclient.client";
 // Sanity cap on a single message payload; the largest legitimate payloads are FLAC
 // wire chunks (a few KB) and codec headers.
 static constexpr uint32_t MAX_PAYLOAD_SIZE = 262144;
+
+/// Player task stack. One constant, because STACKHWM prints it beside the high-water mark and a
+/// stale number there would misreport the margin it exists to measure.
+static constexpr uint32_t PLAYER_TASK_STACK = 10240;
 
 #ifdef USE_SNAPCLIENT_OPUS
 // Snapcast's Opus codec header is a 12-byte "pseudo header": raw Opus packets carry no
@@ -962,7 +968,18 @@ bool SnapcastClient::start() {
   // on a path whose errors are measured in microseconds.
   //
   // The player outranks the network task so decode bursts cannot starve playout.
-  if (xTaskCreatePinnedToCore(SnapcastClient::player_task_trampoline, "snap_player", 6144, this, 8,
+  // 10240, WAS 6144. snap_player overflowed six times on 2026-09-03 -- board a 01:02, board b
+  // 01:56 and 06:09, observer three more -- always this task, never a WDT or a Guru Meditation,
+  // and with `|<-CORRUPTED` on the backtrace every time, so the frames that did it were never
+  // recoverable from the crash itself. What is measurable: log_sync_report_ reserves 592 bytes of
+  // string buffers in one frame and emit_pre_trace_line_ 416 as its sibling, both on this task's
+  // deepest path, before the logger's own formatting.
+  //
+  // The raise is not the fix, it is what keeps the bench alive long enough to measure: STACKHWM
+  // reports the true high-water mark every 30 s and WARNs under 1 KB, so the margin this crash
+  // never reported is now a number. A board that reboots costs a full re-acquisition and five
+  // consensus membership changes, which is the largest disturbance this bench produces.
+  if (xTaskCreatePinnedToCore(SnapcastClient::player_task_trampoline, "snap_player", PLAYER_TASK_STACK, this, 8,
                               &this->player_task_handle_, 1) != pdPASS) {
     return false;
   }
@@ -5465,6 +5482,30 @@ void SnapcastClient::emit_pre_trace_line_(ServoState &st) {
 // repairs a sustained accounted-vs-measured split. Resets the window counters.
 void SnapcastClient::log_sync_report_(ServoState &st, const ChunkRecord &rec, uint32_t frame_bytes,
                                       int64_t median_err_us) {
+    // STACK MARGIN, on its own short line and with no variable-length tail. This runs on
+    // snap_player, which is the task that overflowed, and this is the deepest path it takes:
+    // log_sync_report_ holds 592 bytes of string buffers in one frame (drift/fill/trim/tsf/blk)
+    // and emit_pre_trace_line_ another 416 as its sibling.
+    //
+    // hwm is what FreeRTOS reports as the minimum free stack since the task started -- ESP-IDF
+    // returns it in BYTES, unlike vanilla FreeRTOS which returns words, so `size` is printed
+    // beside it rather than a percentage that would silently mean the wrong thing on either.
+    {
+      const uint32_t hwm = static_cast<uint32_t>(uxTaskGetStackHighWaterMark(nullptr));
+      if (hwm < this->stack_hwm_min_) this->stack_hwm_min_ = hwm;
+      const int64_t now = now_us();
+      // A thin margin is WARNed the moment it is seen; the routine line is throttled to 30 s
+      // because raising log volume on the task that is running out of stack is not a diagnosis.
+      if (hwm < 1024) {
+        ESP_LOGW(TAG, "STACKHWM task=snap_player hwm=%" PRIu32 " min=%" PRIu32 " size=%" PRIu32 " THIN",
+                 hwm, this->stack_hwm_min_, PLAYER_TASK_STACK);
+        this->stack_hwm_last_log_us_ = now;
+      } else if (now - this->stack_hwm_last_log_us_ >= 30000000) {
+        ESP_LOGI(TAG, "STACKHWM task=snap_player hwm=%" PRIu32 " min=%" PRIu32 " size=%" PRIu32, hwm,
+                 this->stack_hwm_min_, PLAYER_TASK_STACK);
+        this->stack_hwm_last_log_us_ = now;
+      }
+    }
     if (++st.err_count >= 128) {
       int64_t max_gap_us;
       int64_t pipeline_frames;

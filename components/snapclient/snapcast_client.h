@@ -1687,6 +1687,13 @@ class SnapcastClient {
   uint32_t dbg_clamp_events_{0};
   int64_t dbg_clamp_last_log_us_{0};
 
+  /// Worst free stack ever seen on the player task, and when it was last reported. snap_player
+  /// overflowed its 6144 bytes six times on 2026-09-03 (a 01:02, b 01:56 and 06:09, observer x3)
+  /// with a corrupted backtrace each time, so the depth was never measured -- only that it was
+  /// exceeded. This is the margin the crash did not report.
+  uint32_t stack_hwm_min_{UINT32_MAX};
+  int64_t stack_hwm_last_log_us_{0};
+
   // Recent history of the two playout counters, so the accounted queue can be evaluated at the
   // instant a sink reading describes rather than at the instant we read it.
   //
