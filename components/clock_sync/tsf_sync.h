@@ -295,6 +295,10 @@ class TsfSync {
   }
 
   void set_render_phase_broadcast(bool on) { this->render_phase_broadcast_.store(on, std::memory_order_relaxed); }
+  /// Whether this board currently trusts its own render phase enough to publish it -- the same
+  /// flag GDIN reports as steady=. Exposed so the phase's own diagnostics can be labelled with it:
+  /// the 8633 us phase error was seen only while this was false.
+  bool render_phase_broadcast() const { return this->render_phase_broadcast_.load(std::memory_order_relaxed); }
   /// @brief 30 Hz phase-only exchange (build 84, SHADOW). Sends a no_mapping=1 TsfPacket carrying
   /// the newest render-phase sample; multicast only (the 1 Hz beacon still unicasts the roster).
   /// Call from the player task at chunk cadence; throttled internally to PHASE_TX_INTERVAL_US.

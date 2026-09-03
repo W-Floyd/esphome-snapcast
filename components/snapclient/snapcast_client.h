@@ -1135,6 +1135,14 @@ class SnapcastClient {
   std::atomic<int64_t> dma_span_us_{0};
   /// as_of_us of the last depth snapshot. Used to count DISTINCT measurements, not re-reads.
   std::atomic<int64_t> depth_as_of_us_{0};
+  /// PHDBG state: the previous render-phase decomposition, so each term's CHANGE can be logged.
+  /// Player task only (the phase is computed there), hence plain members rather than atomics.
+  int64_t ph_prev_us_{0};
+  int64_t ph_prev_ffl_us_{0};
+  int64_t ph_prev_map_us_{0};
+  int64_t ph_prev_srv_us_{0};
+  int64_t ph_log_us_{0};
+  bool ph_prev_valid_{false};
   /// RING MASS BALANCE. The loop servos the deadline error and nothing servos buffer occupancy,
   /// so audio-in = audio-out is INFERRED, never checked: chasing a drifting deadline is the same
   /// action as balancing the buffer only while the deadline moves because the clocks differ. A

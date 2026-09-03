@@ -4546,7 +4546,56 @@ void SnapcastClient::publish_render_phase_sample_() {
   const int64_t first_frame_local = tr.adjusted_ts_us - static_cast<int64_t>(tr.frames) * 1000000 / rate;
   const int64_t render_tsf = first_frame_local + (phase_tsf - phase_local);
   const int64_t render_server = tr.server_ts_us + static_cast<int64_t>(tr.offset_frames) * 1000000 / rate;
-  this->tsf_sync_->set_render_phase_us(render_tsf - render_server, phase_local);
+  const int64_t phase_us = render_tsf - render_server;
+  this->tsf_sync_->set_render_phase_us(phase_us, phase_local);
+
+  // PHDBG: WHICH TERM MOVED. A phase error of 8633 us was measured on board b during acquisition
+  // (GDIN raw=-8633, steady=0) while the analyser had the pair within 33 us p2p, and three
+  // hypotheses for it were tested and killed: inter-board ring depth (correlation -0.056, and the
+  // phase is verifiably depth-independent), the documented 8526 us double-re-baseline bug (zero
+  // re-baselines had occurred -- the magnitudes merely coincided), and a fixed identity (it
+  // drifted 8633 -> 8570, and is no multiple of the frame, chunk or DMA buffer). Every one of
+  // those was inferred from the phase's OUTPUT. Nothing logs its inputs.
+  //
+  // DELTAS, not absolutes: the phase is a large number whose absolute value is meaningless (TSF
+  // and server epochs are unrelated), so what diagnoses a jump is which constituent jumped with
+  // it. And the decomposition is exact, so the line CHECKS ITSELF:
+  //
+  //     dph = dffl + dmap - dsrv        (res prints the residual; non-zero means a term is missing)
+  //
+  // dffl  first_frame_local relative to the sample instant -- the render tag's own timing
+  // dmap  the TSF<->local mapping, i.e. the shared timebase
+  // dsrv  the server audio time of the first rendered frame -- a chunk skip shows here
+  {
+    const int64_t ffl_rel = first_frame_local - phase_local;
+    const int64_t map_rel = phase_tsf - phase_local;
+    if (this->ph_prev_valid_) {
+      const int64_t dph = phase_us - this->ph_prev_us_;
+      const int64_t dffl = ffl_rel - this->ph_prev_ffl_us_;
+      const int64_t dmap = map_rel - this->ph_prev_map_us_;
+      const int64_t dsrv = render_server - this->ph_prev_srv_us_;
+      const int64_t res = dph - (dffl + dmap - dsrv);
+      const bool steady_now = this->tsf_sync_->render_phase_broadcast();
+      const int64_t now = phase_local;
+      // A JUMP ALWAYS, and otherwise throttled -- harder when the board distrusts its own phase,
+      // which is exactly the state the 8633 us sample was taken in.
+      const bool jumped = dph > 500 || dph < -500;
+      const int64_t period = steady_now ? 5000000 : 1000000;
+      if (jumped || now - this->ph_log_us_ >= period) {
+        this->ph_log_us_ = now;
+        ESP_LOGD(TAG,
+                 "PHDBG dph=%+" PRId64 " dffl=%+" PRId64 " dmap=%+" PRId64 " dsrv=%+" PRId64
+                 " res=%+" PRId64 " fr=%" PRIu32 " off=%" PRIu32 " age=%+" PRId64 " st=%d",
+                 dph, dffl, dmap, dsrv, res, tr.frames, tr.offset_frames, tag_age_us,
+                 steady_now ? 1 : 0);
+      }
+    }
+    this->ph_prev_us_ = phase_us;
+    this->ph_prev_ffl_us_ = ffl_rel;
+    this->ph_prev_map_us_ = map_rel;
+    this->ph_prev_srv_us_ = render_server;
+    this->ph_prev_valid_ = true;
+  }
 #endif
 }
 
