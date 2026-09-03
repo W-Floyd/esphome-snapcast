@@ -1122,6 +1122,27 @@ class SnapcastClient {
   std::atomic<float> bias_kick_request_us_{0.0f};  // bench hook: bias change to deliver as a kick (see align_bias_kick_us)
   std::atomic<int64_t> pipe_depth_us_{0};   // pushed-minus-played, us; mirrored per block for travel_horizon_us_()
   std::atomic<int64_t> ring_depth_us_{0};   // pcm ring fill, us; mirrored per chunk for travel_horizon_us_()
+  /// RING MASS BALANCE. The loop servos the deadline error and nothing servos buffer occupancy,
+  /// so audio-in = audio-out is INFERRED, never checked: chasing a drifting deadline is the same
+  /// action as balancing the buffer only while the deadline moves because the clocks differ. A
+  /// bias change, a mapping re-anchor or a resync repair moves it for other reasons, and the loop
+  /// then commands a rate with nothing to balance and the ring drifts at exactly that rate.
+  ///
+  /// Ring depth is the integral of (in - out) and the only observable that separates them, and it
+  /// was logged only on RSYNC/RPRE/stall -- all armed BY a threshold crossing, so the drain is
+  /// over before the first line exists (see the note at the pre-trigger history). A slow permanent
+  /// imbalance that never trips the threshold left no trace at all.
+  ///
+  /// DISCARDS ARE COUNTED SEPARATELY because they are the whole question: bytes read out and
+  /// thrown away are the CORRECTION draining the ring, not the DAC consuming it. in - out - disc
+  /// says which, and the codebase's own open question ("whether the ring drains because the client
+  /// is behind or because the correction is draining it") is answerable only with the split.
+  std::atomic<uint64_t> pcm_in_bytes_{0};       // written into the ring by emit_pcm_
+  std::atomic<uint64_t> pcm_out_bytes_{0};      // read out to be PLAYED
+  std::atomic<uint64_t> pcm_discard_bytes_{0};  // read out and discarded (resync repair)
+  std::atomic<float> rate_ppm_mirror_{0.0f};    // last commanded rate, for the balance line
+  int64_t mb_report_us_{0};                     // MASSBAL window start (player task)
+  uint64_t mb_in_prev_{0}, mb_out_prev_{0}, mb_disc_prev_{0};
   std::atomic<int64_t> write_begin_us_{0};  // last on_audio_write() entry (player task); see the fill-drift comparison
   std::atomic<int64_t> write_end_us_{0};    // its return; end < begin while a write is in progress
   // Ring of the last write windows: the depth snapshot can be 50-60 ms old and fall inside a window
@@ -1207,6 +1228,10 @@ class SnapcastClient {
   /// depends on what is being chased: 5 ppm catches the 20-40 ppm excursions without drowning in
   /// the 3-5 ppm of ordinary tracking, but a quiet hunt wants it lower and a storm wants it higher.
   std::atomic<float> tune_ratewhy_ppm_{5.0f};
+  /// Shared common-mode correction. 0 = shadow only (consensus formed and CMNC logged, nothing
+  /// applied), which is the default and what the falsified 3c result argues for.
+  std::atomic<float> tune_common_gain_{0.0f};
+  std::atomic<float> tune_common_authority_ppm_{50.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
   /// pushed past the frame index it was applied at. Until then the engine issues no further

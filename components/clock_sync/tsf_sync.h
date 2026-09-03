@@ -10,7 +10,10 @@
 
 #include "esphome/core/helpers.h"
 
+#include "consensus_math.h"
+
 #include <algorithm>
+#include <cmath>
 #include <esp_timer.h>
 #include <atomic>
 #include <limits>
@@ -245,6 +248,52 @@ class TsfSync {
     }
     return n >= 2 ? static_cast<int32_t>(sum / n) : INT32_MIN;
   }
+  /// This device's common error for the beacon (INT32_MIN = it has none this decision).
+  void set_common_err_us(int32_t us) { this->pub_common_err_us_.store(us, std::memory_order_relaxed); }
+
+  /// @brief The group's consensus common error: robust mean over this device and every peer heard
+  /// within PHASE_STALE_US that published one. Returns false when fewer than two members
+  /// contribute -- one value is not a consensus, it is this board's own opinion.
+  ///
+  /// HELD WHILE FRESH, exactly as the group delta is. Dropping to zero the moment a member misses
+  /// a beacon is itself an asymmetry, and the measured one: in tests/group the consensus formed on
+  /// both boards only 34% of the time and on exactly ONE of them 30% of the time, and the
+  /// resulting correction differed between boards by 15.08 ppm -- as large as the correction
+  /// itself. Holding it took that to 4.56 ppm with both-sided availability at 75%. A correction
+  /// that is not simultaneous is a per-board gain, which is the one thing this exists to avoid.
+  ///
+  /// Player task; peers are written on the network task, so this reads them under the same
+  /// relaxed-atomic discipline the bias mean uses.
+  bool common_err_consensus_us(int64_t local_now_us, int64_t &out_us, uint8_t &out_n) {
+    double vals[MAX_PEERS + 1];
+    size_t n = 0;
+    const int32_t mine = this->pub_common_err_us_.load(std::memory_order_relaxed);
+    if (mine != INT32_MIN) {
+      vals[n++] = static_cast<double>(mine);
+    }
+    for (size_t i = 0; i < MAX_PEERS && n < MAX_PEERS + 1; i++) {
+      if (this->peer_[i].used && this->peer_[i].common_err_us != INT32_MIN &&
+          local_now_us - this->peer_[i].common_seen_us < PHASE_STALE_US) {
+        vals[n++] = static_cast<double>(this->peer_[i].common_err_us);
+      }
+    }
+    if (n >= 2) {
+      this->common_c_us_ = static_cast<int64_t>(
+          llround(robust_mean(vals, n, CONSENSUS_SCALE_FLOOR_US)));
+      this->common_c_at_us_ = local_now_us;
+      this->common_c_n_ = static_cast<uint8_t>(n);
+      out_us = this->common_c_us_;
+      out_n = this->common_c_n_;
+      return true;
+    }
+    if (this->common_c_at_us_ != 0 && local_now_us - this->common_c_at_us_ <= GROUP_DELTA_STALE_US) {
+      out_us = this->common_c_us_;
+      out_n = this->common_c_n_;
+      return true;
+    }
+    return false;
+  }
+
   void set_render_phase_broadcast(bool on) { this->render_phase_broadcast_.store(on, std::memory_order_relaxed); }
   /// @brief 30 Hz phase-only exchange (build 84, SHADOW). Sends a no_mapping=1 TsfPacket carrying
   /// the newest render-phase sample; multicast only (the 1 Hz beacon still unicasts the roster).
@@ -363,6 +412,10 @@ class TsfSync {
   /// stops offering it to peers, so they hold still while it steps home. Player task writes.
   std::atomic<bool> render_phase_broadcast_{true};
   std::atomic<int32_t> pub_render_bias_us_{INT32_MIN};  // our render_align bias for the beacon
+  std::atomic<int32_t> pub_common_err_us_{INT32_MIN};   // our e_common for the beacon
+  int64_t common_c_us_{0};      // last consensus formed, held while fresh (player task)
+  int64_t common_c_at_us_{0};
+  uint8_t common_c_n_{0};
   int64_t pipeline_diverged_since_us_{0};  // 0 = currently within tolerance
   int64_t last_diverge_log_us_{0};
   int64_t last_render_log_us_{0};
@@ -397,6 +450,9 @@ class TsfSync {
     // The peer's render_align bias and when we last heard it (INT32_MIN = unknown). See TsfPacket.
     int32_t bias_us;
     int64_t bias_seen_us;
+    // The peer's published common error and when we last heard it (INT32_MIN = unknown).
+    int32_t common_err_us;
+    int64_t common_seen_us;
     // The peer's RAW published server<->TSF line. A line, not a point, so it is evaluated at a
     // common instant rather than needing to have been sampled at one.
     bool map_valid;

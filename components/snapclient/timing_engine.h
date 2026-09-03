@@ -67,6 +67,28 @@ struct Profile {
   /// buffer or codec. Not a constant in this file -- it is a property of the hardware.
   float rate_authority_ppm = 100.0f;
 
+  /// SHARED COMMON-MODE CORRECTION, off by default (0 = today's behaviour exactly).
+  ///
+  /// Fraction of the group's shared common error to remove per rate horizon. 1.0 asks rate to
+  /// take it all out over one horizon -- the same "reach" arithmetic as needed_ppm, and for the
+  /// same reason: the horizon is how far ahead rate can honestly see.
+  ///
+  /// Today nothing corrects the common error promptly. The crystal integral absorbs it, slowly,
+  /// and that is what winds the estimate: a starved board is behind for the whole shortage AND
+  /// the whole catch-up, one-signed throughout, so the integral learns a DISPLACEMENT as a
+  /// permanent rate. Measured 2026-09-02: a hand-zeroed crystal at +192 ppm against a true +46,
+  /// 8 ppm off the rail, while the true requirement was never above ~46. The harm is not that
+  /// the clock cannot keep up -- it has 2000 ppm of actuator for a 46 ppm job -- but that a
+  /// railed integral has no headroom and trips crystal_spent, which hands the work to POSITION,
+  /// which is audible.
+  float common_gain = 0.0f;
+  /// Ceiling on the shared correction, separate from rate_authority_ppm because it answers a
+  /// different question: authority bounds what this board may do ALONE (and so bounds the
+  /// differential it can inject), while this bounds a motion the whole group makes together and
+  /// which is inaudible by construction. Sized to leave the integral's job small rather than to
+  /// bound audibility.
+  float common_authority_ppm = 50.0f;
+
   int64_t frame_us() const { return 1000000 / static_cast<int64_t>(frame_rate_hz); }
 
   /// Lag the error filter adds. A multiple of the TRANSPORT delay (compensation_us), not of the
@@ -146,6 +168,26 @@ struct GroupEvidence {
   int64_t delta_us = 0;      ///< offset from the group, same sign convention
   int64_t age_us = 0;
   uint8_t contributors = 0;  ///< phase contributors including self
+
+  /// THE GROUP'S SHARED COMMON ERROR: the consensus of every member's e_common, computed the way
+  /// the mapping is (robust mean over the set, self included), so every device holding the same
+  /// set derives the SAME number.
+  ///
+  /// That sameness is the whole point, and it is why this may be acted on at a gain the crystal
+  /// integral may not. A per-board gain on a per-board estimate turns common error into
+  /// differential motion at gain x (noise_A - noise_B) -- the rule stated at the head of this
+  /// file, and measured: a resync-window boost on one board alone walked the wire 2-3 us/s.
+  /// A correction computed from a SHARED value is the same number on both boards, so it injects
+  /// no differential at all, whatever its gain.
+  ///
+  /// Verified before it was built (tests/group, "is e_common actually COMMON?"): across every
+  /// scenario the two boards' e_common agree to 1-4% with r up to 1.00, and disagree by a flat
+  /// ~80 us that does not scale with the error -- exactly the per-board measurement noise and
+  /// nothing else. Averaging N members cuts that by sqrt(N); making the correction shared removes
+  /// its differential component entirely, which is the larger effect at N=2.
+  bool common_valid = false;
+  int64_t common_us = 0;     ///< consensus e_common; meaningless unless common_valid
+  uint8_t common_n = 0;      ///< members contributing to it, self included
 };
 
 /// Why the engine acted. One record per decision; the log line writes this and nothing else.
@@ -216,6 +258,15 @@ struct Decision {
   float p_ppm = 0.0f;           ///< P itself, so a standing P is distinguishable from a moving one
   float kp_ppm_per_us = 0.0f;   ///< the gain in force, which sigma_e moves under you
   bool slew_clipped = false;    ///< the command wanted to move further than authority*dt/horizon
+
+  /// THE SHARED COMMON-MODE TERM, and the value it acted on. Recorded even when the correction is
+  /// disabled (common_gain = 0), so the consensus can be SHADOWED against the live loop -- logged
+  /// beside what the board actually did, acting on nothing -- before any gain is applied. Every
+  /// mechanism proposed on this bench that skipped that step was withdrawn.
+  bool common_shared_valid = false;  ///< false = the group supplied no consensus; NOT "it was zero"
+  int32_t common_shared_us = 0;      ///< the consensus value; meaningless unless the flag is set
+  uint8_t common_n = 0;              ///< how many members it came from, self included
+  float pc_ppm = 0.0f;               ///< what the shared correction contributed to the command
 };
 
 /// The two actuators. Separate fields: doing position work through the rate field requires

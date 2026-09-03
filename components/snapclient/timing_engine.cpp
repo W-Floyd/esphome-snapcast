@@ -687,7 +687,33 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   const float dt_cmd_s =
       dt_us > 0 ? std::min(static_cast<float>(dt_us) / 1e6f, horizon_s) : 0.0f;
   const float max_slew_ppm = profile_.rate_authority_ppm * (dt_cmd_s / horizon_s);
-  const float want = crystal_ppm_ + p_term;
+
+  // THE SHARED COMMON-MODE TERM. Recorded unconditionally so it can be shadowed; applied only
+  // when a gain is configured.
+  //
+  // This is the one term in the command that is NOT this board's own opinion. Every member
+  // holding the same set computes the same number, so whatever it does, it does to the group
+  // together -- which is why it may run at a gain the crystal integral may not, and why it is
+  // clamped by common_authority_ppm rather than by the authority that bounds solo motion.
+  //
+  // It acts on the consensus, never on this board's own e_common: acting on the latter is
+  // precisely the per-board gain the design forbids, and would convert the ~80 us of per-board
+  // measurement noise straight into differential motion.
+  cmd.decision.common_shared_valid = group.common_valid;
+  cmd.decision.common_n = group.common_n;
+  float pc_term = 0.0f;
+  if (group.common_valid) {
+    cmd.decision.common_shared_us = static_cast<int32_t>(
+        std::clamp<int64_t>(group.common_us, INT32_MIN, INT32_MAX));
+    if (profile_.common_gain > 0.0f) {
+      const float pc_raw =
+          profile_.common_gain * static_cast<float>(group.common_us) / horizon_s;
+      pc_term = std::clamp(pc_raw, -profile_.common_authority_ppm, profile_.common_authority_ppm);
+    }
+  }
+  cmd.decision.pc_ppm = pc_term;
+
+  const float want = crystal_ppm_ + p_term + pc_term;
   const float prev_cmd = last_rate_cmd_;
   cmd.rate_ppm =
       rate_cmd_seeded_

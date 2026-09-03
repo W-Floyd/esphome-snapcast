@@ -13,6 +13,7 @@
 // n/(n-1)). The quantity that matters is the SKEW BETWEEN BOARDS, which is what the logic analyser
 // measures on the bench and what a listener hears.
 #include "../../components/snapclient/timing_engine.h"
+#include "../../components/clock_sync/consensus_math.h"
 
 #include <algorithm>
 #include <cmath>
@@ -58,6 +59,12 @@ struct Board {
   double phase_us = 0.0;    // what it publishes
   int64_t phase_at_us = 0;  // and when it sampled it -- pairing needs both
   int64_t last_beacon_us = -1000000;
+  /// What peers last told us about THEIR common error, and when. Carried on the same beacon as
+  /// the phase and subject to the same staleness -- it is a measurement with an age like any
+  /// other, and treating a stale one as current is how a shared value stops being shared.
+  double heard_common_us[4] = {};
+  int64_t heard_common_at_us[4] = {};
+  bool heard_common_valid[4] = {};
   double heard_phase_us[4] = {};
   int64_t heard_at_us[4] = {};
   bool heard_valid[4] = {};
@@ -72,6 +79,12 @@ struct Board {
   /// than realtime, because the server keeps sending and the backlog lands; and a position
   /// correction is SPENT from it, which is the drain-and-starve spiral the engine documents.
   double buffer_us = 1724000.0;
+  /// Mass-balance accounting, mirroring the firmware's MASSBAL counters so one analysis grades
+  /// both. in - out - disc must track the change in buffer_us, or a path is uncounted.
+  double mb_in_us = 0.0, mb_out_us = 0.0, mb_disc_us = 0.0;
+  /// Audio the server sent while we could not receive it. An outage queues audio, it does not
+  /// destroy it, and the queue is the only thing that may then arrive faster than realtime.
+  double backlog_us = 0.0;
   /// Phase publication gating, as the client does it. Before this the simulator published
   /// unconditionally, so a board declining to publish -- the whole mechanism behind 4e68870 --
   /// could not be represented, let alone tested.
@@ -82,6 +95,14 @@ struct Board {
   double last_rate_ppm = 0.0;
   double last_xtal_ppm = 0.0;
   int32_t last_gd_snap_us = 0;
+  /// The split is only computed when the group supplies a differential. Without this flag the CSV
+  /// wrote a 0 for "not computed", indistinguishable from a genuine zero error -- 340731 of the
+  /// 388786 rows, every one of which would have been averaged in as a measurement.
+  int64_t last_common_c_us = 0;      ///< last consensus formed, held while fresh
+  int64_t last_common_c_at_us = 0;
+  double last_pc_ppm = 0.0;          ///< the shared common-mode term the engine applied
+  bool last_common_valid = false;    ///< whether the group could form a consensus at all
+  bool last_e_split_valid = false;
   int32_t last_e_common_us = 0;
   int32_t last_e_diff_us = 0;
   explicit Board(const Profile &p) : eng(p) {}
@@ -111,6 +132,25 @@ struct Result {
   // starved board wound a hand-zeroed crystal to +192 ppm in twelve minutes against a true +46.
   // Reported per board because the whole point is that it should stay near the PLANT rate.
   double xtal_a = 0.0, xtal_b = 0.0;
+  /// THE TOTAL COMMANDED RATE, which is the quantity that must always equal plant + common
+  /// whatever the shared correction does. The crystal alone does NOT: if pc_term supplies the
+  /// common part, the integral is correct to settle at plant instead. Scoring the crystal against
+  /// a fixed target across a gain sweep would therefore mark the mechanism working as a failure.
+  double rate_a = 0.0, rate_b = 0.0;
+  /// The shared correction actually applied, and how often the group could form one at all.
+  double pc_a = 0.0, pc_b = 0.0;
+  double common_valid_frac = 0.0;
+  /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
+  /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
+  /// while the buffer is UNCLAMPED -- at 0 the DAC cannot consume what is not there, and at
+  /// nominal the arriving backlog is dropped -- so a mismatch is the clamp, not a lost path.
+  double mb_in_a = 0.0, mb_out_a = 0.0, mb_disc_a = 0.0, buf_end_a = 0.0;
+  double mb_in_b = 0.0, mb_out_b = 0.0, mb_disc_b = 0.0, buf_end_b = 0.0;
+  double buf_start = 0.0;
+  /// Mean |pc_a - pc_b|: the differential the "shared" correction actually injects. Must be ~0.
+  double pc_absdiff = 0.0;
+  double common_one_sided_frac = 0.0;  ///< exactly one board held a consensus
+  double common_both_frac = 0.0;       ///< both did, which is the only case that is truly shared
   /// FILTER SNAPS. A confirmed jump ASSIGNS the filter rather than stepping it, which is a
   /// discontinuity in the signal P is computed from -- at Kp ~ 0.45 ppm/us a 45 us snap is ~20 ppm
   /// of commanded rate arriving in one decision. The bench shows full 2 pi cycles in d(rate)/dt at
@@ -175,8 +215,13 @@ struct Faults {
 
 /// `common_ppm` drifts every board's deadline together -- a server/timebase offset, which is what
 /// the bench sees: gd of tens of us while each board sits hundreds of us off its own deadline.
-Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
+/// `label` is REQUIRED, not a global set by hand at each block: g_scenario was declared with a
+/// comment saying it "labels the rows so one file holds every scenario" and then never assigned,
+/// so all 388k rows of the dump read "sim" and every per-scenario statistic taken from the file
+/// silently mixed the clean runs with the starvation ones. A parameter cannot be forgotten.
+Result simulate(const char *label, Profile p, double plant_a, double plant_b, double common_ppm,
                 double noise_us, double seconds, int64_t true_land_us, Faults f = {}) {
+  g_scenario = label;
   std::vector<Board> b;
   b.emplace_back(p);
   b.emplace_back(p);
@@ -191,6 +236,9 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
   double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
+  double rate_sum_a = 0.0, rate_sum_b = 0.0, pc_sum_a = 0.0, pc_sum_b = 0.0;
+  long settled_n = 0, common_valid_n = 0, common_one_sided_n = 0, both_valid_n = 0;
+  double pc_absdiff_sum = 0.0;
 
   for (int64_t t = 0; t < static_cast<int64_t>(seconds * 1e6); t += tick) {
     deadline_shift += common_ppm * 1e-6 * static_cast<double>(tick);
@@ -214,6 +262,14 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
           b[j].heard_phase_us[i] = b[i].phase_us;
           b[j].heard_at_us[i] = t;
           b[j].heard_valid[i] = true;
+          // The beacon also carries this board's own common error, when it has one. Absent is
+          // sent as absent: a board with no differential has no split, and publishing a 0 for
+          // that would drag every peer's consensus toward zero with a non-measurement.
+          if (b[i].last_e_split_valid) {
+            b[j].heard_common_us[i] = static_cast<double>(b[i].last_e_common_us);
+            b[j].heard_common_at_us[i] = t;
+            b[j].heard_common_valid[i] = true;
+          }
         }
       }
     }
@@ -249,15 +305,54 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         stalled = bph < f.burst_stall_s;
       }
       const double nominal_buf_us = 1724000.0;
+      // SUPPLY, and the accounting kept beside it. in is what ARRIVED and out is what the DAC
+      // consumed, so the two branches below are not just buffer arithmetic: starvation means
+      // in = 0 while the DAC keeps consuming, and recovery means the backlog lands at 3x while
+      // the DAC still consumes at 1x. Counting `in` unconditionally would have said supply never
+      // failed, in the one scenario built to make it fail.
+      const double tick_us = static_cast<double>(tick);
+      // SUPPLY IS REALTIME PLUS A BACKLOG, not "2x whenever below nominal". The old form keyed
+      // recovery to the buffer LEVEL, so the rate surplus dipping the level a few us below
+      // nominal re-triggered it every tick: over a 900 s run it manufactured 1349 s of audio and
+      // let the nominal clamp swallow the difference. Invisible while nothing counted supply.
+      //
+      // The server sends at realtime and nothing else, so that is what arrives. An outage does
+      // not destroy that audio, it QUEUES it, and the queue is what lands faster than realtime
+      // afterwards -- bounded by the backlog, which is finite and which recovery exhausts.
+      double in_us = 0.0;
       if (starved || stalled) {
-        x.buffer_us = std::max(0.0, x.buffer_us - static_cast<double>(tick));
-        // Out of audio entirely: now the board really does fall behind in real time.
-        if (x.buffer_us <= 0.0) {
-          x.err_us += static_cast<double>(tick);
-        }
-      } else if (x.buffer_us < nominal_buf_us) {
-        x.buffer_us = std::min(nominal_buf_us, x.buffer_us + 2.0 * static_cast<double>(tick));
+        x.backlog_us += tick_us;    // the server kept sending; none of it reached us
+      } else {
+        const double catchup = std::min(x.backlog_us, 2.0 * tick_us);
+        x.backlog_us -= catchup;
+        in_us = tick_us + catchup;
       }
+      const double out_us = tick_us;
+      x.buffer_us = std::min(nominal_buf_us, std::max(0.0, x.buffer_us + in_us - out_us));
+      x.mb_in_us += in_us;
+      x.mb_out_us += out_us;
+      // Out of audio entirely: now the board really does fall behind in real time.
+      if (x.buffer_us <= 0.0) {
+        x.err_us += tick_us;
+      }
+      // THE RATE'S OWN EFFECT ON THE BUFFER, which this model did not have. Until now the buffer
+      // was bang-bang -- drain 1:1 when starved, refill at 2x, then sit pinned at nominal -- and
+      // the COMMANDED RATE never entered it. So the one thing the buffer exists to integrate,
+      // audio-in minus audio-out, could not be expressed: no rate, however wrong, moved it.
+      //
+      // Derived from this simulator's OWN equilibrium rather than invented. The loop is balanced
+      // when rate == plant + common (that is exactly the condition under which the measured error
+      // holds still, and it is what 3a scores against), so the surplus consumption is the excess
+      // of the commanded rate over it. Positive surplus = the DAC eats faster than supply
+      // arrives = the ring drains.
+      //
+      // This is what makes the mass-balance question askable here at all: the buffer becomes the
+      // integral of the loop's rate error, which is what it is on the hardware.
+      const double want_ppm = x.plant_ppm + common_ppm;
+      const double surplus_ppm = x.last_rate_ppm - want_ppm;
+      const double out_extra_us = surplus_ppm * 1e-6 * tick_us;
+      x.buffer_us = std::max(0.0, x.buffer_us - out_extra_us);
+      x.mb_out_us += out_extra_us;
       // ROOT DISTURBANCE 2: the timebase re-anchors. COMMON-MODE, as the firmware states outright
       // ("every device holding this set steps identically") -- but the devices do not adopt it at
       // the same INSTANT. Beacons arrive once a second and a device steps when its own consensus
@@ -332,6 +427,44 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         g.contributors = 2;
         g.delta_us = x.last_gd_us;
       }
+      // THE SHARED COMMON ERROR, formed the way the mapping is: robust_mean over the whole set,
+      // self included, using the REAL estimator rather than a plain average written here -- the
+      // production weighting is what has to be shown to work, and a mean of my own would only
+      // test itself. Self must be in the set or the members are not averaging the same thing.
+      {
+        double vals[8];
+        size_t nv = 0;
+        if (x.last_e_split_valid) {
+          vals[nv++] = static_cast<double>(x.last_e_common_us);
+        }
+        for (size_t j = 0; j < b.size() && nv < 8; j++) {
+          if (j == i || !x.heard_common_valid[j]) continue;
+          if (t - x.heard_common_at_us[j] > PHASE_STALE_US) continue;
+          vals[nv++] = x.heard_common_us[j];
+        }
+        // Two or more, for the same reason the group delta needs two: one value is not a
+        // consensus, it is just this board's own opinion wearing the word.
+        if (nv >= 2) {
+          g.common_valid = true;
+          g.common_n = static_cast<uint8_t>(nv);
+          g.common_us = static_cast<int64_t>(std::llround(
+              esphome::clock_sync::robust_mean(vals, nv, esphome::clock_sync::CONSENSUS_SCALE_FLOOR_US)));
+          x.last_common_c_us = g.common_us;
+          x.last_common_c_at_us = t;
+        } else if (x.last_common_c_at_us != 0 &&
+                   t - x.last_common_c_at_us <= GROUP_DELTA_STALE_US) {
+          // HOLD THE LAST CONSENSUS while it is fresh, exactly as the group delta is held above.
+          // Dropping to zero the moment a pairing is missed is itself an asymmetry, and the
+          // measured one: the consensus formed on both boards only 34% of the time and on exactly
+          // ONE of them 30% of the time, so the "shared" correction differed between boards by
+          // 15.08 ppm -- as large as the correction itself. A correction that is not simultaneous
+          // is a per-board gain, which is the one thing this mechanism exists to avoid.
+          g.common_valid = true;
+          g.common_n = 2;
+          g.common_us = x.last_common_c_us;
+        }
+      }
+
       if (g.present) {
         gd_present_ticks++;
         gd_age_sum_us += static_cast<double>(t - x.last_gd_at_us);
@@ -380,11 +513,17 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         // and that cap was unreachable here while the buffer was a constant.
         if (c.frames > 0) {
           x.buffer_us = std::max(0.0, x.buffer_us - static_cast<double>(c.frames) * p.frame_us());
+          // Discarded, not played -- counted apart for the same reason the firmware counts it
+          // apart: this is the CORRECTION draining the ring, not the DAC consuming it.
+          x.mb_disc_us += static_cast<double>(c.frames) * p.frame_us();
         }
       }
       x.last_rate_ppm = c.rate_ppm;
       x.last_xtal_ppm = c.decision.crystal_ppm;
       x.last_gd_snap_us = c.decision.gd_snap_us;
+      x.last_pc_ppm = c.decision.pc_ppm;
+      x.last_common_valid = c.decision.common_shared_valid;
+      x.last_e_split_valid = c.decision.e_split_valid;
       x.last_e_common_us = c.decision.e_common_us;
       x.last_e_diff_us = c.decision.e_diff_us;
       x.err_us += (x.plant_ppm - c.rate_ppm) * 1e-6 * double(tick);
@@ -405,12 +544,35 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         // this decision, and the two error components the integral saw. A snap is a step in P, so
         // a cycle in d(rate)/dt should sit against a snap out and a snap back -- and that claim is
         // checkable from this file rather than from a shape.
-        fprintf(g_skew_csv, "%s,%.6f,%.3f,%.4f,%.4f,%.4f,%.4f,%d,%d,%d,%d,%d,%d\n", g_scenario,
+        // An invalid split writes an EMPTY field, not a zero: the reader gets NaN and drops the
+        // row, which is the only honest encoding of "the group supplied no differential here".
+        char sa[16] = "", sb[16] = "", da[16] = "", db[16] = "";
+        if (b[0].last_e_split_valid) {
+          snprintf(sa, sizeof(sa), "%d", b[0].last_e_common_us);
+          snprintf(da, sizeof(da), "%d", b[0].last_e_diff_us);
+        }
+        if (b[1].last_e_split_valid) {
+          snprintf(sb, sizeof(sb), "%d", b[1].last_e_common_us);
+          snprintf(db, sizeof(db), "%d", b[1].last_e_diff_us);
+        }
+        fprintf(g_skew_csv, "%s,%.6f,%.3f,%.4f,%.4f,%.4f,%.4f,%d,%d,%s,%s,%s,%s\n", g_scenario,
                 static_cast<double>(t) / 1e6, skew_signed, b[0].last_rate_ppm, b[1].last_rate_ppm,
                 b[0].last_xtal_ppm, b[1].last_xtal_ppm, b[0].last_gd_snap_us, b[1].last_gd_snap_us,
-                b[0].last_e_common_us, b[1].last_e_common_us, b[0].last_e_diff_us,
-                b[1].last_e_diff_us);
+                sa, sb, da, db);
       }
+      // Means over the SETTLED window only, the same window the skew statistics use.
+      rate_sum_a += b[0].last_rate_ppm;  rate_sum_b += b[1].last_rate_ppm;
+      pc_sum_a += b[0].last_pc_ppm;      pc_sum_b += b[1].last_pc_ppm;
+      if (b[0].last_common_valid) common_valid_n++;
+      // THE CLAIM THE WHOLE MECHANISM RESTS ON: both boards apply the SAME correction, so it
+      // injects no differential. Measured rather than assumed -- if the two pc terms differ, the
+      // shared correction is a per-board gain wearing a different name, which is the one thing
+      // the design forbids. Split out by cause: a difference because only one board HAS the
+      // consensus is a different defect from a difference in its value.
+      pc_absdiff_sum += std::fabs(b[0].last_pc_ppm - b[1].last_pc_ppm);
+      if (b[0].last_common_valid != b[1].last_common_valid) common_one_sided_n++;
+      if (b[0].last_common_valid && b[1].last_common_valid) both_valid_n++;
+      settled_n++;
       errs.push_back(std::fabs(b[0].err_us + deadline_shift));
     }
   }
@@ -465,6 +627,19 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
   r.gd_snap_max = snap_max;
   r.xtal_a = b[0].eng.crystal_ppm();
   r.xtal_b = b[1].eng.crystal_ppm();
+  r.buf_start = 1724000.0;
+  r.mb_in_a = b[0].mb_in_us;  r.mb_out_a = b[0].mb_out_us;  r.mb_disc_a = b[0].mb_disc_us;
+  r.mb_in_b = b[1].mb_in_us;  r.mb_out_b = b[1].mb_out_us;  r.mb_disc_b = b[1].mb_disc_us;
+  r.buf_end_a = b[0].buffer_us;  r.buf_end_b = b[1].buffer_us;
+  if (settled_n > 0) {
+    const double sn = static_cast<double>(settled_n);
+    r.rate_a = rate_sum_a / sn;  r.rate_b = rate_sum_b / sn;
+    r.pc_a = pc_sum_a / sn;      r.pc_b = pc_sum_b / sn;
+    r.common_valid_frac = static_cast<double>(common_valid_n) / sn;
+    r.pc_absdiff = pc_absdiff_sum / sn;
+    r.common_one_sided_frac = static_cast<double>(common_one_sided_n) / sn;
+    r.common_both_frac = static_cast<double>(both_valid_n) / sn;
+  }
   return r;
 }
 
@@ -502,7 +677,7 @@ int main() {
     // The bench's own case: gd tens of us while each board sits hundreds of us off its deadline.
     // Correcting that with position moves the pair APART, which is the only thing a listener can
     // hear. The boards must stay together and must not spend frames doing it.
-    Result r = simulate(p, 0.0, 0.0, 40.0, 80.0, 600.0, TRUE_LAND);
+    Result r = simulate("common", p, 0.0, 0.0, 40.0, 80.0, 600.0, TRUE_LAND);
     printf("        skew median %.0f us, p90 %.0f us; own error median %.0f us; "
            "%d corrections, %ld frames\n", r.skew_med, r.skew_p90, r.err_med, r.corr, r.gross);
     check(r.skew_med < 2.0 * static_cast<double>(p.frame_us()),
@@ -512,7 +687,7 @@ int main() {
 
   printf("\n2. DIFFERENTIAL: the boards disagree with each other, which IS audible\n");
   {
-    Result r = simulate(p, -15.0, +15.0, 0.0, 80.0, 600.0, TRUE_LAND);
+    Result r = simulate("differential", p, -15.0, +15.0, 0.0, 80.0, 600.0, TRUE_LAND);
     printf("        skew median %.0f us, p90 %.0f us; %d corrections, %ld frames\n",
            r.skew_med, r.skew_p90, r.corr, r.gross);
     check(r.skew_med < 2.0 * static_cast<double>(p.frame_us()),
@@ -521,7 +696,7 @@ int main() {
 
   printf("\n3. both at once: common drift plus a differential split\n");
   {
-    Result r = simulate(p, -15.0, +15.0, 40.0, 80.0, 600.0, TRUE_LAND);
+    Result r = simulate("both", p, -15.0, +15.0, 40.0, 80.0, 600.0, TRUE_LAND);
     printf("        skew median %.0f us, p90 %.0f us; own error median %.0f us; "
            "%d corrections, %ld frames\n", r.skew_med, r.skew_p90, r.err_med, r.corr, r.gross);
     check(r.skew_med < 2.0 * static_cast<double>(p.frame_us()),
@@ -561,7 +736,14 @@ int main() {
     Faults hungry{};
     hungry.starve_period_s = 120.0;
     hungry.starve_secs = 6.0;
-    Result r = simulate(p, plant_a, plant_b, common, 80.0, 1800.0, TRUE_LAND, hungry);
+    // THE CLIENT'S HARD RESYNC, 50 ms. Omitted here until 2026-09-02, and its absence was not a
+    // simplification -- it removed the only thing bounding the error. A starved board fell behind
+    // with nothing to catch it up, so the COMMON error ran to 129 SECONDS and skew p90 to 2.7 s,
+    // and the wind-up figures below were measured in that regime rather than in the client's.
+    // Found because a shared common-mode correction saturated its clamp for every gain: the
+    // scenario, not the mechanism, was what the sweep was measuring.
+    hungry.resync_us = 50000.0;
+    Result r = simulate("starve-xtal", p, plant_a, plant_b, common, 80.0, 1800.0, TRUE_LAND, hungry);
     printf("        want %+.0f / %+.0f (plant + common)  ->  got %+.1f / %+.1f ppm"
            "   differential want %+.0f got %+.1f   (skew med %.0f us)\n",
            want_a, want_b, r.xtal_a, r.xtal_b, want_b - want_a, r.xtal_b - r.xtal_a, r.skew_med);
@@ -575,20 +757,94 @@ int main() {
           r.xtal_b - r.xtal_a, want_b - want_a);
     check(r.skew_med < 60.0, "and the boards stay in sync with each other", r.skew_med, 60.0);
 
-    // NOT FIXED, AND SAID SO. The common wind-up is real and large: measured +156.5/+183.6 ppm
-    // against +25/+55 at this cadence, with the second within 17 ppm of the +-200 clamp. It is
-    // inaudible right up until a board RAILS, at which point it loses the authority to correct
-    // anything -- which is exactly what board a did on the bench 2026-09-02. Two attempts at this
+    // THIS SCENARIO NO LONGER REPRODUCES THE WIND-UP AT ALL, and every step of that was a defect
+    // in the model rather than a change to the engine:
+    //
+    //   no resync, bang-bang buffer     +156.5/+183.6   excess +131/+129 ppm
+    //   + the client's 50 ms resync      +46.4/ +75.4   excess  +21/ +20
+    //   + honest supply (backlog)        +22.5/ +51.6   excess -2.5/ -3.4
+    //
+    // Against a target of +25/+55. The first version let the error run to 129 s because nothing
+    // bounded it; the second still refilled the buffer at 2x whenever it sat below nominal, which
+    // the rate surplus triggered every tick -- manufacturing 449 s of audio across a 900 s run and
+    // hiding it in the nominal clamp. With supply at realtime plus a finite backlog, the integral
+    // settles within ~3 ppm of correct and there is no wind-up to see.
+    //
+    // So: the bench wound a hand-zeroed crystal to +192 against a true +46, WITH a resync active,
+    // and this model given the same conditions winds essentially nothing. The gap is now total,
+    // not narrowed -- the bench's wind-up has a driver this simulator does not contain, and the
+    // three drivers it used to be blamed on here were all artifacts. Do not cite 3a as evidence
+    // that the wind-up is reproduced, and do not tune against it.
+    //
+    // The wind-up is inaudible right up until a board RAILS, at which point it loses the authority
+    // to correct anything -- which is what board a did on the bench 2026-09-02. Three attempts at this
     // have now failed: holding the integral during starvation (reverted, bc80f18: it suppresses
     // real drift identically) and gating phase publication (4e68870: measured NEUTRAL here at this
     // cadence, and actively harmful at 50% duty, where losing gd sends position onto the common
-    // error). The bound below is where it sits today, not where it should sit.
+    // error). The third was a shared common-mode correction on RATE (3c): the consensus is sound
+    // and the plumbing works, but rate is the wrong actuator for a displacement -- see 3c.
+    // The bound below is where it sits today, not where it should sit.
     check(std::fabs(r.xtal_a) < 200.0f && std::fabs(r.xtal_b) < 200.0f,
           "neither has RAILED yet (documented gap: the wind-up itself is unaddressed)",
           std::max(std::fabs(r.xtal_a), std::fabs(r.xtal_b)), 200.0);
     printf("        gd filter SNAPS: %d, mean |snap| %.0f us, max %d us  -> Kp*snap ~ %.0f ppm at the max\n",
            r.gd_snaps, r.gd_snaps ? r.gd_snap_abs_sum / r.gd_snaps : 0.0, r.gd_snap_max,
            0.45 * r.gd_snap_max);
+  }
+
+  printf("\n3c. SHARED COMMON-MODE CORRECTION: can the group take the common error out itself,\n");
+  printf("    so the crystal integral stops absorbing it?\n");
+  {
+    // THE PREREQUISITE, checked before the mechanism was written: e_common is genuinely common.
+    // Across every scenario above the two boards' values agree to 1-4% with r up to 1.00, and
+    // disagree by a flat ~80 us that does NOT scale with the error -- exactly the per-board
+    // measurement noise. So a consensus over them is well posed, and the reason to take it is not
+    // the sqrt(2) of noise it saves at N=2 but that a SHARED correction is the same number on
+    // every board and therefore injects no differential at all.
+    //
+    // WHAT MUST HOLD, and what must not be confused:
+    //   - total commanded rate stays at plant + common          (the loop still tracks)
+    //   - skew does not regress                                 (nothing audible was traded)
+    //   - the CRYSTAL falls from plant + common toward plant    (the integral stops absorbing it)
+    // The third is the point, and it is why the crystal cannot be scored against a fixed target
+    // across this sweep: the correct value for the integral MOVES as the gain takes the common
+    // part away from it. Scoring against `plant + common` throughout would report the mechanism
+    // working as a failure -- the same error that made a reverted guard look like a 20 ppm win.
+    const double plant_a = -15.0, plant_b = +15.0, common = 40.0;
+    Faults hungry{};
+    hungry.starve_period_s = 120.0;
+    hungry.starve_secs = 6.0;
+    // THE HARD RESYNC, which 3a deliberately omits and this test must not. Without it the error
+    // accumulates unbounded -- the common error reaches 129 SECONDS and the baseline skew p90 is
+    // 2.7 s -- so the correction saturates at its clamp for every gain and the sweep returns four
+    // identical rows. That is a property of the scenario, not of the mechanism. The real client
+    // resyncs at 50 ms, which is what keeps the common error in the millisecond range the bench
+    // actually shows (1-11 ms) and where a proportional correction means anything at all.
+    hungry.resync_us = 50000.0;
+    printf("        plant %+.0f/%+.0f, common %+.0f  ->  total wants %+.0f/%+.0f;"
+           " integral wants %+.0f/%+.0f once the gain carries the common part\n",
+           plant_a, plant_b, common, plant_a + common, plant_b + common, plant_a, plant_b);
+    printf("        %-6s %9s %9s %9s %9s %9s %9s %8s %7s\n",
+           "gain", "xtal a", "xtal b", "pc a", "pc b", "rate a", "rate b", "skew med", "p90");
+    for (double gain : {0.0, 0.25, 0.5, 1.0}) {
+      Profile q = p;
+      q.common_gain = static_cast<float>(gain);
+      char tag[24];
+      snprintf(tag, sizeof(tag), "cmn-%.2f", gain);
+      Result r = simulate(tag, q, plant_a, plant_b, common, 80.0, 1800.0, TRUE_LAND, hungry);
+      printf("        %-6.2f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f %8.0f %7.0f\n",
+             gain, r.xtal_a, r.xtal_b, r.pc_a, r.pc_b, r.rate_a, r.rate_b,
+             r.skew_med, r.skew_p90);
+      printf("               [shared? mean |pc_a - pc_b| = %.2f ppm; consensus BOTH %.0f%%,"
+             " ONE-SIDED %.0f%%]\n",
+             r.pc_absdiff, 100.0 * r.common_both_frac, 100.0 * r.common_one_sided_frac);
+      if (gain == 0.0) {
+        // The consensus is formed and recorded even when the gain is zero -- that is the shadow,
+        // and it is what makes the first row a genuine control rather than a different experiment.
+        printf("               [shadow: consensus available on %.0f%% of settled decisions,"
+               " correction applied %.2f ppm]\n", 100.0 * r.common_valid_frac, r.pc_a);
+      }
+    }
   }
 
   printf("\n3b. SPLIT FILTER: does rate benefit from a faster error filter than position?\n");
@@ -612,7 +868,9 @@ int main() {
     for (int64_t div : {1, 2, 4, 8}) {
       Profile q = p;
       q.rate_filter_lag_us = div == 1 ? 0 : shared / div;   // 0 = shared, i.e. today
-      Result r = simulate(q, -15.0, +15.0, 40.0, 80.0, 600.0, TRUE_LAND);
+      char tag[24];
+      snprintf(tag, sizeof(tag), "rtfilt-%lld", static_cast<long long>(div));
+      Result r = simulate(tag, q, -15.0, +15.0, 40.0, 80.0, 600.0, TRUE_LAND);
       char lbl[48];
       if (div == 1) {
         snprintf(lbl, sizeof(lbl), "shared (%lld ms)", static_cast<long long>(shared / 1000));
@@ -626,6 +884,44 @@ int main() {
     printf("        (a faster rate filter should cut lag; it also passes more noise to Kp)\n");
   }
 
+  printf("\n3d. MASS BALANCE: does audio in equal audio out? Nothing in the loop enforces it --\n");
+  printf("    the servo closes on the deadline error and buffer occupancy is never a setpoint.\n");
+  {
+    // The firmware now emits MASSBAL for exactly this; this is the same accounting in the model,
+    // so the analysis that grades a log can be reasoned about before a board ever runs it.
+    //
+    // WHAT A DEFICIT MEANS depends entirely on which column carries it, which is why discards are
+    // counted apart from playout: in < out with disc ~ 0 is the network failing to supply, while
+    // disc carrying it is the correction eating the buffer. From the buffer level alone -- all
+    // anything had until now -- those are indistinguishable.
+    struct MbCase { const char *name; const char *tag; Faults f; };
+    Faults none{};
+    Faults starve{};  starve.starve_period_s = 119.0; starve.starve_secs = 3.0;
+                      starve.resync_us = 50000.0;
+    const MbCase cases[] = {{"clean", "mb-clean", none},
+                            {"starvation bursts", "mb-starve", starve}};
+    printf("        %-20s %10s %10s %9s %10s %10s %9s\n",
+           "case", "in (s)", "out (s)", "disc (ms)", "d (ms)", "dbuf (ms)", "resid");
+    for (const MbCase &c : cases) {
+      Result r = simulate(c.tag, p, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, c.f);
+      const double d_a = r.mb_in_a - r.mb_out_a - r.mb_disc_a;
+      const double dbuf_a = r.buf_end_a - r.buf_start;
+      printf("        %-20s %10.1f %10.1f %9.0f %10.0f %10.0f %9.0f\n",
+             c.name, r.mb_in_a / 1e6, r.mb_out_a / 1e6, r.mb_disc_a / 1000.0,
+             d_a / 1000.0, dbuf_a / 1000.0, (d_a - dbuf_a) / 1000.0);
+      // THE IDENTITY, on the clean case only. With starvation the buffer spends real time pinned
+      // at 0 and at nominal, and a clamp genuinely destroys audio -- the DAC cannot consume what
+      // has not arrived -- so a residual there is the clamp doing its job, not a missing path.
+      // Asserting it in both cases would be asserting that starvation is lossless.
+      if (c.f.starve_period_s == 0.0) {
+        check(std::fabs(d_a - dbuf_a) < 20000.0,
+              "unclamped, the buffer IS the integral of in - out - disc",
+              (d_a - dbuf_a) / 1000.0, 0.0);
+      }
+    }
+    printf("        (a clean run should show in ~ out, disc 0, and the residual at the clamp only)\n");
+  }
+
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
   printf("   behind the engine's back by a resync path that never tells it\n");
   {
@@ -634,7 +930,9 @@ int main() {
     // winding 15-26 ppm/min to 280 ppm apart, |ef| in milliseconds. In here, previously:
     // skew median 19 us, p90 34 us, zero corrections. One of those is wrong about the same system.
     // Each fault on its own, then together, so the dominant one is visible rather than inferred.
-    struct Case { const char *name; Faults f; };
+    // `tag` is the CSV label and `name` the printed one: two of the display names contain a
+    // comma, which would split into a phantom column and shift every field after it.
+    struct Case { const char *name; const char *tag; Faults f; };
     Faults none{}, blind{}, resync{}, both{};
     blind.blind_fraction = 0.5;                                     // as measured on a
     resync.resync_us = 50000.0;                       // the client's hard_resync threshold, 50 ms
@@ -648,15 +946,15 @@ int main() {
     Faults all{};     all = starve; all.reanchor_period_s = 180.0; all.reanchor_us = 120000.0;
                       all.blind_fraction = 0.5;
     Faults all_told = all; all_told.announce_resync = true;
-    const Case cases[] = {{"clean (as before)", none},
-                          {"50% observations missing", blind},
-                          {"starvation bursts", starve},
-                          {"timebase re-anchors", anchor},
-                          {"all three, UNANNOUNCED resync", all},
-                          {"all three, ANNOUNCED resync", all_told}};
+    const Case cases[] = {{"clean (as before)", "clean", none},
+                          {"50% observations missing", "blind50", blind},
+                          {"starvation bursts", "starve", starve},
+                          {"timebase re-anchors", "reanchor", anchor},
+                          {"all three, UNANNOUNCED resync", "all-blind", all},
+                          {"all three, ANNOUNCED resync", "all-told", all_told}};
     printf("        %-28s %10s %10s %8s %9s\n", "faults", "skew med", "skew p90", "corr", "frames");
     for (const Case &c : cases) {
-      Result r = simulate(p, -1.5, +1.5, 40.0, 80.0, 900.0, TRUE_LAND, c.f);
+      Result r = simulate(c.tag, p, -1.5, +1.5, 40.0, 80.0, 900.0, TRUE_LAND, c.f);
       printf("        %-28s %9.0fu %9.0fu %8d %9ld\n", c.name, r.skew_med, r.skew_p90,
              r.corr, r.gross);
     }

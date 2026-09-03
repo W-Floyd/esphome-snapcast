@@ -419,6 +419,21 @@ struct __attribute__((packed)) TsfPacket {
   // the group mean so only the differential survives (2026-08-30: a residual ~5 us asymmetry in the
   // pairing marched both biases +3 us/min toward the +-500 cap).
   int32_t render_bias_us;
+  // THIS SENDER'S COMMON ERROR (us), INT32_MIN = unknown / older sender / no split available.
+  //
+  // e_common is the part of this device's deadline error that it SHARES with the group, as
+  // opposed to e_diff which separates it from peers. Published so the group can agree on one
+  // value for it: a correction computed from a SHARED number is identical on every member and so
+  // injects no differential, whereas each device acting on its own estimate injects
+  // gain x (noise_A - noise_B), which is the per-board gain the timing design forbids.
+  //
+  // Verified in tests/group before the field existed: two boards' e_common agree to 1-4% with
+  // r up to 1.00, disagreeing by a flat ~80 us that does not scale with the error -- their
+  // measurement noise and nothing else. That is what makes a consensus over them well posed.
+  //
+  // Diagnostics-and-control, NOT timebase: it never feeds the mapping. Appended at the END with
+  // no version bump, per the crystal_ppm precedent -- an older sender simply does not carry it.
+  int32_t common_err_us;
 };
 
 // Fields from render_phase_us onward are the newest additions, so an older sender's packet is
@@ -596,16 +611,34 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
       // perfectly usable. BOTH must be reset every iteration, since pkt is reused and would
       // otherwise carry the PREVIOUS sender's values -- for stream_id_hash that means silently
       // accepting a short packet as belonging to whatever stream the last long packet named.
-      if (n < static_cast<ssize_t>(offsetof(TsfPacket, render_phase_age_ms))) {
+      // EVERY DEFAULT IS GATED ON ITS OWN FIELD'S PRESENCE. render_phase_age_ms and
+      // render_bias_us used to be reset for ANY short packet, which was correct only while
+      // render_bias_us was the last field -- "short" then implied "lacks it". Appending
+      // common_err_us broke that silently: a peer on the previous build sends a packet carrying a
+      // valid bias that is merely 4 bytes shorter, and the unconditional reset would clobber it
+      // with INT32_MIN, disabling render-bias exchange for the whole rolling reflash. The same
+      // trap arms itself again for whoever appends the next field, so the rule is now uniform
+      // rather than special-cased at the tail.
+#define TSF_LACKS(field) (n < static_cast<ssize_t>(offsetof(TsfPacket, field) + sizeof(pkt.field)))
+      if (TSF_LACKS(crystal_ppm)) {
         pkt.crystal_ppm = NAN;
+      }
+      if (TSF_LACKS(stream_id_hash)) {
         pkt.stream_id_hash = 0;
       }
-      pkt.render_phase_age_ms = 0xFFFF;  // older sender: pair by receipt, as before
-      pkt.render_bias_us = INT32_MIN;
-      if (n < static_cast<ssize_t>(offsetof(TsfPacket, adopted_tms_at_base_us) +
-                                   sizeof(pkt.adopted_tms_at_base_us))) {
-        pkt.adopted_tms_at_base_us = TMS_ADOPT_UNKNOWN;  // sender predates the field
+      if (TSF_LACKS(render_phase_age_ms)) {
+        pkt.render_phase_age_ms = 0xFFFF;  // older sender: pair by receipt, as before
       }
+      if (TSF_LACKS(render_bias_us)) {
+        pkt.render_bias_us = INT32_MIN;
+      }
+      if (TSF_LACKS(adopted_tms_at_base_us)) {
+        pkt.adopted_tms_at_base_us = TMS_ADOPT_UNKNOWN;
+      }
+      if (TSF_LACKS(common_err_us)) {
+        pkt.common_err_us = INT32_MIN;  // sender predates the field: absent, not zero
+      }
+#undef TSF_LACKS
     }
     if (pkt.magic != TSF_MAGIC || pkt.version != TSF_VERSION) {
       continue;
@@ -671,6 +704,12 @@ void TsfSync::receive_(int64_t local_now_us, const Estimate &est, uint32_t serve
     if (pkt.render_bias_us != INT32_MIN) {
       peer->bias_us = pkt.render_bias_us;
       peer->bias_seen_us = local_now_us;
+    }
+    // Absent stays absent: a peer with no differential has no split to publish, and storing a 0
+    // for that would drag the consensus toward zero with a non-measurement.
+    if (pkt.common_err_us != INT32_MIN) {
+      peer->common_err_us = pkt.common_err_us;
+      peer->common_seen_us = local_now_us;
     }
     // An incomparable phase is dropped, not recorded as UNKNOWN: record_peer_phase_ deliberately
     // keeps a peer's last phase when it reports UNKNOWN, so overwriting would be a no-op anyway,
@@ -844,6 +883,8 @@ TsfSync::Peer *TsfSync::find_peer_(const uint8_t mac[6], int64_t local_now_us) {
       p.used = true;
       p.bias_us = INT32_MIN;  // unknown until this peer reports one
       p.bias_seen_us = 0;
+      p.common_err_us = INT32_MIN;
+      p.common_seen_us = 0;
       p.phase_us = RENDER_PHASE_UNKNOWN;
       p.pipeline_us = PIPELINE_UNKNOWN;
       p.crystal_ppm = NAN;
@@ -1424,6 +1465,7 @@ void TsfSync::broadcast_phase_only_(uint32_t server_id_hash, uint32_t stream_id_
   pkt.render_phase_us = this->render_phase_for_beacon_();
   pkt.render_phase_age_ms = this->render_phase_age_ms_();
   pkt.render_bias_us = this->pub_render_bias_us_.load(std::memory_order_relaxed);
+  pkt.common_err_us = this->pub_common_err_us_.load(std::memory_order_relaxed);
   pkt.crystal_ppm = this->pub_crystal_ppm_.load(std::memory_order_relaxed);
 
   struct sockaddr_in dest = {};
@@ -1569,6 +1611,7 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
     pkt.render_phase_us = this->render_phase_for_beacon_();
     pkt.render_phase_age_ms = this->render_phase_age_ms_();
     pkt.render_bias_us = this->pub_render_bias_us_.load(std::memory_order_relaxed);
+    pkt.common_err_us = this->pub_common_err_us_.load(std::memory_order_relaxed);
   }
   struct sockaddr_in dest = {};
   dest.sin_family = AF_INET;
@@ -1641,6 +1684,7 @@ void TsfSync::send_phase_report(int64_t local_now_us) {
   pkt.render_phase_age_ms =
       static_cast<uint16_t>(std::clamp<int64_t>((local_now_us - at) / 1000, 0, 0xFFFE));
   pkt.render_bias_us = this->pub_render_bias_us_.load(std::memory_order_relaxed);
+  pkt.common_err_us = this->pub_common_err_us_.load(std::memory_order_relaxed);
   struct sockaddr_in dest = {};
   dest.sin_family = AF_INET;
   dest.sin_port = htons(TSF_PORT);

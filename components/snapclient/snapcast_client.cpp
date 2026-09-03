@@ -2504,6 +2504,9 @@ void SnapcastClient::emit_pcm_(const uint8_t *data, size_t len, int64_t server_t
   while (written < len && !this->shutdown_.load(std::memory_order_relaxed)) {
     written += this->pcm_ring_->write_without_replacement(data + written, len - written, pdMS_TO_TICKS(100));
   }
+  // Mass balance: what actually entered the ring, not what was offered. A short write on shutdown
+  // must not be counted as supply.
+  this->pcm_in_bytes_.fetch_add(written, std::memory_order_relaxed);
   if (written < len) {
     return;
   }
@@ -3834,6 +3837,41 @@ void SnapcastClient::player_task_() {
         this->ring_depth_us_.store(static_cast<int64_t>(this->pcm_ring_->available()) * 1000000 /
                                        (static_cast<int64_t>(fb_h) * rec.params.sample_rate),
                                    std::memory_order_relaxed);
+        // MASSBAL: does audio in equal audio out? Nothing in the loop enforces it -- the servo
+        // closes on the deadline error and buffer occupancy is never a setpoint -- so this is the
+        // only place the question is asked. Own short line, fixed field count, no variable tail.
+        //
+        // d = in - out - disc is the ring's own accounting identity: over a window it must equal
+        // the change in depth, so a d that does not match the depth delta means bytes went
+        // somewhere unaccounted. in < out with disc ~ 0 is a supply shortfall; disc carrying the
+        // deficit is the correction eating the buffer. Those are the two cases that look identical
+        // from the ring depth alone, which is all anything has had until now.
+        {
+          const int64_t mb_now = now_us();
+          if (this->mb_report_us_ == 0) {
+            this->mb_report_us_ = mb_now;
+          } else if (mb_now - this->mb_report_us_ >= 10000000) {
+            const uint64_t in_now = this->pcm_in_bytes_.load(std::memory_order_relaxed);
+            const uint64_t out_now = this->pcm_out_bytes_.load(std::memory_order_relaxed);
+            const uint64_t disc_now = this->pcm_discard_bytes_.load(std::memory_order_relaxed);
+            const int64_t bps = static_cast<int64_t>(fb_h) * rec.params.sample_rate;
+            const int64_t in_us = static_cast<int64_t>(in_now - this->mb_in_prev_) * 1000000 / bps;
+            const int64_t out_us = static_cast<int64_t>(out_now - this->mb_out_prev_) * 1000000 / bps;
+            const int64_t disc_us =
+                static_cast<int64_t>(disc_now - this->mb_disc_prev_) * 1000000 / bps;
+            ESP_LOGW(TAG,
+                     "MASSBAL dt=%" PRId64 " in=%" PRId64 " out=%" PRId64 " disc=%" PRId64
+                     " d=%" PRId64 " ring=%" PRId64 " rate=%+.2f",
+                     (mb_now - this->mb_report_us_) / 1000, in_us, out_us, disc_us,
+                     in_us - out_us - disc_us,
+                     this->ring_depth_us_.load(std::memory_order_relaxed),
+                     this->rate_ppm_mirror_.load(std::memory_order_relaxed));
+            this->mb_report_us_ = mb_now;
+            this->mb_in_prev_ = in_now;
+            this->mb_out_prev_ = out_now;
+            this->mb_disc_prev_ = disc_now;
+          }
+        }
         // Capacity, not fill: the starvation floor and the implausibility bound are both derived
         // from it, and both need a value that does not collapse when the buffer empties.
         this->ring_capacity_us_.store(static_cast<int64_t>(this->config_.buffer_size) * 1000000 /
@@ -4536,6 +4574,8 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // bench's 2972 ms capacity this is ~371 ms, above the 500 ms "ring low" band a keeps entering.
   prof.buffer_floor_us = this->ring_capacity_us_.load(std::memory_order_relaxed) / 8;
   prof.target_position_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
+  prof.common_gain = this->tune_common_gain_.load(std::memory_order_relaxed);
+  prof.common_authority_ppm = this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
 
   timing::Observation obs;
@@ -4554,9 +4594,39 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
       grp.delta_us = gd;
       grp.contributors = this->tsf_sync_->group_delta_n();
     }
+    // The group's shared view of the COMMON error. Absent unless two members published one, and
+    // absent is not zero -- the engine reports common_shared_valid so a shadow can tell the
+    // difference between "the group agreed on 0" and "there was no group to agree".
+    int64_t cmn_us = 0;
+    uint8_t cmn_n = 0;
+    if (this->tsf_sync_->common_err_consensus_us(obs.at_us, cmn_us, cmn_n)) {
+      grp.common_valid = true;
+      grp.common_us = cmn_us;
+      grp.common_n = cmn_n;
+    }
   }
 
   const timing::Command cmd = this->timing_engine_.step(obs.at_us, obs, grp);
+
+  // PUBLISH OUR OWN e_common for the next beacon, and only when the split actually exists. A
+  // board with no differential has no common part to speak of, and publishing 0 for that would
+  // pull every peer's consensus toward zero with a value that is not a measurement.
+  if (this->tsf_sync_ != nullptr) {
+    this->tsf_sync_->set_common_err_us(cmd.decision.e_split_valid ? cmd.decision.e_common_us
+                                                                  : INT32_MIN);
+  }
+
+  // CMNC: the consensus beside this board's own value, on its own short line. This is the SHADOW
+  // -- it is logged whether or not common_gain is applying it, so the prerequisite ("is e_common
+  // actually common on real boards?") is answerable before any gain is turned on. The simulator
+  // says yes (agreement to 1-4%, r up to 1.00, disagreement flat at the measurement noise); no
+  // board has ever been asked.
+  if (cmd.decision.common_shared_valid) {
+    ESP_LOGD(TAG, "CMNC n=%u grp=%+" PRId32 " mine=%+" PRId32 " val=%d pc=%+.2f t=%" PRId64,
+             cmd.decision.common_n, cmd.decision.common_shared_us,
+             cmd.decision.e_split_valid ? cmd.decision.e_common_us : 0,
+             cmd.decision.e_split_valid ? 1 : 0, cmd.decision.pc_ppm, now_us());
+  }
 
   // Persist the learned crystal on the old gate: 10 minutes or 2 ppm of movement, whichever
   // comes first, so a reboot restores a value that is minutes old at worst rather than zero.
@@ -4658,6 +4728,8 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
              cmd.decision.e_diff_us, cmd.decision.gd_snap_us, cmd.decision.slew_clipped ? 1 : 0,
              tnow);
   }
+  // Mirrored for the mass-balance line, which runs on the player task and has no decision to hand.
+  this->rate_ppm_mirror_.store(cmd.rate_ppm, std::memory_order_relaxed);
   return cmd;
 }
 
@@ -4860,6 +4932,12 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "ratewhy_ppm") {
     return this->tune_ratewhy_ppm_.load(std::memory_order_relaxed);
   }
+  if (name == "common_gain") {
+    return this->tune_common_gain_.load(std::memory_order_relaxed);
+  }
+  if (name == "common_authority_ppm") {
+    return this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
+  }
   if (name == "tag_stale_ms") {
     return static_cast<float>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed));
   }
@@ -4925,6 +5003,22 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     if (!std::isfinite(value) || value < 0.5f || value > 500.0f) return false;
     this->tune_ratewhy_ppm_.store(value, std::memory_order_relaxed);
     ESP_LOGI(TAG, "ratewhy_ppm = %.2f t=%" PRId64, value, now_us());
+  } else if (name == "common_gain") {
+    // 0 = OFF, and off is the default: the shared correction is SHADOWED (CMNC is logged, the
+    // consensus is formed) without acting. Turning it on is an A/B, not a setting -- the
+    // rate-actuated form was falsified in tests/group 3c, where a 14 ms common error over a 2 s
+    // horizon demands 7000 ppm, so the term pins at its clamp and the gain stops mattering above
+    // a threshold far below 0.25. Kept tunable so that result can be confirmed on hardware
+    // without a reflash, not because a nonzero value is expected to help.
+    if (!std::isfinite(value) || value < 0.0f || value > 2.0f) return false;
+    this->tune_common_gain_.store(value, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "common_gain = %.3f t=%" PRId64, value, now_us());
+  } else if (name == "common_authority_ppm") {
+    // The ceiling the term actually operates at, given it saturates. This is the knob that
+    // matters for an A/B, not the gain.
+    if (!std::isfinite(value) || value < 0.0f || value > 200.0f) return false;
+    this->tune_common_authority_ppm_.store(value, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "common_authority_ppm = %.1f t=%" PRId64, value, now_us());
   } else if (name == "split_ramp_us_per_s") {
     // TEST HOOK rate. The default 100 us/s is deliberately "ordinary drift" (the clock-offset
     // estimate wanders about that fast unaided), which is right for measuring a repair but wrong
@@ -6287,6 +6381,9 @@ void SnapcastClient::discard_ring_bytes_(size_t bytes) {
     size_t n = this->pcm_ring_->read(this->slice_buffer_.get(), std::min(bytes, SLICE_BUFFER_SIZE),
                                      pdMS_TO_TICKS(100));
     bytes -= n;
+    // DISCARDED, not played: this is the correction draining the ring. Counted apart from the
+    // played path so the balance line can say which of the two emptied the buffer.
+    this->pcm_discard_bytes_.fetch_add(n, std::memory_order_relaxed);
     // Same silent-unbounded-wait problem as push_chunk_'s read, and the same fix: this is the other
     // place the player task can disappear into without a word.
     if (n == 0) {
@@ -6419,6 +6516,7 @@ void SnapcastClient::push_chunk_(const ChunkRecord &rec, uint32_t drop_frames, b
     while (got < want && !this->shutdown_.load(std::memory_order_relaxed)) {
       const size_t n = this->pcm_ring_->read(this->slice_buffer_.get() + got, want - got, pdMS_TO_TICKS(100));
       got += n;
+      this->pcm_out_bytes_.fetch_add(n, std::memory_order_relaxed);
       if (n == 0) {
         if (starve_since == 0) {
           starve_since = now_us();
