@@ -739,7 +739,23 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       (profile_.kp_from_diff_sigma && have_diff)
           ? std::max(gd_sigma_us, static_cast<float>(profile_.frame_us()))
           : sigma_e_us();
-  const float kp_used = p_sigma_us > 0.0f ? profile_.rate_noise_budget_ppm() / p_sigma_us : 0.0f;
+  float kp_used = p_sigma_us > 0.0f ? profile_.rate_noise_budget_ppm() / p_sigma_us : 0.0f;
+  // STABILITY CAP. The budget above is a noise constraint; this is the phase-margin one, and
+  // nothing in the design had it. Kp_crit = pi/(2L) for an integrator behind L of dead time, and
+  // rate_horizon_us IS that L. Capping can only ever REDUCE the gain, so it cannot introduce an
+  // instability of its own -- it removes the one the noise budget was blind to.
+  bool kp_capped = false;
+  if (profile_.kp_stability_frac > 0.0f) {
+    const float horizon_s_cap = static_cast<float>(profile_.rate_horizon_us()) / 1e6f;
+    if (horizon_s_cap > 0.0f) {
+      const float kp_crit = 1.5707963f / horizon_s_cap;   // pi/(2L)
+      const float kp_max = profile_.kp_stability_frac * kp_crit;
+      if (kp_used > kp_max) {
+        kp_used = kp_max;
+        kp_capped = true;
+      }
+    }
+  }
   const float p_raw = kp_used * static_cast<float>(e_position);
   const float p_term = std::clamp(p_raw, -profile_.rate_authority_ppm, profile_.rate_authority_ppm);
 
@@ -837,6 +853,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   cmd.decision.kp_ppm_per_us = kp_used;
   cmd.decision.p_sigma_us = p_sigma_us;
   cmd.decision.gd_sigma_us = gd_sigma_us;
+  cmd.decision.kp_capped = kp_capped;
   last_crystal_ppm_ = crystal_ppm_;
   last_p_ppm_ = p_term;
   rate_cmd_seeded_ = true;

@@ -1334,6 +1334,48 @@ int main() {
     printf("        (lower target = lower Kp; watch for corr/frames rising as rate gives up authority)\n");
   }
 
+  printf("\n3j. THE STABILITY CAP: Kp = budget/sigma_e has no phase margin in it\n");
+  {
+    // Rate drives position through an integrator behind rate_horizon_us of dead time, so the
+    // critical proportional gain is Kp_crit = pi/(2L). budget/sigma_e is a NOISE constraint and
+    // lands wherever sigma_e puts it -- which on the bench is 58% of critical at target=20, with
+    // the loop ringing at 10-14 s against a predicted 4L = 8 s.
+    //
+    // NOISE 20 us IS THE BENCH'S REGIME, and it is the only row that can test this. sigma_e floors
+    // at one frame (22 us) there, exactly as measured on hardware, so Kp lands high relative to
+    // Kp_crit. At the simulator's usual 80 us sigma_e is MEASURED at ~80, Kp lands at 16% of
+    // critical, and the loop is under-gained instead -- which is why lowering the target damped the
+    // bench and made the sim sluggish, and why 3i and the hardware sweep disagreed all night.
+    // Opposite sides of one optimum, not a fidelity bug.
+    //
+    // The cap can only REDUCE Kp, so it cannot introduce an instability of its own. What it should
+    // do: help where the loop rings, and be neutral where it is already below the limit.
+    const double L_s = static_cast<double>(p.rate_horizon_us()) / 1e6;
+    printf("        L=%.2f s so Kp_crit=pi/(2L)=%.3f /s; cap at 0.30 -> Kp_max=%.3f\n",
+           L_s, 1.5707963 / L_s, 0.30 * 1.5707963 / L_s);
+    printf("        %-26s %9s %8s %8s %8s %8s\n",
+           "case", "p2p/2min", "sd", "period", "corr", "frames");
+    for (double noise : {20.0}) {
+      for (int64_t tgt : {10, 20}) {
+        for (double frac : {0.0, 0.30, 0.20, 0.12, 0.07}) {
+          Profile q = p;
+          q.target_diff_us = tgt;
+          q.kp_stability_frac = static_cast<float>(frac);
+          const double budget = 1e6 * static_cast<double>(tgt) / static_cast<double>(p.rate_horizon_us());
+          char tag[32]; snprintf(tag, sizeof(tag), "cap-%.0f-%lld-%.0f", noise,
+                                 static_cast<long long>(tgt), frac * 100);
+          char nm[48]; snprintf(nm, sizeof(nm), "noise %.0f tgt %lld cap %s", noise,
+                                static_cast<long long>(tgt), frac > 0 ? "ON " : "off");
+          Result r = simulate(tag, q, -15.0, +15.0, 40.0, noise, 900.0, TRUE_LAND);
+          printf("        %-26s %9.1f %8.2f %8.1f %8d %8ld\n",
+                 nm, r.p2p_med, r.sd_med, r.period_s, r.corr, r.gross);
+          (void) budget;
+        }
+      }
+    }
+    printf("        (bench reference, target=10 diluted gd_sigma: p2p 87.7 us, sd 14.15, period 10-14 s)\n");
+  }
+
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
   printf("   behind the engine's back by a resync path that never tells it\n");
   {

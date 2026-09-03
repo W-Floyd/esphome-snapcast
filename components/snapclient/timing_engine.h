@@ -89,6 +89,52 @@ struct Profile {
   /// buffer or codec. Not a constant in this file -- it is a property of the hardware.
   float rate_authority_ppm = 100.0f;
 
+  /// STABILITY CAP ON Kp, as a fraction of the delay-limited critical gain. 0 disables it.
+  ///
+  /// Kp = budget/sigma_e bounds NOISE INJECTION and says nothing about phase margin. Rate drives
+  /// position through an integrator with rate_horizon_us of dead time, and for that plant the
+  /// critical proportional gain is Kp_crit = pi/(2L). Where budget/sigma_e lands relative to that
+  /// depends entirely on sigma_e -- so a gain can satisfy the noise budget and still ring.
+  ///
+  /// Measured 2026-09-03, bench L = 2.0 s so Kp_crit = 0.785 /s:
+  ///
+  ///     target=20  budget 10 ppm / sigma_e 22  ->  Kp 0.455  = 58% of critical
+  ///     target=10  budget  5 ppm / sigma_e 22  ->  Kp 0.227  = 29% of critical
+  ///
+  /// At 58% the loop is lightly damped and rings; the period for a delay-dominated loop near that
+  /// point is ~4L = 8 s against 10-14 s measured on the wire, and p2p tracked the gain (target 20
+  /// -> 106-146 us, target 10 -> 88-96). Lowering the target improved BOTH p2p and sd, which is
+  /// over-gain rather than a trade.
+  ///
+  /// This also reconciles the simulator, which disagreed all night: its sigma_e is measured at ~80
+  /// rather than floored at 22, so the same target puts it at 16% of critical -- UNDER-gained,
+  /// where the bench is over-gained. Lowering the target damped the bench and made the sim
+  /// sluggish. Opposite sides of the same optimum, not a fidelity bug.
+  ///
+  /// With the cap in force the target stops controlling ringing, which is what it should never
+  /// have controlled: it is a position-accuracy budget, not a phase margin.
+  /// 0.20, chosen with margin from a CLIFF rather than for its own number. Swept at bench-like
+  /// sigma_e (tests/group 3j, noise 20 us so sigma_e floors at one frame as it does on hardware),
+  /// median 2-minute p2p:
+  ///
+  ///     frac      off    0.30    0.20    0.12    0.07
+  ///     tgt=10    7.0    7.0     5.3     3.7    96.1   <- unstable
+  ///     tgt=20   10.7    7.4     5.2     3.5     2.8
+  ///
+  /// 0.12 is better still and sits next to a cliff: at 0.07 both targets cap Kp to the same 0.063
+  /// yet one is stable and the other is not, because target_diff_us ALSO gates how often the
+  /// crystal integral runs. Starving P while changing the integral's cadence goes unstable, and
+  /// the sim's L (1.75 s) and noise are only an approximation of the bench's, so the cliff's exact
+  /// position on hardware is unknown. 0.20 keeps a factor of ~3 from it.
+  ///
+  /// It also makes the loop nearly INDIFFERENT to the target -- 5.3 at tgt=10 against 5.2 at
+  /// tgt=20 -- which is the point: the target is a position-accuracy budget and should never have
+  /// been what set phase margin.
+  ///
+  /// On the bench (L = 2.0 s) this gives Kp_max = 0.157 against a current Kp of 0.227 at
+  /// target=10, so it binds and reduces the gain ~31%.
+  float kp_stability_frac = 0.20f;
+
   /// SHARED COMMON-MODE CORRECTION: SECONDS to drain the group's shared common error over.
   /// 0 = off, which is today's behaviour exactly.
   ///
@@ -330,6 +376,9 @@ struct Decision {
   /// cadences measures the loop's slow excursion rather than sample-to-sample noise, which is the
   /// distinction the noise estimator was deliberately built around.
   float gd_sigma_us = 0.0f;
+  /// Whether the stability cap bound this decision, i.e. the noise budget asked for a gain past
+  /// the delay limit. If this is set most of the time, the budget is not what is setting Kp.
+  bool kp_capped = false;
   bool slew_clipped = false;    ///< the command wanted to move further than authority*dt/horizon
 
   /// THE SHARED COMMON-MODE TERM, and the value it acted on. Recorded even when the correction is
