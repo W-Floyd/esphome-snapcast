@@ -1243,6 +1243,26 @@ void TsfSync::recompute_group_delta_(int64_t local_now_us) {
   // wire), the pairing gap, and the drift extrapolation. Shadow-only: nothing here steers. The
   // plan's pass condition is raw tracks the rival-clean wire at slope 1.0 +-0.15; gd (the halved
   // control-path delta) is logged beside it so the two are never confused.
+  //
+  // GRADED 2026-09-03 (scripts/bench/gdin-vs-wire.py), ~40 min post-flash against 100k
+  // rival-gated captures. IT FAILS, and the reason is the tails, not the signal:
+  //
+  //   Theil-Sen slope   a +0.462   b -0.476     (opposite signs, magnitudes within 3%)
+  //   raw MAD           a 15 us    b 15 us      <- core, comparable to the wire's 27-37 p10..p90
+  //   raw sd            a 48-87    b 127-269    <- tails
+  //   raw extremes      a -850438 us            b +44182 us
+  //
+  // The slope attenuates to ~0.47 by leverage from those extremes; least squares alone reported
+  // +0.005 with r=+0.914, which cannot both hold. So the group delta's core is about as tight as
+  // the wire and the damage is done by rare large inputs -- NOTHING here argues for reducing
+  // noise, it argues for rejecting outliers before they reach robust_mean, which with two
+  // contributors has nothing to reject them with.
+  //
+  // Three mechanisms tested and killed on the way: the pairing gap injecting a bias (r=0.098 and
+  // 0.009, zero pairings outside PHASE_PAIR_WINDOW_US), a random walk accumulating over the gap
+  // (raw MAD is FLAT at 14-17 us across a 170x range of |gap|, where sqrt accumulation predicts
+  // 15 -> 195), and the shared timebase being the source (PHDBG dmap MAD is 5 us and explains
+  // ~10% of dph; the phase moves 5 us MAD between calls).
   int64_t gdin_raw = 0, gdin_gap = 0, gdin_n = 0;
   double gdin_drift = 0.0, gdin_extrap = 0.0;
   for (size_t i = 0; i < MAX_PEERS && n < MAX_PEERS + 1; i++) {
