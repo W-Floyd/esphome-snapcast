@@ -371,7 +371,18 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   int64_t e_diff = 0;
   bool have_diff = false;
   float gd_sigma_us = 0.0f;
-  if (group.present && group.contributors > 1) {
+  // HOLD, don't sample, while this board is stepping its own audio. The differential the filter
+  // would read is this board's own correction reflected back at it (bench 2026-09-03: gd read 97%
+  // of a 1136-frame step), and the filter clamps rather than rejects, so it would be adopted in
+  // part. The last good value stays in gd_mean_us_ and continues to drive P.
+  //
+  // gd_last_at_us_ IS refreshed during the hold. The first version deliberately did not, reasoning
+  // that the interval should reflect real observations -- which is backwards: gmax = (authority +
+  // CRYSTAL_LIMIT) * gdt + frame, so letting gdt grow across the hold WIDENS the clamp, and the
+  // first sample after release lands harder than if the hold had never happened. Measured: skew
+  // p90 1782 -> 15792 us and corrections 61 -> 96 with the interval left to grow.
+  const bool gd_hold = profile_.gate_gd_on_transient && group.self_transient;
+  if (group.present && group.contributors > 1 && !gd_hold) {
     // FILTERED, with the same discipline as the deadline error: same time constant from the
     // measured transport delay, same consecutive-difference noise estimate, same innovation
     // rate-limit. Acting on the raw delta is what made single measurement spikes into whole-frame
@@ -425,6 +436,16 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     gd_sigma_prev_us_ = gd_sigma_us;
     e_diff = static_cast<int64_t>(std::llround(gd_mean_us_));
     have_diff = true;
+    differential = std::llabs(e_diff) >= profile_.target_position_us;
+  } else if (gd_hold && gd_seeded_) {
+    // HOLDING STILL SUPPLIES A DIFFERENTIAL. Dropping have_diff here would send e_position to the
+    // DEADLINE error instead -- 700 us to 10 ms on the bench against a differential of tens of us
+    // -- so a gate meant to reject a phantom would hand P something an order of magnitude worse.
+    // The held value is the last differential measured while the phase still described the audio.
+    e_diff = static_cast<int64_t>(std::llround(gd_mean_us_));
+    have_diff = true;
+    gd_last_at_us_ = now_us;
+    gd_sigma_us = gd_sigma_prev_us_;
     differential = std::llabs(e_diff) >= profile_.target_position_us;
   }
 

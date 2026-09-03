@@ -98,6 +98,11 @@ struct Board {
   /// The split is only computed when the group supplies a differential. Without this flag the CSV
   /// wrote a 0 for "not computed", indistinguishable from a genuine zero error -- 340731 of the
   /// 388786 rows, every one of which would have been averaged in as a measurement.
+  /// When a position correction last LANDED. The bench shows the board's own landed step reappearing
+  /// as a phantom differential -- gd read 25.0 ms against a 1136-frame (25.76 ms) correction -- because
+  /// phase is derived from err_us and a peer's beaconed phase is up to a second stale. Recorded so the
+  /// same signature can be looked for here rather than argued about.
+  int64_t last_land_us = 0;
   int64_t last_common_c_us = 0;      ///< last consensus formed, held while fresh
   int64_t last_common_c_at_us = 0;
   double last_pc_ppm = 0.0;          ///< the shared common-mode term the engine applied
@@ -139,6 +144,11 @@ struct Result {
   double rate_a = 0.0, rate_b = 0.0;
   /// The shared correction actually applied, and how often the group could form one at all.
   double pc_a = 0.0, pc_b = 0.0;
+  /// Mean |e_diff| within 2 s of this board's own correction landing, versus everywhere else.
+  /// The bench's phantom signature: gd reading the board's own step back as a differential.
+  double ediff_after_land = 0.0, ediff_baseline = 0.0;
+  long ediff_after_n = 0;
+  double ediff_after_flagged = 0.0;  ///< fraction of phantom samples the transient flag catches
   double common_valid_frac = 0.0;
   /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
   /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
@@ -236,6 +246,8 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
+  double ph_after_sum = 0.0, ph_base_sum = 0.0;
+  long ph_after_n = 0, ph_base_n = 0, ph_after_flagged = 0;
   double rate_sum_a = 0.0, rate_sum_b = 0.0, pc_sum_a = 0.0, pc_sum_b = 0.0;
   long settled_n = 0, common_valid_n = 0, common_one_sided_n = 0, both_valid_n = 0;
   double pc_absdiff_sum = 0.0;
@@ -277,7 +289,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     for (size_t i = 0; i < b.size(); i++) {
       Board &x = b[i];
       for (auto it = x.inflight.begin(); it != x.inflight.end();) {
-        if (t >= it->first) { x.err_us -= double(it->second) * double(p.frame_us()); it = x.inflight.erase(it); }
+        if (t >= it->first) { x.err_us -= double(it->second) * double(p.frame_us()); x.last_land_us = t; it = x.inflight.erase(it); }
         else ++it;
       }
       if (x.live && x.inflight.empty()) { x.eng.confirm_position_landed(x.pid, t); x.live = false; }
@@ -465,6 +477,9 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
         }
       }
 
+      // The board's own transient, exactly the flag it already uses to stop beaconing.
+      g.self_transient = !x.phase_publishing;
+
       if (g.present) {
         gd_present_ticks++;
         gd_age_sum_us += static_cast<double>(t - x.last_gd_at_us);
@@ -508,6 +523,14 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
         x.live = true;
         x.corrections++;
         x.gross_frames += std::abs(c.frames);
+        // A DELIVERED CORRECTION ARMS THE TRANSIENT, which is what the client does at
+        // snapcast_client.cpp `if (applied_frames != 0)`: "a delivered correction moves the audio,
+        // so the phase does not describe it until the horizon passes". This simulator's comment
+        // claimed the arm existed and the code only ever armed on the ring floor, so the phantom
+        // differential was produced here but never FLAGGED -- and a gate on the flag would have
+        // read as a no-op for the wrong reason. Armed at delivery, not at landing, because the
+        // phase is wrong for the whole flight.
+        x.phase_transient_until_us = std::max(x.phase_transient_until_us, t + p.compensation_us());
         // A DROP IS SPENT FROM THE BUFFER: dropping frames removes audio from the very thing that
         // lets playout continue. The engine caps a correction at half the buffer for this reason,
         // and that cap was unreachable here while the buffer was a constant.
@@ -521,6 +544,18 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       x.last_rate_ppm = c.rate_ppm;
       x.last_xtal_ppm = c.decision.crystal_ppm;
       x.last_gd_snap_us = c.decision.gd_snap_us;
+      // THE PHANTOM TEST: is |e_diff| larger just after this board's own correction landed than at
+      // other times? If the board is seeing its own step as a differential, it must be.
+      if (c.decision.e_split_valid && t > 120000000) {
+        const double ad = std::fabs(static_cast<double>(c.decision.e_diff_us));
+        if (x.last_land_us > 0 && t - x.last_land_us <= 2000000) {
+          ph_after_sum += ad; ph_after_n++;
+          // Would the gate have caught it? The flag must actually be set on these samples, or a
+          // gate on it is inert -- which is precisely what the missing delivered-correction arm
+          // would have hidden.
+          if (!x.phase_publishing) ph_after_flagged++;
+        } else { ph_base_sum += ad; ph_base_n++; }
+      }
       x.last_pc_ppm = c.decision.pc_ppm;
       x.last_common_valid = c.decision.common_shared_valid;
       x.last_e_split_valid = c.decision.e_split_valid;
@@ -636,6 +671,10 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     r.rate_a = rate_sum_a / sn;  r.rate_b = rate_sum_b / sn;
     r.pc_a = pc_sum_a / sn;      r.pc_b = pc_sum_b / sn;
     r.common_valid_frac = static_cast<double>(common_valid_n) / sn;
+    r.ediff_after_land = ph_after_n ? ph_after_sum / ph_after_n : 0.0;
+    r.ediff_baseline = ph_base_n ? ph_base_sum / ph_base_n : 0.0;
+    r.ediff_after_n = ph_after_n;
+    r.ediff_after_flagged = ph_after_n ? static_cast<double>(ph_after_flagged) / ph_after_n : 0.0;
     r.pc_absdiff = pc_absdiff_sum / sn;
     r.common_one_sided_frac = static_cast<double>(common_one_sided_n) / sn;
     r.common_both_frac = static_cast<double>(both_valid_n) / sn;
@@ -920,6 +959,42 @@ int main() {
       }
     }
     printf("        (a clean run should show in ~ out, disc 0, and the residual at the clamp only)\n");
+  }
+
+  printf("\n3e. THE PHANTOM DIFFERENTIAL: does a board read its OWN landed correction as skew?\n");
+  {
+    // BENCH 2026-09-03: board a applied frames=+1136 (25.76 ms) and its group delta immediately
+    // read gd=+25005 us -- 97% of its own step, with a pairing gap of 71 us and extrap 0.00, so
+    // neither staleness nor extrapolation. Every such sample carried steady=0; every clean one
+    // carried steady=1. The board stops BEACONING during its transient but keeps feeding that
+    // same phase into its own gd filter, which clamps rather than rejects, and P = 0.46 * gd then
+    // commands tens of ppm. Position corrects a displacement and rate corrects the correction.
+    //
+    // The mechanism is expressible here: a landing steps err_us instantly, phase is derived from
+    // err_us, and a peer's beaconed phase is up to a second stale. So if it happens on the bench
+    // it must happen here -- unless the simulator's corrections are too small or too rare to show
+    // it. That is what this measures, rather than assuming either way.
+    printf("        %-26s %9s %9s %7s %8s %8s %8s %8s\n",
+           "case", "eD base", "after", "ratio", "flagged", "skew med", "skew p90", "corr");
+    struct PhCase { const char *name; const char *tag; Faults f; };
+    Faults none{};
+    Faults starve{};  starve.starve_period_s = 119.0; starve.starve_secs = 3.0; starve.resync_us = 50000.0;
+    const PhCase cases[] = {{"clean", "ph-clean", none}, {"starvation bursts", "ph-starve", starve}};
+    for (const PhCase &c : cases) {
+      for (int gate = 0; gate <= 1; gate++) {
+        Profile q = p;
+        q.gate_gd_on_transient = (gate == 1);
+        char tag[32]; snprintf(tag, sizeof(tag), "%s-g%d", c.tag, gate);
+        Result r = simulate(tag, q, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, c.f);
+        const double ratio = r.ediff_baseline > 0 ? r.ediff_after_land / r.ediff_baseline : 0.0;
+        char nm[48]; snprintf(nm, sizeof(nm), "%s %s", c.name, gate ? "GATE ON" : "gate off");
+        printf("        %-26s %9.0f %9.0f %7.2f %7.0f%% %8.0f %8.0f %8d\n",
+               nm, r.ediff_baseline, r.ediff_after_land, ratio,
+               100.0 * r.ediff_after_flagged, r.skew_med, r.skew_p90, r.corr);
+      }
+    }
+    printf("        (flagged%% must be high or the gate has nothing to act on -- that was the\n");
+    printf("         missing delivered-correction arm, which made the flag inert here)\n");
   }
 
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");

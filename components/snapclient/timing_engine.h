@@ -81,6 +81,18 @@ struct Profile {
   /// the clock cannot keep up -- it has 2000 ppm of actuator for a 46 ppm job -- but that a
   /// railed integral has no headroom and trips crystal_spent, which hands the work to POSITION,
   /// which is audible.
+  /// HOLD THE GROUP DELTA WHILE THIS BOARD IS STEPPING ITS OWN AUDIO. Off by default (today's
+  /// behaviour exactly), so it can be A/B'd rather than assumed.
+  ///
+  /// The filter clamps a wild innovation to gmax and then EWMAs it in; it never REJECTS one. So a
+  /// 25 ms phantom enters as several hundred us, P = Kp * gd turns that into tens of ppm, and the
+  /// slew limiter renders it as a smooth ramp out and back -- the 2 pi cycle the bench plots in
+  /// d(rate)/dt. Position corrects a displacement and rate then corrects the correction.
+  ///
+  /// Holding, not zeroing: the last good differential is the best estimate available while the
+  /// board's own phase is meaningless, and zeroing would itself be a step.
+  bool gate_gd_on_transient = false;
+
   float common_gain = 0.0f;
   /// Ceiling on the shared correction, separate from rate_authority_ppm because it answers a
   /// different question: authority bounds what this board may do ALONE (and so bounds the
@@ -188,6 +200,17 @@ struct GroupEvidence {
   bool common_valid = false;
   int64_t common_us = 0;     ///< consensus e_common; meaningless unless common_valid
   uint8_t common_n = 0;      ///< members contributing to it, self included
+
+  /// THIS BOARD IS STEPPING ITS OWN AUDIO. delta_us is measured as (peer phase - my phase), so
+  /// while my own audio is being moved the difference carries MY correction, not the group's
+  /// disagreement. The board already knows this -- it stops beaconing its phase for exactly this
+  /// reason -- and then feeds the same phase to its own filter anyway.
+  ///
+  /// Measured 2026-09-03: board a applied frames=+1136 (25.76 ms) and its group delta read
+  /// +25005 us on the next sample, 97% of its own step, with a pairing gap of 71 us and
+  /// extrap 0.00 -- neither staleness nor extrapolation. Every such sample carried steady=0 and
+  /// every clean one steady=1, so the discriminator already exists and is already logged.
+  bool self_transient = false;
 };
 
 /// Why the engine acted. One record per decision; the log line writes this and nothing else.
