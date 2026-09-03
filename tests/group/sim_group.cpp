@@ -62,6 +62,7 @@ struct Board {
   /// Repair already applied but not yet visible in the lagged measurement.
   double resync_pending_us = 0.0;
   int64_t resync_pending_until_us = 0;
+  int64_t transient_end_us = -1;     ///< when this board's own transient last ended
   int64_t meas_at_us = 0;            ///< instant of the snapshot this evaluation is reading
   int64_t resync_confirm_at_us = -1; ///< snapshot the last confirmation was counted from
   long gross_frames = 0;
@@ -175,6 +176,10 @@ struct Result {
   double sigma_e_max = 0.0;
   /// Fraction of decisions with P pinned at the authority clamp, and the largest |P| seen.
   double p_sat_frac = 0.0, p_max_ppm = 0.0;
+  /// Corrections taken AFTER the phase fault ended, within two filter lengths -- paid out of a
+  /// filter still unwinding a phantom rather than out of any error present now.
+  int decay_corr = 0;
+  long decay_frames = 0;
   double common_valid_frac = 0.0;
   /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
   /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
@@ -304,6 +309,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
+  long decay_corr = 0, decay_frames = 0;
   long psat_n = 0, psat_hit = 0;
   double psat_max = 0.0;
   double sig_e_sum = 0.0, sig_g_sum = 0.0, sig_e_max = 0.0;
@@ -506,7 +512,14 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
           x.phase_transient_until_us = std::max(x.phase_transient_until_us, t + tick);
         }
       }
+      const bool was_publishing = x.phase_publishing;
       x.phase_publishing = (t >= x.phase_transient_until_us);
+      // WHEN THE FAULT ENDED. The phantom's damage is not only what it does while present -- the
+      // filter is LOADED with it, and then pays it off in irreversible frames as it decays,
+      // re-crossing a shrinking coarse gate on the way down. Bench 2026-09-03 04:52, board a,
+      // three corrections after the fault had gone: ep -6049 -> -2740 -> -960 us against a raw
+      // GDIN gd of +-20, frames -274 -> -124 -> -43, gate 48 -> 46 -> 35.
+      if (!was_publishing && x.phase_publishing) x.transient_end_us = t;
       x.obs.emplace_back(t, measured + nd(rng));
       double seen = x.obs.front().second;
       while (x.obs.size() > 1 && x.obs.front().first <= t - p.measurement_lag_us) {
@@ -706,6 +719,14 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
         x.live = true;
         x.corrections++;
         x.gross_frames += std::abs(c.frames);
+        // A DECAY CORRECTION: taken while the phase is trustworthy again, but within two filter
+        // lengths of the fault ending -- i.e. paid out of a filter still unwinding a phantom, not
+        // out of any error present now. These are the ones that cannot be justified by the current
+        // measurement, and on the bench they were the whole visible excursion.
+        if (x.transient_end_us >= 0 && t - x.transient_end_us <= 2 * p.filter_lag_us()) {
+          decay_corr++;
+          decay_frames += std::abs(c.frames);
+        }
         // A DELIVERED CORRECTION ARMS THE TRANSIENT, which is what the client does at
         // snapcast_client.cpp `if (applied_frames != 0)`: "a delivered correction moves the audio,
         // so the phase does not describe it until the horizon passes". This simulator's comment
@@ -922,6 +943,8 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     r.ediff_after_n = ph_after_n;
     r.ediff_after_flagged = ph_after_n ? static_cast<double>(ph_after_flagged) / ph_after_n : 0.0;
     r.common_max = common_max_us;
+    r.decay_corr = static_cast<int>(decay_corr);
+    r.decay_frames = decay_frames;
     r.p_sat_frac = psat_n ? static_cast<double>(psat_hit) / psat_n : 0.0;
     r.p_max_ppm = psat_max;
     if (sig_n > 0) {
@@ -1474,8 +1497,8 @@ int main() {
     pf.transient_period_s = 60.0; pf.transient_secs = 4.0;
     pf.phase_fault_us = 8600.0;   // the bench's raw phase error
     printf("        phase wrong by %.1f ms while steady=0; audio never moves\n", pf.phase_fault_us / 1000.0);
-    printf("        %-30s %9s %8s %9s %9s %8s\n",
-           "case", "p2p/2min", "sd", "P sat %", "max |P|", "corr");
+    printf("        %-30s %9s %8s %8s %6s %7s %7s %7s\n",
+           "case", "p2p/2min", "sd", "max|P|", "corr", "frames", "decayC", "decayF");
     // LONG transients too: the bench's was post-reboot acquisition lasting MINUTES, and gd can
     // only climb at the filter's gmax per sample -- so a 4 s transient never lets dif reach the
     // 2.5 ms that pinned P at the clamp on hardware. The 40 s rows are what test that path.
@@ -1495,8 +1518,9 @@ int main() {
       f.transient_secs = c.secs;
       if (!c.fault) f.phase_fault_us = 0.0;
       Result r = simulate(c.tag, q, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, f);
-      printf("        %-30s %9.1f %8.2f %8.0f%% %9.1f %8d\n",
-             c.name, r.p2p_med, r.sd_med, 100.0 * r.p_sat_frac, r.p_max_ppm, r.corr);
+      printf("        %-30s %9.1f %8.2f %8.1f %6d %7ld %7d %7ld\n",
+             c.name, r.p2p_med, r.sd_med, r.p_max_ppm, r.corr, r.gross,
+             r.decay_corr, r.decay_frames);
     }
     printf("        (gate_gd_on_transient holds gd while the board's own phase is meaningless)\n");
   }
