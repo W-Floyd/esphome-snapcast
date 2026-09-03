@@ -406,6 +406,41 @@ int main() {
           r.skew_med, 2.0 * p.frame_us());
   }
 
+  printf("\n3b. SPLIT FILTER: does rate benefit from a faster error filter than position?\n");
+  {
+    // One EWMA serves both actuators today, with tau = ERR_TAU_HORIZONS * compensation_us(), and
+    // compensation is dominated by position_delay (ring + pipe). So RATE is smoothed on the
+    // timescale of an actuator it does not use: measured on the bench, rate_horizon 2.0 s against
+    // rate's own measurement lag of ~250 ms.
+    //
+    // Sweeping the rate-side horizon alone. Position keeps the slow filter throughout -- it is
+    // irreversible and quantised, and must not fire on noise. The question is only whether rate,
+    // which is continuous and reversible, is being held back for no benefit.
+    //
+    // A faster filter cuts rate's lag but passes more noise to Kp, and Kp = budget / sigma_e is
+    // sized from the noise it sees, so this is a genuine trade rather than a free win. If skew
+    // does not improve, the shared filter is correct and the coupling is not a defect.
+    const int64_t shared = p.filter_lag_us();
+    printf("        shared filter lag %lld ms (position keeps this throughout)\n",
+           static_cast<long long>(shared / 1000));
+    printf("        %-22s %9s %9s %9s %9s %9s\n", "rate filter", "skew med", "skew p90", "period", "amp p05", "amp p95");
+    for (int64_t div : {1, 2, 4, 8}) {
+      Profile q = p;
+      q.rate_filter_lag_us = div == 1 ? 0 : shared / div;   // 0 = shared, i.e. today
+      Result r = simulate(q, -15.0, +15.0, 40.0, 80.0, 600.0, TRUE_LAND);
+      char lbl[48];
+      if (div == 1) {
+        snprintf(lbl, sizeof(lbl), "shared (%lld ms)", static_cast<long long>(shared / 1000));
+      } else {
+        snprintf(lbl, sizeof(lbl), "1/%lld (%lld ms)", static_cast<long long>(div),
+                 static_cast<long long>(shared / div / 1000));
+      }
+      printf("        %-22s %9.0f %9.0f %9.1f %9.0f %9.0f   %d corr, %ld frames\n",
+             lbl, r.skew_med, r.skew_p90, r.period_s, r.amp_p05, r.amp_p95, r.corr, r.gross);
+    }
+    printf("        (a faster rate filter should cut lag; it also passes more noise to Kp)\n");
+  }
+
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
   printf("   behind the engine's back by a resync path that never tells it\n");
   {

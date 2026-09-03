@@ -76,6 +76,28 @@ struct Profile {
   /// slow, and rate's horizon carries that lag honestly rather than pretending to be faster.
   int64_t filter_lag_us() const;
 
+  /// SPLIT FILTER, off by default (0 = use filter_lag_us() for everything, i.e. today's behaviour).
+  ///
+  /// One EWMA currently serves two actuators with very different physics. Its time constant is
+  /// ERR_TAU_HORIZONS * compensation_us(), and compensation_us() is dominated by position_delay_us
+  /// (~1.25 s of ring and pipe) -- so RATE's knowledge of the error is smoothed on the timescale of
+  /// an actuator rate does not use. Measured on the bench: rate_horizon 2.0 s, of which the
+  /// position delay is the bulk, while rate's own measurement lag is ~250 ms.
+  ///
+  /// The filter is slow for a reason: position is irreversible and quantised to a frame, so it must
+  /// not fire on noise. Rate is continuous and reversible and pays no such penalty for being wrong
+  /// briefly. Sharing one filter buys the guarantee that the two actuators never contradict each
+  /// other, and costs rate an order of magnitude in responsiveness.
+  ///
+  /// Whether that trade is right is a design question, not a tuning one, which is why this exists
+  /// as a Profile field the simulator can sweep rather than as a constant someone edits.
+  int64_t rate_filter_lag_us = 0;
+
+  /// The horizon the RATE path filters on: the split value when set, else the shared one.
+  int64_t rate_filter_lag_effective_us() const {
+    return rate_filter_lag_us > 0 ? rate_filter_lag_us : filter_lag_us();
+  }
+
   /// RATE's loop delay: measure it, then filter it. Sets Kp, the integral's bandwidth, and how
   /// far rate can reach before position has to act.
   int64_t rate_horizon_us() const { return measurement_lag_us + filter_lag_us(); }

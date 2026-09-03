@@ -368,7 +368,12 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     } else {
       const int64_t gdt = gd_last_at_us_ > 0 ? now_us - gd_last_at_us_ : 0;
       const float gdt_s = gdt > 0 ? static_cast<float>(gdt) / 1e6f : 0.0f;
-      const float gtau_s = std::max(1e-3f, static_cast<float>(profile_.filter_lag_us()) / 1e6f);
+      // The DIFFERENTIAL feeds rate's proportional term (e_position = e_diff whenever the group
+      // supplies one), so this is the filter that actually gates how fast rate may believe
+      // anything. It follows the rate-side horizon, which equals the shared one unless the split
+      // is enabled -- see Profile::rate_filter_lag_us.
+      const float gtau_s =
+          std::max(1e-3f, static_cast<float>(profile_.rate_filter_lag_effective_us()) / 1e6f);
       const float galpha = gdt_s > 0.0f ? 1.0f - std::exp(-gdt_s / gtau_s) : 0.0f;
       const float gspan = profile_.rate_authority_ppm + CRYSTAL_LIMIT_PPM;
       const float gmax = gspan * gdt_s + static_cast<float>(profile_.frame_us());
