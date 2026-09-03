@@ -545,6 +545,8 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     if (frames > affordable) frames = affordable;
   }
   cmd.decision.filtered_us = e_position;
+  cmd.decision.e_position_us = e_position;
+  cmd.decision.e_from_diff = have_diff;
   cmd.decision.gate_us = coarse_gate_us;
   cmd.decision.needed_ppm = needed_ppm;
   cmd.decision.authority_ppm = profile_.rate_authority_ppm;

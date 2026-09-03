@@ -410,6 +410,18 @@ struct Decision {
   /// Whether the stability cap bound this decision, i.e. the noise budget asked for a gain past
   /// the delay limit. If this is set most of the time, the budget is not what is setting Kp.
   bool kp_capped = false;
+
+  /// WHICH SIGNAL e_position TOOK, and its value. e_position = have_diff ? e_diff : e_filtered,
+  /// and every actuator decision -- the coarse gate, rate_can_fix, the frame count -- is computed
+  /// from it. Nothing logged it, so which quantity drove a correction had to be INFERRED, and that
+  /// inference was wrong three times on 2026-09-03: once concluding the position path lacked
+  /// confirmation (it has the filter), once concluding a sustained deadline glitch drove it (the
+  /// glitch cannot reach position while a delta exists), and once unable to reconcile GDIN gd of
+  /// +-20 us with corrections of 124-1038 frames while CMNC reported a valid split.
+  ///
+  /// One field ends that: esrc says diff or deadline, ep says how much.
+  bool e_from_diff = false;
+  int64_t e_position_us = 0;
   bool slew_clipped = false;    ///< the command wanted to move further than authority*dt/horizon
 
   /// THE SHARED COMMON-MODE TERM, and the value it acted on. Recorded even when the correction is

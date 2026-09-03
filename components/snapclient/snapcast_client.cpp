@@ -4825,11 +4825,13 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
     }
     ESP_LOGD(TAG,
              "ENGINE err=%+" PRId64 " act=%d why=%d frames=%+" PRId32 " rate=%+.2f xtal=%+.2f "
-             "sigma=%.1f gsig=%s sup=%" PRIu32 " t=%" PRId64,
+             "sigma=%.1f gsig=%s esrc=%c ep=%+" PRId64 " gate=%" PRId64 " sup=%" PRIu32
+             " t=%" PRId64,
              cmd.decision.error_us, static_cast<int>(cmd.decision.act),
              static_cast<int>(cmd.decision.why), cmd.decision.frames, cmd.decision.rate_ppm,
              cmd.decision.crystal_ppm, this->timing_engine_.sigma_e_us(),
-             gsig_buf, cmd.decision.suppressed, tnow);
+             gsig_buf, cmd.decision.e_from_diff ? 'd' : 'l', cmd.decision.e_position_us,
+             cmd.decision.gate_us, cmd.decision.suppressed, tnow);
     // ESPLIT: the integral's input, split into the part this board SHARES with the group and the
     // part that SEPARATES it from its peers. Only e_diff is audible; only e_common can wind the
     // crystal without anyone hearing it, which is why a wind-up went unnoticed to +192 ppm.
