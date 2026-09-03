@@ -193,6 +193,11 @@ struct Decision {
   /// crystals reaching +156/+183 ppm against targets of +25/+55 while the DIFFERENTIAL stayed
   /// correct at +27 against +30, so the pair sounded synchronised the whole way to the rail. This
   /// is what makes that checkable on hardware instead of inferred.
+  /// VALID ONLY WHEN THE INTEGRAL RAN. These are written inside the integral block, which is
+  /// skipped when the decision is not differential -- so a plain 0 here means "not computed this
+  /// decision", not "the error was zero". Reporting the two as the same value is the defect this
+  /// codebase keeps finding elsewhere; the flag is here so this instrument does not repeat it.
+  bool e_split_valid = false;
   int32_t e_common_us = 0;
   int32_t e_diff_us = 0;
   /// What actually reached the integrator this decision, after both clamps. The gap between this

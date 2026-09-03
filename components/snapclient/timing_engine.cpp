@@ -597,6 +597,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     const float fu = static_cast<float>(frame_us);
     const float e_bounded =
         std::clamp(e_common_f, -fu, fu) + std::clamp(e_diff_f, -fu, fu);
+    cmd.decision.e_split_valid = true;
     cmd.decision.e_common_us = static_cast<int32_t>(std::llround(e_common_f));
     cmd.decision.e_diff_us = static_cast<int32_t>(std::llround(e_diff_f));
     cmd.decision.e_bounded_us = static_cast<int32_t>(std::llround(e_bounded));

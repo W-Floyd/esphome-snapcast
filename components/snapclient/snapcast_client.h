@@ -1203,6 +1203,10 @@ class SnapcastClient {
   /// on 2026-09-02 produced ONE diagnostic event in four trials and settled nothing. A probe that
   /// cannot exceed the thing it is probing is not a probe.
   std::atomic<float> tune_split_ramp_us_per_s_{100.0f};
+  /// Rate change past which the loop explains itself (RATEWHY). Runtime because the right value
+  /// depends on what is being chased: 5 ppm catches the 20-40 ppm excursions without drowning in
+  /// the 3-5 ppm of ordinary tracking, but a quiet hunt wants it lower and a storm wants it higher.
+  std::atomic<float> tune_ratewhy_ppm_{5.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
   /// pushed past the frame index it was applied at. Until then the engine issues no further

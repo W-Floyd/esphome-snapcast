@@ -869,9 +869,8 @@ static constexpr float LEGACY_TRIM_TAU_S = 120.0f;
 // case worth explaining. A LOGGING threshold, not an actuator arm -- the coarse path's own gate is
 // frame_us + 2*sigma, derived in the engine.
 static constexpr int64_t RSKIP_REPORT_US = 100;
-// Rate change past which the loop explains itself (RATEWHY). Above the 3-5 ppm per report the
-// command moves while merely tracking, below the 20-40 ppm excursions under investigation.
-static constexpr float RATEWHY_PPM = 5.0f;
+
+
 
 #if defined(CLOCK_SYNC_TSF_ACTIVE) && defined(USE_SNAPCLIENT_TIMING_DIAG)
 /// @brief Renders a render-phase value for a log line, printing the UNKNOWN sentinel as a word.
@@ -4610,9 +4609,16 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
     //
     // Its own line, same 2 s throttle: ENGINE is already 167 bytes worst case and a field appended
     // to the end of a long line is a record of whether the line fitted.
-    ESP_LOGD(TAG, "ESPLIT com=%+" PRId32 " dif=%+" PRId32 " bnd=%+" PRId32 " xtal=%+.2f t=%" PRId64,
-             cmd.decision.e_common_us, cmd.decision.e_diff_us, cmd.decision.e_bounded_us,
-             cmd.decision.crystal_ppm, tnow);
+    // "n/a" when the integral did not run this decision. A plain 0 there would say the error was
+    // zero, which is a different claim and the one this codebase keeps getting wrong.
+    if (cmd.decision.e_split_valid) {
+      ESP_LOGD(TAG, "ESPLIT com=%+" PRId32 " dif=%+" PRId32 " bnd=%+" PRId32 " xtal=%+.2f t=%" PRId64,
+               cmd.decision.e_common_us, cmd.decision.e_diff_us, cmd.decision.e_bounded_us,
+               cmd.decision.crystal_ppm, tnow);
+    } else {
+      ESP_LOGD(TAG, "ESPLIT com=n/a dif=n/a bnd=n/a xtal=%+.2f t=%" PRId64,
+               cmd.decision.crystal_ppm, tnow);
+    }
   }
   // GDSNAP: a confirmed jump ASSIGNED a filter rather than stepping it, which is a discontinuity
   // in the signal P is computed from. Its own short line, unthrottled, because these are rare and
@@ -4629,7 +4635,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
              cmd.decision.gd_snap_us, cmd.decision.err_snap_us, cmd.decision.rate_ppm,
              cmd.decision.crystal_ppm, tnow);
   }
-  // RATEWHY: for any rate change past RATEWHY_PPM, say WHY at the moment it happened.
+  // RATEWHY: for any rate change past ratewhy_ppm (runtime), say WHY at the moment it happened.
   //
   // The command is crystal + P, slew-limited, so a change is exactly dx + dp and the line carries
   // both -- plus P itself (a standing P is not a moving one), the gain in force, the error split
@@ -4643,7 +4649,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   //
   // Threshold, not every decision: 5 ppm is well above the 3-5 ppm per report seen when the loop
   // is merely tracking, and well below the 20-40 ppm excursions being chased.
-  if (std::fabs(cmd.decision.d_rate_ppm) >= RATEWHY_PPM) {
+  if (std::fabs(cmd.decision.d_rate_ppm) >= this->tune_ratewhy_ppm_.load(std::memory_order_relaxed)) {
     ESP_LOGW(TAG,
              "RATEWHY d=%+.2f dx=%+.2f dp=%+.2f p=%+.2f kp=%.3f com=%+" PRId32 " dif=%+" PRId32
              " snap=%+" PRId32 " clip=%d t=%" PRId64,
@@ -4851,6 +4857,9 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "split_ramp_us_per_s") {
     return this->tune_split_ramp_us_per_s_.load(std::memory_order_relaxed);
   }
+  if (name == "ratewhy_ppm") {
+    return this->tune_ratewhy_ppm_.load(std::memory_order_relaxed);
+  }
   if (name == "tag_stale_ms") {
     return static_cast<float>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed));
   }
@@ -4910,6 +4919,12 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     this->tune_rate_filter_lag_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
     ESP_LOGI(TAG, "rate_filter_lag_us = %" PRId32 " (0 = shared) t=%" PRId64,
              this->tune_rate_filter_lag_us_.load(std::memory_order_relaxed), now_us());
+  } else if (name == "ratewhy_ppm") {
+    // Reporting threshold only -- it steers nothing. Bounded away from 0 because at 0 every
+    // decision emits a line and the logger ring is what crashed twice on this bench.
+    if (!std::isfinite(value) || value < 0.5f || value > 500.0f) return false;
+    this->tune_ratewhy_ppm_.store(value, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "ratewhy_ppm = %.2f t=%" PRId64, value, now_us());
   } else if (name == "split_ramp_us_per_s") {
     // TEST HOOK rate. The default 100 us/s is deliberately "ordinary drift" (the clock-offset
     // estimate wanders about that fast unaided), which is right for measuring a repair but wrong
