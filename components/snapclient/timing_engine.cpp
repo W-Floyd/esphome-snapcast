@@ -591,6 +591,16 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     // through a shrinking gate (48 -> 46 -> 35). tests/group 3k puts 25% of frames in the short
     // case and 54% in the long one AFTER the fault that loaded the filter had gone.
     //
+    // MEASURED AND REJECTED, 2026-09-03, tests/group 3m. The flag stays OFF. In the only scenario
+    // that exercises this branch (esrc d/l = 279/0, so every correction takes it) turning it on
+    // made the repeat signature WORSE, not better: repeat corrections 11 -> 15, frames spent twice
+    // 5537 -> 8172, gross frames 68598 -> 76759. The reasoning below is intact and the branch is
+    // reached; the sign of the effect is simply not what it predicts. Do not enable it on the
+    // strength of the argument alone -- that argument is written out in full here and it is wrong.
+    // What is NOT yet separated: whether the share is mis-sized (over-shooting past zero, the risk
+    // the paragraph below names) or whether shifting gd_mean_us_ at all is the wrong move. A share
+    // sweep is the test that would tell them apart.
+    //
     // (n-1)/n, NOT the whole displacement. group.delta_us is this board's deviation from the group
     // MEAN, so moving this board by D moves its deviation by D*(n-1)/n -- D/2 for a pair. This is
     // the same factor the "NO unhalve" note guards, in the opposite direction: over-compensating

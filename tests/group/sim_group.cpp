@@ -63,6 +63,10 @@ struct Board {
   double resync_pending_us = 0.0;
   int64_t resync_pending_until_us = 0;
   int64_t transient_end_us = -1;     ///< when this board's own transient last ended
+  /// e_position the PREVIOUS correction acted on. Its own validity flag rather than a sentinel,
+  /// so "no correction yet" can never be differenced against as if it were a measurement.
+  int64_t last_corr_ep_us = 0;
+  bool last_corr_ep_valid = false;
   int64_t meas_at_us = 0;            ///< instant of the snapshot this evaluation is reading
   int64_t resync_confirm_at_us = -1; ///< snapshot the last confirmation was counted from
   long gross_frames = 0;
@@ -182,6 +186,14 @@ struct Result {
   long decay_frames = 0;
   /// Corrections split by which signal drove them, as esrc reports on the bench.
   int corr_from_diff = 0, corr_from_dl = 0;
+  /// A REPEAT: a correction whose e_position is the same value the previous one acted on, so the
+  /// filter has not moved between them and the second is buying the first error again. Bench
+  /// 2026-09-03 05:2x, both boards, all esrc=d: ep=+742 then +742 (fr +33, +33), ep=-2409 then
+  /// -2409 (fr -109, -109) -- 4/15 and 5/14 of corrections, 238 and 294 frames spent twice.
+  /// This is the signature compensate_gd_filter exists to remove; if it does not move, the
+  /// coordinate shift is not reaching gd_mean_us_.
+  int repeat_corr = 0;
+  long repeat_frames = 0;
   double common_valid_frac = 0.0;
   /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
   /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
@@ -312,6 +324,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
   long decay_corr = 0, decay_frames = 0, corr_from_diff = 0, corr_from_dl = 0;
+  long repeat_corr = 0, repeat_frames = 0;
   long psat_n = 0, psat_hit = 0;
   double psat_max = 0.0;
   double sig_e_sum = 0.0, sig_g_sum = 0.0, sig_e_max = 0.0;
@@ -734,6 +747,14 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
         // only when have_diff is true, and if these corrections are have_diff=false then this
         // simulator cannot test it at all -- which byte-identical output would look exactly like.
         if (c.decision.e_from_diff) corr_from_diff++; else corr_from_dl++;
+        // THE REPEAT TEST. Equal to the microsecond means the filter did not move at all between
+        // the two decisions, so the second cannot be justified by anything new.
+        if (x.last_corr_ep_valid && c.decision.e_position_us == x.last_corr_ep_us) {
+          repeat_corr++;
+          repeat_frames += std::abs(c.frames);
+        }
+        x.last_corr_ep_us = c.decision.e_position_us;
+        x.last_corr_ep_valid = true;
         // A DELIVERED CORRECTION ARMS THE TRANSIENT, which is what the client does at
         // snapcast_client.cpp `if (applied_frames != 0)`: "a delivered correction moves the audio,
         // so the phase does not describe it until the horizon passes". This simulator's comment
@@ -952,6 +973,8 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     r.common_max = common_max_us;
     r.decay_corr = static_cast<int>(decay_corr);
     r.decay_frames = decay_frames;
+    r.repeat_corr = static_cast<int>(repeat_corr);
+    r.repeat_frames = repeat_frames;
     r.corr_from_diff = static_cast<int>(corr_from_diff);
     r.corr_from_dl = static_cast<int>(corr_from_dl);
     r.p_sat_frac = psat_n ? static_cast<double>(psat_hit) / psat_n : 0.0;
@@ -1590,6 +1613,58 @@ int main() {
              c.name, r.p2p_med, r.sd_med, r.corr, r.gross, r.sigma_e_max);
     }
     printf("        (a jump the resync gate would now reject can still buy a 1491-frame step)\n");
+  }
+
+  printf("\n3m. REPEAT CORRECTIONS: does compensate_gd_filter stop the filter buying the same\n");
+  printf("    error twice? (bench 2026-09-03 05:2x, both boards, every correction esrc=d)\n");
+  {
+    // THE SIGNATURE, from the ten minutes of acquisition after the 05:08 flash:
+    //
+    //   board a   ep=+742  gate=99  fr=+33     board b   ep=+2587 gate=340 fr=+117
+    //             ep=+742  gate=32  fr=+33               ep=+2587 gate=75  fr=+117
+    //             ep=-2409 gate=130 fr=-109              ep=-2384 gate=114 fr=-108
+    //             ep=-2409 gate=121 fr=-109              ep=-776  gate=46  fr=-35
+    //
+    // repeats 4/15 and 5/14 of corrections; 238 and 294 frames spent twice. Distinct t= and a
+    // DIFFERENT gate each time, so these are two decisions, not one line logged twice -- ep equal
+    // to the microsecond across more than a second means gd_mean_us_ did not move between them.
+    //
+    // WHY IT SHOULD BE FIXABLE HERE: the compensation at timing_engine.cpp:601 is a one-shot
+    // coordinate shift applied the instant frames are committed, not something that decays with
+    // the pending flight, so a repeat after landing is as covered as one during it.
+    //
+    // WHAT WOULD MAKE THIS TEST WORTHLESS, checked first: the branch needs have_diff and
+    // contributors > 1. esrc d/l says whether these corrections take that path at all -- a
+    // d/l of 0/N means the simulator cannot exercise the flag and any "no change" below is
+    // UNEXERCISED, not FAILED. That is the exact ambiguity that made the first attempt at this
+    // measurement unreadable.
+    printf("        %-34s %6s %8s %7s %8s %9s %8s\n",
+           "case", "corr", "frames", "repeatC", "repeatF", "p2p/2min", "esrc d/l");
+    struct RpCase { const char *name; const char *tag; Faults f; };
+    Faults starve{};
+    starve.starve_period_s = 119.0; starve.starve_secs = 3.0; starve.resync_us = 50000.0;
+    Faults phase{};
+    phase = starve;
+    phase.transient_period_s = 60.0; phase.transient_secs = 40.0; phase.phase_fault_us = 8600.0;
+    const RpCase cases[] = {
+      {"starvation bursts", "rp-st", starve},
+      {"starvation + 8.6 ms phase fault", "rp-ph", phase},
+    };
+    for (const RpCase &c : cases) {
+      for (int comp = 0; comp <= 1; comp++) {
+        Profile q = p;
+        q.compensate_gd_filter = (comp == 1);
+        char tag[40]; snprintf(tag, sizeof(tag), "%s-c%d", c.tag, comp);
+        Result r = simulate(tag, q, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, c.f);
+        char nm[64];
+        snprintf(nm, sizeof(nm), "%s %s", c.name, comp ? "COMP ON" : "comp off");
+        printf("        %-34s %6d %8ld %7d %8ld %9.1f %5d/%d\n",
+               nm, r.corr, r.gross, r.repeat_corr, r.repeat_frames, r.p2p_med,
+               r.corr_from_diff, r.corr_from_dl);
+      }
+    }
+    printf("        (esrc d/l = 0/N in both rows means the flag's branch is never reached and\n");
+    printf("         these rows say nothing about it either way)\n");
   }
 
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
