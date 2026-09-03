@@ -991,12 +991,17 @@ bool SnapcastClient::start() {
   // boards rather than deterministically. refresh_tsf_peers_ (816) is a second deep branch off
   // the same task. At 10240 the same path sits at 48%.
   //
-  // The raise is not the fix, it is what keeps the bench alive long enough to measure: STACKHWM
-  // reports the true high-water mark every 30 s and WARNs under 1 KB, so the margin this crash
-  // never reported is now a number. The real fix is narrower -- player_task_'s own 2528 bytes and
-  // log_sync_report_'s 1104 are one function's worth of locals each, and the float formatting
-  // path costs 944 on top. A board that reboots costs a full re-acquisition and five consensus
-  // membership changes, which is the largest disturbance this bench produces.
+  // THE ACTUAL FIX went in alongside this: ServoState (1856 bytes) moved off this task's stack
+  // into servo_state_, which took player_task_'s frame from 2528 to 688 and the deepest chain
+  // from 4896 to 2816 -- 46% of the ORIGINAL 6144. So this raise is no longer load-bearing and
+  // 6144 would now hold, with headroom.
+  //
+  // It stays at 10240 for one reason only: 2816 is a LOWER BOUND. Every frame on that chain also
+  // makes indirect calls, which a static call graph cannot follow, and the float-formatting
+  // branch (_svfprintf_r 800 + _dtoa_r 144) is a separate path that adds on top. STACKHWM
+  // reports the true high-water mark every 30 s and WARNs under 1 KB; once it has a settled
+  // number from hardware, this can come back down to 6144 or 8192 on evidence rather than on the
+  // same reasoning that sized it at 6144 in the first place.
   if (xTaskCreatePinnedToCore(SnapcastClient::player_task_trampoline, "snap_player", PLAYER_TASK_STACK, this, 8,
                               &this->player_task_handle_, 1) != pdPASS) {
     return false;
@@ -2593,7 +2598,19 @@ void SnapcastClient::player_task_() {
   // All servo state lives in one struct so the loop below can be split into named
   // steps; see ServoState for what each field is and why. rate_lock_ok starts from
   // whether the hardware lock exists at all.
-  ServoState st;
+  //
+  // A REFERENCE TO A MEMBER, NOT A LOCAL. sizeof(ServoState) is 1856 bytes and this task has
+  // 10240: as a local it was 73% of this function's 2528-byte frame and the largest single term
+  // in the stack overflow that rebooted all three boards 21 times on 2026-09-03. Storage moved;
+  // ownership did not -- only this task touches it.
+  //
+  // RESET ON ENTRY, explicitly, because a member persists where a local could not. If this task
+  // is ever recreated, the servo must start from the same state a fresh local gave it, not from
+  // the previous run's crystal fit and error accumulators. The assignment is what a local's
+  // construction used to do; ServoState is an aggregate of value types with member initialisers,
+  // so this restores every field to its declared default.
+  this->servo_state_ = ServoState{};
+  ServoState &st = this->servo_state_;
 #ifdef USE_I2S_RATE_LOCK
   st.rate_lock_ok = this->rate_lock_ != nullptr;
   // CRYSTAL OFFSET PERSISTENCE. The integral is a property of the hardware, not the session, so a

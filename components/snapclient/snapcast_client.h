@@ -513,8 +513,13 @@ class SnapcastClient {
   /// These were locals of player_task_(), which is why the loop was ~700 lines: the
   /// declarations and their rationale sat 600 lines from the code that used them.
   /// Grouping them changes nothing at runtime -- the servo is still single-threaded in
-  /// the player task, and this is still its stack -- but it lets the loop body be split
-  /// into named steps that take the state explicitly.
+  /// the player task -- but it lets the loop body be split into named steps that take the
+  /// state explicitly.
+  ///
+  /// NO LONGER ON THE STACK, and that is the whole point: sizeof(ServoState) is 1856 bytes,
+  /// which was 73% of player_task_'s 2528-byte frame and the single largest term in the
+  /// overflow that rebooted all three boards 21 times on 2026-09-03. It lives in
+  /// servo_state_ now and player_task_ resets it on entry. Do not make it a local again.
   struct ServoState {
     bool warned_no_sync{false};
     // Rolling sync-error diagnostics, logged once per ~128 chunks (~3 s)
@@ -1373,6 +1378,11 @@ class SnapcastClient {
   TaskHandle_t network_task_handle_{nullptr};
   TaskHandle_t player_task_handle_{nullptr};
   std::atomic<bool> shutdown_{false};
+
+  /// The servo's 1856 bytes, held here rather than on the player task's stack. Touched ONLY by
+  /// the player task, which resets it on entry, so it needs no synchronisation -- the ownership
+  /// is the same as when it was a local, only the storage moved.
+  ServoState servo_state_{};
 
   QueueHandle_t event_queue_{nullptr};
   QueueHandle_t record_queue_{nullptr};
