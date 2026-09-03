@@ -2796,6 +2796,28 @@ void SnapcastClient::player_task_() {
       st.no_timebase_chunks = 0;
       st.warned_no_timebase = false;
     }
+    // A STARVED BOARD MUST NOT LET PEERS ALIGN TO IT. Its audio has been displaced by a shortage,
+    // so its render phase describes where the audio IS rather than where it will be once the
+    // shortage clears -- and a peer aligning to that chases a target that is about to move back.
+    //
+    // The policy already exists ("A BOARD IN TRANSIENT PUBLISHES NO PHASE") and is armed by a
+    // delivered correction and by mark_kp_event_. Starvation armed NEITHER, which left the one
+    // case where the displacement is largest and least this board's fault.
+    //
+    // Measured 2026-09-02 22:38-22:39, and this is the whole chain: board a starved (49 late
+    // chunks, 9.8 s of accumulated arrival lateness), its audio went 13 ms out, it kept publishing
+    // a phase, and board b -- whose own supply was CLEAN, late=0 on every window -- stepped
+    // +369 frames (8.4 ms) and wound its crystal +37.5 -> +57.9 ppm entirely second-hand. Then both
+    // walked back in opposite signs (+63/-64, +64/-61, -58/+174). That is the stairstep: one
+    // board's network problem propagating to a healthy peer through the group delta.
+    //
+    // Armed on the SUPPLY evidence rather than on the ring depth, because arrival lateness is what
+    // actually says the audio was displaced by the network; the ring can dip for a beat without
+    // the audio having moved.
+    if (rec.arrival_us > 0 && deadline - rec.arrival_us < 0) {
+      st.phase_transient_until_us =
+          std::max(st.phase_transient_until_us, now_us() + this->visibility_horizon_us());
+    }
     // SUPPLY SHADOW, measuring only. Slack is how long before its own deadline the chunk reached
     // the socket; negative means it arrived after the instant it was due to play, so whatever
     // error follows is the NETWORK being late and not this board's clock. Summed per window and
