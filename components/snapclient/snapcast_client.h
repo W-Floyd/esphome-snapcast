@@ -1272,6 +1272,9 @@ class SnapcastClient {
   /// only so the shipped behaviour can be A/B'd against it; the shipped behaviour divides the
   /// budget by the wrong distribution's sigma.
   std::atomic<int32_t> tune_kp_from_diff_sigma_{0};
+  /// 0/1, default 1: when peers exist but no delta is available, position stands down rather than
+  /// spending irreversible frames on an unvalidated deadline error.
+  std::atomic<int32_t> tune_position_needs_diff_{1};
   std::atomic<float> tune_common_authority_ppm_{50.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has

@@ -171,6 +171,32 @@ struct Profile {
   /// board's own phase is meaningless, and zeroing would itself be a step.
   bool gate_gd_on_transient = false;
 
+  /// POSITION MUST NOT SPEND FRAMES ON AN UNVALIDATED DEADLINE ERROR when peers exist.
+  ///
+  /// `bool differential = true;` is a fail-open initialiser: when the group is absent it is never
+  /// overwritten, so differential stays true, have_diff stays false, e_position becomes the
+  /// DEADLINE error, and position spends irreversible frames on it with no differential check.
+  ///
+  /// That is right for a LONE client -- tracking the server is the only meaning "in sync" has when
+  /// there is nobody to be in sync with -- and wrong for a board that HAS peers and has merely
+  /// lost its delta, which is a signal that has gone missing rather than a signal that says zero.
+  ///
+  /// Measured 2026-09-03 04:23, board b, with ARRGAP max 130-152 ms (no supply event) and board a
+  /// untouched: ESPLIT dif=n/a, then act=2 why=4 frames=+1491 (33.8 ms, matching err=+32815, the
+  /// deadline error) followed by frames=-195 four seconds later. The wire went to -4758 us.
+  ///
+  /// Reproduced in tests/group 3l once the peer stays silent longer than the delta's stale window,
+  /// so the HELD value expires and present actually goes false:
+  ///
+  ///     control                          p2p  33.9 us   corr  0   frames   0
+  ///     1 chunk 3 s + peer silent 20 s   p2p 326.3 us   corr 17   frames 276
+  ///     2 chunks 3 s + peer silent       p2p 519.6 us   corr 17   frames 288
+  ///
+  /// With this on, a board that has peers but no delta HOLDS instead: rate still works, the hard
+  /// resync still covers a genuine large displacement, and no irreversible frames are spent on an
+  /// error nothing has corroborated.
+  bool position_needs_diff = true;
+
   /// SIZE Kp FROM THE DIFFERENTIAL'S NOISE rather than the deadline error's, whenever the group
   /// supplies a differential. Off by default so it can be A/B'd on hardware; see the note at its
   /// use for why the current default is a known mis-sizing rather than a choice.
@@ -293,6 +319,11 @@ struct GroupEvidence {
   /// extrap 0.00 -- neither staleness nor extrapolation. Every such sample carried steady=0 and
   /// every clean one steady=1, so the discriminator already exists and is already logged.
   bool self_transient = false;
+
+  /// THIS BOARD HAS PEERS, whether or not a delta is available right now. `present` conflates
+  /// "nobody to be differential from" with "somebody, but no usable delta this instant", and those
+  /// require opposite handling -- see Profile::position_needs_diff.
+  bool has_peers = false;
 };
 
 /// Why the engine acted. One record per decision; the log line writes this and nothing else.

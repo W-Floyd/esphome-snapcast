@@ -608,6 +608,9 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
 
       // The board's own transient, exactly the flag it already uses to stop beaconing.
       g.self_transient = !x.phase_publishing;
+      // There is always another board here, so peers exist whether or not a delta does. This is
+      // the bit that lets the engine tell "lone client" from "peer exists, delta missing".
+      g.has_peers = b.size() > 1;
 
       if (g.present) {
         gd_present_ticks++;
@@ -1547,7 +1550,7 @@ int main() {
       f.resync_on_measurement = false;
       if (std::string(c.tag).find("p") == std::string(c.tag).size() - 1) {
         f.peer_silent_period_s = 90.0;   // aligned with the glitch, and wider so dif is absent
-        f.peer_silent_secs = 8.0;
+        f.peer_silent_secs = 20.0;   // > GROUP_DELTA_STALE_US (15 s), so the HELD delta expires and g.present goes false
       }
       Result r = simulate(c.tag, p, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, f);
       printf("        %-30s %9.1f %8.2f %8d %9ld %10.0f\n",

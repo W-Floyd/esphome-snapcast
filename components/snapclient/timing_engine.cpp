@@ -467,6 +467,16 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     gd_last_at_us_ = now_us;
     gd_sigma_us = gd_sigma_prev_us_;
     differential = std::llabs(e_diff) >= profile_.target_diff_us;
+  } else if (profile_.position_needs_diff && group.has_peers) {
+    // PEERS EXIST BUT NO DELTA IS AVAILABLE. Fall closed, not open: differential's initialiser is
+    // true, which would let position spend frames on the DEADLINE error with nothing corroborating
+    // it. A missing signal is not a signal that says zero. Rate is unaffected and the hard resync
+    // still covers a genuine large displacement; only the irreversible actuator stands down.
+    //
+    // A LONE client keeps the old behaviour, because tracking the server is the only meaning "in
+    // sync" has when there is nobody to be in sync with -- which is why this needs has_peers and
+    // not merely !present.
+    differential = false;
   }
 
   // Coarse: whole frames, one at a time, verified. Decided on the FILTERED error, not the latest

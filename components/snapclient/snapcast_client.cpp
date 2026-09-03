@@ -4719,6 +4719,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   prof.target_diff_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
   prof.target_common_us = this->tune_common_target_us_.load(std::memory_order_relaxed);
   prof.kp_from_diff_sigma = this->tune_kp_from_diff_sigma_.load(std::memory_order_relaxed) != 0;
+  prof.position_needs_diff = this->tune_position_needs_diff_.load(std::memory_order_relaxed) != 0;
   prof.common_drain_s = this->tune_common_drain_s_.load(std::memory_order_relaxed);
   prof.common_authority_ppm = this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
@@ -4742,6 +4743,10 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
     // The group's shared view of the COMMON error. Absent unless two members published one, and
     // absent is not zero -- the engine reports common_shared_valid so a shadow can tell the
     // difference between "the group agreed on 0" and "there was no group to agree".
+    // Does this board have peers AT ALL, independent of whether a delta is available right now?
+    // Without this the engine cannot tell "lone client" from "peer exists, delta missing", and
+    // those need opposite handling -- see Profile::position_needs_diff.
+    grp.has_peers = this->tsf_sync_->peer_count() > 0;
     int64_t cmn_us = 0;
     uint8_t cmn_n = 0;
     if (this->tsf_sync_->common_err_consensus_us(obs.at_us, cmn_us, cmn_n)) {
@@ -5092,6 +5097,9 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "common_drain_s") {
     return this->tune_common_drain_s_.load(std::memory_order_relaxed);
   }
+  if (name == "position_needs_diff") {
+    return static_cast<float>(this->tune_position_needs_diff_.load(std::memory_order_relaxed));
+  }
   if (name == "kp_from_diff_sigma") {
     return static_cast<float>(this->tune_kp_from_diff_sigma_.load(std::memory_order_relaxed));
   }
@@ -5178,6 +5186,14 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     if (!std::isfinite(value) || (value != 0.0f && (value < 30.0f || value > 3600.0f))) return false;
     this->tune_common_drain_s_.store(value, std::memory_order_relaxed);
     ESP_LOGI(TAG, "common_drain_s = %.1f t=%" PRId64, value, now_us());
+  } else if (name == "position_needs_diff") {
+    // 0/1, DEFAULT 1. When peers exist but no delta is available, position stands down instead of
+    // spending irreversible frames on an unvalidated deadline error. Runtime-settable so the old
+    // fail-open behaviour can be A/B'd, not because 0 is a reasonable place to sit.
+    if (!std::isfinite(value) || value < 0.0f || value > 1.0f) return false;
+    this->tune_position_needs_diff_.store(value >= 0.5f ? 1 : 0, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "position_needs_diff = %d t=%" PRId64,
+             this->tune_position_needs_diff_.load(std::memory_order_relaxed), now_us());
   } else if (name == "kp_from_diff_sigma") {
     // 0/1. Sizes Kp from the DIFFERENTIAL's noise instead of the deadline error's whenever the
     // group supplies a differential -- i.e. from the distribution P actually multiplies. Off by
