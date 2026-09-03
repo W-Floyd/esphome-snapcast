@@ -322,6 +322,13 @@ number:
     type: tag_stale_ms
     snapclient_id: snap
     name: Tag Stale
+  # Rate authority: how much rate the loop may command on top of the learned crystal before it
+  # hands the error to position. Raise it and fewer errors become frame steps; the wire sees a
+  # step on one board as a step in the pair's difference, which is the audible part.
+  - platform: snapclient
+    type: rate_authority_ppm
+    snapclient_id: snap
+    name: Rate Authority
   - platform: snapclient
     type: blank_ms
     snapclient_id: snap

@@ -4439,7 +4439,10 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // STEP of authority. The rate command is slew-limited now, so P ramps rather than snaps, and the
   // 907 us case that motivated 100 cannot be re-entered at full authority in one observation.
   // 150 covers the measured 114-131 with margin and stays well inside the crystal's 200 ppm clamp.
-  prof.rate_authority_ppm = 150.0f;
+  // Read from the tunable so the value above is the DEFAULT, not the only reachable setting: this
+  // is the one knob whose evidence came from watching the ceiling get hit, so it is also the one
+  // most likely to need moving again, and a reflash to move it is five membership changes.
+  prof.rate_authority_ppm = this->tune_rate_authority_ppm_.load(std::memory_order_relaxed);
   // Starvation floor: an eighth of the ring's CAPACITY, from the mirror updated where the frame
   // size is known. Dimensionless and config-derived, so it moves with buffer_size and the sample
   // rate and carries no time of its own -- and, unlike the measurement lag it used to be keyed
@@ -4716,6 +4719,17 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
       this->crystal_saved_at_us_ = now_us();
     }
     ESP_LOGI(TAG, "crystal_ppm = %+.2f ppm (set and persisted) t=%" PRId64, v, now_us());
+  } else if (name == "rate_authority_ppm") {
+    // BOUNDED BELOW THE CRYSTAL CLAMP, not at it. Authority is what P may add on top of the
+    // crystal integral, and the integral is what must HOLD the correction once P decays. At
+    // CRYSTAL_LIMIT_PPM (200) P could accept an error only a fully-railed integral could sustain
+    // -- the reach-but-cannot-hold case crystal_spent exists to catch, measured in test 14 as
+    // need=92 against auth=100 reading as "rate can fix it", zero frames spent, error peaking at
+    // 162 ms. The floor is the plant's own wander (p90 30 ppm): below that, rate cannot even track
+    // the plant and every correction becomes position's problem.
+    if (!std::isfinite(value) || value < 30.0f || value > 180.0f) return false;
+    this->tune_rate_authority_ppm_.store(value, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "rate_authority_ppm = %.1f t=%" PRId64, value, now_us());
   } else if (name == "timing_target_us") {
     this->tune_timing_target_us_.store(static_cast<int32_t>(value), std::memory_order_relaxed);
     ESP_LOGI(TAG, "timing_target_us = %" PRId32 " t=%" PRId64,

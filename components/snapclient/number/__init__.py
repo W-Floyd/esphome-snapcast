@@ -34,6 +34,12 @@ SERVO_PARAM_NUMBERS = {
     "blank_ms": ("blank_ms", UNIT_MILLISECOND, 0.0, 5000.0, 10.0, "mdi:blur-off"),
     "gap_blank_ms": ("gap_blank_ms", UNIT_MILLISECOND, 0.0, 2000.0, 10.0, "mdi:blur-off"),
     "tag_stale_ms": ("tag_stale_ms", UNIT_MILLISECOND, 100.0, 10000.0, 50.0, "mdi:timer-sand"),
+    # How much rate may be commanded ON TOP of the learned crystal before the loop hands the error
+    # to position. Editable because the bench measured the ceiling being hit (need 114-131 ppm
+    # against auth 100, each followed by an 11-frame step landing 250 us on the wire), and because
+    # an A/B of it previously cost a reflash per arm. The range stops at 180: authority at
+    # CRYSTAL_LIMIT_PPM (200) lets P accept what only a railed integral could hold.
+    "rate_authority_ppm": ("rate_authority_ppm", "ppm", 30.0, 180.0, 5.0, "mdi:speedometer"),
     # LEARNED, so adjustable but never restored -- see NO_RESTORE_PARAMS. Writable so a poisoned
     # estimate can be zeroed without a serial NVS erase: board a came back from three reflashes at
     # +92 then +200 railed, having converged to ~50 ppm earlier the same day, and every

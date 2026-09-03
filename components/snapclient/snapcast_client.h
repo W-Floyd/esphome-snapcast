@@ -1167,6 +1167,11 @@ class SnapcastClient {
   std::atomic<uint32_t> tune_timing_engine_{1};
   /// Position accuracy the engine aims at (us); sets its rate-command noise budget.
   std::atomic<int32_t> tune_timing_target_us_{20};
+  /// Rate authority, runtime-settable so it can be A/B'd WITHOUT A REFLASH. Every bench change
+  /// costs five consensus membership changes and a settle, which made the operator the dominant
+  /// disturbance for most of 2026-09-02; a knob turns an hour-per-arm experiment into a write.
+  /// Default matches the compiled-in value -- see the profile-build site for why it is 150.
+  std::atomic<float> tune_rate_authority_ppm_{150.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has
   /// pushed past the frame index it was applied at. Until then the engine issues no further
