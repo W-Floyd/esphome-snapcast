@@ -4685,8 +4685,33 @@ void SnapcastClient::persist_now() {
 // analyser's timeline carries each change; NOT persisted, so a reboot restores the flashed
 // defaults -- a bad experiment is one power cycle from gone.
 float SnapcastClient::servo_param_value(const std::string &name) const {
+  // EVERY tunable, not just the learned one. A knob with no stored value used to publish the
+  // BOTTOM OF ITS RANGE as though it were the setting, so the frontend read timing_target_us = 1
+  // (its minimum) while the engine ran the compiled 20 -- a twentyfold error in Kp = budget /
+  // sigma_e, reported confidently, on the knob whose own comment calls it "the one that matters".
+  // Every never-written knob was doing it: tag_stale 100, blank 0, gap_blank 0, all minima.
+  //
+  // The failure mode is worse than a wrong display: confirming the shown value writes it, so
+  // trusting the UI would have SET the target to 1 and crippled rate correction for real.
+  //
+  // Answering here lets the number publish what is actually running.
   if (name == "crystal_ppm") {
     return this->timing_engine_.crystal_ppm();
+  }
+  if (name == "timing_target_us") {
+    return static_cast<float>(this->tune_timing_target_us_.load(std::memory_order_relaxed));
+  }
+  if (name == "rate_authority_ppm") {
+    return this->tune_rate_authority_ppm_.load(std::memory_order_relaxed);
+  }
+  if (name == "tag_stale_ms") {
+    return static_cast<float>(this->tune_tag_stale_ms_.load(std::memory_order_relaxed));
+  }
+  if (name == "blank_ms") {
+    return static_cast<float>(this->tune_blank_ms_.load(std::memory_order_relaxed));
+  }
+  if (name == "gap_blank_ms") {
+    return static_cast<float>(this->tune_gap_blank_ms_.load(std::memory_order_relaxed));
   }
   return NAN;
 }

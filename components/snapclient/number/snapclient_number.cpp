@@ -41,12 +41,32 @@ void SnapclientServoParamNumber::setup() {
   }
   float restored = NAN;
   if (this->pref_.load(&restored) && std::isfinite(restored)) {
+    this->last_shown_ = restored;   // a stored value is authoritative; loop() must not overwrite it
     this->publish_state(restored);
     if (this->parent_ != nullptr) {
       this->parent_->set_servo_param(this->param_, restored);
     }
   } else {
-    this->publish_state(this->traits.get_min_value());
+    // NEVER WRITTEN IS NOT "SET TO THE MINIMUM". This used to publish traits.get_min_value(), so a
+    // knob nobody had touched reported the bottom of its range as though it were the setting:
+    // timing_target_us read 1 against a compiled 20, tag_stale_ms 100 against 1000, blank_ms 0
+    // against 500, gap_blank_ms 0 against 50. The timing_target_us case is the expensive one --
+    // it prices the rate gain (Kp = budget / sigma_e), so the frontend understated it twentyfold,
+    // and 2026-09-02 an entire analysis of why the loop under-corrects was built on the displayed
+    // number before the discrepancy was noticed.
+    //
+    // Worse than a wrong readout: confirming the shown value WRITES it, so anyone trusting the UI
+    // would have set the target to 1 us for real and crippled rate correction.
+    //
+    // Ask the firmware what it is running. Same reasoning the no_restore branch above already
+    // applies to crystal_ppm ("publishing the minimum would misreport it"); it simply was not
+    // carried across. If the answer is not available yet, publish NOTHING and let loop() fill it
+    // in -- an empty knob is honest, a minimum is not.
+    const float live = this->parent_ != nullptr ? this->parent_->servo_param_value(this->param_) : NAN;
+    if (std::isfinite(live)) {
+      this->last_shown_ = live;
+      this->publish_state(live);
+    }
   }
 }
 
@@ -55,7 +75,13 @@ void SnapclientServoParamNumber::loop() {
   // the last typed number would be lying within seconds -- the crystal moves continuously. So the
   // knob follows the live value and stays writable: typing sets the learner, and the learner then
   // owns it again.
-  if (!this->no_restore_ || this->parent_ == nullptr) {
+  if (this->parent_ == nullptr) {
+    return;
+  }
+  // A no_restore knob TRACKS for ever (the firmware owns and moves the value). A restore knob only
+  // needs filling in ONCE, and only if it has never shown anything -- setup() runs before the
+  // client is necessarily reachable, and a knob left blank would otherwise stay blank.
+  if (!this->no_restore_ && std::isfinite(this->last_shown_)) {
     return;
   }
   const uint32_t now_ms = millis();
