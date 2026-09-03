@@ -883,6 +883,11 @@ class SnapcastClient {
     // Rolling hard-resync count, for telling a one-shot catch-up from a storm
     int64_t storm_window_us{0};
     uint32_t storm_resyncs{0};
+    /// Consecutive same-direction samples past the hard-resync threshold, and their direction.
+    /// A single sample is not evidence: the deadline error was measured stepping one whole DMA
+    /// buffer (+50010 us) between consecutive decisions while the peer 15.7 us away never moved.
+    int resync_confirm_run{0};
+    int resync_confirm_dir{0};
     // When the drift first exceeded the repair threshold, 0 while it has not, plus the
     // range it has covered since -- a split is steady, an artefact moves.
     int32_t drift_excess_min_us{0};
@@ -1122,6 +1127,9 @@ class SnapcastClient {
   std::atomic<float> bias_kick_request_us_{0.0f};  // bench hook: bias change to deliver as a kick (see align_bias_kick_us)
   std::atomic<int64_t> pipe_depth_us_{0};   // pushed-minus-played, us; mirrored per block for travel_horizon_us_()
   std::atomic<int64_t> ring_depth_us_{0};   // pcm ring fill, us; mirrored per chunk for travel_horizon_us_()
+  /// The sink's DMA descriptor span (AudioDepth::render_nondraining_us), mirrored per chunk. Used
+  /// ONLY to keep the hard-resync threshold from coinciding with a whole number of DMA buffers.
+  std::atomic<int64_t> dma_span_us_{0};
   /// RING MASS BALANCE. The loop servos the deadline error and nothing servos buffer occupancy,
   /// so audio-in = audio-out is INFERRED, never checked: chasing a drifting deadline is the same
   /// action as balancing the buffer only while the deadline moves because the clocks differ. A
@@ -1230,7 +1238,7 @@ class SnapcastClient {
   std::atomic<float> tune_ratewhy_ppm_{5.0f};
   /// Shared common-mode correction. 0 = shadow only (consensus formed and CMNC logged, nothing
   /// applied), which is the default and what the falsified 3c result argues for.
-  std::atomic<float> tune_common_gain_{0.0f};
+  std::atomic<float> tune_common_drain_s_{0.0f};
   std::atomic<float> tune_common_authority_ppm_{50.0f};
   timing::Engine timing_engine_{timing::Profile{}};
   /// In-flight position correction, confirmed frame-exactly: it has landed once the player has

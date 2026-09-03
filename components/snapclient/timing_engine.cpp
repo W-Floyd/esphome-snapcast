@@ -616,6 +616,16 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     const float e_common_f = static_cast<float>(have_diff ? e - e_diff : e);
     const float e_diff_f = static_cast<float>(have_diff ? e_diff : 0);
     const float fu = static_cast<float>(frame_us);
+    // THE INTEGRAL KEEPS THE COMMON PART even when the shared drain is active. Excluding it was
+    // tried and is wrong: pc is PROPORTIONAL, so it needs a standing error to produce output, and
+    // a sustained 40 ppm common drift at drain_s=300 would demand a permanent 12 ms error to
+    // generate the ppm it needs. Zero steady-state error on the common part is the integral's job
+    // and nothing else here can do it.
+    //
+    // The two are not competing for the same work: the integral handles common DRIFT (a rate that
+    // must be matched indefinitely), while pc exists to drain a common DISPLACEMENT before it
+    // reaches the resync threshold. pc is bounded and slow enough that the integral simply sees a
+    // slightly faster-decaying error.
     const float e_bounded =
         std::clamp(e_common_f, -fu, fu) + std::clamp(e_diff_f, -fu, fu);
     cmd.decision.e_split_valid = true;
@@ -726,9 +736,11 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   if (group.common_valid) {
     cmd.decision.common_shared_us = static_cast<int32_t>(
         std::clamp<int64_t>(group.common_us, INT32_MIN, INT32_MAX));
-    if (profile_.common_gain > 0.0f) {
-      const float pc_raw =
-          profile_.common_gain * static_cast<float>(group.common_us) / horizon_s;
+    if (profile_.common_drain_s > 0.0f) {
+      // us / s == ppm. A sustained offset sized to drain the common error over MINUTES, which is
+      // the budget that matters (stay under the resync threshold between disturbances), not over
+      // rate's 2 s horizon, which no achievable rate can satisfy.
+      const float pc_raw = static_cast<float>(group.common_us) / profile_.common_drain_s;
       pc_term = std::clamp(pc_raw, -profile_.common_authority_ppm, profile_.common_authority_ppm);
     }
   }

@@ -22,6 +22,7 @@
 #include <cstring>
 #include <deque>
 #include <random>
+#include <string>
 #include <vector>
 
 using namespace esphome::snapclient::timing;
@@ -56,6 +57,11 @@ struct Board {
   bool live = false;
   int corrections = 0;
   int resyncs = 0;          ///< whole-chunk repairs taken by THIS board
+  int resync_run = 0;       ///< consecutive same-direction samples past the threshold
+  int resync_dir = 0;
+  /// Repair already applied but not yet visible in the lagged measurement.
+  double resync_pending_us = 0.0;
+  int64_t resync_pending_until_us = 0;
   long gross_frames = 0;
   double phase_us = 0.0;    // what it publishes
   int64_t phase_at_us = 0;  // and when it sampled it -- pairing needs both
@@ -151,6 +157,9 @@ struct Result {
   double ediff_after_land = 0.0, ediff_baseline = 0.0;
   long ediff_after_n = 0;
   double ediff_after_flagged = 0.0;  ///< fraction of phantom samples the transient flag catches
+  /// Peak |e_common| seen after settling. The drain exists to hold this under the 50 ms resync
+  /// threshold; above it the cascade (solo repair -> broken pair -> phantom -> P excursion) starts.
+  double common_max = 0.0;
   double common_valid_frac = 0.0;
   /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
   /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
@@ -193,6 +202,16 @@ struct Faults {
   /// Chunk the repair is quantised to; 0 = the client's ~26 ms. The repair cannot null the error,
   /// only step it by whole chunks, which is what makes the residual board-dependent.
   double resync_chunk_us = 0.0;
+  /// A single-sample measurement error, injected on board A only, every glitch_period_s. The
+  /// audio does NOT move -- only the reading is wrong.
+  double glitch_period_s = 0.0;
+  double glitch_us = 0.0;
+  /// Consecutive same-direction samples past the threshold before the repair may act; 0 = act on
+  /// one sample, which is what the client did before 2026-09-03.
+  int resync_confirm = 0;
+  /// Test the repair against the lagged MEASUREMENT (as the client does) rather than the truth.
+  /// Required for any measurement fault to reach the repair at all. See the note at its use.
+  bool resync_on_measurement = false;
   /// Whether the resync path tells the engine what it did. The bench did not, until
   /// note_external_move() existed.
   bool announce_resync = false;
@@ -251,6 +270,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
+  double common_max_us = 0.0;
   double ph_after_sum = 0.0, ph_base_sum = 0.0;
   long ph_after_n = 0, ph_base_n = 0, ph_after_flagged = 0;
   double rate_sum_a = 0.0, rate_sum_b = 0.0, pc_sum_a = 0.0, pc_sum_b = 0.0;
@@ -415,6 +435,21 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
         seen = x.obs.front().second;
         x.obs.pop_front();
       }
+      // A MEASUREMENT THAT LIES. Every fault here until now moved real audio (starve, reanchor,
+      // resync) or withheld an observation (blind_fraction); none made a reading WRONG while the
+      // audio stayed put. That is the bench's actual fault: board a's deadline error stepped
+      // +50010 us for a single decision -- one whole DMA buffer plus drift -- while board b, 15.7
+      // us away on the wire, never moved, and the repair then dropped 1136 frames of real audio.
+      //
+      // Injected into the OBSERVATION only. err_us, the truth, is untouched: the audio has not
+      // moved, which is the whole point and the reason a confirmation gate can reject it.
+      bool glitched = false;
+      if (f.glitch_period_s > 0.0 && f.glitch_us != 0.0 && i == 0) {
+        const double gph = std::fmod(static_cast<double>(t) / 1e6, f.glitch_period_s);
+        // One tick wide: a single bad sample, not a sustained offset.
+        glitched = gph < (static_cast<double>(tick) / 1e6);
+        if (glitched) seen += f.glitch_us;
+      }
 
       // PAIR ONLY PHASES SAMPLED AT ROUGHLY THE SAME INSTANT, as recompute_group_delta_ does:
       // these are absolute offsets drifting continuously, so differencing a fresh peer phase
@@ -507,13 +542,48 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       //
       // Bench 2026-09-03: board a's repair was frames=+1136 = 25.76 ms, i.e. exactly one chunk,
       // taken while the pair was 15.7 us apart on the wire.
-      if (f.resync_us > 0.0 && std::fabs(x.err_us + deadline_shift + x.own_deadline_us) > f.resync_us) {
-        const double measured_now = x.err_us + deadline_shift + x.own_deadline_us;
+      // ACTS ON THE MEASUREMENT, NOT THE TRUTH -- as the client does. This tested
+      // x.err_us + shifts, i.e. the true error, so no measurement fault could ever reach it and
+      // "the repair believed a bad reading" was unrepresentable. The firmware tests coarse_err_us,
+      // which is derived from the observation, so a lie in the observation is a lie to the repair.
+      //
+      // CONFIRMATION, matching the client's RESYNC_CONFIRM_SAMPLES: a real displacement persists
+      // across samples, an artifact does not. resync_confirm = 0 reproduces the old behaviour.
+      // PENDING REPAIRS SUBTRACTED, as the client does with `err_pre - pend`. seen is lagged by
+      // measurement_lag_us, so for ~10 ticks after a repair it still reports the error the repair
+      // has already removed. Acting on that re-applies the same fix again and again: without this
+      // the model took 5231 repairs from 7 injected glitches and diverged to NaN, and section 4's
+      // frame counts reached 2.7e9. That was my model, not the loop.
+      if (x.resync_pending_us != 0.0 && t >= x.resync_pending_until_us) {
+        x.resync_pending_us = 0.0;
+      }
+      // OPT-IN, and the default is the LESS FAITHFUL path. The client always tests a value derived
+      // from the observation; this model tested the TRUTH, which is why no measurement fault could
+      // reach it. Switching every scenario over destabilised the calibrated ones badly -- 3a went
+      // to 631 ms of median skew with gd pairing collapsing from 100%/32% to 42%/8% -- so the
+      // faithful path is enabled only where it is being exercised (3g) rather than shipped broken
+      // everywhere. Completing the model (the client's per-block pacing, which bounds repair rate
+      // in a way this does not) is follow-up work, and until it is done the truth-based default is
+      // a KNOWN fidelity gap, not a choice.
+      const double measured_now =
+          f.resync_on_measurement ? (seen - x.resync_pending_us)
+                                  : (x.err_us + deadline_shift + x.own_deadline_us);
+      const bool past = f.resync_us > 0.0 && std::fabs(measured_now) > f.resync_us;
+      const int rdir = measured_now > 0 ? 1 : -1;
+      if (past) {
+        if (rdir == x.resync_dir) x.resync_run++;
+        else { x.resync_dir = rdir; x.resync_run = 1; }
+      } else {
+        x.resync_run = 0; x.resync_dir = 0;
+      }
+      if (past && x.resync_run >= (f.resync_confirm > 0 ? f.resync_confirm : 1)) {
         const double chunk = f.resync_chunk_us > 0.0 ? f.resync_chunk_us : 26123.0;
         const double moved = std::trunc(measured_now / chunk) * chunk;
         if (moved != 0.0) {
           x.err_us -= moved;
           x.resyncs++;
+          x.resync_pending_us += moved;
+          x.resync_pending_until_us = t + p.measurement_lag_us;
           if (f.announce_resync) {
             x.eng.note_external_move(static_cast<int64_t>(std::llround(moved)), t);
           }
@@ -572,6 +642,12 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
           // would have hidden.
           if (!x.phase_publishing) ph_after_flagged++;
         } else { ph_base_sum += ad; ph_base_n++; }
+      }
+      // PEAK COMMON ERROR is the quantity the drain exists to bound: the resync fires at 50 ms,
+      // so keeping the peak under that is what prevents the whole cascade.
+      if (c.decision.e_split_valid && t > 120000000) {
+        const double ac = std::fabs(static_cast<double>(c.decision.e_common_us));
+        if (ac > common_max_us) common_max_us = ac;
       }
       x.last_pc_ppm = c.decision.pc_ppm;
       x.last_common_valid = c.decision.common_shared_valid;
@@ -695,6 +771,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     r.ediff_baseline = ph_base_n ? ph_base_sum / ph_base_n : 0.0;
     r.ediff_after_n = ph_after_n;
     r.ediff_after_flagged = ph_after_n ? static_cast<double>(ph_after_flagged) / ph_after_n : 0.0;
+    r.common_max = common_max_us;
     r.pc_absdiff = pc_absdiff_sum / sn;
     r.common_one_sided_frac = static_cast<double>(common_one_sided_n) / sn;
     r.common_both_frac = static_cast<double>(both_valid_n) / sn;
@@ -883,21 +960,23 @@ int main() {
     printf("        plant %+.0f/%+.0f, common %+.0f  ->  total wants %+.0f/%+.0f;"
            " integral wants %+.0f/%+.0f once the gain carries the common part\n",
            plant_a, plant_b, common, plant_a + common, plant_b + common, plant_a, plant_b);
-    printf("        %-6s %9s %9s %9s %9s %9s %9s %8s %7s\n",
-           "gain", "xtal a", "xtal b", "pc a", "pc b", "rate a", "rate b", "skew med", "p90");
-    for (double gain : {0.0, 0.25, 0.5, 1.0}) {
+    printf("        THE TARGET IS max|com| < 50000 us -- below the resync threshold, so the solo\n");
+    printf("        repair that breaks the pair (3f) never fires at all.\n");
+    printf("        %-8s %8s %8s %8s %8s %10s %7s %8s %7s\n",
+           "drain_s", "xtal a", "xtal b", "pc a", "pc b", "max|com|", "rsync", "skew med", "p90");
+    for (double drain : {0.0, 600.0, 300.0, 120.0}) {
       Profile q = p;
-      q.common_gain = static_cast<float>(gain);
+      q.common_drain_s = static_cast<float>(drain);
       char tag[24];
-      snprintf(tag, sizeof(tag), "cmn-%.2f", gain);
+      snprintf(tag, sizeof(tag), "cmn-%.0f", drain);
       Result r = simulate(tag, q, plant_a, plant_b, common, 80.0, 1800.0, TRUE_LAND, hungry);
-      printf("        %-6.2f %9.1f %9.1f %9.1f %9.1f %9.1f %9.1f %8.0f %7.0f\n",
-             gain, r.xtal_a, r.xtal_b, r.pc_a, r.pc_b, r.rate_a, r.rate_b,
-             r.skew_med, r.skew_p90);
+      printf("        %-8.0f %8.1f %8.1f %8.1f %8.1f %10.0f %3d/%-3d %8.0f %7.0f\n",
+             drain, r.xtal_a, r.xtal_b, r.pc_a, r.pc_b, r.common_max,
+             r.resync_a, r.resync_b, r.skew_med, r.skew_p90);
       printf("               [shared? mean |pc_a - pc_b| = %.2f ppm; consensus BOTH %.0f%%,"
              " ONE-SIDED %.0f%%]\n",
              r.pc_absdiff, 100.0 * r.common_both_frac, 100.0 * r.common_one_sided_frac);
-      if (gain == 0.0) {
+      if (drain == 0.0) {
         // The consensus is formed and recorded even when the gain is zero -- that is the shadow,
         // and it is what makes the first row a genuine control rather than a different experiment.
         printf("               [shadow: consensus available on %.0f%% of settled decisions,"
@@ -1060,6 +1139,42 @@ int main() {
              c.name, r.skew_med, r.skew_p90, r.skew_max, r.resync_a, r.resync_b);
     }
     printf("        (unequal resync counts are the signature: one board took a chunk the other did not)\n");
+  }
+
+  printf("\n3g. A MEASUREMENT THAT LIES: one bad sample, an irreversible repair (bench 2026-09-03)\n");
+  {
+    // Board a's deadline error stepped +50010 us for a single decision -- one whole DMA buffer
+    // (50000 us) plus 10 us of drift -- while board b sat 15.7 us away on the wire and never
+    // moved. hard_resync_threshold_ms was 50, so the artifact equalled the threshold EXACTLY, and
+    // the repair dropped 1136 frames of real audio, putting the pair 2.9 ms apart.
+    //
+    // Equal plants, no drift, no starvation: the audio is never displaced here. Any skew is the
+    // repair acting on a reading that was wrong.
+    Faults g{};
+    g.glitch_period_s = 120.0;
+    g.resync_on_measurement = true;   // the fault is a bad READING; it cannot reach a truth-tested repair
+    g.glitch_us = 50010.0;      // one DMA buffer plus drift, on board A only
+    g.resync_us = 50000.0;      // the coincidence: threshold == the artifact
+    printf("        glitch +50010 us on board A every 120 s; audio never moves\n");
+    printf("        %-34s %9s %9s %9s %8s\n", "case", "skew med", "skew p90", "skew max", "rsync a/b");
+    struct GCase { const char *name; const char *tag; int confirm; double thresh; };
+    const GCase cases[] = {
+      {"no glitch (control)",            "gl-none",  0, 50000.0},
+      {"glitch, act on 1 sample (today)","gl-1",     0, 50000.0},
+      {"glitch, confirm 3 samples",      "gl-3",     3, 50000.0},
+      {"glitch, threshold 75 ms (1.5x)", "gl-thr",   0, 75000.0},
+      {"glitch, confirm 3 + 75 ms",      "gl-both",  3, 75000.0},
+    };
+    for (const GCase &c : cases) {
+      Faults f = g;
+      f.resync_confirm = c.confirm;
+      f.resync_us = c.thresh;
+      if (std::string(c.tag) == "gl-none") { f.glitch_period_s = 0.0; f.glitch_us = 0.0; }
+      Result r = simulate(c.tag, p, 0.0, 0.0, 0.0, 80.0, 900.0, TRUE_LAND, f);
+      printf("        %-34s %9.0f %9.0f %9.0f %4d/%-4d\n",
+             c.name, r.skew_med, r.skew_p90, r.skew_max, r.resync_a, r.resync_b);
+    }
+    printf("        (a repair on a lie shows as skew with resyncs on A only and none on B)\n");
   }
 
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");

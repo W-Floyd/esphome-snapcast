@@ -870,6 +870,12 @@ static constexpr float LEGACY_TRIM_TAU_S = 120.0f;
 // frame_us + 2*sigma, derived in the engine.
 static constexpr int64_t RSKIP_REPORT_US = 100;
 
+/// Consecutive same-direction samples past the threshold before a hard resync may act. Matches
+/// the group-delta filter's JUMP_CONFIRM_SAMPLES, and for the same reason: a step that is real
+/// persists, and one that is an artifact of the measurement does not. The resync was the only
+/// actuator here acting on a single raw sample, and it is the only irreversible one.
+static constexpr int RESYNC_CONFIRM_SAMPLES = 3;
+
 
 
 #if defined(CLOCK_SYNC_TSF_ACTIVE) && defined(USE_SNAPCLIENT_TIMING_DIAG)
@@ -2884,7 +2890,22 @@ void SnapcastClient::player_task_() {
       st.dl_off_valid = true;
       st.dl_off_prev_us = dl_off;
     }
-    const int64_t hard_us = static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000;
+    // HARD-RESYNC THRESHOLD, DECOUPLED FROM THE DMA BUFFER.
+    //
+    // Measured 2026-09-03: the sink's DMA span is 50000 us and hard_resync_threshold_ms is 50, so
+    // the two were EXACTLY EQUAL. Nothing chose them with reference to each other. The consequence
+    // is that any discontinuity of one whole DMA buffer in the pipeline accounting lands precisely
+    // on the threshold: board a's deadline error stepped +50010 us between consecutive decisions
+    // (one buffer plus 10 us of drift) while board b, 15.7 us away on the wire, never moved. The
+    // repair dropped 1136 frames of real audio and put the pair 2.9 ms apart.
+    //
+    // So the threshold is held clear of a whole number of buffers. One buffer now sits below it
+    // and cannot trip it at all; two buffers is above, which is what the confirmation below is
+    // for. Derived from the MEASURED span rather than a constant, so it cannot silently re-coincide
+    // when the DMA configuration changes -- which is exactly how this arose.
+    const int64_t dma_span = this->dma_span_us_.load(std::memory_order_relaxed);
+    const int64_t hard_cfg_us = static_cast<int64_t>(this->config_.hard_resync_threshold_ms) * 1000;
+    const int64_t hard_us = dma_span > 0 ? std::max(hard_cfg_us, (3 * dma_span) / 2) : hard_cfg_us;
     const uint32_t frames = rec.bytes / frame_bytes;
     const int64_t predicted = this->predict_next_play_us_(rec.params.sample_rate);
 
@@ -3342,8 +3363,39 @@ void SnapcastClient::player_task_() {
     // timebase step) with only 5 resyncs, and playing audibly toward something that
     // far outside the server's buffer is meaningless -- so anything past bufferMs
     // mutes on the spot, and the bailout above reconnects if it persists.
+    // CONFIRM BEFORE AN IRREVERSIBLE REPAIR. The hard resync drops or inserts whole chunks and
+    // cannot be undone, and until now it acted on ONE raw sample gated only by coarse_plausible --
+    // which is |err| <= 4 * pipeline, about 12 s on this bench, so a 50 ms artifact sails through.
+    // Every other actuator in this design already confirms: position acts on the FILTERED error
+    // and must clear a frame by 2 sigma, and the group-delta filter needs JUMP_CONFIRM_SAMPLES
+    // consecutive same-direction innovations before it will believe a step.
+    //
+    // Chosen over a consistency check on the depth snapshot because no such check exists: the
+    // publisher is already a seqlock (all fields from one publish, bounded retry), and the pair
+    // that looked contradictory -- dma=50000 with inflight=0 -- is this platform's NORMAL output,
+    // since the standard i2s speaker passes dbg_inflight_us as a literal 0. A predicate on that
+    // would reject every observation. Confirmation costs ~2 samples on a genuine displacement,
+    // which is nothing to a board already tens of ms out, and it does not depend on knowing WHY
+    // the accounting moved -- which is still open.
+    const int resync_dir = coarse_err_us > 0 ? 1 : -1;
+    if (std::abs(coarse_err_us) > hard_us && coarse_plausible) {
+      if (resync_dir == st.resync_confirm_dir) {
+        st.resync_confirm_run++;
+      } else {
+        st.resync_confirm_dir = resync_dir;
+        st.resync_confirm_run = 1;
+      }
+    } else {
+      st.resync_confirm_run = 0;
+      st.resync_confirm_dir = 0;
+    }
+    // The single decision all three sites below share. Computing it once is deliberate: this file
+    // has already shipped a bug where two halves of one policy tested different quantities.
+    const bool resync_confirmed =
+        st.resync_confirm_run >= RESYNC_CONFIRM_SAMPLES && coarse_ok && coarse_plausible;
+
     bool mute_now = false;
-    if (std::abs(coarse_err_us) > hard_us && coarse_ok && coarse_plausible) {
+    if (std::abs(coarse_err_us) > hard_us && resync_confirmed) {
       if (now_us() - st.storm_window_us > RESYNC_STORM_WINDOW_US) {
         st.storm_window_us = now_us();
         st.storm_resyncs = 0;
@@ -3454,7 +3506,7 @@ void SnapcastClient::player_task_() {
     // log traffic competes with the audio stream on the already-congested link — a
     // feedback loop that prolongs the outage. The periodic sync report carries the
     // full per-window count either way.
-    if (coarse_err_us > hard_us && coarse_ok && coarse_plausible) {
+    if (coarse_err_us > hard_us && resync_confirmed) {
       if (coarse_on_tags) {
         st.coarse_act_us = now_us();
         st.coarse_act_err_us = coarse_err_us;
@@ -3489,7 +3541,7 @@ void SnapcastClient::player_task_() {
     }
 
     uint32_t drop_frames = 0;
-    if (coarse_err_us < -hard_us && coarse_ok && coarse_plausible) {
+    if (coarse_err_us < -hard_us && resync_confirmed) {
       if (coarse_on_tags) {
         st.coarse_act_us = now_us();
         st.coarse_act_err_us = coarse_err_us;
@@ -4021,6 +4073,13 @@ void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase)
   const int64_t r_push = p_now - static_cast<int64_t>(m.dbg_src_received);
   const int64_t r_src = static_cast<int64_t>(m.dbg_src_received) - static_cast<int64_t>(m.dbg_src_consumed) -
                         own_frames;
+  // THE DMA SPAN, mirrored for the resync threshold. render_nondraining_us is the whole descriptor
+  // span the sink always keeps full, i.e. the DMA buffer -- measured 50000 us on this bench, which
+  // is exactly hard_resync_threshold_ms. See the threshold's derivation for why that coincidence
+  // matters and must not be relied on.
+  if (m.render_nondraining_us > 0) {
+    this->dma_span_us_.store(static_cast<int64_t>(m.render_nondraining_us), std::memory_order_relaxed);
+  }
   const int64_t inflight_frames = static_cast<int64_t>(m.dbg_inflight_us) * rate / 1000000;
   const int64_t r_mix = static_cast<int64_t>(m.dbg_src_consumed) - static_cast<int64_t>(m.dbg_sink_received) -
                         xfer_frames - inflight_frames;
@@ -4574,7 +4633,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   // bench's 2972 ms capacity this is ~371 ms, above the 500 ms "ring low" band a keeps entering.
   prof.buffer_floor_us = this->ring_capacity_us_.load(std::memory_order_relaxed) / 8;
   prof.target_position_us = this->tune_timing_target_us_.load(std::memory_order_relaxed);
-  prof.common_gain = this->tune_common_gain_.load(std::memory_order_relaxed);
+  prof.common_drain_s = this->tune_common_drain_s_.load(std::memory_order_relaxed);
   prof.common_authority_ppm = this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
   this->timing_engine_.set_profile(prof);
 
@@ -4617,7 +4676,7 @@ timing::Command SnapcastClient::timing_step_(ServoState &st, uint32_t sample_rat
   }
 
   // CMNC: the consensus beside this board's own value, on its own short line. This is the SHADOW
-  // -- it is logged whether or not common_gain is applying it, so the prerequisite ("is e_common
+  // -- it is logged whether or not the drain is applying it, so the prerequisite ("is e_common
   // actually common on real boards?") is answerable before any gain is turned on. The simulator
   // says yes (agreement to 1-4%, r up to 1.00, disagreement flat at the measurement noise); no
   // board has ever been asked.
@@ -4932,8 +4991,8 @@ float SnapcastClient::servo_param_value(const std::string &name) const {
   if (name == "ratewhy_ppm") {
     return this->tune_ratewhy_ppm_.load(std::memory_order_relaxed);
   }
-  if (name == "common_gain") {
-    return this->tune_common_gain_.load(std::memory_order_relaxed);
+  if (name == "common_drain_s") {
+    return this->tune_common_drain_s_.load(std::memory_order_relaxed);
   }
   if (name == "common_authority_ppm") {
     return this->tune_common_authority_ppm_.load(std::memory_order_relaxed);
@@ -5003,16 +5062,18 @@ bool SnapcastClient::set_servo_param(const std::string &name, float value) {
     if (!std::isfinite(value) || value < 0.5f || value > 500.0f) return false;
     this->tune_ratewhy_ppm_.store(value, std::memory_order_relaxed);
     ESP_LOGI(TAG, "ratewhy_ppm = %.2f t=%" PRId64, value, now_us());
-  } else if (name == "common_gain") {
-    // 0 = OFF, and off is the default: the shared correction is SHADOWED (CMNC is logged, the
-    // consensus is formed) without acting. Turning it on is an A/B, not a setting -- the
-    // rate-actuated form was falsified in tests/group 3c, where a 14 ms common error over a 2 s
-    // horizon demands 7000 ppm, so the term pins at its clamp and the gain stops mattering above
-    // a threshold far below 0.25. Kept tunable so that result can be confirmed on hardware
-    // without a reflash, not because a nonzero value is expected to help.
-    if (!std::isfinite(value) || value < 0.0f || value > 2.0f) return false;
-    this->tune_common_gain_.store(value, std::memory_order_relaxed);
-    ESP_LOGI(TAG, "common_gain = %.3f t=%" PRId64, value, now_us());
+  } else if (name == "common_drain_s") {
+    // SECONDS to drain the shared common error over; 0 = OFF and off is the default, so the
+    // consensus is still formed and CMNC still logged without anything acting.
+    //
+    // This replaced a "fraction per rate horizon" gain, which was the wrong timescale: over a 2 s
+    // horizon a 14 ms common error asks for 7000 ppm, so it pinned at its clamp for every gain
+    // and a sweep returned identical rows. The budget that matters is staying under the 50 ms
+    // resync threshold between disturbances -- minutes, not seconds. Bounded below at 30 s
+    // because faster than that is the failed formulation again by another name.
+    if (!std::isfinite(value) || (value != 0.0f && (value < 30.0f || value > 3600.0f))) return false;
+    this->tune_common_drain_s_.store(value, std::memory_order_relaxed);
+    ESP_LOGI(TAG, "common_drain_s = %.1f t=%" PRId64, value, now_us());
   } else if (name == "common_authority_ppm") {
     // The ceiling the term actually operates at, given it saturates. This is the knob that
     // matters for an A/B, not the gain.

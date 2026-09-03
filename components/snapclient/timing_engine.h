@@ -67,20 +67,30 @@ struct Profile {
   /// buffer or codec. Not a constant in this file -- it is a property of the hardware.
   float rate_authority_ppm = 100.0f;
 
-  /// SHARED COMMON-MODE CORRECTION, off by default (0 = today's behaviour exactly).
-  ///
-  /// Fraction of the group's shared common error to remove per rate horizon. 1.0 asks rate to
-  /// take it all out over one horizon -- the same "reach" arithmetic as needed_ppm, and for the
-  /// same reason: the horizon is how far ahead rate can honestly see.
+  /// SHARED COMMON-MODE CORRECTION: SECONDS to drain the group's shared common error over.
+  /// 0 = off, which is today's behaviour exactly.
   ///
   /// Today nothing corrects the common error promptly. The crystal integral absorbs it, slowly,
   /// and that is what winds the estimate: a starved board is behind for the whole shortage AND
   /// the whole catch-up, one-signed throughout, so the integral learns a DISPLACEMENT as a
   /// permanent rate. Measured 2026-09-02: a hand-zeroed crystal at +192 ppm against a true +46,
-  /// 8 ppm off the rail, while the true requirement was never above ~46. The harm is not that
-  /// the clock cannot keep up -- it has 2000 ppm of actuator for a 46 ppm job -- but that a
-  /// railed integral has no headroom and trips crystal_spent, which hands the work to POSITION,
-  /// which is audible.
+  /// 8 ppm off the rail. The harm is not that the clock cannot keep up -- it has 2000 ppm of
+  /// actuator for a 46 ppm job -- but that a railed integral has no headroom and trips
+  /// crystal_spent, which hands the work to POSITION, which is audible.
+  ///
+  /// NOT a fraction per rate horizon, which is what this was first written as and why it failed.
+  /// Over a 2 s horizon a 14 ms common error asks for 7000 ppm, so the term pinned at its clamp
+  /// for every gain above ~0.005 and a gain sweep returned four identical rows. The horizon is
+  /// the wrong timescale: it is how far ahead rate can SEE, not how fast the common error must
+  /// go away.
+  ///
+  /// The real budget is "stay under the 50 ms hard-resync threshold between disturbances", which
+  /// is minutes. At 350 ppm of total authority a 51 ms error walks off in 146 s, and at a shared
+  /// 50 ppm in 17 min, against a measured disturbance interval of ~13 min on this bench. So the
+  /// correction is a bounded, sustained offset, not a fast null -- and unlike the horizon form it
+  /// stays proportional for small errors instead of saturating immediately.
+  float common_drain_s = 0.0f;
+
   /// HOLD THE GROUP DELTA WHILE THIS BOARD IS STEPPING ITS OWN AUDIO. Off by default (today's
   /// behaviour exactly), so it can be A/B'd rather than assumed.
   ///
@@ -93,7 +103,6 @@ struct Profile {
   /// board's own phase is meaningless, and zeroing would itself be a step.
   bool gate_gd_on_transient = false;
 
-  float common_gain = 0.0f;
   /// Ceiling on the shared correction, separate from rate_authority_ppm because it answers a
   /// different question: authority bounds what this board may do ALONE (and so bounds the
   /// differential it can inject), while this bounds a motion the whole group makes together and
@@ -283,7 +292,7 @@ struct Decision {
   bool slew_clipped = false;    ///< the command wanted to move further than authority*dt/horizon
 
   /// THE SHARED COMMON-MODE TERM, and the value it acted on. Recorded even when the correction is
-  /// disabled (common_gain = 0), so the consensus can be SHADOWED against the live loop -- logged
+  /// disabled (common_drain_s = 0), so the consensus can be SHADOWED against the live loop -- logged
   /// beside what the board actually did, acting on nothing -- before any gain is applied. Every
   /// mechanism proposed on this bench that skipped that step was withdrawn.
   bool common_shared_valid = false;  ///< false = the group supplied no consensus; NOT "it was zero"
