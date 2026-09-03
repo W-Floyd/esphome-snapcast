@@ -1141,6 +1141,7 @@ class SnapcastClient {
   int64_t ph_prev_ffl_us_{0};
   int64_t ph_prev_map_us_{0};
   int64_t ph_prev_srv_us_{0};
+  int64_t ph_prev_loc_us_{0};
   int64_t ph_log_us_{0};
   bool ph_prev_valid_{false};
   /// RING MASS BALANCE. The loop servos the deadline error and nothing servos buffer occupancy,

@@ -170,6 +170,9 @@ struct Result {
   /// Kp from the differential raises or lowers the gain, and it is inverted between here and the
   /// bench -- which is why 3h reported the opposite sign to the hardware sweep.
   double sigma_e_mean = 0.0, gd_sigma_mean = 0.0;
+  /// Peak sigma_e. A measurement JUMP is counted as noise by the estimator, so this is what
+  /// collapses Kp -- the bench saw sig=30590 us and kp=0.000 at the moment it mattered.
+  double sigma_e_max = 0.0;
   /// Fraction of decisions with P pinned at the authority clamp, and the largest |P| seen.
   double p_sat_frac = 0.0, p_max_ppm = 0.0;
   double common_valid_frac = 0.0;
@@ -228,6 +231,10 @@ struct Faults {
   /// only. Needed because the other two arms are disturbances that swamp any measurement.
   double transient_period_s = 0.0;
   double transient_secs = 0.0;
+  /// Board 1 stops publishing its phase, so board 0 has NO differential and position falls back to
+  /// the deadline error. The bench's 1491-frame step happened in exactly that state (dif=n/a).
+  double peer_silent_period_s = 0.0;
+  double peer_silent_secs = 0.0;
   /// Depth-snapshot cadence; 0 = 50000 us, the sink's DMA buffer on this bench.
   int64_t publish_interval_us = 0;
   /// Count confirmations per DISTINCT SNAPSHOT rather than per evaluation. False reproduces the
@@ -299,7 +306,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
   long psat_n = 0, psat_hit = 0;
   double psat_max = 0.0;
-  double sig_e_sum = 0.0, sig_g_sum = 0.0;
+  double sig_e_sum = 0.0, sig_g_sum = 0.0, sig_e_max = 0.0;
   long sig_n = 0;
   double common_max_us = 0.0;
   double ph_after_sum = 0.0, ph_base_sum = 0.0;
@@ -481,6 +488,18 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       // be measured (3k's first attempt: control p2p 96.9 ms). Board b's bench transient was
       // post-reboot ACQUISITION: it declines to publish, its phase is untrustworthy, and its audio
       // is not being stepped at all. Board 0 only, so the pair stays asymmetric as it was.
+      // THE PEER GOES SILENT, so board 0 loses its differential entirely and e_position falls back
+      // to the DEADLINE error. Without this the observation glitch cannot reach the position path
+      // at all -- position acts on e_diff whenever the group supplies one, and in this simulator it
+      // almost always does (gd present 100% of decisions, held when stale). The bench had
+      // ESPLIT dif=n/a at the moment it spent 1491 frames, i.e. no differential, which is the
+      // condition that let a 33 ms deadline error buy an irreversible step.
+      if (f.peer_silent_period_s > 0.0 && i == 1) {
+        const double sph = std::fmod(static_cast<double>(t) / 1e6, f.peer_silent_period_s);
+        if (sph < f.peer_silent_secs) {
+          x.phase_transient_until_us = std::max(x.phase_transient_until_us, t + tick);
+        }
+      }
       if (f.transient_period_s > 0.0 && i == 0) {
         const double tph = std::fmod(static_cast<double>(t) / 1e6, f.transient_period_s);
         if (tph < f.transient_secs) {
@@ -727,7 +746,9 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       // numbers formed the same way the engine forms them, so they are comparable with the bench's
       // ENGINE sigma=/gsig= fields rather than merely similar.
       if (t > 120000000) {
-        sig_e_sum += x.eng.sigma_e_us();
+        const double se = x.eng.sigma_e_us();
+        if (se > sig_e_max) sig_e_max = se;
+        sig_e_sum += se;
         sig_g_sum += c.decision.gd_sigma_us;
         sig_n++;
       }
@@ -903,6 +924,7 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     if (sig_n > 0) {
       r.sigma_e_mean = sig_e_sum / static_cast<double>(sig_n);
       r.gd_sigma_mean = sig_g_sum / static_cast<double>(sig_n);
+      r.sigma_e_max = sig_e_max;
     }
     r.pc_absdiff = pc_absdiff_sum / sn;
     r.common_one_sided_frac = static_cast<double>(common_one_sided_n) / sn;
@@ -1474,6 +1496,64 @@ int main() {
              c.name, r.p2p_med, r.sd_med, 100.0 * r.p_sat_frac, r.p_max_ppm, r.corr);
     }
     printf("        (gate_gd_on_transient holds gd while the board's own phase is meaningless)\n");
+  }
+
+  printf("\n3l. A CHUNK-SIZED MEASUREMENT JUMP, and the position path's missing confirmation\n");
+  {
+    // BENCH 2026-09-03 04:23, board b, with ARRGAP max 130-152 ms on both boards (absorbed) so
+    // no supply event:
+    //
+    //   04:23:05  err=-26157                                     ~= -1 chunk (26123)
+    //   04:23:06  RATEWHY kp=0.000 sig=30590.8 com=+32847 dif=+0  sigma_e exploded to 30 ms
+    //   04:23:08  err=+32815  act=2 why=4  frames=+1491           33.8 ms correction
+    //   04:23:12  err=+6603   act=2 why=4  frames=-195            opposite sign, 4 s later
+    //
+    // and the wire went to -4758 us. Board a was untouched, so it reached the wire as asymmetric
+    // stepping.
+    //
+    // THE POINT: those were ORDINARY position corrections (act=2 why=4), not hard resyncs. The
+    // confirmation gate added in 646837c covers only the resync path, so the same class of
+    // quantised measurement jump that can no longer trigger a resync CAN still buy a 1491-frame
+    // correction. RESYNC IS DISABLED in these rows precisely to isolate that path.
+    //
+    // sigma_e's collapse of Kp is the second half: the estimator counts a jump as noise, so the
+    // rate loop goes open-loop exactly when the error is largest, leaving position to act alone.
+    printf("        resync DISABLED, so only the ordinary position path can act\n");
+    printf("        %-30s %9s %8s %8s %9s %10s\n",
+           "case", "p2p/2min", "sd", "corr", "frames", "sigma_e max");
+    // SPAN MATTERS MORE THAN MAGNITUDE. A one-tick chunk-sized glitch is REJECTED outright: the
+    // position path acts on the FILTERED error, and the filter plus jump detector threw it away
+    // (0 corrections, sigma_e peaking at 1591 us against the bench's 30590). So "the position path
+    // has no confirmation" was wrong -- it has the filter, and for a single sample the filter is
+    // enough. The bench's error instead STAYED displaced: -26157, then +32818, +32815, +6643,
+    // +10971 across seconds, which the filter is designed to follow.
+    struct MjCase { const char *name; const char *tag; double glitch; double span; };
+    const MjCase cases[] = {
+      {"no glitch (control)",          "mj-none",      0.0, 0.0},
+      {"1 chunk, 1 tick",              "mj-c1t",   26123.0, 0.0},
+      {"1 chunk, 3 s sustained",       "mj-c3s",   26123.0, 3.0},
+      {"2 chunks, 3 s sustained",      "mj-2c3s",  52246.0, 3.0},
+      {"1 chunk, 10 s sustained",      "mj-c10s",  26123.0, 10.0},
+      // THE BENCH'S ACTUAL STATE: no differential (peer silent) AND a sustained deadline offset.
+      {"1 chunk 3 s + PEER SILENT",    "mj-c3sp",  26123.0, 3.0},
+      {"2 chunks 3 s + PEER SILENT",   "mj-2c3sp", 52246.0, 3.0},
+    };
+    for (const MjCase &c : cases) {
+      Faults f{};
+      f.resync_us = 0.0;                 // isolate the ordinary position path
+      f.glitch_period_s = 90.0;
+      f.glitch_us = c.glitch;
+      f.glitch_span_s = c.span;
+      f.resync_on_measurement = false;
+      if (std::string(c.tag).find("p") == std::string(c.tag).size() - 1) {
+        f.peer_silent_period_s = 90.0;   // aligned with the glitch, and wider so dif is absent
+        f.peer_silent_secs = 8.0;
+      }
+      Result r = simulate(c.tag, p, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, f);
+      printf("        %-30s %9.1f %8.2f %8d %9ld %10.0f\n",
+             c.name, r.p2p_med, r.sd_med, r.corr, r.gross, r.sigma_e_max);
+    }
+    printf("        (a jump the resync gate would now reject can still buy a 1491-frame step)\n");
   }
 
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");

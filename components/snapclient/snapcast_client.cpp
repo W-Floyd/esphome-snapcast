@@ -4574,7 +4574,21 @@ void SnapcastClient::publish_render_phase_sample_() {
       const int64_t dffl = ffl_rel - this->ph_prev_ffl_us_;
       const int64_t dmap = map_rel - this->ph_prev_map_us_;
       const int64_t dsrv = render_server - this->ph_prev_srv_us_;
-      const int64_t res = dph - (dffl + dmap - dsrv);
+      // dloc COMPLETES THE IDENTITY. ffl and map are BOTH logged relative to phase_local, so
+      // phase_local survives once in the total and its change is a term in its own right:
+      //
+      //     phase = ffl_rel + map_rel + phase_local - render_server
+      //
+      // The first version omitted it and res printed 4.0-5.1 SECONDS on the very first lines it
+      // emitted, which is exactly what the field is for -- it caught my own algebra before the
+      // number could be read as a fault in the firmware. res is now 0 whenever this decomposition
+      // is complete, so any non-zero value is a real missing term.
+      //
+      // NOTE the deltas are between consecutive CALLS, not consecutive logged lines: the previous
+      // values are stored every call and only logged on a jump or the throttle. dloc is therefore
+      // the call interval (~10 ms here), not the gap between lines.
+      const int64_t dloc = phase_local - this->ph_prev_loc_us_;
+      const int64_t res = dph - (dffl + dmap + dloc - dsrv);
       const bool steady_now = this->tsf_sync_->render_phase_broadcast();
       const int64_t now = phase_local;
       // A JUMP ALWAYS, and otherwise throttled -- harder when the board distrusts its own phase,
@@ -4584,9 +4598,10 @@ void SnapcastClient::publish_render_phase_sample_() {
       if (jumped || now - this->ph_log_us_ >= period) {
         this->ph_log_us_ = now;
         ESP_LOGD(TAG,
-                 "PHDBG dph=%+" PRId64 " dffl=%+" PRId64 " dmap=%+" PRId64 " dsrv=%+" PRId64
-                 " res=%+" PRId64 " fr=%" PRIu32 " off=%" PRIu32 " age=%+" PRId64 " st=%d",
-                 dph, dffl, dmap, dsrv, res, tr.frames, tr.offset_frames, tag_age_us,
+                 "PHDBG dph=%+" PRId64 " dffl=%+" PRId64 " dmap=%+" PRId64 " dloc=%+" PRId64
+                 " dsrv=%+" PRId64 " res=%+" PRId64 " fr=%" PRIu32 " off=%" PRIu32
+                 " age=%+" PRId64 " st=%d",
+                 dph, dffl, dmap, dloc, dsrv, res, tr.frames, tr.offset_frames, tag_age_us,
                  steady_now ? 1 : 0);
       }
     }
@@ -4594,6 +4609,7 @@ void SnapcastClient::publish_render_phase_sample_() {
     this->ph_prev_ffl_us_ = ffl_rel;
     this->ph_prev_map_us_ = map_rel;
     this->ph_prev_srv_us_ = render_server;
+    this->ph_prev_loc_us_ = phase_local;
     this->ph_prev_valid_ = true;
   }
 #endif
