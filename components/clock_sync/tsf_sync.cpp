@@ -4,6 +4,7 @@
 
 #ifdef CLOCK_SYNC_TSF_ACTIVE
 
+#include "consensus_math.h"
 #include "esphome/core/log.h"
 
 #include <esp_timer.h>
@@ -113,6 +114,19 @@ static constexpr int32_t PIPELINE_UNKNOWN = INT32_MIN;
 // hurt exactly the weakest link.
 static constexpr int64_t BEACON_INTERVAL_US = 1000000;   // every device publishes at this rate
 static constexpr int64_t MAPPING_EXPIRY_US = 5000000;    // stale mapping → Kalman fallback
+// A tsf<->server line's drift is the DIFFERENCE OF TWO CRYSTAL RATES, so it is bounded by physics:
+// the tsf-vs-local term is already rejected past ±100 ppm ("larger = TSF discontinuity") and the
+// Kalman term is the same kind of quantity. ±200 ppm allows both at their limit and still rejects
+// everything seen misbehaving. For scale, the servo's own crystal integral clamps at 200 ppm.
+//
+// Measured 2026-09-02: an offset STEP (reconnect, server restart, stream change) re-seeds the
+// Kalman drift across the discontinuity, and the significance gate that admits it is inverted in
+// practice -- a real +43 ppm crystal drift NEVER clears `drift² > 4·drift_cov` (0 of 5000 clean
+// samples), while a 30 ms step reaches +322 ppm and a 180 ms step +1460 ppm, which do. So the
+// filter publishes drift only when the drift is WRONG. Observed on the wire: -1158, +1462, +5059,
+// +10930, +61641 and -179896 ppm from whichever board had most recently rebooted, adopted by peers
+// with no rejection, dragging their mappings ~1.6 ms/s until two boards sat 250 ms apart.
+static constexpr float MAX_PLAUSIBLE_DRIFT_PPM = 200.0f;
 static constexpr int64_t SHARED_HOLD_GRACE_US = 3000000;  // a TSF-sample blip shorter than this keeps the shared deadline (see shared_server_offset_us)
 // MUST TRACK THE BEACON RATE. service() returns early inside this interval, so it is a hard ceiling
 // on the beacon rate no matter what BEACON_INTERVAL_US says -- at 200 ms the beacons would cap at
@@ -263,8 +277,6 @@ static constexpr int64_t MAP_STEP_REPORT_US = TMS_SNAP_US;
 // another route: without it, three values spread over 3 us would give one of them a large d/scale
 // and near-zero weight, which is discrimination against noise. Below the floor everything is
 // noise and everything should count equally.
-static constexpr double CONSENSUS_REWEIGHT_K = 2.0;
-static constexpr double CONSENSUS_SCALE_FLOOR_US = 50.0;
 static constexpr double CONSENSUS_PHASE_SCALE_FLOOR_US = 20.0;
 
 // Low-pass on the shared offset: 1/32 over per-chunk calls (~26 ms) is a ~0.8 s time constant,
@@ -855,29 +867,6 @@ TsfSync::Peer *TsfSync::find_peer_(const uint8_t mac[6], int64_t local_now_us) {
 // ONE REWEIGHTING PASS AROUND THE MEAN -- the continuous stand-in for a median. See
 // CONSENSUS_REWEIGHT_K for why a median is not used and what the scale floor is protecting.
 // Values are passed pre-differenced against a reference so they stay small and exact in double.
-static double robust_mean(const double *vals, size_t n, double scale_floor) {
-  double sum = 0.0;
-  for (size_t i = 0; i < n; i++) {
-    sum += vals[i];
-  }
-  const double mean0 = sum / static_cast<double>(n);
-  if (n < 3) {
-    return mean0;  // with two values the weights are equal by construction; skip the arithmetic
-  }
-  double dev = 0.0;
-  for (size_t i = 0; i < n; i++) {
-    dev += std::fabs(vals[i] - mean0);
-  }
-  const double scale = std::max(dev / static_cast<double>(n), scale_floor) * CONSENSUS_REWEIGHT_K;
-  double wsum = 0.0, wvsum = 0.0;
-  for (size_t i = 0; i < n; i++) {
-    const double d = (vals[i] - mean0) / scale;
-    const double w = 1.0 / (1.0 + d * d);
-    wsum += w;
-    wvsum += w * vals[i];
-  }
-  return wvsum / wsum;
-}
 
 // THE CORE OF THE LEADERLESS DESIGN. Average every live raw estimate -- ours and every peer's --
 // and slew the adopted mapping toward the result.
@@ -896,20 +885,52 @@ static double robust_mean(const double *vals, size_t n, double scale_floor) {
 // other, and no on-device measurement could see it. This is the one failure mode of the design
 // and this is the line of code that prevents it.
 void TsfSync::update_consensus_(int64_t local_now_us) {
-  // Reference instant: our own base when we have one, else the freshest peer's.
+  // Reference instant: THE FRESHEST BASE IN THE SET, ours included. A FUNCTION OF THE SET, NOT OF
+  // THE DEVICE.
+  //
+  // This used to prefer our own base ("no extrapolation on our own term") and fall back to the
+  // freshest peer's. That made ref_tsf device-dependent, and the design's correctness argument
+  // does not survive it: identical sets must give identical mappings, so that the mapping's own
+  // error is common-mode and cancels on the wire. It is common-mode only if every device computes
+  // the SAME number.
+  //
+  // A plain mean would not have cared -- ref factors out of it as mean(drift)*ref, shifting every
+  // device's answer identically. robust_mean is not linear: its weights are 1/(1+d^2) on each
+  // line's deviation from the mean, and when the lines' DRIFTS differ their spread grows with the
+  // reference instant. So different references give different weights, hence different means.
+  // The comment elsewhere that "the estimator is gauge-invariant, so arrival order cannot matter"
+  // is true of the mean and false of the reweighted mean.
+  //
+  // Measured in tests/timebase group 9, three boards with the crystals actually on this bench
+  // (46.3 / 42.2 / 37.9 ppm) and beacons 500 ms apart: 43.4 us of spread between the mappings the
+  // three devices adopt, from the reference alone, with identical sets. Anchoring on the freshest
+  // base in the set takes it to EXACTLY zero -- peers' tsf_base is a transmitted field, so `max`
+  // over the same set is the same number on every device.
+  //
+  // The cost is real and small: our own line is now extrapolated too, by at most one beacon
+  // interval, using the drift we just measured. Under a microsecond, against 43 us of disagreement
+  // that lands directly on the wire. Extrapolation stays forward for every line (dt >= 0), which
+  // is the well-defined direction.
+  //
+  // This does NOT address sets that genuinely differ -- a beacon lost by one device and not
+  // another, for up to PEER_MAP_STALE_US. That is bounded, documented above, and softened by the
+  // adopted-consensus slew limiter. This removes only the device-dependent term.
   int64_t ref_tsf = 0;
-  bool have_ref = this->pub_valid_;
-  if (have_ref) {
+  bool have_ref = false;
+  if (this->pub_valid_) {
     ref_tsf = this->pub_tsf_base_;
-  } else {
-    for (const Peer &p : this->peer_) {
-      if (!p.used || !p.map_valid || local_now_us - p.map_seen_us > PEER_MAP_STALE_US) {
-        continue;
-      }
-      if (!have_ref || p.tsf_base_us > ref_tsf) {
-        ref_tsf = p.tsf_base_us;
-        have_ref = true;
-      }
+    have_ref = true;
+  }
+  for (const Peer &p : this->peer_) {
+    if (!p.used || !p.map_valid || local_now_us - p.map_seen_us > PEER_MAP_STALE_US) {
+      continue;
+    }
+    if (std::fabs(p.drift_ppm) > MAX_PLAUSIBLE_DRIFT_PPM) {
+      continue;  // not a contributor (see the intake gate below), so not an anchor either
+    }
+    if (!have_ref || p.tsf_base_us > ref_tsf) {
+      ref_tsf = p.tsf_base_us;
+      have_ref = true;
     }
   }
   if (!have_ref) {
@@ -967,6 +988,18 @@ void TsfSync::update_consensus_(int64_t local_now_us) {
   }
   for (const Peer &p : this->peer_) {
     if (n >= MAX_PEERS + 1 || !p.used || !p.map_valid || local_now_us - p.map_seen_us > PEER_MAP_STALE_US) {
+      continue;
+    }
+    // NOT VOTABLE. robust_mean reweights around a mean, which cannot survive an outlier this far
+    // out with the 2-4 contributors a small group actually has: a single +61641 ppm line carried
+    // the mean regardless of how the others were weighted. A rejected peer is correctly ABSENT --
+    // it does not contribute a zero, which would be its own wrong answer -- and the peer is still
+    // free to rejoin the moment it publishes something physical again.
+    if (std::fabs(p.drift_ppm) > MAX_PLAUSIBLE_DRIFT_PPM) {
+      if (!this->warned_peer_drift_) {
+        this->warned_peer_drift_ = true;
+        ESP_LOGW(TAG, "DRIFTREJ peer %02X%02X %+.0f ppm implausible, excluded", p.mac[4], p.mac[5], p.drift_ppm);
+      }
       continue;
     }
     add(false, p.mac, p.tsf_base_us, p.tms_base_us, p.drift_ppm);
@@ -1445,7 +1478,25 @@ void TsfSync::broadcast_(int64_t local_now_us, const Estimate &est, uint32_t ser
   const int64_t server_now_us =
       local_mid + static_cast<int64_t>((est.offset_ms + est.drift * ((local_mid - local_now_us) / 1000.0)) * 1000.0);
   // d(tsf−server)/dt = d(tsf−local)/dt + d(local−server)/dt = tsf_rate − kalman_drift
-  const float drift_ppm = (this->tsf_rate_valid_ ? this->tsf_rate_ppm_ : 0.0f) - static_cast<float>(est.drift * 1e6);
+  //
+  // THE SAME SANITY THE TSF TERM ABOVE ALREADY GETS. That one rejects past ±100 ppm as a
+  // discontinuity; this one had no bound at all, and it is the same class of quantity measured
+  // across the same kind of discontinuity. The guard was on the term whose failure was being
+  // thought about, not on the term that could do identical damage.
+  //
+  // ZERO, NOT CLAMPED. A clamped garbage line is still a wrong line -- it keeps a drift the plant
+  // does not have and walks the mapping away at the clamp. Zero means "no drift correction, trust
+  // the offset", which is exactly what get_drift() already returns when drift is not significant,
+  // and is what a healthy board publishes anyway (0 of 5000 clean samples ever cleared the
+  // significance gate). So this costs a good board nothing and stops a bad one entirely.
+  const float kalman_drift_ppm = static_cast<float>(est.drift * 1e6);
+  const bool kalman_plausible = std::fabs(kalman_drift_ppm) <= MAX_PLAUSIBLE_DRIFT_PPM;
+  if (!kalman_plausible && !this->warned_kalman_drift_) {
+    this->warned_kalman_drift_ = true;
+    ESP_LOGW(TAG, "DRIFTREJ own kalman %+.0f ppm implausible, publishing 0", kalman_drift_ppm);
+  }
+  const float drift_ppm =
+      (this->tsf_rate_valid_ ? this->tsf_rate_ppm_ : 0.0f) - (kalman_plausible ? kalman_drift_ppm : 0.0f);
 
   // Slew-limit the published line toward the live estimate (see TMS_SLEW_MAX_US_PER_S)
   const int64_t tms_target = tsf_now - server_now_us;

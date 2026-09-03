@@ -370,6 +370,8 @@ class TsfSync {
   int64_t last_phase_tx_us_{0};  // our last phase-only beacon (no mature estimate yet)
   int64_t last_service_us_{0};   // rate-limits the wifi state polling
   bool warned_rejected_{false};  // one log line per rejection episode
+  bool warned_kalman_drift_{false};  // our own Kalman drift rejected as implausible (DRIFTREJ)
+  bool warned_peer_drift_{false};    // a peer's published drift rejected as implausible (DRIFTREJ)
   bool warned_foreign_bss_{false};
   bool warned_foreign_server_{false};
   bool warned_foreign_stream_{false};
