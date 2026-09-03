@@ -24,7 +24,12 @@ constexpr float CREDIT_MAX_PPM_PER_WINDOW = 5.0f;
 /// overshot 80 ppm at a 1 s horizon and K=5 was needlessly slow. Not a time constant -- the
 /// horizon supplies the timescale, so this stays dimensionless and no constant here is tied to
 /// rate, chunk size or sample depth.
-constexpr float CRYSTAL_DELAY_MARGIN = 3.0f;
+/// Overridable at BUILD TIME ONLY, so tests/group can sweep it (-DCRYSTAL_DELAY_MARGIN_VALUE=5.0f)
+/// without a bench reflash. The default is the measured value and firmware never changes it.
+#ifndef CRYSTAL_DELAY_MARGIN_VALUE
+#define CRYSTAL_DELAY_MARGIN_VALUE 3.0f
+#endif
+constexpr float CRYSTAL_DELAY_MARGIN = CRYSTAL_DELAY_MARGIN_VALUE;
 /// A crystal is tens of ppm; hundreds means the estimate is tracking something else.
 constexpr float CRYSTAL_LIMIT_PPM = 200.0f;
 /// NOTE: authority now arrives as Profile::rate_authority_ppm, from the transport that owns the

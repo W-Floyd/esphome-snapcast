@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <random>
@@ -64,11 +65,25 @@ struct Board {
   explicit Board(const Profile &p) : eng(p) {}
 };
 
+/// Per-tick skew dump, opened from SIM_SKEW_CSV. Null unless asked for, so the suite is unchanged
+/// by default. g_scenario labels the rows so one file holds every scenario.
+static FILE *g_skew_csv = nullptr;
+static const char *g_scenario = "sim";
+
 struct Result {
   double skew_med = 0.0, skew_p90 = 0.0;
   int corr = 0;
   long gross = 0;
   double err_med = 0.0;
+  // OSCILLATION. skew_med/p90 are order statistics: they cannot tell a loop RINGING at +-50 us
+  // from one sitting quietly at 50 us, and the bench does the first while this simulator reported
+  // the second and passed. The rate loop is fully closed here (err_us integrates plant - rate_ppm
+  // every tick, against the real timing_engine.cpp), so a limit cycle IS simulated -- it was only
+  // ever invisible, because the series was stored as |skew| and a sign is what a crossing needs.
+  double period_s = 0.0;    // median interval between upward crossings of the median
+  double amp_p05 = 0.0;     // signed, so a biased ring is distinguishable from a centred one
+  double amp_p95 = 0.0;
+  int n_periods = 0;        // fewer than ~6 and the period is not evidence (bench: 5 was not)
 };
 
 /// Everything below `noise_us` models something the bench does that this simulator did not, and
@@ -125,6 +140,7 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
   std::normal_distribution<double> nd(0.0, noise_us);
   const int64_t tick = 25000;
   std::vector<double> skews, errs;
+  std::vector<double> skews_signed, skew_t_us;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
 
@@ -271,7 +287,18 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
       x.err_us += (x.plant_ppm - c.rate_ppm) * 1e-6 * double(tick);
     }
     if (t > 120000000) {
-      skews.push_back(std::fabs(b[1].err_us - b[0].err_us));
+      const double skew_signed = b[1].err_us - b[0].err_us;
+      skews.push_back(std::fabs(skew_signed));
+      skews_signed.push_back(skew_signed);
+      skew_t_us.push_back(static_cast<double>(t));
+      // THE SERIES ITSELF, per tick, when asked for. Summary statistics answer only the question
+      // they were written for; the bench's test.csv is analysed with whatever the question turns
+      // out to need. Dumping the same shape here means ONE analysis runs over both, so a claim
+      // about the sim and a claim about the wire are comparable rather than merely similar.
+      //   SIM_SKEW_CSV=/tmp/sim.csv ./tests/group/run.sh
+      if (g_skew_csv != nullptr) {
+        fprintf(g_skew_csv, "%s,%.6f,%.3f\n", g_scenario, static_cast<double>(t) / 1e6, skew_signed);
+      }
       errs.push_back(std::fabs(b[0].err_us + deadline_shift));
     }
   }
@@ -287,9 +314,35 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
            100.0 * gd_fresh_ticks / static_cast<double>(gd_ticks),
            gd_age_sum_us / static_cast<double>(gd_present_ticks) / 1000.0);
   }
+  Result r;
+  // Periodicity BEFORE sorting: the crossing test needs the series in time order. Crossings are
+  // taken against the MEDIAN, not the mean -- a ring with a standing bias crosses its mean rarely,
+  // which on the bench gave 5 crossings in 187 s and a "period" that was not evidence of anything.
+  if (skews_signed.size() > 8) {
+    std::vector<double> sorted_signed = skews_signed;
+    std::sort(sorted_signed.begin(), sorted_signed.end());
+    const double mid = sorted_signed[sorted_signed.size() / 2];
+    std::vector<double> periods;
+    double prev_cross = -1.0;
+    for (size_t i = 1; i < skews_signed.size(); i++) {
+      if (skews_signed[i - 1] <= mid && skews_signed[i] > mid) {
+        const double now_s = skew_t_us[i] / 1e6;
+        if (prev_cross >= 0.0) {
+          periods.push_back(now_s - prev_cross);
+        }
+        prev_cross = now_s;
+      }
+    }
+    r.n_periods = static_cast<int>(periods.size());
+    if (!periods.empty()) {
+      std::sort(periods.begin(), periods.end());
+      r.period_s = periods[periods.size() / 2];
+    }
+    r.amp_p05 = sorted_signed[static_cast<size_t>(0.05 * sorted_signed.size())];
+    r.amp_p95 = sorted_signed[static_cast<size_t>(0.95 * sorted_signed.size())];
+  }
   std::sort(skews.begin(), skews.end());
   std::sort(errs.begin(), errs.end());
-  Result r;
   r.skew_med = skews[skews.size()/2];
   r.skew_p90 = skews[static_cast<size_t>(0.9*skews.size())];
   r.err_med = errs[errs.size()/2];
@@ -301,6 +354,15 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
 }  // namespace
 
 int main() {
+  if (const char *path = getenv("SIM_SKEW_CSV")) {
+    g_skew_csv = fopen(path, "w");
+    if (g_skew_csv != nullptr) {
+      fprintf(g_skew_csv, "scenario,t_s,skew_us\n");
+      fprintf(stderr, "dumping per-tick skew to %s\n", path);
+    } else {
+      fprintf(stderr, "could not open %s -- continuing without the dump\n", path);
+    }
+  }
   Profile p;
   p.frame_rate_hz = 44100;
   p.measurement_lag_us = 250000;
