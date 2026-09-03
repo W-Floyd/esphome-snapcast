@@ -1217,7 +1217,17 @@ class SnapcastClient {
   /// The new engine owns both actuators. 0 falls back to the old ladder + PI, for one flash's
   /// worth of comparison; the old paths go once this holds.
   /// Position accuracy the engine aims at (us); sets its rate-command noise budget.
-  std::atomic<int32_t> tune_timing_target_us_{20};
+  /// NEIGHBOUR target, us. 10 rather than 20 since 2026-09-03, measured on both boards with a
+  /// control: 20 -> 10 gave offset sd -24% (16.25 -> 12.41 us) and rate p2p -33% (87.9 -> 58.6
+  /// ppm), and reverting to 20 degraded both again, so the gain was responsible rather than the
+  /// bench settling. Two metrics improving together is over-gain, not a trade.
+  ///
+  /// This is a WORKAROUND and should not outlive its cause. Kp = budget/sigma_e divides by the
+  /// DEADLINE error's noise while P multiplies the DIFFERENTIAL, and sigma_e sits at its 22 us
+  /// frame floor here -- so lowering the target compensates for the wrong denominator by
+  /// coincidence and will stop compensating whenever gd's noise moves. Board a's gd p90 reached
+  /// 333 us the same night. Fix the denominator and this returns to meaning what it says.
+  std::atomic<int32_t> tune_timing_target_us_{10};
   /// Rate authority, runtime-settable so it can be A/B'd WITHOUT A REFLASH. Every bench change
   /// costs five consensus membership changes and a settle, which made the operator the dominant
   /// disturbance for most of 2026-09-02; a knob turns an hour-per-arm experiment into a write.

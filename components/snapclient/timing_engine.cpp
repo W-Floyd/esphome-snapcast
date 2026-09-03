@@ -428,8 +428,24 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
       } else {
         gd_mean_us_ += galpha * std::clamp(g_innov, -gmax, gmax);
       }
-      gd_diff_us_ += galpha * (std::fabs(gx - gd_last_us_) - gd_diff_us_);
-      gd_last_us_ = gx;
+      // DIFFERENCE ONLY FRESH SAMPLES. The group delta is HELD between pairings -- present on
+      // every decision but freshly paired on ~32% of them, both here and on the bench -- so most
+      // consecutive pairs are bit-identical and contribute a zero difference. Averaging those in
+      // drags the estimate toward its floor: measured 5.5 us in tests/group where the phase noise
+      // implies ~14, i.e. understated by 2.5x.
+      //
+      // That matters because gd_sigma is a candidate denominator for Kp, and an UNDERSTATED noise
+      // estimate means an OVER-stated gain -- the opposite of what sizing Kp from the differential
+      // is meant to achieve. A held value is not a measurement and must not count as one.
+      //
+      // Equality is the discriminator because a held delta is literally the previous number, while
+      // a fresh one is a us-quantised measurement carrying tens of us of noise. Two consecutive
+      // fresh samples can coincide by chance and be skipped; at this noise that is a few percent,
+      // against the ~68% of samples the old form counted as zero-noise evidence.
+      if (gx != gd_last_us_) {
+        gd_diff_us_ += galpha * (std::fabs(gx - gd_last_us_) - gd_diff_us_);
+        gd_last_us_ = gx;
+      }
     }
     gd_last_at_us_ = now_us;
     gd_sigma_us = std::max(0.8862f * gd_diff_us_, 0.25f * static_cast<float>(profile_.frame_us()));
