@@ -442,7 +442,7 @@ int main() {
           r.skew_med, 2.0 * p.frame_us());
   }
 
-  printf("\n3a. STARVATION MUST NOT WIND THE CRYSTAL\n");
+  printf("\n3a. CRYSTAL UNDER STARVATION (characterisation; the guard that tried to fix it was reverted)\n");
   {
     // The integral's input is clamped to one frame per component, which bounds the winding RATE
     // (~38 ppm/min here) but not where it stops. A starved board is behind for as long as the
@@ -453,31 +453,27 @@ int main() {
     // the rail, against a true crystal of +46. The starvation guard already held DURING the
     // shortage; it released the moment the buffer cleared its floor, which is not when the error
     // stops describing the shortage.
-    // 50% duty, far harsher than the bench's ~119 s cadence, because that is where the guard's
-    // effect is unambiguous. Measured with the guard forced off, same seed:
-    //
-    //   starve  6s/40s over 1800s   on  +7.7 / +33.5    off +10.4 / +38.3    (small)
-    //   starve 10s/30s over 1800s   on -60.9 / -32.6    off -60.0 / -32.5    (NO effect)
-    //   starve 10s/20s over 1800s   on  +2.5 / +29.0    off +23.2 / +47.2    (~20 ppm)
-    //
-    // THE MIDDLE ROW IS UNEXPLAINED and is recorded rather than hidden: at that duty both boards
-    // wind to 45 ppm from plant whether the hold is there or not, so something other than the
-    // post-starvation catch-up is winding them and this guard does not address it. The guard is a
-    // real improvement, not a solution -- board b is still 14 ppm off plant with it.
-    const double plant_a = -15.0, plant_b = +15.0;
+    // THE TARGET IS plant + common, NOT plant. Holding the error still requires cancelling the
+    // plant AND the common deadline drift, since measured = err + deadline_shift and
+    // d(err)/dt = plant - rate. Scoring against `plant` alone is what made a REVERTED guard look
+    // like a 20 ppm improvement when it was really a 25 ppm regression -- the convenient property
+    // rather than the one that matters.
+    const double plant_a = -15.0, plant_b = +15.0, common = 40.0;
+    const double want_a = plant_a + common, want_b = plant_b + common;
     Faults hungry{};
-    hungry.starve_period_s = 20.0;
+    hungry.starve_period_s = 20.0;   // 50% duty, far harsher than the bench's ~119 s cadence
     hungry.starve_secs = 10.0;
-    Result r = simulate(p, plant_a, plant_b, 40.0, 80.0, 1800.0, TRUE_LAND, hungry);
-    printf("        plant %+.0f / %+.0f ppm   ->   crystal %+.1f / %+.1f ppm   (skew med %.0f us)\n",
-           plant_a, plant_b, r.xtal_a, r.xtal_b, r.skew_med);
-    // The crystal is an estimate OF THE PLANT. Starvation must not move it far from one.
-    check(std::fabs(r.xtal_a - plant_a) < 20.0,
-          "board a's crystal still estimates its plant, not the shortage", r.xtal_a, plant_a);
-    check(std::fabs(r.xtal_b - plant_b) < 20.0,
-          "board b's crystal still estimates its plant, not the shortage", r.xtal_b, plant_b);
+    Result r = simulate(p, plant_a, plant_b, common, 80.0, 1800.0, TRUE_LAND, hungry);
+    printf("        want %+.0f / %+.0f (plant + common)  ->  got %+.1f / %+.1f ppm   (skew med %.0f us)\n",
+           want_a, want_b, r.xtal_a, r.xtal_b, r.skew_med);
+    // CHARACTERISATION, not a fix. Under 50% starvation the estimate lands within a few tens of
+    // ppm of correct and does NOT run to the rail; that much is worth pinning, because the rail is
+    // what was seen on hardware (+192 ppm against a true +46). What is NOT claimed is that the
+    // engine handles starvation well -- it does not, and a hold that tried to help made it worse.
+    check(std::fabs(r.xtal_a - want_a) < 35.0, "board a's crystal stays near plant+common", r.xtal_a, want_a);
+    check(std::fabs(r.xtal_b - want_b) < 35.0, "board b's crystal stays near plant+common", r.xtal_b, want_b);
     check(std::fabs(r.xtal_a) < CRYSTAL_RAIL_PPM && std::fabs(r.xtal_b) < CRYSTAL_RAIL_PPM,
-          "and neither is anywhere near the rail", std::max(std::fabs(r.xtal_a), std::fabs(r.xtal_b)),
+          "and neither runs to the rail", std::max(std::fabs(r.xtal_a), std::fabs(r.xtal_b)),
           CRYSTAL_RAIL_PPM);
   }
 

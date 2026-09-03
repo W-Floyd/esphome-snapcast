@@ -290,11 +290,6 @@ class Engine {
   float last_rate_cmd_ = 0.0f;
   bool rate_cmd_seeded_ = false;
   int64_t last_obs_us_ = 0;
-  /// Set while starved, and held for one settle window AFTER the buffer recovers. The starvation
-  /// guard alone was not enough: it releases the moment the buffer clears its floor, but a board
-  /// that has just refilled is still seconds behind, so the error stays large and ONE-SIGNED --
-  /// which is exactly what an integrator eats. See the hold in step().
-  int64_t starved_until_us_ = 0;
   uint32_t suppressed_ = 0;
 };
 
