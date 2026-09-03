@@ -133,6 +133,26 @@ struct Profile {
   ///
   /// On the bench (L = 2.0 s) this gives Kp_max = 0.157 against a current Kp of 0.227 at
   /// target=10, so it binds and reduces the gain ~31%.
+  ///
+  /// LOWERING THE CAP ON HARDWARE WAS TESTED AND IS WORSE. 2026-09-03 13:00, A-B-A with 12 min
+  /// arms, all three clean of reboots, graded on the p10-p90 spread because arm B's p2p and sd are
+  /// outlier-driven:
+  ///
+  ///     arm            Kp cap   p10..p90   corrections   P sd a/b
+  ///     A   (0.180)     0.180      37.2       0 / 0      3.34 / 3.89
+  ///     B   (0.097)     0.097      41.7       2 / 9     30.90 / 4.37
+  ///     A'  (0.180)     0.180      27.3       0 / 0      2.20 / 3.68
+  ///
+  /// B is worse than both baselines and is the only arm that spent frames at all.
+  ///
+  /// BUT THE KNOB IS CONFOUNDED, so this does NOT measure gain alone. The only runtime route to
+  /// the cap is rate_filter_lag_us, which lowers it by lengthening L -- and a longer L also
+  /// genuinely slows the loop, so it tracks the plant's ~30 ppm wander worse, the error grows and
+  /// position starts acting. What is established is that THAT ROUTE is harmful, not that 0.097 is
+  /// a bad gain. Isolating gain needs a runtime knob for this field, which does not exist.
+  ///
+  /// A' beat A by 27.3 against 37.2 on identical settings, so the hour carried an improving trend
+  /// of its own: any two-arm version of this test would have been read wrong in either direction.
   float kp_stability_frac = 0.20f;
 
   /// SHARED COMMON-MODE CORRECTION: SECONDS to drain the group's shared common error over.
