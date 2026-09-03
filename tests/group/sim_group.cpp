@@ -170,6 +170,8 @@ struct Result {
   /// Kp from the differential raises or lowers the gain, and it is inverted between here and the
   /// bench -- which is why 3h reported the opposite sign to the hardware sweep.
   double sigma_e_mean = 0.0, gd_sigma_mean = 0.0;
+  /// Fraction of decisions with P pinned at the authority clamp, and the largest |P| seen.
+  double p_sat_frac = 0.0, p_max_ppm = 0.0;
   double common_valid_frac = 0.0;
   /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
   /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
@@ -219,6 +221,13 @@ struct Faults {
   /// How long the bad reading persists; 0 = one publish interval, i.e. a single bad snapshot
   /// served to every evaluation inside it.
   double glitch_span_s = 0.0;
+  /// Offset added to a board's PUBLISHED phase while it is in its own transient (steady=0). The
+  /// audio does not move; only the phase the group reads is wrong.
+  double phase_fault_us = 0.0;
+  /// A transient that moves NO audio -- acquisition, not a correction or a starvation. Board 0
+  /// only. Needed because the other two arms are disturbances that swamp any measurement.
+  double transient_period_s = 0.0;
+  double transient_secs = 0.0;
   /// Depth-snapshot cadence; 0 = 50000 us, the sink's DMA buffer on this bench.
   int64_t publish_interval_us = 0;
   /// Count confirmations per DISTINCT SNAPSHOT rather than per evaluation. False reproduces the
@@ -288,6 +297,8 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
+  long psat_n = 0, psat_hit = 0;
+  double psat_max = 0.0;
   double sig_e_sum = 0.0, sig_g_sum = 0.0;
   long sig_n = 0;
   double common_max_us = 0.0;
@@ -437,6 +448,22 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       // declares a purely common error "differential". Publishing it noiseless makes the gate
       // look perfect.
       x.phase_us = measured + nd(rng) * 0.25;
+      // PHASE IS WRONG WHILE THE BOARD IS IN ITS OWN TRANSIENT. Modelled as an observed fact, not
+      // as a mechanism: steady=0 exists precisely because the board knows its phase does not
+      // describe its audio then, and the bench shows it wrong by MILLISECONDS while the wire says
+      // the pair is within microseconds.
+      //
+      // Bench 2026-09-03 03:46, board b, seven minutes post-reboot:
+      //     GDIN raw=-8633 gd=+4317 gap=-103188 extrap=+1.42 steady=0
+      //     RATEWHY p=-150.00 kp=0.156 dif=-2519 clip=1   <- P PINNED at the authority clamp
+      // while the analyser had the pair at p2p 33 us, mean +1.1 us. So dif was false by ~2.5 ms,
+      // and neither the 103 ms pairing gap nor the 1.42 us extrapolation accounts for it.
+      //
+      // Applied to the PUBLISHED phase only. err_us -- the truth -- is untouched, so the audio has
+      // not moved and any skew that follows is manufactured by the loop believing a bad phase.
+      if (f.phase_fault_us != 0.0 && !x.phase_publishing) {
+        x.phase_us += f.phase_fault_us;
+      }
       x.phase_at_us = t;
       // A BOARD IN TRANSIENT PUBLISHES NO PHASE, as the client gates it. Armed by a delivered
       // correction and -- since 4e68870 -- by the ring falling below its starvation floor, because
@@ -447,6 +474,18 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       if (x.buffer_us > 0.0 && p.buffer_floor_us > 0 &&
           x.buffer_us < static_cast<double>(p.buffer_floor_us)) {
         x.phase_transient_until_us = t + p.compensation_us();
+      }
+      // A TRANSIENT THAT MOVES NO AUDIO, which is the bench's actual case and the one this model
+      // could not express. Both existing arms -- the ring floor and a delivered correction -- are
+      // disturbances that dominate every metric, so a phase fault injected alongside them cannot
+      // be measured (3k's first attempt: control p2p 96.9 ms). Board b's bench transient was
+      // post-reboot ACQUISITION: it declines to publish, its phase is untrustworthy, and its audio
+      // is not being stepped at all. Board 0 only, so the pair stays asymmetric as it was.
+      if (f.transient_period_s > 0.0 && i == 0) {
+        const double tph = std::fmod(static_cast<double>(t) / 1e6, f.transient_period_s);
+        if (tph < f.transient_secs) {
+          x.phase_transient_until_us = std::max(x.phase_transient_until_us, t + tick);
+        }
       }
       x.phase_publishing = (t >= x.phase_transient_until_us);
       x.obs.emplace_back(t, measured + nd(rng));
@@ -692,6 +731,15 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
         sig_g_sum += c.decision.gd_sigma_us;
         sig_n++;
       }
+      // P PINNED AT THE AUTHORITY CLAMP is the bench's signature, not merely a large P: with
+      // dx=0 and dp=0 the command is no longer tracking anything, it is being slew-walked toward
+      // a saturated setpoint, which is what draws the near-vertical cliff on the wire.
+      if (t > 120000000) {
+        const double ap = std::fabs(static_cast<double>(c.decision.p_ppm));
+        psat_n++;
+        if (ap >= 0.99 * static_cast<double>(p.rate_authority_ppm)) psat_hit++;
+        if (ap > psat_max) psat_max = ap;
+      }
       x.last_pc_ppm = c.decision.pc_ppm;
       x.last_common_valid = c.decision.common_shared_valid;
       x.last_e_split_valid = c.decision.e_split_valid;
@@ -850,6 +898,8 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     r.ediff_after_n = ph_after_n;
     r.ediff_after_flagged = ph_after_n ? static_cast<double>(ph_after_flagged) / ph_after_n : 0.0;
     r.common_max = common_max_us;
+    r.p_sat_frac = psat_n ? static_cast<double>(psat_hit) / psat_n : 0.0;
+    r.p_max_ppm = psat_max;
     if (sig_n > 0) {
       r.sigma_e_mean = sig_e_sum / static_cast<double>(sig_n);
       r.gd_sigma_mean = sig_g_sum / static_cast<double>(sig_n);
@@ -1374,6 +1424,56 @@ int main() {
       }
     }
     printf("        (bench reference, target=10 diluted gd_sigma: p2p 87.7 us, sd 14.15, period 10-14 s)\n");
+  }
+
+  printf("\n3k. THE PHANTOM SATURATING P: a bad phase during a board's own transient\n");
+  {
+    // BENCH 2026-09-03 03:46, board b, seven minutes post-reboot:
+    //     GDIN raw=-8633 gd=+4317 gap=-103188 extrap=+1.42 steady=0
+    //     RATEWHY p=-150.00 kp=0.156 sig=22.0 dif=-2519 dx=+0.00 dp=+0.00 clip=1
+    // while the analyser had the pair at p2p 33 us, mean +1.1 us. The differential was false by
+    // ~2.5 ms, P was PINNED at the -150 ppm authority clamp, and dx=dp=0 with clip=1 means the
+    // command was being slew-walked toward a saturated setpoint -- which draws the near-vertical
+    // cliff the wire showed, followed by the limiter walking back.
+    //
+    // The fault is injected on the PUBLISHED PHASE while steady=0, i.e. as the observed fact that
+    // a board's phase does not describe its audio during its own transient. err_us is untouched,
+    // so no audio moves and every microsecond of skew below is manufactured by the loop believing
+    // a phase the board itself has already declined to broadcast.
+    //
+    // The signature to reproduce is not "large P" -- it is P PINNED at the clamp with the slew
+    // limiter walking toward it.
+    // NO STARVATION, NO CORRECTIONS: the transient here moves no audio, so the control is clean
+    // and every microsecond below is the loop believing a bad phase.
+    Faults pf{};
+    pf.transient_period_s = 60.0; pf.transient_secs = 4.0;
+    pf.phase_fault_us = 8600.0;   // the bench's raw phase error
+    printf("        phase wrong by %.1f ms while steady=0; audio never moves\n", pf.phase_fault_us / 1000.0);
+    printf("        %-30s %9s %8s %9s %9s %8s\n",
+           "case", "p2p/2min", "sd", "P sat %", "max |P|", "corr");
+    // LONG transients too: the bench's was post-reboot acquisition lasting MINUTES, and gd can
+    // only climb at the filter's gmax per sample -- so a 4 s transient never lets dif reach the
+    // 2.5 ms that pinned P at the clamp on hardware. The 40 s rows are what test that path.
+    struct PkCase { const char *name; const char *tag; bool fault; bool gate; double secs; };
+    const PkCase cases[] = {
+      {"no fault, 4 s transient",   "pk-none",  false, false,  4.0},
+      {"fault 4 s, gate off",       "pk-off",   true,  false,  4.0},
+      {"fault 4 s, GATE ON",        "pk-on",    true,  true,   4.0},
+      {"no fault, 40 s transient",  "pk-nl",    false, false, 40.0},
+      {"fault 40 s, gate off",      "pk-offl",  true,  false, 40.0},
+      {"fault 40 s, GATE ON",       "pk-onl",   true,  true,  40.0},
+    };
+    for (const PkCase &c : cases) {
+      Profile q = p;
+      q.gate_gd_on_transient = c.gate;
+      Faults f = pf;
+      f.transient_secs = c.secs;
+      if (!c.fault) f.phase_fault_us = 0.0;
+      Result r = simulate(c.tag, q, -15.0, +15.0, 40.0, 80.0, 900.0, TRUE_LAND, f);
+      printf("        %-30s %9.1f %8.2f %8.0f%% %9.1f %8d\n",
+             c.name, r.p2p_med, r.sd_med, 100.0 * r.p_sat_frac, r.p_max_ppm, r.corr);
+    }
+    printf("        (gate_gd_on_transient holds gd while the board's own phase is meaningless)\n");
   }
 
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
