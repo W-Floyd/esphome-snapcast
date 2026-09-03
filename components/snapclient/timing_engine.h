@@ -320,6 +320,16 @@ struct Decision {
   /// the group supplies one, the deadline error's otherwise. Logged because "which distribution
   /// was the gain sized from" is exactly the question that went unasked.
   float p_sigma_us = 0.0f;
+  /// The DIFFERENTIAL's own noise estimate, formed the same way sigma_e is (0.8862 * EWMA of
+  /// consecutive differences) and floored at a quarter frame by the gate that owns it.
+  ///
+  /// Logged because the ratio sigma(gd)/sigma_e decides whether sizing Kp from the differential
+  /// raises or lowers the gain, and that ratio is INVERTED between this bench and the simulator --
+  /// so the sign of the fix depends on it. It cannot be recovered from the existing lines: ENGINE
+  /// is throttled to one line per 2 s and GDIN to one per second, and differencing at those
+  /// cadences measures the loop's slow excursion rather than sample-to-sample noise, which is the
+  /// distinction the noise estimator was deliberately built around.
+  float gd_sigma_us = 0.0f;
   bool slew_clipped = false;    ///< the command wanted to move further than authority*dt/horizon
 
   /// THE SHARED COMMON-MODE TERM, and the value it acted on. Recorded even when the correction is

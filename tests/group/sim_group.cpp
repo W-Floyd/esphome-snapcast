@@ -162,6 +162,10 @@ struct Result {
   /// Peak |e_common| seen after settling. The drain exists to hold this under the 50 ms resync
   /// threshold; above it the cascade (solo repair -> broken pair -> phantom -> P excursion) starts.
   double common_max = 0.0;
+  /// Mean sigma_e and mean gd_sigma, as the engine forms them. Their RATIO decides whether sizing
+  /// Kp from the differential raises or lowers the gain, and it is inverted between here and the
+  /// bench -- which is why 3h reported the opposite sign to the hardware sweep.
+  double sigma_e_mean = 0.0, gd_sigma_mean = 0.0;
   double common_valid_frac = 0.0;
   /// Mass balance, per board: what arrived, what the DAC consumed, what the correction threw away,
   /// and where the buffer started and ended. The identity in - out - disc == dbuffer holds only
@@ -280,6 +284,8 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   double snap_sum = 0.0;
   gd_ticks = 0; gd_present_ticks = 0; gd_fresh_ticks = 0; gd_age_sum_us = 0.0;
   double deadline_shift = 0.0;   // common-mode: moves both deadlines together
+  double sig_e_sum = 0.0, sig_g_sum = 0.0;
+  long sig_n = 0;
   double common_max_us = 0.0;
   double ph_after_sum = 0.0, ph_base_sum = 0.0;
   long ph_after_n = 0, ph_base_n = 0, ph_after_flagged = 0;
@@ -674,6 +680,14 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
         const double ac = std::fabs(static_cast<double>(c.decision.e_common_us));
         if (ac > common_max_us) common_max_us = ac;
       }
+      // THE NOISE RATIO, which is what decides the SIGN of sizing Kp from the differential. Both
+      // numbers formed the same way the engine forms them, so they are comparable with the bench's
+      // ENGINE sigma=/gsig= fields rather than merely similar.
+      if (t > 120000000) {
+        sig_e_sum += x.eng.sigma_e_us();
+        sig_g_sum += c.decision.gd_sigma_us;
+        sig_n++;
+      }
       x.last_pc_ppm = c.decision.pc_ppm;
       x.last_common_valid = c.decision.common_shared_valid;
       x.last_e_split_valid = c.decision.e_split_valid;
@@ -797,6 +811,10 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
     r.ediff_after_n = ph_after_n;
     r.ediff_after_flagged = ph_after_n ? static_cast<double>(ph_after_flagged) / ph_after_n : 0.0;
     r.common_max = common_max_us;
+    if (sig_n > 0) {
+      r.sigma_e_mean = sig_e_sum / static_cast<double>(sig_n);
+      r.gd_sigma_mean = sig_g_sum / static_cast<double>(sig_n);
+    }
     r.pc_absdiff = pc_absdiff_sum / sn;
     r.common_one_sided_frac = static_cast<double>(common_one_sided_n) / sn;
     r.common_both_frac = static_cast<double>(both_valid_n) / sn;
@@ -1240,7 +1258,10 @@ int main() {
         char nm[48]; snprintf(nm, sizeof(nm), "noise %.0f us, Kp from %s", noise,
                               fix ? "DIFF sigma" : "sigma_e");
         Result r = simulate(tag, q, -15.0, +15.0, 40.0, noise, 600.0, TRUE_LAND);
-        printf("        %-28s %9.0f %9.0f %9d %8ld\n", nm, r.skew_med, r.skew_p90, r.corr, r.gross);
+        printf("        %-28s %9.0f %9.0f %9d %8ld   sigma_e=%.1f gd_sigma=%.1f ratio=%.2f\n",
+               nm, r.skew_med, r.skew_p90, r.corr, r.gross,
+               r.sigma_e_mean, r.gd_sigma_mean,
+               r.sigma_e_mean > 0 ? r.gd_sigma_mean / r.sigma_e_mean : 0.0);
       }
     }
     printf("        (the fix should help where sigma(gd) > sigma_e and be neutral otherwise)\n");

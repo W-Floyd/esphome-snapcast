@@ -816,6 +816,7 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // the first place. An instrument that reports a number the code did not use is worse than none.
   cmd.decision.kp_ppm_per_us = kp_used;
   cmd.decision.p_sigma_us = p_sigma_us;
+  cmd.decision.gd_sigma_us = gd_sigma_us;
   last_crystal_ppm_ = crystal_ppm_;
   last_p_ppm_ = p_term;
   rate_cmd_seeded_ = true;
