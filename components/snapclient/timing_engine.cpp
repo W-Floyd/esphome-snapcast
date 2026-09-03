@@ -240,6 +240,20 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
   // not telling us about the clock.
   if (obs.buffer_us > 0 && profile_.buffer_floor_us > 0 &&
       obs.buffer_us < profile_.buffer_floor_us) {
+    // AND THE RECOVERY IS NOT A RATE MEASUREMENT EITHER. Holding only while the buffer is under
+    // its floor releases the integral the instant it clears -- but a board that has just refilled
+    // is still seconds behind, so the error stays large and ONE-SIGNED for the whole catch-up, and
+    // a one-signed error is precisely what an integrator eats.
+    //
+    // Measured 2026-09-02: board a starved (ARRGAP mean 61-100 ms against 26 ms of audio per
+    // chunk, n down to a fifth), and its crystal wound from a hand-zeroed 0 to +192 ppm in twelve
+    // minutes -- 8 ppm off the rail, against a true crystal of +46. The input clamp bounds the
+    // winding RATE (one frame per component, ~38 ppm/min here) and not where it stops.
+    //
+    // The integral cannot tell "my oscillator runs fast" from "I am behind because the audio did
+    // not arrive": both are a persistent one-signed error. So it must be told, and the only
+    // quantity that knows is the buffer.
+    starved_until_us_ = now_us + profile_.settle_us();
     cmd.rate_ppm = crystal_ppm_;
     cmd.decision.act = Decision::Act::Hold;
     cmd.decision.why = Decision::Why::NoEvidence;
@@ -602,8 +616,14 @@ Command Engine::step(int64_t now_us, const Observation &obs, const GroupEvidence
     // A gap longer than the loop's own horizon means observability was lost, and integrating
     // across it is not justified by anything: past that the estimate should wait, not extrapolate.
     const float dt_int_s = std::min(dt_s, std::max(1e-3f, rate_h_s));
-    crystal_ppm_ = std::clamp(crystal_ppm_ + wn * wn * e_bounded * dt_int_s,
-                              -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
+    // AND NOT WHILE CATCHING UP FROM A STARVATION. starved_until_us_ runs one settle window past
+    // the buffer clearing its floor, which is how long the error keeps describing the shortage
+    // rather than the clock. P and position still act -- the error is real and worth correcting --
+    // but the ESTIMATE must not learn from it, because nothing about it is a rate.
+    if (now_us >= starved_until_us_) {
+      crystal_ppm_ = std::clamp(crystal_ppm_ + wn * wn * e_bounded * dt_int_s,
+                                -CRYSTAL_LIMIT_PPM, CRYSTAL_LIMIT_PPM);
+    }
   }
   last_obs_us_ = now_us;
 

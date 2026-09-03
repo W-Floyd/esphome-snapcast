@@ -31,6 +31,8 @@ constexpr int64_t BEACON_INTERVAL_US = 1000000;
 constexpr int64_t PHASE_PAIR_WINDOW_US = 300000;
 constexpr int64_t PHASE_STALE_US = 15000000;
 constexpr int64_t GROUP_DELTA_STALE_US = 15000000;
+// The engine clamps its crystal estimate at +-200 ppm. "Near the rail" is the failure this checks.
+constexpr double CRYSTAL_RAIL_PPM = 150.0;
 static long gd_ticks = 0, gd_present_ticks = 0, gd_fresh_ticks = 0;
 static double gd_age_sum_us = 0.0;
 
@@ -62,6 +64,14 @@ struct Board {
   int64_t last_gd_us = 0;
   int64_t last_gd_at_us = 0;
   double own_deadline_us = 0.0;   // this board's own deadline steps (re-anchors)
+  /// AUDIO QUEUED AHEAD OF THE DAC, and the reason the starvation guard exists. This used to be
+  /// the constant 1724000 handed to every Observation, so the buffer was always full, the guard's
+  /// `obs.buffer_us < buffer_floor_us` was never true, and NO buffer-gated behaviour in the engine
+  /// was reachable from this simulator -- including the guard that had been there all along.
+  /// Starvation drains it 1:1 with the clock (nothing is arriving); recovery refills it faster
+  /// than realtime, because the server keeps sending and the backlog lands; and a position
+  /// correction is SPENT from it, which is the drain-and-starve spiral the engine documents.
+  double buffer_us = 1724000.0;
   explicit Board(const Profile &p) : eng(p) {}
 };
 
@@ -84,6 +94,11 @@ struct Result {
   double amp_p05 = 0.0;     // signed, so a biased ring is distinguishable from a centred one
   double amp_p95 = 0.0;
   int n_periods = 0;        // fewer than ~6 and the period is not evidence (bench: 5 was not)
+  // CRYSTAL WIND-UP. The integral cannot tell "my oscillator runs fast" from "I am behind because
+  // the audio did not arrive" -- both are a persistent one-signed error. On the bench 2026-09-02 a
+  // starved board wound a hand-zeroed crystal to +192 ppm in twelve minutes against a true +46.
+  // Reported per board because the whole point is that it should stay near the PLANT rate.
+  double xtal_a = 0.0, xtal_b = 0.0;
 };
 
 /// Everything below `noise_us` models something the bench does that this simulator did not, and
@@ -183,6 +198,15 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         starved = ph < f.starve_secs;
         if (starved) x.err_us += static_cast<double>(tick);   // 1:1 with the clock
       }
+      // THE BUFFER, which is what the engine's starvation guard actually reads. Nothing arriving
+      // means it drains in real time; once audio resumes the backlog lands faster than realtime,
+      // so recovery is quicker than the outage that caused it. Capped at the nominal depth.
+      const double nominal_buf_us = 1724000.0;
+      if (starved) {
+        x.buffer_us = std::max(0.0, x.buffer_us - static_cast<double>(tick));
+      } else if (x.buffer_us < nominal_buf_us) {
+        x.buffer_us = std::min(nominal_buf_us, x.buffer_us + 2.0 * static_cast<double>(tick));
+      }
       // ROOT DISTURBANCE 2: the timebase re-anchors. COMMON-MODE, as the firmware states outright
       // ("every device holding this set steps identically") -- but the devices do not adopt it at
       // the same INSTANT. Beacons arrive once a second and a device steps when its own consensus
@@ -276,13 +300,19 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
         valid = u(rng) >= f.blind_fraction;
       }
       Command c = x.eng.step(t, Observation{t, static_cast<int64_t>(std::llround(seen)), valid,
-                                            1724000}, g);
+                                            static_cast<int64_t>(std::llround(x.buffer_us))}, g);
       if (c.frames != 0 && !x.live) {
         x.pid = c.correction_id;
         x.inflight.push_back({t + true_land_us, c.frames});
         x.live = true;
         x.corrections++;
         x.gross_frames += std::abs(c.frames);
+        // A DROP IS SPENT FROM THE BUFFER: dropping frames removes audio from the very thing that
+        // lets playout continue. The engine caps a correction at half the buffer for this reason,
+        // and that cap was unreachable here while the buffer was a constant.
+        if (c.frames > 0) {
+          x.buffer_us = std::max(0.0, x.buffer_us - static_cast<double>(c.frames) * p.frame_us());
+        }
       }
       x.err_us += (x.plant_ppm - c.rate_ppm) * 1e-6 * double(tick);
     }
@@ -348,6 +378,8 @@ Result simulate(Profile p, double plant_a, double plant_b, double common_ppm,
   r.err_med = errs[errs.size()/2];
   r.corr = b[0].corrections + b[1].corrections;
   r.gross = b[0].gross_frames + b[1].gross_frames;
+  r.xtal_a = b[0].eng.crystal_ppm();
+  r.xtal_b = b[1].eng.crystal_ppm();
   return r;
 }
 
@@ -369,6 +401,10 @@ int main() {
   p.position_delay_us = 1250000;
   p.target_position_us = 20;
   p.rate_authority_ppm = 100.0f;
+  // An eighth of the ring's capacity, as snapcast_client derives it. Never set here before, so it
+  // was 0 and the engine's starvation guard was disabled outright -- the guard has never once run
+  // in this simulator.
+  p.buffer_floor_us = 1724000 / 8;
   const int64_t TRUE_LAND = 1250000;
 
   printf("two boards, shared drifting deadline; frame %lld us\n\n",
@@ -404,6 +440,45 @@ int main() {
     check(r.skew_med < 2.0 * static_cast<double>(p.frame_us()),
           "the differential is corrected without chasing the common part",
           r.skew_med, 2.0 * p.frame_us());
+  }
+
+  printf("\n3a. STARVATION MUST NOT WIND THE CRYSTAL\n");
+  {
+    // The integral's input is clamped to one frame per component, which bounds the winding RATE
+    // (~38 ppm/min here) but not where it stops. A starved board is behind for as long as the
+    // shortage lasts AND for the whole catch-up after it, and that error is one-signed throughout.
+    //
+    // Bench 2026-09-02: board a starved (ARRGAP mean 61-100 ms against 26 ms of audio per chunk,
+    // n down to a fifth) and wound a hand-zeroed crystal to +192 ppm in twelve minutes, 8 ppm off
+    // the rail, against a true crystal of +46. The starvation guard already held DURING the
+    // shortage; it released the moment the buffer cleared its floor, which is not when the error
+    // stops describing the shortage.
+    // 50% duty, far harsher than the bench's ~119 s cadence, because that is where the guard's
+    // effect is unambiguous. Measured with the guard forced off, same seed:
+    //
+    //   starve  6s/40s over 1800s   on  +7.7 / +33.5    off +10.4 / +38.3    (small)
+    //   starve 10s/30s over 1800s   on -60.9 / -32.6    off -60.0 / -32.5    (NO effect)
+    //   starve 10s/20s over 1800s   on  +2.5 / +29.0    off +23.2 / +47.2    (~20 ppm)
+    //
+    // THE MIDDLE ROW IS UNEXPLAINED and is recorded rather than hidden: at that duty both boards
+    // wind to 45 ppm from plant whether the hold is there or not, so something other than the
+    // post-starvation catch-up is winding them and this guard does not address it. The guard is a
+    // real improvement, not a solution -- board b is still 14 ppm off plant with it.
+    const double plant_a = -15.0, plant_b = +15.0;
+    Faults hungry{};
+    hungry.starve_period_s = 20.0;
+    hungry.starve_secs = 10.0;
+    Result r = simulate(p, plant_a, plant_b, 40.0, 80.0, 1800.0, TRUE_LAND, hungry);
+    printf("        plant %+.0f / %+.0f ppm   ->   crystal %+.1f / %+.1f ppm   (skew med %.0f us)\n",
+           plant_a, plant_b, r.xtal_a, r.xtal_b, r.skew_med);
+    // The crystal is an estimate OF THE PLANT. Starvation must not move it far from one.
+    check(std::fabs(r.xtal_a - plant_a) < 20.0,
+          "board a's crystal still estimates its plant, not the shortage", r.xtal_a, plant_a);
+    check(std::fabs(r.xtal_b - plant_b) < 20.0,
+          "board b's crystal still estimates its plant, not the shortage", r.xtal_b, plant_b);
+    check(std::fabs(r.xtal_a) < CRYSTAL_RAIL_PPM && std::fabs(r.xtal_b) < CRYSTAL_RAIL_PPM,
+          "and neither is anywhere near the rail", std::max(std::fabs(r.xtal_a), std::fabs(r.xtal_b)),
+          CRYSTAL_RAIL_PPM);
   }
 
   printf("\n3b. SPLIT FILTER: does rate benefit from a faster error filter than position?\n");
