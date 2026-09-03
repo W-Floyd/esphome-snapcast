@@ -888,6 +888,9 @@ class SnapcastClient {
     /// buffer (+50010 us) between consecutive decisions while the peer 15.7 us away never moved.
     int resync_confirm_run{0};
     int resync_confirm_dir{0};
+    /// Measurement instant the last confirmation was counted from, so several evaluations reading
+    /// ONE snapshot count once. Without it the gate counts re-reads and rejects nothing.
+    int64_t resync_confirm_at_us{0};
     // When the drift first exceeded the repair threshold, 0 while it has not, plus the
     // range it has covered since -- a split is steady, an artefact moves.
     int32_t drift_excess_min_us{0};
@@ -1130,6 +1133,8 @@ class SnapcastClient {
   /// The sink's DMA descriptor span (AudioDepth::render_nondraining_us), mirrored per chunk. Used
   /// ONLY to keep the hard-resync threshold from coinciding with a whole number of DMA buffers.
   std::atomic<int64_t> dma_span_us_{0};
+  /// as_of_us of the last depth snapshot. Used to count DISTINCT measurements, not re-reads.
+  std::atomic<int64_t> depth_as_of_us_{0};
   /// RING MASS BALANCE. The loop servos the deadline error and nothing servos buffer occupancy,
   /// so audio-in = audio-out is INFERRED, never checked: chasing a drifting deadline is the same
   /// action as balancing the buffer only while the deadline moves because the clocks differ. A

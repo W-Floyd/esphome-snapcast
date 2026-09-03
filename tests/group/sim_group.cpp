@@ -62,6 +62,8 @@ struct Board {
   /// Repair already applied but not yet visible in the lagged measurement.
   double resync_pending_us = 0.0;
   int64_t resync_pending_until_us = 0;
+  int64_t meas_at_us = 0;            ///< instant of the snapshot this evaluation is reading
+  int64_t resync_confirm_at_us = -1; ///< snapshot the last confirmation was counted from
   long gross_frames = 0;
   double phase_us = 0.0;    // what it publishes
   int64_t phase_at_us = 0;  // and when it sampled it -- pairing needs both
@@ -206,6 +208,14 @@ struct Faults {
   /// audio does NOT move -- only the reading is wrong.
   double glitch_period_s = 0.0;
   double glitch_us = 0.0;
+  /// How long the bad reading persists; 0 = one publish interval, i.e. a single bad snapshot
+  /// served to every evaluation inside it.
+  double glitch_span_s = 0.0;
+  /// Depth-snapshot cadence; 0 = 50000 us, the sink's DMA buffer on this bench.
+  int64_t publish_interval_us = 0;
+  /// Count confirmations per DISTINCT SNAPSHOT rather than per evaluation. False reproduces the
+  /// gate's first, ineffective form.
+  bool confirm_distinct = false;
   /// Consecutive same-direction samples past the threshold before the repair may act; 0 = act on
   /// one sample, which is what the client did before 2026-09-03.
   int resync_confirm = 0;
@@ -443,11 +453,22 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       //
       // Injected into the OBSERVATION only. err_us, the truth, is untouched: the audio has not
       // moved, which is the whole point and the reason a confirmation gate can reject it.
+      // THE SNAPSHOT'S INSTANT, not the tick's. The publisher runs once per DMA buffer while the
+      // repair is evaluated far more often, so several consecutive evaluations read ONE snapshot.
+      // Modelling that is what lets this suite tell a confirmation gate that counts DISTINCT
+      // MEASUREMENTS from one that counts re-reads -- the first rejects a bad snapshot, the second
+      // confirms it three times over and rejects nothing. A one-tick glitch cannot distinguish
+      // them, which is why 3g reported success for both before this existed.
+      const int64_t pub_us = f.publish_interval_us > 0 ? f.publish_interval_us : 50000;
+      x.meas_at_us = (t / pub_us) * pub_us;
       bool glitched = false;
       if (f.glitch_period_s > 0.0 && f.glitch_us != 0.0 && i == 0) {
         const double gph = std::fmod(static_cast<double>(t) / 1e6, f.glitch_period_s);
-        // One tick wide: a single bad sample, not a sustained offset.
-        glitched = gph < (static_cast<double>(tick) / 1e6);
+        // Spans a whole publish interval by default: ONE bad snapshot, read by every evaluation
+        // that falls inside it.
+        const double span_s = f.glitch_span_s > 0.0 ? f.glitch_span_s
+                                                    : static_cast<double>(pub_us) / 1e6;
+        glitched = gph < span_s;
         if (glitched) seen += f.glitch_us;
       }
 
@@ -571,10 +592,14 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       const bool past = f.resync_us > 0.0 && std::fabs(measured_now) > f.resync_us;
       const int rdir = measured_now > 0 ? 1 : -1;
       if (past) {
-        if (rdir == x.resync_dir) x.resync_run++;
-        else { x.resync_dir = rdir; x.resync_run = 1; }
+        const bool fresh = !f.confirm_distinct || x.meas_at_us != x.resync_confirm_at_us;
+        if (fresh) {
+          if (rdir == x.resync_dir) x.resync_run++;
+          else { x.resync_dir = rdir; x.resync_run = 1; }
+          x.resync_confirm_at_us = x.meas_at_us;
+        }
       } else {
-        x.resync_run = 0; x.resync_dir = 0;
+        x.resync_run = 0; x.resync_dir = 0; x.resync_confirm_at_us = -1;
       }
       if (past && x.resync_run >= (f.resync_confirm > 0 ? f.resync_confirm : 1)) {
         const double chunk = f.resync_chunk_us > 0.0 ? f.resync_chunk_us : 26123.0;
@@ -1157,18 +1182,22 @@ int main() {
     g.resync_us = 50000.0;      // the coincidence: threshold == the artifact
     printf("        glitch +50010 us on board A every 120 s; audio never moves\n");
     printf("        %-34s %9s %9s %9s %8s\n", "case", "skew med", "skew p90", "skew max", "rsync a/b");
-    struct GCase { const char *name; const char *tag; int confirm; double thresh; };
+    struct GCase { const char *name; const char *tag; int confirm; double thresh; bool distinct; };
     const GCase cases[] = {
-      {"no glitch (control)",            "gl-none",  0, 50000.0},
-      {"glitch, act on 1 sample (today)","gl-1",     0, 50000.0},
-      {"glitch, confirm 3 samples",      "gl-3",     3, 50000.0},
-      {"glitch, threshold 75 ms (1.5x)", "gl-thr",   0, 75000.0},
-      {"glitch, confirm 3 + 75 ms",      "gl-both",  3, 75000.0},
+      {"no glitch (control)",             "gl-none", 0, 50000.0, false},
+      {"glitch, act on 1 sample (today)", "gl-1",    0, 50000.0, false},
+      // THE TWO GATE DESIGNS, and the reason the distinction is not cosmetic: the lie spans one
+      // publish interval, so it is READ by several evaluations. Counting reads confirms it.
+      {"glitch, confirm 3 reads",         "gl-3r",   3, 50000.0, false},
+      {"glitch, confirm 3 SNAPSHOTS",     "gl-3s",   3, 50000.0, true},
+      {"glitch, threshold 75 ms (1.5x)",  "gl-thr",  0, 75000.0, false},
+      {"glitch, 3 snapshots + 75 ms",     "gl-both", 3, 75000.0, true},
     };
     for (const GCase &c : cases) {
       Faults f = g;
       f.resync_confirm = c.confirm;
       f.resync_us = c.thresh;
+      f.confirm_distinct = c.distinct;
       if (std::string(c.tag) == "gl-none") { f.glitch_period_s = 0.0; f.glitch_us = 0.0; }
       Result r = simulate(c.tag, p, 0.0, 0.0, 0.0, 80.0, 900.0, TRUE_LAND, f);
       printf("        %-34s %9.0f %9.0f %9.0f %4d/%-4d\n",

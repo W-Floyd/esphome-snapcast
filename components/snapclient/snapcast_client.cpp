@@ -3377,17 +3377,30 @@ void SnapcastClient::player_task_() {
     // would reject every observation. Confirmation costs ~2 samples on a genuine displacement,
     // which is nothing to a board already tens of ms out, and it does not depend on knowing WHY
     // the accounting moved -- which is still open.
+    // COUNT DISTINCT MEASUREMENTS, NOT EVALUATIONS. This is the whole difference between a gate
+    // that works and one that is decoration: the resync is evaluated per chunk (5-15 ms apart,
+    // measured) while the depth snapshot publishes once per DMA buffer (~50 ms), so one bad
+    // snapshot is read 3-10 times in a row. Counting reads would confirm it three times over and
+    // reject nothing. The measurement's own instant is the discriminator -- st.dl_err_at_us on the
+    // tag path (the same value the RSKIP dedup at the line below already keys on) and the depth
+    // snapshot's as_of_us otherwise.
+    const int64_t coarse_at_us =
+        coarse_on_tags ? st.dl_err_at_us : this->depth_as_of_us_.load(std::memory_order_relaxed);
     const int resync_dir = coarse_err_us > 0 ? 1 : -1;
     if (std::abs(coarse_err_us) > hard_us && coarse_plausible) {
-      if (resync_dir == st.resync_confirm_dir) {
-        st.resync_confirm_run++;
-      } else {
-        st.resync_confirm_dir = resync_dir;
-        st.resync_confirm_run = 1;
+      if (coarse_at_us != st.resync_confirm_at_us) {   // a NEW measurement, not a re-read
+        if (resync_dir == st.resync_confirm_dir) {
+          st.resync_confirm_run++;
+        } else {
+          st.resync_confirm_dir = resync_dir;
+          st.resync_confirm_run = 1;
+        }
+        st.resync_confirm_at_us = coarse_at_us;
       }
     } else {
       st.resync_confirm_run = 0;
       st.resync_confirm_dir = 0;
+      st.resync_confirm_at_us = 0;
     }
     // The single decision all three sites below share. Computing it once is deliberate: this file
     // has already shipped a bug where two halves of one policy tested different quantities.
@@ -4080,6 +4093,12 @@ void SnapcastClient::dbg_early_recon_(const ChunkRecord &rec, const char *phase)
   if (m.render_nondraining_us > 0) {
     this->dma_span_us_.store(static_cast<int64_t>(m.render_nondraining_us), std::memory_order_relaxed);
   }
+  // THE SNAPSHOT'S OWN INSTANT, mirrored so a consumer can tell one measurement from a re-read of
+  // the same one. The publisher runs once per DMA buffer (~50 ms) while the resync is evaluated
+  // per chunk (measured 5-15 ms apart on this bench), so several consecutive evaluations share one
+  // snapshot -- and a confirmation that counts EVALUATIONS rather than measurements would pass a
+  // bad snapshot three times over and reject nothing.
+  this->depth_as_of_us_.store(m.as_of_us, std::memory_order_relaxed);
   const int64_t inflight_frames = static_cast<int64_t>(m.dbg_inflight_us) * rate / 1000000;
   const int64_t r_mix = static_cast<int64_t>(m.dbg_src_consumed) - static_cast<int64_t>(m.dbg_sink_received) -
                         xfer_frames - inflight_frames;
