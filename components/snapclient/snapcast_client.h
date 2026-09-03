@@ -979,6 +979,19 @@ class SnapcastClient {
     uint32_t implausible_err_count{0};  // errors rejected as unanchored (see IMPLAUSIBLE)
     int64_t implausible_log_us{0};
     bool warned_far_deadline{false};  // throttle for the first-chunk deadline bound
+    // SUPPLY SHADOW. Does arrival lateness account for the crystal wind-up seen under starvation?
+    // A chunk that reaches the socket after its own deadline is late because the NETWORK was late,
+    // and error growth from that is not evidence of a rate error -- but the integral cannot tell
+    // the two apart, since both are a persistent one-signed error.
+    //
+    // Logged beside the live loop and ACTING ON NOTHING, because the mechanism this is meant to
+    // explain (+192 ppm in twelve minutes on a starved board, against a true +46) already survived
+    // one proposed explanation that did not hold up. Shadow first, then decide.
+    int64_t supply_late_sum_us{0};   // sum of negative slack over the window
+    int64_t supply_late_worst_us{0};
+    uint32_t supply_late_chunks{0};
+    uint32_t supply_chunks{0};
+    int64_t supply_report_us{0};
     bool warned_no_timebase{false};   // throttle for chunks discarded with no timebase at all
     uint32_t no_timebase_chunks{0};   // chunks discarded since the last timebase was available
     int64_t phase_transient_until_us{0};  // my render phase does not describe my audio until then (steps, hard resyncs, deadline source changes)
@@ -1010,6 +1023,11 @@ class SnapcastClient {
     int64_t server_ts_us;
     uint32_t bytes;
     StreamParams params;
+    /// When this chunk came off the socket. Carried so the player can ask whether the audio was
+    /// late because the NETWORK was late, which is the one question the engine cannot answer from
+    /// the error alone: a starvation and a real clock drift are both a persistent one-signed
+    /// error. Set on the network task; read on the player task.
+    int64_t arrival_us;
   };
 
   enum class EventType : uint8_t { CONNECTED, DISCONNECTED, SERVER_SETTINGS, STREAM_START, STREAM_END };

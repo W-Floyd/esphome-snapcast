@@ -2505,7 +2505,13 @@ void SnapcastClient::emit_pcm_(const uint8_t *data, size_t len, int64_t server_t
   if (written < len) {
     return;
   }
-  ChunkRecord record{.server_ts_us = server_ts_us, .bytes = static_cast<uint32_t>(len), .params = this->stream_params_};
+  // last_chunk_us_ is stamped in handle_wire_chunk_, which calls the decode path synchronously on
+  // this same task, so it is THIS chunk's arrival instant. A chunk that decodes into several
+  // records shares one arrival, which is correct: they came off the socket together.
+  ChunkRecord record{.server_ts_us = server_ts_us,
+                     .bytes = static_cast<uint32_t>(len),
+                     .params = this->stream_params_,
+                     .arrival_us = this->last_chunk_us_.load(std::memory_order_relaxed)};
   while (xQueueSend(this->record_queue_, &record, pdMS_TO_TICKS(100)) != pdTRUE) {
     if (this->shutdown_.load(std::memory_order_relaxed)) {
       return;
@@ -2789,6 +2795,37 @@ void SnapcastClient::player_task_() {
       ESP_LOGW(TAG, "NOTB recovered after %" PRIu32 " chunks", st.no_timebase_chunks);
       st.no_timebase_chunks = 0;
       st.warned_no_timebase = false;
+    }
+    // SUPPLY SHADOW, measuring only. Slack is how long before its own deadline the chunk reached
+    // the socket; negative means it arrived after the instant it was due to play, so whatever
+    // error follows is the NETWORK being late and not this board's clock. Summed per window and
+    // logged beside the crystal so the two can be compared -- if starvation accounts for the
+    // wind-up, the sum should track it; if it does not, this hypothesis dies like the last one.
+    if (rec.arrival_us > 0) {
+      st.supply_chunks++;
+      const int64_t slack = deadline - rec.arrival_us;
+      if (slack < 0) {
+        st.supply_late_chunks++;
+        st.supply_late_sum_us += -slack;
+        if (-slack > st.supply_late_worst_us) {
+          st.supply_late_worst_us = -slack;
+        }
+      }
+      if (st.supply_report_us == 0) {
+        st.supply_report_us = now_us();
+      } else if (now_us() - st.supply_report_us >= 10000000 && st.supply_chunks > 0) {
+        // Fixed field count, own line, no variable tail: a field near the end of a long line is a
+        // record of whether the line fitted, not of what happened.
+        ESP_LOGW(TAG,
+                 "SUPPLY n=%" PRIu32 " late=%" PRIu32 " sum=%" PRId64 " worst=%" PRId64 " xtal=%+.2f",
+                 st.supply_chunks, st.supply_late_chunks, st.supply_late_sum_us, st.supply_late_worst_us,
+                 this->timing_engine_.crystal_ppm());
+        st.supply_report_us = now_us();
+        st.supply_chunks = 0;
+        st.supply_late_chunks = 0;
+        st.supply_late_sum_us = 0;
+        st.supply_late_worst_us = 0;
+      }
     }
     {
       // See dl_off_* in ServoState: isolates the timebase's contribution to the error so it can be
