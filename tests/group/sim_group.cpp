@@ -55,6 +55,7 @@ struct Board {
   uint64_t pid = 0;
   bool live = false;
   int corrections = 0;
+  int resyncs = 0;          ///< whole-chunk repairs taken by THIS board
   long gross_frames = 0;
   double phase_us = 0.0;    // what it publishes
   int64_t phase_at_us = 0;  // and when it sampled it -- pairing needs both
@@ -119,7 +120,8 @@ static FILE *g_skew_csv = nullptr;
 static const char *g_scenario = "sim";
 
 struct Result {
-  double skew_med = 0.0, skew_p90 = 0.0;
+  double skew_med = 0.0, skew_p90 = 0.0, skew_max = 0.0;
+  int resync_a = 0, resync_b = 0;   ///< whole-chunk repairs per board; unequal counts break the pair
   int corr = 0;
   long gross = 0;
   double err_med = 0.0;
@@ -188,6 +190,9 @@ struct Faults {
   double blind_fraction = 0.0;
   double resync_period_s = 0.0;
   double resync_us = 0.0;
+  /// Chunk the repair is quantised to; 0 = the client's ~26 ms. The repair cannot null the error,
+  /// only step it by whole chunks, which is what makes the residual board-dependent.
+  double resync_chunk_us = 0.0;
   /// Whether the resync path tells the engine what it did. The bench did not, until
   /// note_external_move() existed.
   bool announce_resync = false;
@@ -495,11 +500,23 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
       //
       // The engine's problem is not the move, it is not being TOLD: it sees the error vanish in
       // one step and reads that as the plant having jumped.
+      // WHOLE CHUNKS, not a continuous null. The client "drops chunks until we catch back up", so
+      // the repair is QUANTISED to a chunk (~26 ms) and cannot land on zero. Modelling it as an
+      // exact null hid the mechanism that matters: two boards either side of the threshold drop a
+      // DIFFERENT WHOLE NUMBER of chunks, and an aligned pair is then a chunk apart.
+      //
+      // Bench 2026-09-03: board a's repair was frames=+1136 = 25.76 ms, i.e. exactly one chunk,
+      // taken while the pair was 15.7 us apart on the wire.
       if (f.resync_us > 0.0 && std::fabs(x.err_us + deadline_shift + x.own_deadline_us) > f.resync_us) {
-        const double moved = x.err_us + deadline_shift + x.own_deadline_us;
-        x.err_us -= moved;
-        if (f.announce_resync) {
-          x.eng.note_external_move(static_cast<int64_t>(std::llround(moved)), t);
+        const double measured_now = x.err_us + deadline_shift + x.own_deadline_us;
+        const double chunk = f.resync_chunk_us > 0.0 ? f.resync_chunk_us : 26123.0;
+        const double moved = std::trunc(measured_now / chunk) * chunk;
+        if (moved != 0.0) {
+          x.err_us -= moved;
+          x.resyncs++;
+          if (f.announce_resync) {
+            x.eng.note_external_move(static_cast<int64_t>(std::llround(moved)), t);
+          }
         }
       }
 
@@ -655,6 +672,9 @@ Result simulate(const char *label, Profile p, double plant_a, double plant_b, do
   r.skew_med = skews[skews.size()/2];
   r.skew_p90 = skews[static_cast<size_t>(0.9*skews.size())];
   r.err_med = errs[errs.size()/2];
+  r.skew_max = skews.empty() ? 0.0 : skews.back();   // skews is sorted by here
+  r.resync_a = b[0].resyncs;
+  r.resync_b = b[1].resyncs;
   r.corr = b[0].corrections + b[1].corrections;
   r.gross = b[0].gross_frames + b[1].gross_frames;
   r.gd_snaps = snap_n;
@@ -995,6 +1015,51 @@ int main() {
     }
     printf("        (flagged%% must be high or the gate has nothing to act on -- that was the\n");
     printf("         missing delivered-correction arm, which made the flag inert here)\n");
+  }
+
+  printf("\n3f. THE RESYNC BREAKING AN ALIGNED PAIR on a COMMON error (bench 2026-09-03)\n");
+  {
+    // THE CASE THE FIX HAS TO BE TESTED AGAINST, and the one this simulator could not produce.
+    //
+    // Bench: both boards sat ~51 ms from the server deadline TOGETHER while 15.7 us apart on the
+    // wire (rival 0.027, a clean lock). Board a crossed the 50 ms threshold first, RSKIP fired on
+    // the DEADLINE error -- `if (coarse_err_us > hard_us && ...)`, no e_diff, no group check --
+    // and it stepped one chunk alone. The pair went from 15.7 us to 2.9 ms apart: an inaudible
+    // common error converted into an audible differential one.
+    //
+    // Modelled as a SHARED deadline step (reanchor_stagger_s = 0, so both adopt at the same
+    // instant) large enough to cross the threshold. The plants are equal and the common drift is
+    // zero, so ANY skew here is manufactured by the repair -- there is no differential to find.
+    const double step_us = 60000.0;   // one shared step, past the 50 ms threshold
+    printf("        equal plants, no common drift: any skew below is MADE by the repair\n");
+    printf("        %-30s %9s %9s %9s %8s %8s\n",
+           "case", "skew med", "skew p90", "skew max", "rsync a", "rsync b");
+    struct RCase { const char *name; const char *tag; double step; double stagger; double resync; };
+    const RCase cases[] = {
+      {"no step (control)",           "rs-none",   0.0,     0.0, 50000.0},
+      {"shared step 60 ms, no resync","rs-nofix",  step_us, 0.0,     0.0},
+      {"shared step 60 ms + resync",  "rs-common", step_us, 0.0, 50000.0},
+      {"staggered 1 s + resync",      "rs-stag",   step_us, 1.0, 50000.0},
+      // ON A CHUNK BOUNDARY. The repair steps whole 26.123 ms chunks, so trunc() is a cliff: two
+      // boards whose common error straddles a multiple of the chunk drop a DIFFERENT COUNT, and
+      // an aligned pair is instantly a chunk apart. 52.246 ms is exactly two chunks, so 80 us of
+      // measurement noise is enough to put the boards on opposite sides of it. Simultaneous
+      // adoption, equal plants, no common drift -- nothing here is asymmetric except the rounding.
+      {"shared step 52.246 ms (2 chunks)", "rs-cliff", 52246.0, 0.0, 50000.0},
+    };
+    for (const RCase &c : cases) {
+      Faults f{};
+      if (c.step > 0.0) {
+        f.reanchor_period_s = 200.0;
+        f.reanchor_us = c.step;
+        f.reanchor_stagger_s = c.stagger;
+      }
+      f.resync_us = c.resync;
+      Result r = simulate(c.tag, p, 0.0, 0.0, 0.0, 80.0, 900.0, TRUE_LAND, f);
+      printf("        %-30s %9.0f %9.0f %9.0f %8d %8d\n",
+             c.name, r.skew_med, r.skew_p90, r.skew_max, r.resync_a, r.resync_b);
+    }
+    printf("        (unequal resync counts are the signature: one board took a chunk the other did not)\n");
   }
 
   printf("\n4. THE BENCH'S OWN FAULTS: half the observations missing, and audio moved\n");
